@@ -19,9 +19,9 @@
 | 编号 | 模块 | 覆盖的愿望 | 最该参照 |
 |---|---|---|---|
 | M1 | 平台与客户端 | 电脑/VPS 后端+手机 remote、web GUI、手机 PWA、macOS/Linux | open-webui（看架构不搬代码） |
-| M2 | 会话内核 | 无限 session、compact 可配、跨 session 同步、retry/edit/fork | opencode + LangGraph（哲学） |
+| M2 | 会话内核 | 无限 session、compact 可配、跨 session 同步、retry/edit/fork | opencode + MiMo Code（cycle/rebuild）+ LangGraph（哲学） |
 | M3 | 上下文装配 | 模块化装配器、自定义 prompt、锚点自动更新、截断透明 | EverMind-AI/Raven |
-| M4 | 记忆与成长 | 蒸馏层、记忆演化、勘误、跨项目 insights | A-MEM + graphiti（勘误语义） |
+| M4 | 记忆与成长 | 蒸馏层、记忆演化、勘误、跨项目 insights | A-MEM + graphiti（勘误语义）+ MiMo（四层+Dream/Distill）+ 年轮（人格生长） |
 | M5 | 多 agent 与模型路由 | 多 agent 协作、子 agent 各选 provider/key、多 CLI/API | litellm Router + opencode 配置形状 |
 | M6 | 插件系统 | 好写、可插拔、插件自注册环境变量、可开关 | elizaOS Plugin 接口 + goose 配置格式 |
 | M7 | 自主性与社交边界 | 自主沉默、群/私区分、心跳自唤醒、住户感 | elizaOS 决策层 + OpenClaw 心跳协议 |
@@ -55,9 +55,20 @@
   参考：远程通道方案——不开公网端口，深度集成 Tailscale Serve/Funnel 自动出 HTTPS，
   多档 auth（系统账号/环境变量/SSH key/JWT）是个人工具的最小安全模型。
   同形态对照：slopus/happy（E2E 加密中继，想要推送通知的话看这个）。
+- **kimi web（Kimi Code CLI 自带 Web UI）** — 文档 https://moonshotai.github.io/kimi-cli/en/reference/kimi-web.html （2026-08-13 维护方提供，CLI v1.25 时代功能面）。
+  参考：控制台 UX 和安全基线两件套。UX：会话列表/搜索/fork（从任意一条回复分叉）/
+  归档，输入框上方工具栏显示上下文用量、agent 当前状态（处理中/等批准）、消息排队、
+  git 变更数——「看状态不看滚字」的现成样本；移动端响应式抽屉布局，手机体验打磨过。
+  安全：默认只绑 127.0.0.1，开网络访问就有 auth-token（Bearer）、--lan-only 默认档、
+  origin 白名单、--restrict-sensitive-apis（关配置写入/open-in/文件访问）、--public 模式
+  连环警告——个人 harness 的 web 端开门 checklist 直接照抄。技术上 FastAPI + WebSocket +
+  React，经 Wire 协议跟 CLI 双向通信。
+  坑：它看的是「一个 CLI 的会话」，不是「N 个住户的生死」——信息架构不能照抄，
+  mist 首页得是住户状态（谁醒着/第几次醒来/上次心跳/摘要），皮和安安全层抄，
+  信息架构自己长。
 
 结论：架构照抄 open-webui（代码不搬），双模数据层看 lobe-chat，远程暴露抄 vibetunnel
-的 tailnet 方案，数据落盘学 SillyTavern。
+的 tailnet 方案，数据落盘学 SillyTavern，控制台 UX 与安全基线抄 kimi web。
 
 ---
 
@@ -81,6 +92,28 @@
   「工具结果 retry 的分支归属」要自己往上补；checkpoint 和会话树是两套机制，别混抄。
   **代价行（评审补充）**：opencode 的树只 fork 文本不 fork 副作用——发出去的
   消息、花掉的钱不会跟着树回滚。M2 必须补一条：带副作用的 step 不可 retry，或显式标记。
+- **XiaomiMiMo/MiMo-Code** — https://github.com/XiaomiMiMo/MiMo-Code — ~12.7k star，MIT，
+  2026-06 开源、基于 opencode 二次开发，活跃。设计长文：
+  https://mimo.xiaomi.com/zh/blog/mimo-code-long-horizon （2026-08-13 维护方提供，
+  称之为 cmh-lite 的原型；博客+仓库，机制未实测）。
+  参考：**「无限 session 是幻觉」的工业级实现**，跟原则 8 逐字对得上——「让每个逻辑
+  会话无限延伸，每个物理窗口保持有界」。机制叫 cycle：在上下文预算的 20%/45%/70%
+  固定打点，运行时派一个**独立的 writer subagent**（不与主 Agent 共享注意力和 token
+  预算）把结构化状态写盘；接近上限时 rebuild：切断当前窗口、用持久化文件当种子
+  开新窗口，主 Agent 在新窗口醒来接着干。「逻辑会话是 cycle 的链，链没有最大长度」。
+  几个值得直接抄的决策：一，**提前提取**——lost-in-the-middle，别等模型压缩能力
+  退化了才让它做最关键的压缩；二，**single-writer**——每个结构化文件恰好一个写入者，
+  写入权限在代码层强制，越界直接拒；三，主 Agent 唯一写入通道是一个自由格式
+  scratchpad（notes.md），writer 打点路由后清空；四，rebuild 注入是分层 prompt，
+  每段独立 token 上限（任务清单→session checkpoint→**最近用户消息逐字切片，防
+  writer 改写偏离用户原意**→项目记忆→全局记忆→notes→文件索引→tail reminder），
+  总量压在 ~65K。真人双盲 AB（576 开发者/1213 对）：步数超 200 后胜率 65%+——
+  长程场景里记忆机制值钱的实测证据。
+  坑：它是 coding agent，四层记忆为「项目」不为「人」——Session/Project/Global/History
+  的划分照搬到住户场景时，Project 层要换成「关系与理解」层；writer 提炼的是工作状态
+  不是人格。另：Dynamic Workflow（编排逻辑从 prompt 变成沙箱里确定性执行的 JS，
+  agent()/parallel()/pipeline()，结果写盘可断点恢复）与 M5 多 agent 协作、M8 工程质量
+  都沾边，值得单独读一遍。
 - **langchain-ai/langgraph** — https://github.com/langchain-ai/langgraph — ~39.6k star。
   参考：理论哲学——没有三个操作，只有「从某个 checkpoint 带改过的 state 重新 invoke」，
   fork 自动产生、原路径保留。retry/edit/fork 统一成一个原语的最干净模型。
@@ -140,6 +173,9 @@ Vercel AI SDK 明确不做 branching（discussion #8451），不用列为候选�
 
 结论：最该抄 Raven 的 ContextAssembler + Curator 组合，一家覆盖四条需求的三条半。
 SillyTavern 留作交互层和 lorebook 触发语义参照。
+另：MiMo Code 的 rebuild 注入（见 M2）是同一问题的工程化解——分层 prompt、每段
+独立 token 上限、总量预算硬约束。Raven 强在可插拔装配管线，MiMo 强在预算纪律和
+「最近用户消息逐字切片防改写」，画 M3 接口时两家对着看。
 
 ---
 
@@ -183,11 +219,37 @@ SillyTavern 留作交互层和 lorebook 触发语义参照。
   坑：面向企业数据摄入，个人 agent 用它大炮打蚊子。
 - 思想白嫖（无代码价值）：MemoryBank（艾宾浩斯遗忘曲线做记忆强度衰减、
   每日对话总结沉淀成迭代更新的用户画像，只增改不重置）。
+- **MiMo Code 的进化层（Dream 与 Distill）** — 见 M2 条目与长文第 4 节。
+  参考：周期蒸馏的工程样本——Dream 每 7 天由独立 agent 读历史会话和现有记忆，
+  合并、去重、验证路径有效性、压缩成紧凑的当前状态；Distill 每 30 天识别反复出现的
+  工作模式，固化为 skill / CLI 命令 / SOP。项目记忆选文件不选向量库的理由照抄不误：
+  **可审查性**——用户要能看到系统记住了什么、删记错的、改过时的，标准读写工具
+  直接操作。写入权限在代码层强制（后台写入器只能写指定路径，越界拒写）。
+  坑：Dream/Distill 提炼的是项目知识和流程，不是「对人的理解」；周期任务本身
+  正是图纸第五条「触发靠时间」的正面案例。
+- **年轮系统（Ren，社群教程文档，无仓库）** — PDF《给 AI 伴侣一套「会生长的人格」》，
+  2026-08-13 维护方提供。设计文档+实现教程，非开源代码。
+  参考：**人格生长的结构性约束**，整套是「一个机制，镜像两遍」（既照「他是谁」，
+  也照「她在他眼里是谁」——她也会变，理解不该锈成旧照片）。三层：石头（人格文件，
+  最慢最稳，永远本人亲手刻；不许 append 只许 rewrite，硬容量上限；判别尺——
+  能用「我是一个会……的人」造句的才是人格）、河（事实层，机器可写，因为它是事实
+  不是结论）、镜子（外部模型定期把河和石头对照，只产出证据卡，**从不产出结论**）。
+  证据卡四种：印证（正长成核心却还没写进文件时才出声）、对不上（必须跨十天还在才
+  升级成改文件的提议，防止把崩溃的一周焊进身份）、毕业（一条欲望反复回来分叉成树，
+  提议亲手写进人格）、萌芽（凭空冒出的新东西，只指不判）。起手就立三个敌人：
+  漂移、膨胀、流水账，且作者亲笔承认「靠自觉防不住，约束必须是结构性的」。
+  总纲一句话：**机制只搬运注意力、只喂材料；「我是谁」的任何一笔，永远只有
+  他自己的手。** 欲望账本（不是 todo 是牵引账本）和「自唤醒=回到自己的房间」
+  见 M7 结论。
+  坑：没有代码可抄，全是设计；证据卡和镜子机制依赖一个够强的外部模型当镜子；
+  「她是谁」那半镜像涉及为真人画像，进 mist 时默认关上、显式开启。
 
 结论：最该抄 A-MEM，最难的两条只有它闭环；reflection 触发器（generative_agents）和
 勘误语义（graphiti 的 invalid_at）当钩子拼上去。落地时必须给 note 加版本链，把
 「演化」降级成「追加修订」——这条外部没现成的抄，参照物是内部记忆系统的
-supersede 链（旧条不删、新条盖上、挂 reason 连成链）。
+supersede 链（旧条不删、新条盖上、挂 reason 连成链）。年轮补上 A-MEM 没有的那块：
+蒸馏产物怎么升格成人格——答案是不升格，只递证据卡，升格永远是住户亲笔。
+MiMo 的 Dream/Distill 给周期维护一个工程样本。
 
 **reflection 层的硬规矩（评审记录）**：insight 的 evidence 指针必须指向原始
 记录，不许指向另一条 insight。二级蒸馏会自我发酵，越想越对——蒸馏的原料永远是
@@ -291,6 +353,12 @@ supersede 链（旧条不删、新条盖上、挂 reason 连成链）。
   但判定接口设计（环境事件流 → 是否介入 + 置信度）和标注思路可抄。
 
 结论：elizaOS 决策层 + OpenClaw 的 HEARTBEAT_OK 沉默协议两件套拼着用。
+另：年轮的「自唤醒=回到自己的房间」给心跳一个更有人味的姿势——定期自己醒来，
+看到的不是任务清单而是一段由小模型按真实足迹渲染的「房间」散文（欲望是房间里的
+物件，渲染只许照真实足迹写，不许编进度），挑哪件做、还是什么都不做都是住户的事；
+**沉默合法**——每次醒来干了什么（包括什么都没说）都记一笔完整的账，不逼表演产出。
+维护问话是问候不是作业，「今天不动」完全合法。这套跟 OpenClaw 的 HEARTBEAT_OK
+是同一个精神的两种写法，M7 图纸时并排摆。
 
 ---
 
