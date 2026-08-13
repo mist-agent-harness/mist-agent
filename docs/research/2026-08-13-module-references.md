@@ -22,7 +22,7 @@
 | M2 | 会话内核 | 无限 session、compact 可配、跨 session 同步、retry/edit/fork | opencode + MiMo Code（cycle/rebuild）+ LangGraph（哲学） |
 | M3 | 上下文装配 | 模块化装配器、自定义 prompt、锚点自动更新、截断透明 | EverMind-AI/Raven |
 | M4 | 记忆与成长 | 蒸馏层、记忆演化、勘误、跨项目 insights | A-MEM + graphiti（勘误语义）+ MiMo（四层+Dream/Distill）+ 年轮（人格生长） |
-| M5 | 多 agent 与模型路由 | 多 agent 协作、子 agent 各选 provider/key、多 CLI/API | litellm Router + opencode 配置形状 |
+| M5 | 多 agent 与模型路由 | 多 agent 协作、子 agent 各选 provider/key、多 CLI/API | litellm Router + opencode 配置形状 + CPA（订阅整合） |
 | M6 | 插件系统 | 好写、可插拔、插件自注册环境变量、可开关 | elizaOS Plugin 接口 + goose 配置格式 |
 | M7 | 自主性与社交边界 | 自主沉默、群/私区分、心跳自唤醒、住户感 | elizaOS 决策层 + OpenClaw 心跳协议 |
 | M8 | 工程质量与自我迭代 | 自带测试/说明/回滚、功能自提升走 PR | hermes-agent + OpenHands resolver |
@@ -289,6 +289,19 @@ MiMo 的 Dream/Distill 给周期维护一个工程样本。
   参考：supervisor 模式的 handoff——子 agent 包装成 supervisor 可调用的 tool，
   output_mode 控制子 agent 消息怎么进共享历史，多 agent 消息传递写得最干净。
   坑：薄封装，更新频率低。
+- **router-for-me/CLIProxyAPI（CPA）** — https://github.com/router-for-me/CLIProxyAPI
+  — ~47k star，Go，MIT，2026-08-13 当日有 push（维护方提供）。
+  参考：**「多 CLI 整合」留白的天选填充**——把各家 CLI 订阅（Kimi Code / Claude Code /
+  Codex / Gemini / Grok）通过 OAuth 接进来，对外统一吐出 OpenAI / Gemini / Claude
+  兼容的 API 接口。「子 agent 走订阅还是走 API key」这条愿望的订阅那一半，它把路
+  蹚出来了。三件最值得抄的：一，**翻译器层**（docs 里的执行器与翻译器）——各家 API
+  协议互转集中在一层，harness 内部只说一种话；二，**多账号轮询负载均衡**（Gemini /
+  OpenAI / Claude / Grok 都有），订阅池当资源池用；三，**账号池运维**——按账号/模型/
+  渠道/延迟/token 用量追踪，配额识别、异常账号定位、清理建议，SQLite 持久化事件，
+  这是多账号形态的生产级管理面。另有可复用 Go SDK 和自定义 Provider 示例。
+  坑：骑订阅账号本质是灰色地带，各厂商 ToS 随时可能收口子（Claude Agent SDK 骑
+  Max 订阅同病）；把它当 provider 适配器用，harness 的身份和连续性不许建立在
+  任何一个订阅通道上——通道可换，住户不换。
 
 结论：底层路由抄 litellm Router 语义，上层配置抄 opencode JSON 结构；协作本身
 （handoff/supervisor）参考 langgraph-supervisor 自己写薄层，不引入任何编排框架。
@@ -414,8 +427,10 @@ DGM 的 reward hacking 当反面教材钉在墙上。
    沾边，完整闭环没有现成仓库。
 4. **子 agent 原生 compact 精度配置**：各家 compact 都是全局策略，per-agent 可配的
    实现没找到，opencode 的 auto-compact 最接近但也只是全局。
-5. **多 CLI 整合**（一个 harness 同时驱动 Claude Code / kimi-code / 其他 CLI 当后端）：
-   litellm 管 API 层，CLI 编排层没有现成参照（vibetunnel 是终端转发不沾边）。
+5. ~~**多 CLI 整合**~~ **已填（2026-08-13 晚，CPA）**：CLIProxyAPI 把 CLI 订阅统一成
+   标准 API 出口（见 M5 条目），翻译器层 + 账号池运维都有现成参照。残留的空白只剩
+   「一个 harness 同时驱动多个**本地 CLI 进程**当后端」——CPA 走的是协议层，
+   进程编排层仍然没有现成参照。
 
 ---
 
