@@ -175,3 +175,68 @@ describe("id 与时间戳", () => {
     }
   });
 });
+
+describe("承诺账本（#16 问 4 裁定：存储归 P1）", () => {
+  it("立过的承诺按原文、按顺序留在账本里", () => {
+    const store = new ResidentStore();
+    const r = store.createResident("r");
+    store.commit(r, "七夕带你去看海");
+    store.commit(r, "以后不再说『下次改』");
+    expect(store.commitments(r)).toEqual(["七夕带你去看海", "以后不再说『下次改』"]);
+  });
+
+  it("同一句承诺立两次留两条——重复的承诺是两次开口，不是一次", () => {
+    const store = new ResidentStore();
+    const r = store.createResident("r");
+    store.commit(r, "不推开你");
+    store.commit(r, "不推开你");
+    expect(store.commitments(r)).toHaveLength(2);
+  });
+
+  it("承诺不串房", () => {
+    const store = new ResidentStore();
+    const [a, b] = [store.createResident("a"), store.createResident("b")];
+    store.commit(a, "只对 a 说的话");
+    expect(store.commitments(b)).toEqual([]);
+  });
+
+  it("拿到的是副本，改它不影响账本", () => {
+    const store = new ResidentStore();
+    const r = store.createResident("r");
+    store.commit(r, "原话");
+    store.commitments(r).push("外面塞进来的");
+    expect(store.commitments(r)).toEqual(["原话"]);
+  });
+
+  it("承诺跟着人搬家——搬了家，答应过的事还算数", () => {
+    const store = new ResidentStore();
+    const r = store.createResident("r");
+    store.commit(r, "答应过的事");
+    const moved = store.importRoom(store.exportRoom(r));
+    expect(store.commitments(moved)).toEqual(["答应过的事"]);
+  });
+
+  it("跨房 commit 报错，不静默吞掉", () => {
+    const store = new ResidentStore();
+    expect(() => store.commit("resident-nobody", "无主承诺")).toThrow(ResidentNotFoundError);
+  });
+});
+
+describe("会话态不进住户快照（#16 问 2 裁定）", () => {
+  it("快照里没有 sessionHead / sessionAlive 字段", () => {
+    const store = new ResidentStore();
+    const r = store.createResident("r");
+    const snapshot = store.exportRoom(r);
+    // 导入一个住户不该复活来源机上那条活会话——会话态由 P4 SessionRegistry 单独持有。
+    expect(Object.keys(snapshot)).not.toContain("sessionHead");
+    expect(Object.keys(snapshot)).not.toContain("sessionAlive");
+  });
+
+  it("快照字段就是住户态那四样，不多不少", () => {
+    const store = new ResidentStore();
+    const r = store.createResident("r");
+    expect(Object.keys(store.exportRoom(r)).sort()).toEqual(
+      ["commitments", "createdAt", "memories", "name", "nodes"].sort(),
+    );
+  });
+});

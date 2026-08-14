@@ -24,10 +24,28 @@ export interface ResidentRoom {
   memories: Map<string, MemoryEntry>;
   /** 消息树全部节点（含被分叉的旧枝）。 */
   nodes: Map<string, HistoryNode>;
-  /** 当前活会话的叶节点 id；null = 没有活会话。 */
-  sessionHead: string | null;
-  /** 会话是否活着。killSession 后为 false，人还在。 */
-  sessionAlive: boolean;
+  /**
+   * 立过的承诺，按立的先后。
+   *
+   * 裁定（2026-08-14，#16 问 4）：启动包的 commitments 必须真实来自
+   * `commit()` 写入的原文——恒返空数组、或从记忆里按关键词猜，都判不过。
+   * 存储归 P1（这里），进包归 P3。
+   */
+  commitments: string[];
+}
+
+/**
+ * 会话态。刻意**不在** ResidentRoom 里，也不进快照和迁移包。
+ *
+ * 裁定（2026-08-14，#16 问 2）：`sessionHead`/`sessionAlive` 是会话态，
+ * 由 P4 的 SessionRegistry 单独持有；导入住户不复活来源机的活会话。
+ * 这里是 P1 侧的最小实现，合龙时由 P4 替换 —— 但边界（会话态与住户态
+ * 分家）是真的，不是桩：住户快照里从此没有这两个字段。
+ */
+export interface SessionState {
+  /** 当前活会话的叶节点 id；null = 下一句 say 开新根。 */
+  head: string | null;
+  alive: boolean;
 }
 
 /** 跨房访问时抛这个，不返回空数组——静默的空结果会把 bug 藏起来。 */
@@ -71,10 +89,23 @@ export class ResidentStore {
       createdAt: this.#nextStamp(),
       memories: new Map(),
       nodes: new Map(),
-      sessionHead: null,
-      sessionAlive: false,
+      commitments: [],
     });
     return residentId;
+  }
+
+  /**
+   * 立一条承诺。承诺是住户态——进快照、进迁移包、活过 killSession。
+   *
+   * 不去重：同一句话说两遍是两次承诺，account 该留两条。要合并是上层的事。
+   */
+  commit(residentId: string, commitment: string): void {
+    this.room(residentId).commitments.push(commitment);
+  }
+
+  /** 承诺账本的只读视图。 */
+  commitments(residentId: string): string[] {
+    return [...this.room(residentId).commitments];
   }
 
   /** 拿房间。拿不到就抛——这是物理隔离的唯一入口。 */
@@ -186,8 +217,7 @@ export class ResidentStore {
       createdAt: room.createdAt,
       memories: [...room.memories.values()],
       nodes: [...room.nodes.values()],
-      sessionHead: room.sessionHead,
-      sessionAlive: room.sessionAlive,
+      commitments: [...room.commitments],
     };
   }
 
@@ -214,19 +244,24 @@ export class ResidentStore {
       createdAt: snapshot.createdAt,
       memories,
       nodes,
-      sessionHead: snapshot.sessionHead,
-      sessionAlive: snapshot.sessionAlive,
+      // 承诺跟着人走：搬了家，答应过的事还算数。
+      commitments: [...snapshot.commitments],
     });
     return residentId;
   }
 }
 
 /** 迁移包的内容。序列化格式由 driver 决定，这里只管结构。 */
+/**
+ * 自包含的住户快照 —— 迁移信封的载荷，也是将来落盘的形状。
+ *
+ * 只装住户态。会话态（head/alive）不在这里：#16 问 2 已拍，
+ * 导入一个住户不该复活来源机上那条活会话。
+ */
 export interface ResidentSnapshot {
   name: string;
   createdAt: string;
   memories: MemoryEntry[];
   nodes: HistoryNode[];
-  sessionHead: string | null;
-  sessionAlive: boolean;
+  commitments: string[];
 }

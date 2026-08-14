@@ -19,10 +19,29 @@
  */
 
 import type { BootPack, HarnessDriver, HistoryNode, MemoryEntry } from "../acceptance/driver.ts";
-import { type ResidentSnapshot, ResidentStore } from "./store/resident-store.ts";
+import { type ResidentSnapshot, ResidentStore, type SessionState } from "./store/resident-store.ts";
 
 class MistDriver implements HarnessDriver {
   readonly #store = new ResidentStore();
+
+  /**
+   * 会话态注册表 —— 跟住户存储分开的一张表（#16 问 2 裁定）。
+   *
+   * 会话是「这次对话进行到哪」，住户是「这个人是谁、记得什么、答应过什么」。
+   * 前者随 killSession 归零，后者活过任何一次会话死亡，也跟着迁移走。
+   * 分开放，是让「会话死人不死」这件事在数据结构上就成立，而不是靠约定。
+   * 合龙时由 P4 的 SessionRegistry 接管这张表。
+   */
+  readonly #sessions = new Map<string, SessionState>();
+
+  #session(residentId: string): SessionState {
+    let s = this.#sessions.get(residentId);
+    if (s === undefined) {
+      s = { head: null, alive: false };
+      this.#sessions.set(residentId, s);
+    }
+    return s;
+  }
 
   // --- P1：记忆库存储（本 issue 的认领范围）---
 
@@ -42,6 +61,10 @@ class MistDriver implements HarnessDriver {
     return this.#store.errata(residentId, entryId, correction);
   }
 
+  async commit(residentId: string, commitment: string): Promise<void> {
+    this.#store.commit(residentId, commitment);
+  }
+
   async destroyResident(residentId: string): Promise<void> {
     this.#store.destroyResident(residentId);
   }
@@ -49,13 +72,18 @@ class MistDriver implements HarnessDriver {
   // --- P2：消息树（TODO(P2) 认领者替换）---
 
   async say(residentId: string, message: string): Promise<HistoryNode> {
-    const room = this.#store.room(residentId);
-    if (!room.sessionAlive) {
-      // 没有活会话就开一个。新会话从整棵树的末端继续长，不清空历史
-      // ——会话死，人不死。
-      room.sessionAlive = true;
+    // 先确认住户真的在（拿不到会抛）——会话态自己那张表没有隔离语义。
+    this.#store.room(residentId);
+    const session = this.#session(residentId);
+    if (!session.alive) {
+      // 没有活会话就开一个：alive=true，head 保持 null。
+      // #16 问 3 裁定：kill 之后第一次说话的 user 节点必须是新根
+      // （parentId === null），会话边界才是可判的——否则「会话死了」
+      // 这件事在树上看不出来，killSession 写成空函数也能蒙混过关。
+      // 旧枝一个字节不动，人和历史都还在，只是这段对话从头起。
+      session.alive = true;
     }
-    const userNode = this.#store.appendNode(residentId, room.sessionHead, "user", message);
+    const userNode = this.#store.appendNode(residentId, session.head, "user", message);
     // TODO(P2)：M0 阶段回应是固定文本，判卷只看树结构不看措辞。
     const replyNode = this.#store.appendNode(
       residentId,
@@ -63,7 +91,7 @@ class MistDriver implements HarnessDriver {
       "assistant",
       `收到：${message}`,
     );
-    room.sessionHead = replyNode.id;
+    session.head = replyNode.id;
     return replyNode;
   }
 
@@ -87,14 +115,14 @@ class MistDriver implements HarnessDriver {
   async buildBootPack(residentId: string): Promise<BootPack> {
     const room = this.#store.room(residentId);
     const memories = this.#store.memories(residentId);
-    // TODO(P3)：identity / commitments 目前从存储机械推导，真实形态应由
-    // 住户的身份锚与承诺账本生成。这里保证的是「由存储生成、不是手写文件」。
+    // TODO(P3)：identity 目前从存储机械推导，真实形态应由住户的身份锚生成。
+    // commitments 不再从记忆里按「答应」二字猜——那是把关键词匹配冒充承诺账本，
+    // 说过「答应」的记忆和真立过的承诺是两回事。改由 commit() 写入的原文供货
+    // （#16 问 4 裁定：存储归 P1、进包归 P3）。
     return {
       residentId,
       identity: `住户 ${room.name}（建于 ${room.createdAt}）`,
-      commitments: memories
-        .filter((m) => m.supersededBy === null && m.content.includes("答应"))
-        .map((m) => m.content),
+      commitments: this.#store.commitments(residentId),
       memories,
     };
   }
@@ -102,10 +130,11 @@ class MistDriver implements HarnessDriver {
   // --- P4：会话生杀（TODO(P4) 认领者替换）---
 
   async killSession(residentId: string): Promise<void> {
-    const room = this.#store.room(residentId);
-    // 只关会话，不动 nodes / memories：会话死，人不能死。
-    // sessionHead 保留，下次 say 从原处继续长，历史不断。
-    room.sessionAlive = false;
+    this.#store.room(residentId);
+    // 只动会话态那张表，一个字节都不碰 nodes / memories / commitments：
+    // 会话死，人不能死（C1 验 kill 前后整棵树的 hash 不变）。
+    // head 清空 —— 下一句 say 开新根，这就是会话边界在树上的形状。
+    this.#sessions.set(residentId, { head: null, alive: false });
   }
 
   // --- P5：迁移（TODO(P5) 认领者替换）---
