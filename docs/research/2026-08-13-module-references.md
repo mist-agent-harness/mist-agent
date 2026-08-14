@@ -1,8 +1,13 @@
 # mist harness 前期调研：框架与分模块参照仓库
 
-2026-08-13。素材：许愿池原始愿望 + 八个模块的 GitHub 实查
-（仓库存在性、star 数、活跃度均经当日搜索验证）。
+2026-08-13。素材：许愿池原始愿望 + 八个模块的 GitHub 实查。
+资料分为公开实现/官方文档、厂商报告、社群非代码设计三档；后两档只作为设计信号，
+不写成本项目已复现的结论。仓库存在性、star 数、活跃度均经当日搜索验证，但热度不作为
+质量证据。
 用途：定大致框架，标出每个模块可参照的现成项目。没找到参照的留空。
+
+关于“现有项目解决了什么、长期关系 harness 仍缺什么”的产品层对照，见
+[面向长期人机关系的 Agent Harness：生态调研与产品缺口](2026-08-13-relationship-harness-landscape.md)。
 
 ---
 
@@ -22,7 +27,7 @@
 | M2 | 会话内核 | 无限 session、compact 可配、跨 session 同步、retry/edit/fork | opencode + MiMo Code（cycle/rebuild）+ LangGraph（哲学） |
 | M3 | 上下文装配 | 模块化装配器、自定义 prompt、锚点自动更新、截断透明 | EverMind-AI/Raven |
 | M4 | 记忆与成长 | 蒸馏层、记忆演化、勘误、跨项目 insights | A-MEM + graphiti（勘误语义）+ MiMo（四层+Dream/Distill）+ 年轮（人格生长） |
-| M5 | 多 agent 与模型路由 | 多 agent 协作、子 agent 各选 provider/key、多 CLI/API | litellm Router + opencode 配置形状 + CPA（订阅整合） |
+| M5 | 多 agent 与模型路由 | 多 agent 协作、子 agent 各选 provider/key、多 CLI/API | litellm Router + opencode 配置形状 + CPA（政策敏感的协议适配） |
 | M6 | 插件系统 | 好写、可插拔、插件自注册环境变量、可开关 | elizaOS Plugin 接口 + goose 配置格式 |
 | M7 | 自主性与社交边界 | 自主沉默、群/私区分、心跳自唤醒、住户感 | elizaOS 决策层 + OpenClaw 心跳协议 |
 | M8 | 工程质量与自我迭代 | 自带测试/说明/回滚、功能自提升走 PR | hermes-agent + OpenHands resolver |
@@ -59,7 +64,8 @@
   参考：控制台 UX 和安全基线两件套。UX：会话列表/搜索/fork（从任意一条回复分叉）/
   归档，输入框上方工具栏显示上下文用量、agent 当前状态（处理中/等批准）、消息排队、
   git 变更数——「看状态不看滚字」的现成样本；移动端响应式抽屉布局，手机体验打磨过。
-  安全：默认只绑 127.0.0.1，开网络访问就有 auth-token（Bearer）、--lan-only 默认档、
+  安全：默认只绑 127.0.0.1；开网络访问时应显式配置 auth-token（Bearer），并使用
+  --lan-only 默认档、
   origin 白名单、--restrict-sensitive-apis（关配置写入/open-in/文件访问）、--public 模式
   连环警告——个人 harness 的 web 端开门 checklist 直接照抄。技术上 FastAPI + WebSocket +
   React，经 Wire 协议跟 CLI 双向通信。
@@ -92,11 +98,12 @@
   「工具结果 retry 的分支归属」要自己往上补；checkpoint 和会话树是两套机制，别混抄。
   **代价行（评审补充）**：opencode 的树只 fork 文本不 fork 副作用——发出去的
   消息、花掉的钱不会跟着树回滚。M2 必须补一条：带副作用的 step 不可 retry，或显式标记。
-- **XiaomiMiMo/MiMo-Code** — https://github.com/XiaomiMiMo/MiMo-Code — ~12.7k star，MIT，
+- **XiaomiMiMo/MiMo-Code** — https://github.com/XiaomiMiMo/MiMo-Code — ~12.7k star，
+  仓库标注 MIT，另附 USE_RESTRICTIONS.md，复制或分发前须单独核兼容性，
   2026-06 开源、基于 opencode 二次开发，活跃。设计长文：
   https://mimo.xiaomi.com/zh/blog/mimo-code-long-horizon （2026-08-13 维护方提供，
   维护方内部同类项目 cmh-lite 的原型；博客+仓库，机制未实测）。
-  参考：**「无限 session 是幻觉」的工业级实现**，跟原则 8 逐字对得上——「让每个逻辑
+  参考：**「无限 session 是幻觉」的公开实现与厂商设计样本**，跟原则 8 逐字对得上——「让每个逻辑
   会话无限延伸，每个物理窗口保持有界」。机制叫 cycle：在上下文预算的 20%/45%/70%
   固定打点，运行时派一个**独立的 writer subagent**（不与主 Agent 共享注意力和 token
   预算）把结构化状态写盘；接近上限时 rebuild：切断当前窗口、用持久化文件当种子
@@ -107,8 +114,8 @@
   scratchpad（notes.md），writer 打点路由后清空；四，rebuild 注入是分层 prompt，
   每段独立 token 上限（任务清单→session checkpoint→**最近用户消息逐字切片，防
   writer 改写偏离用户原意**→项目记忆→全局记忆→notes→文件索引→tail reminder），
-  总量压在 ~65K。真人双盲 AB（576 开发者/1213 对）：步数超 200 后胜率 65%+——
-  长程场景里记忆机制值钱的实测证据。
+  总量压在 ~65K。厂商报告的真人双盲 AB（576 开发者/1213 对）称，步数超 200 后
+  胜率为 65%+。该结果本项目尚未复现，只作为长程任务可能受益于状态机制的研究信号。
   坑：它是 coding agent，四层记忆为「项目」不为「人」——Session/Project/Global/History
   的划分照搬到住户场景时，Project 层要换成「关系与理解」层；writer 提炼的是工作状态
   不是人格。另：Dynamic Workflow（编排逻辑从 prompt 变成沙箱里确定性执行的 JS，
@@ -177,9 +184,9 @@ SillyTavern 留作交互层和 lorebook 触发语义参照。
 独立 token 上限、总量预算硬约束。Raven 强在可插拔装配管线，MiMo 强在预算纪律和
 「最近用户消息逐字切片防改写」，画 M3 接口时两家对着看。
 
-**一条 2026-08-13 的现成教案（写进本模块的坑）**：有厂商计划让网页抓取工具不再
-返回摘要、直接回原文——工具返回多大块、压不压、怎么压，如果是靠厂商默认值，
-厂商一翻脸，所有靠默认摘要过日子的 harness 全部跟着发烧。**工具产出的体积与压缩
+**一条 2026-08-13 的现成教案（写进本模块的坑）**：工具供应方可能改变网页抓取的
+默认摘要或原文返回策略。工具返回多大块、压不压、怎么压，如果依赖供应方默认值，
+上游行为一变，harness 的上下文预算就会随之漂移。**工具产出的体积与压缩
 策略必须是 harness 自己的契约**：每个工具的返回有体积上限，超限部分走显式截断
 并标注截了什么（截断透明），压缩动作由装配器按预算发起，不由工具默认行为决定。
 
@@ -250,7 +257,7 @@ SillyTavern 留作交互层和 lorebook 触发语义参照。
   坑：没有代码可抄，全是设计；证据卡和镜子机制依赖一个够强的外部模型当镜子；
   「她是谁」那半镜像涉及为真人画像，进 mist 时默认关上、显式开启。
 
-结论：最该抄 A-MEM，最难的两条只有它闭环；reflection 触发器（generative_agents）和
+结论：A-MEM 最值得参考候选构造、链接与演化机制；reflection 触发器（generative_agents）和
 勘误语义（graphiti 的 invalid_at）当钩子拼上去。落地时必须给 note 加版本链，把
 「演化」降级成「追加修订」——这条外部没现成的抄，参照物是内部记忆系统的
 supersede 链（旧条不删、新条盖上、挂 reason 连成链）。年轮补上 A-MEM 没有的那块：
@@ -291,17 +298,18 @@ MiMo 的 Dream/Distill 给周期维护一个工程样本。
   坑：薄封装，更新频率低。
 - **router-for-me/CLIProxyAPI（CPA）** — https://github.com/router-for-me/CLIProxyAPI
   — ~47k star，Go，MIT，2026-08-13 当日有 push（维护方提供）。
-  参考：**「多 CLI 整合」留白的天选填充**——把各家 CLI 订阅（Kimi Code / Claude Code /
+  参考：**「多 CLI 协议适配」的公开样本**——把各家 CLI 通道（Kimi Code / Claude Code /
   Codex / Gemini / Grok）通过 OAuth 接进来，对外统一吐出 OpenAI / Gemini / Claude
-  兼容的 API 接口。「子 agent 走订阅还是走 API key」这条愿望的订阅那一半，它把路
-  蹚出来了。三件最值得抄的：一，**翻译器层**（docs 里的执行器与翻译器）——各家 API
+  兼容的 API 接口。它证明协议翻译和账号池管理可以集中到适配层，但不证明供应商允许
+  第三方产品把订阅凭据作为稳定服务提供。三件最值得参考的：一，**翻译器层**（docs 里的执行器与翻译器）——各家 API
   协议互转集中在一层，harness 内部只说一种话；二，**多账号轮询负载均衡**（Gemini /
   OpenAI / Claude / Grok 都有），订阅池当资源池用；三，**账号池运维**——按账号/模型/
   渠道/延迟/token 用量追踪，配额识别、异常账号定位、清理建议，SQLite 持久化事件，
   这是多账号形态的生产级管理面。另有可复用 Go SDK 和自定义 Provider 示例。
-  坑：骑订阅账号本质是灰色地带，各厂商 ToS 随时可能收口子（Claude Agent SDK 骑
-  Max 订阅同病）；把它当 provider 适配器用，harness 的身份和连续性不许建立在
-  任何一个订阅通道上——通道可换，住户不换。
+  坑：订阅、OAuth 与第三方转发是否允许，取决于各供应商当时的政策和具体使用方式。
+  Anthropic 在 2026-06-15 暂缓了此前宣布的 Agent SDK 计费调整；当前状态不能解读为
+  永久禁止，也不能解读为长期产品授权。把 CPA 当 provider 适配器参照时，必须给每条
+  通道单独设政策闸；harness 的身份和连续性不许建立在任何一个通道上——通道可换，住户不换。
 
 结论：底层路由抄 litellm Router 语义，上层配置抄 opencode JSON 结构；协作本身
 （handoff/supervisor）参考 langgraph-supervisor 自己写薄层，不引入任何编排框架。
@@ -427,8 +435,9 @@ DGM 的 reward hacking 当反面教材钉在墙上。
    沾边，完整闭环没有现成仓库。
 4. **子 agent 原生 compact 精度配置**：各家 compact 都是全局策略，per-agent 可配的
    实现没找到，opencode 的 auto-compact 最接近但也只是全局。
-5. ~~**多 CLI 整合**~~ **已填（2026-08-13 晚，CPA）**：CLIProxyAPI 把 CLI 订阅统一成
-   标准 API 出口（见 M5 条目），翻译器层 + 账号池运维都有现成参照。残留的空白只剩
+5. ~~**多 CLI 整合**~~ **协议层已有参照（2026-08-13 晚，CPA）**：CLIProxyAPI 把多种
+   CLI 通道统一成标准 API 出口（见 M5 条目），翻译器层 + 账号池运维都有现成参照；
+   这不等于订阅用途获得供应商授权。残留的工程空白只剩
    「一个 harness 同时驱动多个**本地 CLI 进程**当后端」——CPA 走的是协议层，
    进程编排层仍然没有现成参照。
 
