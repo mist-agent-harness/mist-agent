@@ -213,5 +213,17 @@ describe("MessageTreeService.reviseNode", () => {
     expect(store.history("resident-b")).toEqual(beforeB);
   });
 
-  it.todo("等待 #14 裁定：revise 成功后 active head 是否切到新兄弟");
+  it("assistant 改口即换枝：下一轮 user 挂在新兄弟下", async () => {
+    const { heads, service } = setup();
+    const reply = await service.say("resident-a", "初稿");
+    const revised = await service.reviseNode("resident-a", reply.id, "改口");
+    const nextReply = await service.say("resident-a", "沿新枝继续");
+    const nextUser = (await service.history("resident-a")).find(
+      (node) => node.role === "user" && node.content === "沿新枝继续",
+    );
+
+    expect(heads.getHead("resident-a")).toBe(nextReply.id);
+    expect(nextUser?.parentId).toBe(revised.id);
+    expect(nextReply.parentId).toBe(nextUser?.id);
+  });
 });
