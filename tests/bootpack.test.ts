@@ -58,7 +58,9 @@ describe("P3 buildBootPack（#15）", () => {
     const idA = store.remember(r, "后写入但时间早");
     const idB = store.remember(r, "先排序靠后");
     const idC = store.remember(r, "同刻靠 id 定序");
-    // 白盒改写 createdAt 构造乱序（存储的 Map 插入序 ≠ 时间序的情形）
+    // 白盒改写 createdAt 构造乱序（存储的 Map 插入序 ≠ 时间序的情形）。
+    // 耦合声明（Laurie F1）：此夹具依赖 P1 room() 返回活内脏这一现状；
+    // P1 封舱之日此段连坐，届时换 P1 提供的 fixture 口，不改被测行为。
     const room = store.room(r);
     const get = (id: string) => {
       const entry = room.memories.get(id);
@@ -110,4 +112,13 @@ describe("P3 buildBootPack（#15）", () => {
     const store = freshStore();
     expect(() => buildBootPack(store, "ghost")).toThrow(ResidentNotFoundError);
   });
+});
+
+it("空住户的包形状：commitments/memories 是空数组,不是缺字段（Laurie F3）", () => {
+  const store = new ResidentStore();
+  const r = store.createResident("空房");
+  const pack = buildBootPack(store, r);
+  expect(pack.commitments).toEqual([]);
+  expect(pack.memories).toEqual([]);
+  expect(Object.keys(pack).sort()).toEqual(["commitments", "identity", "memories", "residentId"]);
 });
