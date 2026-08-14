@@ -20,10 +20,28 @@
  */
 
 import type { BootPack, HarnessDriver, HistoryNode, MemoryEntry } from "../acceptance/driver.ts";
-import { type ResidentSnapshot, ResidentStore, type SessionState } from "./store/resident-store.ts";
+import { buildBootPack as assembleBootPack } from "./bootpack.ts";
+import {
+  MessageTreeService,
+  MessageTreeStore,
+  type SessionHeadPort,
+} from "./message-tree/index.ts";
+import { createResidentMigrationService } from "./migration/resident-store-migration.ts";
+import { SessionRegistry } from "./session/session-registry.ts";
+import { ResidentStore } from "./store/resident-store.ts";
 
 class MistDriver implements HarnessDriver {
   readonly #store = new ResidentStore();
+  readonly #messageTreeStore = new MessageTreeStore();
+  readonly #messageTree = new MessageTreeService(
+    this.#messageTreeStore,
+    {
+      getHead: (residentId) => this.#session(residentId).headId,
+      setHead: (residentId, headId) => this.#sessions.setHead(residentId, headId),
+    } satisfies SessionHeadPort,
+    { assistantReply: (_residentId, message) => `收到：${message}` },
+  );
+  readonly #migration = createResidentMigrationService(this.#store, this.#messageTreeStore);
 
   /**
    * 会话态注册表 —— 跟住户存储分开的一张表（#16 问 2 裁定）。
@@ -33,21 +51,18 @@ class MistDriver implements HarnessDriver {
    * 分开放，是让「会话死人不死」这件事在数据结构上就成立，而不是靠约定。
    * 合龙时由 P4 的 SessionRegistry 接管这张表。
    */
-  readonly #sessions = new Map<string, SessionState>();
+  readonly #sessions = new SessionRegistry<null>();
 
-  #session(residentId: string): SessionState {
-    let s = this.#sessions.get(residentId);
-    if (s === undefined) {
-      s = { head: null, alive: false };
-      this.#sessions.set(residentId, s);
-    }
-    return s;
+  #session(residentId: string) {
+    return this.#sessions.get(residentId) ?? this.#sessions.open(residentId, null, null);
   }
 
   // --- P1：记忆库存储（本 issue 的认领范围）---
 
   async createResident(name: string): Promise<string> {
-    return this.#store.createResident(name);
+    const residentId = this.#store.createResident(name);
+    this.#messageTreeStore.createRoom(residentId);
+    return residentId;
   }
 
   async remember(residentId: string, content: string): Promise<string> {
@@ -67,65 +82,31 @@ class MistDriver implements HarnessDriver {
   }
 
   async destroyResident(residentId: string): Promise<void> {
+    this.#sessions.kill(residentId);
+    this.#messageTreeStore.destroyRoom(residentId);
     this.#store.destroyResident(residentId);
   }
 
-  // --- P2：消息树（TODO(P2) 认领者替换）---
+  // --- P2：消息树 ---
 
   async say(residentId: string, message: string): Promise<HistoryNode> {
-    // 先确认住户真的在（拿不到会抛）——会话态自己那张表没有隔离语义。
     this.#store.room(residentId);
-    const session = this.#session(residentId);
-    if (!session.alive) {
-      // 没有活会话就开一个：alive=true，head 保持 null。
-      // #16 问 3 裁定：kill 之后第一次说话的 user 节点必须是新根
-      // （parentId === null），会话边界才是可判的——否则「会话死了」
-      // 这件事在树上看不出来，killSession 写成空函数也能蒙混过关。
-      // 旧枝一个字节不动，人和历史都还在，只是这段对话从头起。
-      session.alive = true;
-    }
-    const userNode = this.#store.appendNode(residentId, session.head, "user", message);
-    // TODO(P2)：M0 阶段回应是固定文本，判卷只看树结构不看措辞。
-    const replyNode = this.#store.appendNode(
-      residentId,
-      userNode.id,
-      "assistant",
-      `收到：${message}`,
-    );
-    session.head = replyNode.id;
-    return replyNode;
+    return this.#messageTree.say(residentId, message);
   }
 
   async history(residentId: string): Promise<HistoryNode[]> {
-    return this.#store.nodes(residentId);
+    return this.#messageTree.history(residentId);
   }
 
   async reviseNode(residentId: string, nodeId: string, newContent: string): Promise<HistoryNode> {
-    const room = this.#store.room(residentId);
-    const target = room.nodes.get(nodeId);
-    if (target === undefined) {
-      throw new Error(`no such node in ${residentId}: ${nodeId}`);
-    }
-    // append-only：改口挂在旧节点的**父节点**下成为兄弟枝，旧枝一个字节不动。
-    // 挂在旧节点自己下面会把「改口」变成「追加」，语义就错了。
-    return this.#store.appendNode(residentId, target.parentId, target.role, newContent);
+    this.#store.room(residentId);
+    return this.#messageTree.reviseNode(residentId, nodeId, newContent);
   }
 
-  // --- P3：启动包（TODO(P3) 认领者替换）---
+  // --- P3：启动包 ---
 
   async buildBootPack(residentId: string): Promise<BootPack> {
-    const room = this.#store.room(residentId);
-    const memories = this.#store.memories(residentId);
-    // TODO(P3)：identity 目前从存储机械推导，真实形态应由住户的身份锚生成。
-    // commitments 不再从记忆里按「答应」二字猜——那是把关键词匹配冒充承诺账本，
-    // 说过「答应」的记忆和真立过的承诺是两回事。改由 commit() 写入的原文供货
-    // （#16 问 4 裁定：存储归 P1、进包归 P3）。
-    return {
-      residentId,
-      identity: `住户 ${room.name}（建于 ${room.createdAt}）`,
-      commitments: this.#store.commitments(residentId),
-      memories,
-    };
+    return assembleBootPack(this.#store, residentId);
   }
 
   // --- P4：会话生杀（TODO(P4) 认领者替换）---
@@ -134,20 +115,19 @@ class MistDriver implements HarnessDriver {
     this.#store.room(residentId);
     // 只动会话态那张表，一个字节都不碰 nodes / memories / commitments：
     // 会话死，人不能死（C1 验 kill 前后整棵树的 hash 不变）。
-    // head 清空 —— 下一句 say 开新根，这就是会话边界在树上的形状。
-    this.#sessions.set(residentId, { head: null, alive: false });
+    // 删除活会话 —— 下一句 say 会开新 generation、新根；旧 generation 的迟到
+    // effect receipt 也不能再被视为当前会话，H1 的 Effect Journal 会接这条线。
+    this.#sessions.kill(residentId);
   }
 
-  // --- P5：迁移（TODO(P5) 认领者替换）---
+  // --- P5：迁移 ---
 
   async exportResident(residentId: string): Promise<Uint8Array> {
-    const snapshot = this.#store.exportRoom(residentId);
-    return new TextEncoder().encode(JSON.stringify(snapshot));
+    return this.#migration.exportResident(residentId);
   }
 
   async importResident(pack: Uint8Array): Promise<string> {
-    const snapshot = JSON.parse(new TextDecoder().decode(pack)) as ResidentSnapshot;
-    return this.#store.importRoom(snapshot);
+    return this.#migration.importResident(pack);
   }
 }
 
@@ -159,12 +139,4 @@ export function createDriver(): HarnessDriver {
  * 判卷桩申报（#16 裁定 1 的执行）：以下方法当前是 P1 代写的最小实现，
  * 各认领包交付时从名单里划掉自己那几个。隐瞒申报按伪证论。
  */
-export const STUBBED = [
-  "say",
-  "history",
-  "reviseNode",
-  "buildBootPack",
-  "killSession",
-  "exportResident",
-  "importResident",
-];
+export const STUBBED: string[] = [];
