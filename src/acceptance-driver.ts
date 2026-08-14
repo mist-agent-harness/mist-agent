@@ -20,6 +20,7 @@
  */
 
 import type { BootPack, HarnessDriver, HistoryNode, MemoryEntry } from "../acceptance/driver.ts";
+import { buildBootPack as assembleBootPack } from "./bootpack.ts";
 import {
   MessageTreeService,
   MessageTreeStore,
@@ -100,21 +101,10 @@ class MistDriver implements HarnessDriver {
     return this.#messageTree.reviseNode(residentId, nodeId, newContent);
   }
 
-  // --- P3：启动包（TODO(P3) 认领者替换）---
+  // --- P3：启动包 ---
 
   async buildBootPack(residentId: string): Promise<BootPack> {
-    const room = this.#store.room(residentId);
-    const memories = this.#store.memories(residentId);
-    // TODO(P3)：identity 目前从存储机械推导，真实形态应由住户的身份锚生成。
-    // commitments 不再从记忆里按「答应」二字猜——那是把关键词匹配冒充承诺账本，
-    // 说过「答应」的记忆和真立过的承诺是两回事。改由 commit() 写入的原文供货
-    // （#16 问 4 裁定：存储归 P1、进包归 P3）。
-    return {
-      residentId,
-      identity: `住户 ${room.name}（建于 ${room.createdAt}）`,
-      commitments: this.#store.commitments(residentId),
-      memories,
-    };
+    return assembleBootPack(this.#store, residentId);
   }
 
   // --- P4：会话生杀（TODO(P4) 认领者替换）---
@@ -151,4 +141,4 @@ export function createDriver(): HarnessDriver {
  * 判卷桩申报（#16 裁定 1 的执行）：以下方法当前是 P1 代写的最小实现，
  * 各认领包交付时从名单里划掉自己那几个。隐瞒申报按伪证论。
  */
-export const STUBBED = ["buildBootPack", "exportResident", "importResident"];
+export const STUBBED = ["exportResident", "importResident"];
