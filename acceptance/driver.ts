@@ -40,22 +40,40 @@ export interface HarnessDriver {
   /** 建一个住户（房间）。返回 residentId。 */
   createResident(name: string): Promise<string>;
 
-  /** 在住户当前会话里落一条用户消息并得到回应节点。没有活会话就开一个。 */
+  /**
+   * 在住户当前会话里说一句话。没有活会话就开一个。
+   * 裁定（2026-08-14，#14 问 1）：必须落两个节点——user 节点和挂在它下面的
+   * assistant 回应节点（M0 允许哑回应），返回 assistant 节点。
+   */
   say(residentId: string, message: string): Promise<HistoryNode>;
 
   /** 往住户记忆库写一条记忆。返回条目 id。 */
   remember(residentId: string, content: string): Promise<string>;
 
-  /** 杀掉住户当前会话。会话死，人不能死。 */
+  /**
+   * 杀掉住户当前会话。会话死，人不能死。
+   * 裁定（2026-08-14，#16 缝 1）：会话态＝活会话指针与在途上下文，可以死；
+   * 消息树、记忆库、关系记录全是住户态，一个字节不许动——留底的树也是人的一部分。
+   */
   killSession(residentId: string): Promise<void>;
 
-  /** 生成住户此刻醒来会读到的启动包。 */
+  /**
+   * 生成住户此刻醒来会读到的启动包。
+   * 裁定（2026-08-14，#16 缝 3）：死活记忆都进包，勘误链带 supersededBy 标记
+   * 原样呈现，装配器不代裁「哪条算数」。
+   * 裁定（#16 缝 2）：同一存储状态必须产出逐字节相同的包——各分区排序规则固定
+   * （按 createdAt 再按 id），时间戳一律 ISO-8601 UTC。
+   */
   buildBootPack(residentId: string): Promise<BootPack>;
 
   /** 读整棵消息树（全部节点，含被分叉的旧枝）。 */
   history(residentId: string): Promise<HistoryNode[]>;
 
-  /** 对某个节点改口/重试：只允许长新枝。返回新节点。 */
+  /**
+   * 对某个节点改口/重试：只允许长新枝。返回新节点。
+   * 裁定（2026-08-14，#14 问 2/问 3）：改口是同父分叉——新节点与被改节点同
+   * parentId，是兄弟不是子嗣；拿别的住户的 nodeId 来改必须拒绝（抛错）。
+   */
   reviseNode(residentId: string, nodeId: string, newContent: string): Promise<HistoryNode>;
 
   /** 勘误一条记忆：旧条目留底并标记被取代，新条目链回旧条目。返回新条目 id。 */

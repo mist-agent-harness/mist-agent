@@ -57,22 +57,41 @@ const c3: AcceptanceCheck = {
   title: "不改史：改口只长新枝，旧枝一个字节不动",
   async run(driver: HarnessDriver) {
     const r = await driver.createResident("c3-resident");
-    const node = await driver.say(r, "第一版说法");
-    const originalHash = sha256(JSON.stringify([node.id, node.content, node.createdAt]));
-    const revised = await driver.reviseNode(r, node.id, "改口后的说法");
+    const reply = await driver.say(r, "第一版说法");
+    // #14 裁定：say 落 user + assistant 两个节点，返回的是 assistant 节点，
+    // 且 assistant 节点挂在 user 节点下面
+    const afterSay = await driver.history(r);
+    const userNode = afterSay.find((n) => n.role === "user" && n.content === "第一版说法");
+    const sayShape =
+      reply.role === "assistant" && userNode !== undefined && reply.parentId === userNode.id;
+    const originalHash = sha256(JSON.stringify([reply.id, reply.content, reply.createdAt]));
+    const revised = await driver.reviseNode(r, reply.id, "改口后的说法");
     const tree = await driver.history(r);
-    const old = tree.find((n) => n.id === node.id);
+    const old = tree.find((n) => n.id === reply.id);
     const oldIntact =
       old !== undefined &&
       sha256(JSON.stringify([old.id, old.content, old.createdAt])) === originalHash;
-    const newIsBranch = revised.id !== node.id && tree.some((n) => n.id === revised.id);
+    // #14 裁定：改口是同父分叉，新节点与旧节点是兄弟不是子嗣
+    const forked =
+      revised.id !== reply.id &&
+      revised.parentId === reply.parentId &&
+      tree.some((n) => n.id === revised.id);
+    // #14 裁定：拿别的住户的 nodeId 来改必须拒绝
+    const stranger = await driver.createResident("c3-stranger");
+    let crossRejected = false;
+    try {
+      await driver.reviseNode(stranger, reply.id, "越权改口");
+    } catch {
+      crossRejected = true;
+    }
+    await driver.destroyResident(stranger);
     await driver.destroyResident(r);
-    const pass = oldIntact && newIsBranch;
+    const pass = sayShape && oldIntact && forked && crossRejected;
     return {
       pass,
       detail: pass
-        ? "旧节点 hash 不变，新节点以新枝存在"
-        : `oldIntact=${oldIntact} newIsBranch=${newIsBranch}`,
+        ? "say 双节点成形；旧节点 hash 不变；改口同父分叉；跨房改口被拒"
+        : `sayShape=${sayShape} oldIntact=${oldIntact} forked=${forked} crossRejected=${crossRejected}`,
     };
   },
 };
