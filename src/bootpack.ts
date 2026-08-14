@@ -30,7 +30,12 @@ export function buildBootPack(store: ResidentStore, residentId: string): BootPac
   };
 }
 
-/** 浅拷贝一条记忆：包与存储互不别名，MemoryEntry 的字段全是原始值，浅拷即深拷。 */
+/**
+ * 浅拷贝一条记忆：包与存储互不别名。
+ * 守卫（Laurie F2）：「浅拷即深拷」的成立前提是 MemoryEntry 全部字段都是
+ * 原始值（对 driver.ts 已核，2026-08-14 为真）。谁给 MemoryEntry 加嵌套
+ * 字段，谁负责把这里升级成深拷——否则该保证静默失效。
+ */
 function cloneEntry(entry: MemoryEntry): MemoryEntry {
   return { ...entry };
 }
