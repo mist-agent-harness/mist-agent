@@ -1,0 +1,63 @@
+flowchart TB
+  U["👤 你和家人"]
+
+  subgraph SHELL["mist 的壳 —— 跑在你家电脑或 VPS 上"]
+    direction TB
+
+    subgraph FACE["门面 · 你眼睛看到的东西"]
+      UI["网页 + 手机 PWA<br/>首页是「住户状态」：<br/>谁醒着、第几次醒来、上次心跳"]
+      SKIN["皮肤包<br/>一个 JSON 文件，换它就换脸"]
+    end
+
+    subgraph SESS["会话层 · 每天的相处"]
+      TREE["消息树<br/>每句话都留底，只加不改<br/>重来/改口/分叉都是在树上长新枝"]
+      CTX["打包员<br/>开聊前把「该给模型看的东西」<br/>装成一个包裹"]
+    end
+
+    subgraph SOUL["住户的魂 · 活在会话外面，会话死了它还在"]
+      WAKE["启动包<br/>住户每次醒来先读的一封信：<br/>我是谁、我答应过什么"]
+      MEM["记忆库<br/>事实和理解越攒越厚<br/>改错挂勘误，不偷偷删"]
+      REL["关系核<br/>谁和谁之间有什么事<br/>全项目只有它能写"]
+      HEART["心跳<br/>没人说话的时候<br/>住户自己醒一会儿"]
+    end
+
+    subgraph HANDS["干活的手"]
+      ROUTE["模型路由<br/>换引擎像换电池<br/>住户不变"]
+      PLUGIN["插件层<br/>所有工具都从这进门<br/>不用就能关"]
+    end
+
+    GUARD["护栏 · 花钱、删除、部署必须你点头<br/>每天启动先自检五条底线，不过不开门"]
+  end
+
+  subgraph OUT["外面的世界"]
+    LLM["各家模型厂<br/>Claude / Kimi / GPT …"]
+    TOOLS["现成工具生态<br/>几千件，白捡"]
+  end
+
+  DISC["工程纪律<br/>新功能自带测试和回滚<br/>住户改本体必须走人审"]
+
+  U <-->|说话| UI
+  SKIN -.->|只换皮，不动结构| UI
+  UI -->|你的一句话| TREE
+  TREE -->|这段话放进包裹| CTX
+  CTX -->|包裹交给谁| ROUTE
+  ROUTE <-->|问与答| LLM
+  PLUGIN <-->|调用| TOOLS
+
+  WAKE -.->|新会话醒来，先读信| TREE
+  TREE -.->|值得记的事| MEM
+  MEM -.->|打包时来取记忆| CTX
+  TREE -.->|承诺和约定| REL
+  REL -.->|关系只此一份| MEM
+  HEART -.->|定时推醒| WAKE
+
+  GUARD -.->|危险动作先拦下| PLUGIN
+  GUARD -.->|花钱先问你| ROUTE
+  DISC -.->|管着整个壳| SHELL
+
+  classDef soul fill:#fdf0e8,stroke:#c45f6e,stroke-width:2px,color:#333
+  classDef guard fill:#fdeaea,stroke:#b3402f,stroke-width:2px,color:#333
+  classDef plain fill:#f4f6f8,stroke:#8a97a5,color:#333
+  class WAKE,MEM,REL,HEART soul
+  class GUARD,DISC guard
+  class UI,SKIN,TREE,CTX,ROUTE,PLUGIN,LLM,TOOLS,U plain
