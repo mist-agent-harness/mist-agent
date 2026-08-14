@@ -26,8 +26,9 @@ import {
   MessageTreeStore,
   type SessionHeadPort,
 } from "./message-tree/index.ts";
+import { createResidentMigrationService } from "./migration/resident-store-migration.ts";
 import { SessionRegistry } from "./session/session-registry.ts";
-import { type ResidentSnapshot, ResidentStore } from "./store/resident-store.ts";
+import { ResidentStore } from "./store/resident-store.ts";
 
 class MistDriver implements HarnessDriver {
   readonly #store = new ResidentStore();
@@ -40,6 +41,7 @@ class MistDriver implements HarnessDriver {
     } satisfies SessionHeadPort,
     { assistantReply: (_residentId, message) => `收到：${message}` },
   );
+  readonly #migration = createResidentMigrationService(this.#store, this.#messageTreeStore);
 
   /**
    * 会话态注册表 —— 跟住户存储分开的一张表（#16 问 2 裁定）。
@@ -118,18 +120,14 @@ class MistDriver implements HarnessDriver {
     this.#sessions.kill(residentId);
   }
 
-  // --- P5：迁移（TODO(P5) 认领者替换）---
+  // --- P5：迁移 ---
 
   async exportResident(residentId: string): Promise<Uint8Array> {
-    const snapshot = this.#store.exportRoom(residentId);
-    return new TextEncoder().encode(JSON.stringify(snapshot));
+    return this.#migration.exportResident(residentId);
   }
 
   async importResident(pack: Uint8Array): Promise<string> {
-    const snapshot = JSON.parse(new TextDecoder().decode(pack)) as ResidentSnapshot;
-    const residentId = this.#store.importRoom(snapshot);
-    this.#messageTreeStore.createRoom(residentId);
-    return residentId;
+    return this.#migration.importResident(pack);
   }
 }
 
@@ -141,4 +139,4 @@ export function createDriver(): HarnessDriver {
  * 判卷桩申报（#16 裁定 1 的执行）：以下方法当前是 P1 代写的最小实现，
  * 各认领包交付时从名单里划掉自己那几个。隐瞒申报按伪证论。
  */
-export const STUBBED = ["exportResident", "importResident"];
+export const STUBBED: string[] = [];
