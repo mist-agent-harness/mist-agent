@@ -87,6 +87,33 @@ interface RoomRecord {
 }
 
 const SCHEMA_VERSION = 1;
+const SEQUENCE_RADIX = 36n;
+const MAX_SEQUENCE_SUFFIX_DIGITS = 64;
+
+/**
+ * 从现有 id 的最后一段恢复全局发号水位。
+ *
+ * Number.parseInt 会在 2^53 之后静默丢精度，导致 #seq += 1 不再前进；
+ * 这里逐位构造 bigint，保证跨机导入超大原生 id 后仍能继续发号。
+ * 64 位 base36 已远超任何可实际产生的序列，同时给恶意超长 id 留下显式拒绝边界。
+ */
+function parseBase36Sequence(id: string): bigint | null {
+  const suffix = id.slice(id.lastIndexOf("-") + 1).toLowerCase();
+  if (!/^[0-9a-z]+$/.test(suffix)) return null;
+  if (suffix.length > MAX_SEQUENCE_SUFFIX_DIGITS) {
+    throw new Error(
+      `id sequence suffix exceeds ${MAX_SEQUENCE_SUFFIX_DIGITS} base36 digits: ${id}`,
+    );
+  }
+
+  let value = 0n;
+  for (const character of suffix) {
+    const code = character.charCodeAt(0);
+    const digit = BigInt(code <= 57 ? code - 48 : code - 87);
+    value = value * SEQUENCE_RADIX + digit;
+  }
+  return value;
+}
 
 export class ResidentStore {
   readonly #rooms = new Map<string, ResidentRoom>();
@@ -107,7 +134,7 @@ export class ResidentStore {
    */
   readonly #dataDir: string | null;
 
-  #seq = 0;
+  #seq = 0n;
 
   constructor(options: { dataDir?: string } = {}) {
     this.#dataDir = options.dataDir ?? null;
@@ -123,7 +150,7 @@ export class ResidentStore {
    * 同毫秒内连续 remember 两条时随机数还有撞号风险。
    */
   #nextId(prefix: string): string {
-    this.#seq += 1;
+    this.#seq += 1n;
     return `${prefix}-${this.#seq.toString(36).padStart(6, "0")}`;
   }
 
@@ -148,9 +175,15 @@ export class ResidentStore {
    * 新档已经原子就位。没有中间态。
    */
   #persist(residentId: string): void {
-    if (this.#dataDir === null) return;
     const room = this.#rooms.get(residentId);
     if (room === undefined) return;
+    this.#persistRoom(room);
+  }
+
+  /** 允许迁移先把 detached room 落盘，成功后才放进可见房间表。 */
+  #persistRoom(room: ResidentRoom): void {
+    if (this.#dataDir === null) return;
+    const residentId = room.residentId;
     // id 全部出自 #nextId，这条断言防的是「将来某个改动让外部输入流进文件名」。
     if (!/^[a-z0-9-]+$/.test(residentId)) {
       throw new Error(`resident id 不可作为文件名: ${residentId}`);
@@ -166,14 +199,29 @@ export class ResidentStore {
     };
     const finalPath = join(this.#dataDir, `${residentId}.json`);
     const tmpPath = `${finalPath}.tmp`;
-    const fd = openSync(tmpPath, "w");
+    let fd: number | null = null;
     try {
+      fd = openSync(tmpPath, "w");
       writeSync(fd, JSON.stringify(record));
       fsyncSync(fd);
-    } finally {
       closeSync(fd);
+      fd = null;
+      renameSync(tmpPath, finalPath);
+    } catch (error) {
+      if (fd !== null) {
+        try {
+          closeSync(fd);
+        } catch {
+          // 保留原始写入错误；close 的二次错误不该遮住病因。
+        }
+      }
+      try {
+        rmSync(tmpPath, { force: true });
+      } catch {
+        // 预先存在的同名目录等异常目标可能删不掉；导入仍保持不可见并显式失败。
+      }
+      throw error;
     }
-    renameSync(tmpPath, finalPath);
   }
 
   /** 启动恢复：读全部快照重建内存视图，并把 id/时间戳序列推进到存量之后。 */
@@ -214,8 +262,8 @@ export class ResidentStore {
   }
 
   #bumpSeq(id: string): void {
-    const n = Number.parseInt(id.slice(id.lastIndexOf("-") + 1), 36);
-    if (Number.isFinite(n) && n > this.#seq) this.#seq = n;
+    const sequence = parseBase36Sequence(id);
+    if (sequence !== null && sequence > this.#seq) this.#seq = sequence;
   }
 
   #bumpStamp(createdAt: string): void {
@@ -225,6 +273,9 @@ export class ResidentStore {
 
   createResident(name: string): string {
     const residentId = this.#nextId("resident");
+    if (this.#rooms.has(residentId)) {
+      throw new Error(`resident id collision, refusing to overwrite: ${residentId}`);
+    }
     this.#rooms.set(residentId, {
       residentId,
       name,
@@ -276,6 +327,9 @@ export class ResidentStore {
   remember(residentId: string, content: string): string {
     const room = this.room(residentId);
     const id = this.#nextId("mem");
+    if (room.memories.has(id)) {
+      throw new Error(`memory id collision, refusing to overwrite: ${id}`);
+    }
     room.memories.set(id, {
       id,
       residentId,
@@ -347,6 +401,9 @@ export class ResidentStore {
       content,
       createdAt: this.#nextStamp(),
     };
+    if (room.nodes.has(node.id)) {
+      throw new Error(`history id collision, refusing to overwrite: ${node.id}`);
+    }
     room.nodes.set(node.id, node);
     this.#persist(residentId);
     return node;
@@ -379,33 +436,56 @@ export class ResidentStore {
    * C6 要逐字节等价（把 residentId 归一化后比较），重新生成 id 会直接判死。
    * 这也符合直觉——搬家不该让记忆换一个身份证号。
    */
-  importRoom(snapshot: ResidentSnapshot): string {
-    const residentId = this.#nextId("resident");
-    const memories = new Map<string, MemoryEntry>();
-    for (const m of snapshot.memories) {
-      memories.set(m.id, { ...m, residentId });
-      // 迁移保 id，而快照可能来自另一台机器——那边发的序号要是比本机 #seq 大，
-      // 不推进的话之后 #nextId 会撞上导入条目，Map.set 静默覆盖，人丢一块。
-      this.#bumpSeq(m.id);
-      this.#bumpStamp(m.createdAt);
+  importRoom(snapshot: ResidentSnapshot, options: ResidentImportOptions = {}): string {
+    const previousSeq = this.#seq;
+    const previousStamp = this.#lastStamp;
+    try {
+      let residentId = this.#nextId("resident");
+      // fresh target 的本机序列可能恰好发出来源身份证。导入件必须真的是“新住户”，
+      // 不能只在另一台机器上碰巧同名；撞上来源 id 就显式跳过再发一张。
+      if (residentId === options.sourceResidentId) residentId = this.#nextId("resident");
+      if (this.#rooms.has(residentId)) {
+        throw new Error(`resident id collision during import: ${residentId}`);
+      }
+
+      const memories = new Map<string, MemoryEntry>();
+      for (const m of snapshot.memories) {
+        if (memories.has(m.id)) throw new Error(`duplicate memory id during import: ${m.id}`);
+        memories.set(m.id, { ...m, residentId });
+        // 迁移保 id，而快照可能来自另一台机器——那边发的序号要是比本机 #seq 大，
+        // 不推进的话之后 #nextId 会撞上导入条目，Map.set 静默覆盖，人丢一块。
+        this.#bumpSeq(m.id);
+        this.#bumpStamp(m.createdAt);
+      }
+      const nodes = new Map<string, HistoryNode>();
+      for (const n of snapshot.nodes) {
+        if (nodes.has(n.id)) throw new Error(`duplicate history id during import: ${n.id}`);
+        nodes.set(n.id, { ...n });
+        this.#bumpSeq(n.id);
+        this.#bumpStamp(n.createdAt);
+      }
+      this.#bumpStamp(snapshot.createdAt);
+
+      const room: ResidentRoom = {
+        residentId,
+        name: snapshot.name,
+        createdAt: snapshot.createdAt,
+        memories,
+        nodes,
+        // 承诺跟着人走：搬了家，答应过的事还算数。
+        commitments: [...snapshot.commitments],
+      };
+
+      // 先落 detached room，成功后才对内存读者可见。失败回滚两条水位，
+      // 不留下半间房，也不让坏包凭空吃掉未来 id/时间戳。
+      this.#persistRoom(room);
+      this.#rooms.set(residentId, room);
+      return residentId;
+    } catch (error) {
+      this.#seq = previousSeq;
+      this.#lastStamp = previousStamp;
+      throw error;
     }
-    const nodes = new Map<string, HistoryNode>();
-    for (const n of snapshot.nodes) {
-      nodes.set(n.id, { ...n });
-      this.#bumpSeq(n.id);
-      this.#bumpStamp(n.createdAt);
-    }
-    this.#rooms.set(residentId, {
-      residentId,
-      name: snapshot.name,
-      createdAt: snapshot.createdAt,
-      memories,
-      nodes,
-      // 承诺跟着人走：搬了家，答应过的事还算数。
-      commitments: [...snapshot.commitments],
-    });
-    this.#persist(residentId);
-    return residentId;
   }
 }
 
@@ -422,4 +502,8 @@ export interface ResidentSnapshot {
   memories: MemoryEntry[];
   nodes: HistoryNode[];
   commitments: string[];
+}
+
+export interface ResidentImportOptions {
+  sourceResidentId?: string;
 }
