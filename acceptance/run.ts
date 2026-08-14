@@ -77,7 +77,9 @@ if (loaded !== null && loaded.stubbed.size > 0) {
 }
 console.log(
   `真绿 ${realGreen}/${checks.length}${stubGreen > 0 ? `，桩灯 ${stubGreen} 盏` : ""}。${
-    realGreen === checks.length ? "里程碑达成，H1 解锁。" : "还没到。"
+    realGreen === checks.length
+      ? "六盏真绿。里程碑判定进入复验——独立复验通过、决策台账落章后才算达成、才解锁 H1。判卷机只报灯色，不宣布胜利。"
+      : "还没到。"
   }`,
 );
 
