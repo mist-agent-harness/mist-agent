@@ -51,9 +51,19 @@ export interface HarnessDriver {
   remember(residentId: string, content: string): Promise<string>;
 
   /**
+   * 立一条承诺（关系核的最小口）。
+   * 裁定（2026-08-14，#16 问 4）：启动包的 commitments 必须真实来自这里写入的
+   * 内容——恒返空数组从此判不过。存储归 P1，进包归 P3。
+   */
+  commit(residentId: string, commitment: string): Promise<void>;
+
+  /**
    * 杀掉住户当前会话。会话死，人不能死。
    * 裁定（2026-08-14，#16 缝 1）：会话态＝活会话指针与在途上下文，可以死；
    * 消息树、记忆库、关系记录全是住户态，一个字节不许动——留底的树也是人的一部分。
+   * 裁定（#16 问 3）：「会话确实死了」的可判形状是会话边界——同一会话内连续 say
+   * 的 user 节点挂在上一个回应节点下面；kill 之后第一次 say 的 user 节点必须是
+   * 新根（parentId 为 null）。会话态不进迁移快照，导入不复活来源机的活会话。
    */
   killSession(residentId: string): Promise<void>;
 
