@@ -6,7 +6,7 @@
  * 不对模型输出的措辞做任何判断。
  */
 import { createHash } from "node:crypto";
-import type { AcceptanceCheck, BootPack, HarnessDriver } from "./driver.ts";
+import type { AcceptanceCheck, BootPack, HarnessDriver, HistoryNode } from "./driver.ts";
 
 function sha256(data: Uint8Array | string): string {
   return createHash("sha256").update(data).digest("hex");
@@ -165,32 +165,44 @@ const c5: AcceptanceCheck = {
 
 const c6: AcceptanceCheck = {
   id: "C6",
-  title: "迁移可回滚：导出导入后启动包逐字节等价，原件不动",
+  title: "迁移可回滚：启动包与消息树都逐字节等价，原件不动",
   async run(driver: HarnessDriver) {
     const r = await driver.createResident("c6-resident");
     await driver.remember(r, "迁移前的记忆一号");
-    await driver.remember(r, "迁移前的记忆二号");
+    // 正文故意包含源 residentId：结构化归一不许碰它
+    const wrongId = await driver.remember(r, `迁移前的记忆二号，正文提到 ${r}`);
+    await driver.errata(r, wrongId, "勘误后的记忆二号");
+    await driver.say(r, "迁移前说过的话");
     const packBefore = await driver.buildBootPack(r);
+    const treeBefore = await driver.history(r);
     const exported = await driver.exportResident(r);
     const r2 = await driver.importResident(exported);
     const packAfter = await driver.buildBootPack(r2);
+    const treeAfter = await driver.history(r2);
     // #16 问 5：结构化归一——只替换 residentId 字段，不碰 content 正文
-    const canonical = (p: BootPack) =>
+    const canonicalPack = (p: BootPack) =>
       JSON.stringify({
         ...p,
         residentId: "RESIDENT",
         memories: p.memories.map((m) => ({ ...m, residentId: "RESIDENT" })),
       });
-    const identical = canonical(packBefore) === canonical(packAfter);
-    const originalStillThere = (await driver.buildBootPack(r)).memories.length === 2;
-    await driver.destroyResident(r);
+    const canonicalTree = (nodes: readonly HistoryNode[]) =>
+      JSON.stringify([...nodes].sort((a, b) => a.id.localeCompare(b.id)));
+    const packIdentical = canonicalPack(packBefore) === canonicalPack(packAfter);
+    // #16 二轮裁定 A：留底的树也是住户态，迁移丢树判不过
+    const treeIdentical = canonicalTree(treeBefore) === canonicalTree(treeAfter);
+    // 销毁导入件后复查原件——回滚的最低含义是导入件的生死不牵连原件
     await driver.destroyResident(r2);
-    const pass = identical && originalStillThere;
+    const originalIntact =
+      canonicalPack(await driver.buildBootPack(r)) === canonicalPack(packBefore) &&
+      canonicalTree(await driver.history(r)) === canonicalTree(treeBefore);
+    await driver.destroyResident(r);
+    const pass = packIdentical && treeIdentical && originalIntact;
     return {
       pass,
       detail: pass
-        ? "导入件与原件启动包等价，原件未被迁移动过"
-        : `identical=${identical} originalIntact=${originalStillThere}`,
+        ? "启动包与消息树均等价，销毁导入件后原件完好"
+        : `packIdentical=${packIdentical} treeIdentical=${treeIdentical} originalIntact=${originalIntact}`,
     };
   },
 };
