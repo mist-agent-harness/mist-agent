@@ -70,7 +70,8 @@ export class MessageTreeStore {
 
   /**
    * 原子落一对节点：user 挂 parentId 下（null 即新根），assistant 挂 user 下。
-   * 全部校验先行，两个节点要么都进树、要么都不进——不存在 user-only 的半截写入。
+   * 全部校验先行（含 id 无碰撞），两个节点要么都进树、要么都不进——
+   * 不存在 user-only 的半截写入，也不存在 id 撞车时先落一半再炸。
    */
   appendPair(
     residentId: string,
@@ -84,6 +85,7 @@ export class MessageTreeStore {
     }
     const user = this.build(parentId, "user", userContent);
     const assistant = this.build(user.id, "assistant", assistantContent);
+    this.assertFreshIds(room, [user, assistant]);
     this.insert(room, user);
     this.insert(room, assistant);
     return { user: { ...user }, assistant: { ...assistant } };
@@ -100,6 +102,7 @@ export class MessageTreeStore {
       throw nodeUnavailable();
     }
     const sibling = this.build(origin.parentId, origin.role, newContent);
+    this.assertFreshIds(room, [sibling]);
     this.insert(room, sibling);
     return { ...sibling };
   }
@@ -135,7 +138,26 @@ export class MessageTreeStore {
     });
   }
 
+  /**
+   * id 无碰撞校验：撞上房内已有节点、或同批次内部互撞，一律整批拒绝。
+   * Map.set 静默覆盖是 append-only 的天敌——历史被吞不会当场炸，
+   * 只会在某天读史时少一个节点（交叉挑刺 fd6dd07 抓出的洞）。
+   */
+  private assertFreshIds(room: Room, nodes: HistoryNode[]): void {
+    const batch = new Set<string>();
+    for (const node of nodes) {
+      if (room.nodes.has(node.id) || batch.has(node.id)) {
+        throw new MessageTreeError(`节点 id 冲突，拒绝覆盖历史：${node.id}`);
+      }
+      batch.add(node.id);
+    }
+  }
+
+  /** 末道闸：即使上游校验漏了，insert 也绝不允许覆盖已有节点。 */
   private insert(room: Room, node: HistoryNode): void {
+    if (room.nodes.has(node.id)) {
+      throw new MessageTreeError(`节点 id 冲突，拒绝覆盖历史：${node.id}`);
+    }
     room.nodes.set(node.id, node);
     room.order.push(node.id);
   }
