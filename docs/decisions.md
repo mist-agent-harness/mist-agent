@@ -30,7 +30,7 @@
 - 2026-08-14　**D3 主笔拍板：语言栈定 TypeScript**。前后端同语言，契约定义共享一份；
   Python 生态（graphiti 等）走 sidecar 外挂，不进主仓。
 - 2026-08-14　**建造阶段开门，验收先行**（主笔拍板）：里程碑判卷程序先于功能代码进仓
-  （[acceptance/milestone-1.md](acceptance/milestone-1.md) + 根目录 `acceptance/`），
+  （人话版与可执行版同住根目录 [acceptance/](../acceptance/)），
   骨架定 npm + TypeScript strict + Biome + Vitest，CI 三件套拦门、判卷报告不拦门，
   六绿后判卷转 strict 开始拦 merge。代价：验收驱动接口在 H1 前是临时法律，
   闭环跑通后可能整体推翻重写。

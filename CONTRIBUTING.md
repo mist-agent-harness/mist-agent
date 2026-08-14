@@ -27,7 +27,7 @@ mist 现在在**建造阶段**（2026-08-14 开门）：第一里程碑是最小
 
 1. **验收先行**。里程碑的判卷程序（`acceptance/`）先于功能代码存在，
    「做完了」以 `npm run acceptance` 的绿灯为准，不以描述为准。
-   验收清单怎么读、怎么改，见 [docs/acceptance/milestone-1.md](docs/acceptance/milestone-1.md)。
+   验收清单怎么读、怎么改，见 [acceptance/README.md](acceptance/README.md)。
 2. **认领整件**。闭环拆出的零件在 issue 里认领，认的是「让它能跑、让它的灯变绿」，
    不是「给它写文档」。认了两天不动工，主笔可以收回重发。
 3. **小 PR**。一个 PR 干一件事，附一句「这个 PR 让哪盏灯（或哪条测试）变了颜色」。

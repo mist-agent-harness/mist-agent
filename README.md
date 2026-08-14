@@ -26,17 +26,27 @@ mist 是一个个人 agent harness（还在图纸阶段）。它的设计从一�
 建造阶段开门（2026-08-14）。许愿池收官，第一里程碑动工：最小垂直闭环——
 杀会话、凭启动包醒来、不改史、勘误留底、不串房、迁移可回滚。
 
-这个阶段的规矩是**验收先行**：判卷程序先于功能代码进仓库。六条验收的人话版在
-[docs/acceptance/milestone-1.md](docs/acceptance/milestone-1.md)，可执行版在 `acceptance/`，
-`npm run acceptance` 随时打红绿灯。六盏全绿即里程碑达成。
+这个阶段的规矩是**验收先行**：判卷程序先于功能代码进仓库。六条验收连人话版带
+可执行版都在 [acceptance/](acceptance/)，`npm run acceptance` 随时打红绿灯。
+六盏全绿即里程碑达成。
 
-图纸不动，还在原处：
+## 仓库地图
 
-- `docs/principles.md` — 设计原则八条，每条带代价
-- `docs/glossary.md` — 术语表（模块边界、证据纪律都钉在这里）
-- `docs/research/` — 分模块调研（每个模块标注可参考的开源仓库）+ 关系型 harness 生态调研
-- `docs/design/` — 从 issue 收编的设计稿：Relationship Core、能力契约双层模型、皮肤包协议
-- `docs/decisions.md` — 决策台账：待决 / 挂起 / 已决，全项目唯一的拍板看板
+想干什么，就进哪个门：
+
+| 你想 | 去哪 |
+|---|---|
+| 知道 mist 是什么 | 这份 README，往下读完就够 |
+| 看设计原则和为什么 | [docs/principles.md](docs/principles.md)，八条，每条带代价 |
+| 查一个词什么意思 | [docs/glossary.md](docs/glossary.md) |
+| 看拍过什么板、还挂着什么 | [docs/decisions.md](docs/decisions.md)，全项目唯一看板 |
+| 读调研和设计稿 | [docs/research/](docs/research/) 和 [docs/design/](docs/design/) |
+| 知道里程碑完成没有 | [acceptance/](acceptance/)，`npm run acceptance` 打红绿灯 |
+| 读或写产品代码 | `src/`（建造中），单元测试在 `tests/` |
+| 参与进来 | [CONTRIBUTING.md](CONTRIBUTING.md) |
+
+根目录剩下的 `package.json`、`tsconfig.json`、`biome.json` 等是给工具读的配置，
+不用管它们。
 
 参与方式见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
