@@ -20,11 +20,25 @@
  */
 
 import type { BootPack, HarnessDriver, HistoryNode, MemoryEntry } from "../acceptance/driver.ts";
+import {
+  MessageTreeService,
+  MessageTreeStore,
+  type SessionHeadPort,
+} from "./message-tree/index.ts";
 import { SessionRegistry } from "./session/session-registry.ts";
 import { type ResidentSnapshot, ResidentStore } from "./store/resident-store.ts";
 
 class MistDriver implements HarnessDriver {
   readonly #store = new ResidentStore();
+  readonly #messageTreeStore = new MessageTreeStore();
+  readonly #messageTree = new MessageTreeService(
+    this.#messageTreeStore,
+    {
+      getHead: (residentId) => this.#session(residentId).headId,
+      setHead: (residentId, headId) => this.#sessions.setHead(residentId, headId),
+    } satisfies SessionHeadPort,
+    { assistantReply: (_residentId, message) => `收到：${message}` },
+  );
 
   /**
    * 会话态注册表 —— 跟住户存储分开的一张表（#16 问 2 裁定）。
@@ -43,7 +57,9 @@ class MistDriver implements HarnessDriver {
   // --- P1：记忆库存储（本 issue 的认领范围）---
 
   async createResident(name: string): Promise<string> {
-    return this.#store.createResident(name);
+    const residentId = this.#store.createResident(name);
+    this.#messageTreeStore.createRoom(residentId);
+    return residentId;
   }
 
   async remember(residentId: string, content: string): Promise<string> {
@@ -63,45 +79,25 @@ class MistDriver implements HarnessDriver {
   }
 
   async destroyResident(residentId: string): Promise<void> {
+    this.#sessions.kill(residentId);
+    this.#messageTreeStore.destroyRoom(residentId);
     this.#store.destroyResident(residentId);
   }
 
-  // --- P2：消息树（TODO(P2) 认领者替换）---
+  // --- P2：消息树 ---
 
   async say(residentId: string, message: string): Promise<HistoryNode> {
-    // 先确认住户真的在（拿不到会抛）——会话态自己那张表没有隔离语义。
     this.#store.room(residentId);
-    const session = this.#session(residentId);
-    // 没有活会话时 #session 会开一个新 generation，headId 为 null。
-    // #16 问 3 裁定：kill 之后第一次说话的 user 节点必须是新根
-    // （parentId === null），会话边界才是可判的——否则「会话死了」
-    // 这件事在树上看不出来，killSession 写成空函数也能蒙混过关。
-    // 旧枝一个字节不动，人和历史都还在，只是这段对话从头起。
-    const userNode = this.#store.appendNode(residentId, session.headId, "user", message);
-    // TODO(P2)：M0 阶段回应是固定文本，判卷只看树结构不看措辞。
-    const replyNode = this.#store.appendNode(
-      residentId,
-      userNode.id,
-      "assistant",
-      `收到：${message}`,
-    );
-    this.#sessions.setHead(residentId, replyNode.id);
-    return replyNode;
+    return this.#messageTree.say(residentId, message);
   }
 
   async history(residentId: string): Promise<HistoryNode[]> {
-    return this.#store.nodes(residentId);
+    return this.#messageTree.history(residentId);
   }
 
   async reviseNode(residentId: string, nodeId: string, newContent: string): Promise<HistoryNode> {
-    const room = this.#store.room(residentId);
-    const target = room.nodes.get(nodeId);
-    if (target === undefined) {
-      throw new Error(`no such node in ${residentId}: ${nodeId}`);
-    }
-    // append-only：改口挂在旧节点的**父节点**下成为兄弟枝，旧枝一个字节不动。
-    // 挂在旧节点自己下面会把「改口」变成「追加」，语义就错了。
-    return this.#store.appendNode(residentId, target.parentId, target.role, newContent);
+    this.#store.room(residentId);
+    return this.#messageTree.reviseNode(residentId, nodeId, newContent);
   }
 
   // --- P3：启动包（TODO(P3) 认领者替换）---
@@ -141,7 +137,9 @@ class MistDriver implements HarnessDriver {
 
   async importResident(pack: Uint8Array): Promise<string> {
     const snapshot = JSON.parse(new TextDecoder().decode(pack)) as ResidentSnapshot;
-    return this.#store.importRoom(snapshot);
+    const residentId = this.#store.importRoom(snapshot);
+    this.#messageTreeStore.createRoom(residentId);
+    return residentId;
   }
 }
 
@@ -153,12 +151,4 @@ export function createDriver(): HarnessDriver {
  * 判卷桩申报（#16 裁定 1 的执行）：以下方法当前是 P1 代写的最小实现，
  * 各认领包交付时从名单里划掉自己那几个。隐瞒申报按伪证论。
  */
-export const STUBBED = [
-  "say",
-  "history",
-  "reviseNode",
-  "buildBootPack",
-  "killSession",
-  "exportResident",
-  "importResident",
-];
+export const STUBBED = ["buildBootPack", "exportResident", "importResident"];
