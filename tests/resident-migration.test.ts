@@ -86,6 +86,31 @@ describe("M0 编解码", () => {
     expect(decoded.history.map((node) => node.id)).toEqual(["node-1", "node-2"]);
   });
 
+  it("非 ASCII id 使用与 locale 无关的固定 code-unit 顺序", () => {
+    const snapshot = fixture();
+    snapshot.memories = [
+      {
+        id: "ä",
+        residentId: sourceResidentId,
+        content: "非 ASCII",
+        supersededBy: null,
+        createdAt: "2026-08-14T06:00:01.000Z",
+      },
+      {
+        id: "z",
+        residentId: sourceResidentId,
+        content: "ASCII",
+        supersededBy: null,
+        createdAt: "2026-08-14T06:00:01.000Z",
+      },
+    ];
+
+    const first = encodeResidentExportM0(snapshot);
+    const second = encodeResidentExportM0(snapshot);
+    expect(first).toEqual(second);
+    expect(decodeResidentExportM0(first).memories.map((entry) => entry.id)).toEqual(["z", "ä"]);
+  });
+
   it("只重绑结构化 residentId，不改正文、承诺、id、时间和引用", () => {
     const decoded = decodeResidentExportM0(encodeResidentExportM0(fixture()));
     const rebound = rebindResidentId(decoded, "resident-target");

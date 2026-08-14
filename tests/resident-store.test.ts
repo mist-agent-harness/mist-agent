@@ -162,6 +162,34 @@ describe("迁移", () => {
 });
 
 describe("id 与时间戳", () => {
+  it("末道碰撞闸拒绝覆盖已有记忆和历史节点", () => {
+    const store = new ResidentStore();
+    const residentId = store.createResident("r");
+    const room = store.room(residentId);
+    room.memories.set("mem-000002", {
+      id: "mem-000002",
+      residentId,
+      content: "不能被覆盖",
+      supersededBy: null,
+      createdAt: "2026-08-14T06:00:00.000Z",
+    });
+
+    expect(() => store.remember(residentId, "试图覆盖")).toThrow(/memory id collision/);
+    expect(room.memories.get("mem-000002")?.content).toBe("不能被覆盖");
+
+    room.nodes.set("node-000003", {
+      id: "node-000003",
+      parentId: null,
+      role: "system",
+      content: "历史不能被覆盖",
+      createdAt: "2026-08-14T06:00:01.000Z",
+    });
+    expect(() => store.appendNode(residentId, null, "system", "试图覆盖历史")).toThrow(
+      /history id collision/,
+    );
+    expect(room.nodes.get("node-000003")?.content).toBe("历史不能被覆盖");
+  });
+
   it("同一毫秒内连续写入的条目时间戳严格递增", () => {
     const store = new ResidentStore();
     const r = store.createResident("r");

@@ -2,7 +2,10 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { ResidentMigrationError } from "../src/migration/resident-migration.ts";
+import {
+  ResidentMigrationError,
+  encodeResidentExportM0,
+} from "../src/migration/resident-migration.ts";
 import { createResidentMigrationService } from "../src/migration/resident-store-migration.ts";
 import { ResidentStore } from "../src/store/resident-store.ts";
 
@@ -81,6 +84,70 @@ describe("ResidentStore 迁移接缝", () => {
     expect(importedIds.has(memoryId)).toBe(false);
     expect(importedIds.has(node.id)).toBe(false);
     expect(latestTimestamp !== undefined && node.createdAt > latestTimestamp).toBe(true);
+  });
+
+  it("超大原生 id 导入后连续写两次，不撞号也不覆盖", async () => {
+    const sourceId = "resident-source";
+    const importedId = "mem-zzzzzzzzzzzz";
+    const pack = encodeResidentExportM0({
+      residentId: sourceId,
+      resident: { name: "超大水位来源", createdAt: "2026-08-14T06:00:00.000Z" },
+      commitments: [],
+      memories: [
+        {
+          id: importedId,
+          residentId: sourceId,
+          content: "导入原件",
+          supersededBy: null,
+          createdAt: "2026-08-14T06:00:01.000Z",
+        },
+      ],
+      history: [],
+    });
+
+    const target = new ResidentStore();
+    const moved = await createResidentMigrationService(target).importResident(pack);
+    const first = target.remember(moved, "落地后第一条");
+    const second = target.remember(moved, "落地后第二条");
+
+    expect(first).toBe("mem-1000000000000");
+    expect(second).toBe("mem-1000000000001");
+    expect(new Set([first, second]).size).toBe(2);
+    expect(target.memories(moved)).toHaveLength(3);
+    expect(target.memories(moved).find((entry) => entry.id === importedId)?.content).toBe(
+      "导入原件",
+    );
+    expect(target.memories(moved).find((entry) => entry.id === first)?.content).toBe(
+      "落地后第一条",
+    );
+    expect(target.memories(moved).find((entry) => entry.id === second)?.content).toBe(
+      "落地后第二条",
+    );
+  });
+
+  it("恶意超长序号显式失败，且不消耗目标 resident id", async () => {
+    const sourceId = "resident-source";
+    const pack = encodeResidentExportM0({
+      residentId: sourceId,
+      resident: { name: "恶意包", createdAt: "2026-08-14T06:00:00.000Z" },
+      commitments: [],
+      memories: [
+        {
+          id: `mem-${"z".repeat(65)}`,
+          residentId: sourceId,
+          content: "不应落地",
+          supersededBy: null,
+          createdAt: "2026-08-14T06:00:01.000Z",
+        },
+      ],
+      history: [],
+    });
+
+    const target = new ResidentStore();
+    await expect(createResidentMigrationService(target).importResident(pack)).rejects.toThrow(
+      /sequence suffix exceeds/,
+    );
+    expect(target.createResident("首个有效住户")).toBe("resident-000001");
   });
 
   it("坏包在 store 前失败，不建房也不消耗 resident id", async () => {

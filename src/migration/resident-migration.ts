@@ -89,6 +89,8 @@ export function encodeResidentExportM0(snapshot: DurableResidentSnapshotM0): Uin
       createdAt: snapshot.resident.createdAt,
     },
     raw: {
+      // 承诺账本本身以立约顺序为语义；这里保留 P1 的 append-only 顺序，
+      // 不像 memories/history 那样另做排序。
       commitments: [...snapshot.commitments],
       memories: snapshot.memories.map((entry) => ({ ...entry })).sort(compareTimedRecords),
       history: snapshot.history.map((node) => ({ ...node })).sort(compareTimedRecords),
@@ -159,7 +161,17 @@ function compareTimedRecords(
   left: { id: string; createdAt: string },
   right: { id: string; createdAt: string },
 ): number {
-  return left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id);
+  return compareCodeUnits(left.createdAt, right.createdAt) || compareCodeUnits(left.id, right.id);
+}
+
+/**
+ * JS 字符串关系比较按 UTF-16 code unit，结果不受 LANG/LC_ALL/ICU locale 影响。
+ * 迁移包要跨机器逐字节稳定，不能把排序交给 localeCompare。
+ */
+function compareCodeUnits(left: string, right: string): number {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
 }
 
 function validateEnvelope(value: unknown): ResidentExportEnvelopeM0 {

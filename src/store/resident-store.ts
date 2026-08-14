@@ -87,6 +87,33 @@ interface RoomRecord {
 }
 
 const SCHEMA_VERSION = 1;
+const SEQUENCE_RADIX = 36n;
+const MAX_SEQUENCE_SUFFIX_DIGITS = 64;
+
+/**
+ * 从现有 id 的最后一段恢复全局发号水位。
+ *
+ * Number.parseInt 会在 2^53 之后静默丢精度，导致 #seq += 1 不再前进；
+ * 这里逐位构造 bigint，保证跨机导入超大原生 id 后仍能继续发号。
+ * 64 位 base36 已远超任何可实际产生的序列，同时给恶意超长 id 留下显式拒绝边界。
+ */
+function parseBase36Sequence(id: string): bigint | null {
+  const suffix = id.slice(id.lastIndexOf("-") + 1).toLowerCase();
+  if (!/^[0-9a-z]+$/.test(suffix)) return null;
+  if (suffix.length > MAX_SEQUENCE_SUFFIX_DIGITS) {
+    throw new Error(
+      `id sequence suffix exceeds ${MAX_SEQUENCE_SUFFIX_DIGITS} base36 digits: ${id}`,
+    );
+  }
+
+  let value = 0n;
+  for (const character of suffix) {
+    const code = character.charCodeAt(0);
+    const digit = BigInt(code <= 57 ? code - 48 : code - 87);
+    value = value * SEQUENCE_RADIX + digit;
+  }
+  return value;
+}
 
 export class ResidentStore {
   readonly #rooms = new Map<string, ResidentRoom>();
@@ -107,7 +134,7 @@ export class ResidentStore {
    */
   readonly #dataDir: string | null;
 
-  #seq = 0;
+  #seq = 0n;
 
   constructor(options: { dataDir?: string } = {}) {
     this.#dataDir = options.dataDir ?? null;
@@ -123,7 +150,7 @@ export class ResidentStore {
    * 同毫秒内连续 remember 两条时随机数还有撞号风险。
    */
   #nextId(prefix: string): string {
-    this.#seq += 1;
+    this.#seq += 1n;
     return `${prefix}-${this.#seq.toString(36).padStart(6, "0")}`;
   }
 
@@ -235,8 +262,8 @@ export class ResidentStore {
   }
 
   #bumpSeq(id: string): void {
-    const n = Number.parseInt(id.slice(id.lastIndexOf("-") + 1), 36);
-    if (Number.isFinite(n) && n > this.#seq) this.#seq = n;
+    const sequence = parseBase36Sequence(id);
+    if (sequence !== null && sequence > this.#seq) this.#seq = sequence;
   }
 
   #bumpStamp(createdAt: string): void {
@@ -246,6 +273,9 @@ export class ResidentStore {
 
   createResident(name: string): string {
     const residentId = this.#nextId("resident");
+    if (this.#rooms.has(residentId)) {
+      throw new Error(`resident id collision, refusing to overwrite: ${residentId}`);
+    }
     this.#rooms.set(residentId, {
       residentId,
       name,
@@ -297,6 +327,9 @@ export class ResidentStore {
   remember(residentId: string, content: string): string {
     const room = this.room(residentId);
     const id = this.#nextId("mem");
+    if (room.memories.has(id)) {
+      throw new Error(`memory id collision, refusing to overwrite: ${id}`);
+    }
     room.memories.set(id, {
       id,
       residentId,
@@ -368,6 +401,9 @@ export class ResidentStore {
       content,
       createdAt: this.#nextStamp(),
     };
+    if (room.nodes.has(node.id)) {
+      throw new Error(`history id collision, refusing to overwrite: ${node.id}`);
+    }
     room.nodes.set(node.id, node);
     this.#persist(residentId);
     return node;
