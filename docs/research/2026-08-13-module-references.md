@@ -384,10 +384,10 @@ MiMo 的 Dream/Distill 给周期维护一个工程样本。
   坑：体量小、骑它有总线因子；M4/M7 完全空白——「dsh 做了一切，唯独不做人」。
   要不要骑它当底盘是路线级问题（A/B/C 未拍板，见 [../decisions.md](../decisions.md) D2）。
 
-结论（2026-08-14 修订）：原结论「elizaOS 接口 + goose 配置 + vscode env 声明三件套」
-在自建路线（A/C）下成立；若走 dsh 底盘路线（B），本模块整体让位给 Cordis，mist 只做
-不变量校验。路线没拍板前，两套都留。自建路线的三件套原结论：elizaOS 的 Plugin
-接口 + goose 的 enabled/envs 配置格式 + manifest 上加 vscode 式 env 声明数组。
+结论（2026-08-14 定稿）：路线已拍板 C（只抄设计不上车，decisions.md D2），本模块按
+自建走：elizaOS 的 Plugin 接口 + goose 的 enabled/envs 配置格式 + manifest 上加
+vscode 式 env 声明数组，三件套齐活。Cordis 留作「一切皆插件可逆注册」的设计参照，
+不当底盘。
 
 ---
 

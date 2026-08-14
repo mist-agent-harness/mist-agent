@@ -2,7 +2,8 @@
 
 收编自 issue #3（契约与信任层 M9 提案）、issue #4（六个待决问题），参照材料
 [../research/2026-08-13-relationship-harness-landscape.md](../research/2026-08-13-relationship-harness-landscape.md)（PR #5，已并入）。
-状态：**待主笔拍板**。旦九 2026-08-13 已对 #4 六问全答赞成，本稿是他的答案加两处补充的汇总。
+状态：**已决（2026-08-14 主笔拍板，decisions.md D1）**。六问按下文现状答案定案，
+Relationship Core 进地基边界。
 
 ## 它是什么
 
