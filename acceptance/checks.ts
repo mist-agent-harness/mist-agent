@@ -161,7 +161,15 @@ const c4: AcceptanceCheck = {
 const c5: AcceptanceCheck = {
   id: "C5",
   title: "不串房：A 的记忆不出现在 B 的启动包和检索里",
-  uses: ["createResident", "remember", "say", "buildBootPack", "recall", "history", "destroyResident"],
+  uses: [
+    "createResident",
+    "remember",
+    "say",
+    "buildBootPack",
+    "recall",
+    "history",
+    "destroyResident",
+  ],
   async run(driver: HarnessDriver) {
     const marker = `串房检测标记-${Date.now()}`;
     const a = await driver.createResident("c5-resident-a");
