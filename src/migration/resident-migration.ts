@@ -182,7 +182,9 @@ function validateEnvelope(value: unknown): ResidentExportEnvelopeM0 {
 
   assertRecord(value.resident, "resident");
   assertExactKeys(value.resident, ["name", "createdAt"], "resident");
-  assertNonEmptyString(value.resident.name, "resident.name");
+  if (typeof value.resident.name !== "string") {
+    throw new ResidentMigrationError("resident.name must be a string");
+  }
   assertTimestamp(value.resident.createdAt, "resident.createdAt");
 
   assertRecord(value.raw, "raw");
