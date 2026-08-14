@@ -106,6 +106,13 @@ const c3: AcceptanceCheck = {
       revised.id !== reply.id &&
       revised.parentId === reply.parentId &&
       tree.some((n) => n.id === revised.id);
+    // #14 二轮裁定：改口即换枝——revise 之后会话头切到新兄弟，
+    // 下一次 say 的 user 节点必须挂在新节点下面，旧枝从此只留底不生长
+    const follow = await driver.say(r, "改口后的下一句");
+    const followTree = await driver.history(r);
+    const followUser = followTree.find((n) => n.role === "user" && n.content === "改口后的下一句");
+    const branchSwitched =
+      followUser !== undefined && followUser.parentId === revised.id && follow.role === "assistant";
     // #14 裁定：拿别的住户的 nodeId 来改必须拒绝
     const stranger = await driver.createResident("c3-stranger");
     let crossRejected = false;
@@ -116,12 +123,12 @@ const c3: AcceptanceCheck = {
     }
     await driver.destroyResident(stranger);
     await driver.destroyResident(r);
-    const pass = sayShape && oldIntact && forked && crossRejected;
+    const pass = sayShape && oldIntact && forked && branchSwitched && crossRejected;
     return {
       pass,
       detail: pass
-        ? "say 双节点成形；旧节点 hash 不变；改口同父分叉；跨房改口被拒"
-        : `sayShape=${sayShape} oldIntact=${oldIntact} forked=${forked} crossRejected=${crossRejected}`,
+        ? "say 双节点成形；旧节点 hash 不变；改口同父分叉；改口后新枝续话；跨房改口被拒"
+        : `sayShape=${sayShape} oldIntact=${oldIntact} forked=${forked} branchSwitched=${branchSwitched} crossRejected=${crossRejected}`,
     };
   },
 };
@@ -154,24 +161,28 @@ const c4: AcceptanceCheck = {
 const c5: AcceptanceCheck = {
   id: "C5",
   title: "不串房：A 的记忆不出现在 B 的启动包和检索里",
-  uses: ["createResident", "remember", "buildBootPack", "recall", "destroyResident"],
+  uses: ["createResident", "remember", "say", "buildBootPack", "recall", "history", "destroyResident"],
   async run(driver: HarnessDriver) {
     const marker = `串房检测标记-${Date.now()}`;
     const a = await driver.createResident("c5-resident-a");
     const b = await driver.createResident("c5-resident-b");
     await driver.remember(a, marker);
+    // #14 coco 补洞：隔离要罩住整个住户态——消息树也不许串房
+    await driver.say(a, `A 房说过：${marker}`);
     const bPack = await driver.buildBootPack(b);
     const bRecall = await driver.recall(b, marker);
+    const bTree = await driver.history(b);
     const leakedInPack = bPack.memories.some((m) => m.content.includes(marker));
     const leakedInRecall = bRecall.some((m) => m.content.includes(marker));
+    const leakedInTree = bTree.some((n) => n.content.includes(marker));
     await driver.destroyResident(a);
     await driver.destroyResident(b);
-    const pass = !leakedInPack && !leakedInRecall;
+    const pass = !leakedInPack && !leakedInRecall && !leakedInTree;
     return {
       pass,
       detail: pass
-        ? "跨住户检索与启动包均无泄漏"
-        : `泄漏：bootPack=${leakedInPack} recall=${leakedInRecall}`,
+        ? "跨住户检索、启动包、消息树均无泄漏"
+        : `泄漏：bootPack=${leakedInPack} recall=${leakedInRecall} history=${leakedInTree}`,
     };
   },
 };
