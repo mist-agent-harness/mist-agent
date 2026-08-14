@@ -23,7 +23,14 @@ mist 是一个个人 agent harness（还在图纸阶段）。它的设计从一�
 
 ## 现在的状态
 
-许愿池与调研阶段，没有代码。图纸在持续收编群友的智慧：
+建造阶段开门（2026-08-14）。许愿池收官，第一里程碑动工：最小垂直闭环——
+杀会话、凭启动包醒来、不改史、勘误留底、不串房、迁移可回滚。
+
+这个阶段的规矩是**验收先行**：判卷程序先于功能代码进仓库。六条验收的人话版在
+[docs/acceptance/milestone-1.md](docs/acceptance/milestone-1.md)，可执行版在 `acceptance/`，
+`npm run acceptance` 随时打红绿灯。六盏全绿即里程碑达成。
+
+图纸不动，还在原处：
 
 - `docs/principles.md` — 设计原则八条，每条带代价
 - `docs/glossary.md` — 术语表（模块边界、证据纪律都钉在这里）
@@ -31,9 +38,7 @@ mist 是一个个人 agent harness（还在图纸阶段）。它的设计从一�
 - `docs/design/` — 从 issue 收编的设计稿：Relationship Core、能力契约双层模型、皮肤包协议
 - `docs/decisions.md` — 决策台账：待决 / 挂起 / 已决，全项目唯一的拍板看板
 
-参与方式（许愿池阶段的收编流程）见 [CONTRIBUTING.md](CONTRIBUTING.md)。
-当前第一里程碑已定：最小垂直闭环——杀会话、凭启动包醒来、不改史、勘误留底、
-不串房、迁移可回滚（见 `docs/decisions.md`）。
+参与方式见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 一张图看懂 mist
 
