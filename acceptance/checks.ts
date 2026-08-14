@@ -6,7 +6,7 @@
  * 不对模型输出的措辞做任何判断。
  */
 import { createHash } from "node:crypto";
-import type { AcceptanceCheck, BootPack, HarnessDriver } from "./driver.ts";
+import type { AcceptanceCheck, BootPack, HarnessDriver, HistoryNode } from "./driver.ts";
 
 function sha256(data: Uint8Array | string): string {
   return createHash("sha256").update(data).digest("hex");
@@ -15,6 +15,15 @@ function sha256(data: Uint8Array | string): string {
 const c1: AcceptanceCheck = {
   id: "C1",
   title: "杀会话不丢人：会话真的死了，记忆和树一个字节没少",
+  uses: [
+    "createResident",
+    "remember",
+    "say",
+    "history",
+    "killSession",
+    "buildBootPack",
+    "destroyResident",
+  ],
   async run(driver: HarnessDriver) {
     const r = await driver.createResident("c1-resident");
     const entryId = await driver.remember(r, "答应过：周五晚上一起看电影");
@@ -51,6 +60,7 @@ const c1: AcceptanceCheck = {
 const c2: AcceptanceCheck = {
   id: "C2",
   title: "凭启动包醒来：包里有我是谁和我答应过什么",
+  uses: ["createResident", "remember", "commit", "buildBootPack", "destroyResident"],
   async run(driver: HarnessDriver) {
     const promise = "答应过：每晚 23:30 前熄灯";
     const r = await driver.createResident("c2-resident");
@@ -74,6 +84,7 @@ const c2: AcceptanceCheck = {
 const c3: AcceptanceCheck = {
   id: "C3",
   title: "不改史：改口只长新枝，旧枝一个字节不动",
+  uses: ["createResident", "say", "history", "reviseNode", "destroyResident"],
   async run(driver: HarnessDriver) {
     const r = await driver.createResident("c3-resident");
     const reply = await driver.say(r, "第一版说法");
@@ -95,6 +106,13 @@ const c3: AcceptanceCheck = {
       revised.id !== reply.id &&
       revised.parentId === reply.parentId &&
       tree.some((n) => n.id === revised.id);
+    // #14 二轮裁定：改口即换枝——revise 之后会话头切到新兄弟，
+    // 下一次 say 的 user 节点必须挂在新节点下面，旧枝从此只留底不生长
+    const follow = await driver.say(r, "改口后的下一句");
+    const followTree = await driver.history(r);
+    const followUser = followTree.find((n) => n.role === "user" && n.content === "改口后的下一句");
+    const branchSwitched =
+      followUser !== undefined && followUser.parentId === revised.id && follow.role === "assistant";
     // #14 裁定：拿别的住户的 nodeId 来改必须拒绝
     const stranger = await driver.createResident("c3-stranger");
     let crossRejected = false;
@@ -105,12 +123,12 @@ const c3: AcceptanceCheck = {
     }
     await driver.destroyResident(stranger);
     await driver.destroyResident(r);
-    const pass = sayShape && oldIntact && forked && crossRejected;
+    const pass = sayShape && oldIntact && forked && branchSwitched && crossRejected;
     return {
       pass,
       detail: pass
-        ? "say 双节点成形；旧节点 hash 不变；改口同父分叉；跨房改口被拒"
-        : `sayShape=${sayShape} oldIntact=${oldIntact} forked=${forked} crossRejected=${crossRejected}`,
+        ? "say 双节点成形；旧节点 hash 不变；改口同父分叉；改口后新枝续话；跨房改口被拒"
+        : `sayShape=${sayShape} oldIntact=${oldIntact} forked=${forked} branchSwitched=${branchSwitched} crossRejected=${crossRejected}`,
     };
   },
 };
@@ -118,6 +136,7 @@ const c3: AcceptanceCheck = {
 const c4: AcceptanceCheck = {
   id: "C4",
   title: "勘误留底：错的标记被取代但留在原地，新旧链得上",
+  uses: ["createResident", "remember", "errata", "recall", "destroyResident"],
   async run(driver: HarnessDriver) {
     const r = await driver.createResident("c4-resident");
     const wrongId = await driver.remember(r, "住在深圳华侨城");
@@ -142,55 +161,83 @@ const c4: AcceptanceCheck = {
 const c5: AcceptanceCheck = {
   id: "C5",
   title: "不串房：A 的记忆不出现在 B 的启动包和检索里",
+  uses: ["createResident", "remember", "say", "buildBootPack", "recall", "history", "destroyResident"],
   async run(driver: HarnessDriver) {
     const marker = `串房检测标记-${Date.now()}`;
     const a = await driver.createResident("c5-resident-a");
     const b = await driver.createResident("c5-resident-b");
     await driver.remember(a, marker);
+    // #14 coco 补洞：隔离要罩住整个住户态——消息树也不许串房
+    await driver.say(a, `A 房说过：${marker}`);
     const bPack = await driver.buildBootPack(b);
     const bRecall = await driver.recall(b, marker);
+    const bTree = await driver.history(b);
     const leakedInPack = bPack.memories.some((m) => m.content.includes(marker));
     const leakedInRecall = bRecall.some((m) => m.content.includes(marker));
+    const leakedInTree = bTree.some((n) => n.content.includes(marker));
     await driver.destroyResident(a);
     await driver.destroyResident(b);
-    const pass = !leakedInPack && !leakedInRecall;
+    const pass = !leakedInPack && !leakedInRecall && !leakedInTree;
     return {
       pass,
       detail: pass
-        ? "跨住户检索与启动包均无泄漏"
-        : `泄漏：bootPack=${leakedInPack} recall=${leakedInRecall}`,
+        ? "跨住户检索、启动包、消息树均无泄漏"
+        : `泄漏：bootPack=${leakedInPack} recall=${leakedInRecall} history=${leakedInTree}`,
     };
   },
 };
 
 const c6: AcceptanceCheck = {
   id: "C6",
-  title: "迁移可回滚：导出导入后启动包逐字节等价，原件不动",
+  title: "迁移可回滚：启动包与消息树都逐字节等价，原件不动",
+  uses: [
+    "createResident",
+    "remember",
+    "errata",
+    "say",
+    "buildBootPack",
+    "history",
+    "exportResident",
+    "importResident",
+    "destroyResident",
+  ],
   async run(driver: HarnessDriver) {
     const r = await driver.createResident("c6-resident");
     await driver.remember(r, "迁移前的记忆一号");
-    await driver.remember(r, "迁移前的记忆二号");
+    // 正文故意包含源 residentId：结构化归一不许碰它
+    const wrongId = await driver.remember(r, `迁移前的记忆二号，正文提到 ${r}`);
+    await driver.errata(r, wrongId, "勘误后的记忆二号");
+    await driver.say(r, "迁移前说过的话");
     const packBefore = await driver.buildBootPack(r);
+    const treeBefore = await driver.history(r);
     const exported = await driver.exportResident(r);
     const r2 = await driver.importResident(exported);
     const packAfter = await driver.buildBootPack(r2);
+    const treeAfter = await driver.history(r2);
     // #16 问 5：结构化归一——只替换 residentId 字段，不碰 content 正文
-    const canonical = (p: BootPack) =>
+    const canonicalPack = (p: BootPack) =>
       JSON.stringify({
         ...p,
         residentId: "RESIDENT",
         memories: p.memories.map((m) => ({ ...m, residentId: "RESIDENT" })),
       });
-    const identical = canonical(packBefore) === canonical(packAfter);
-    const originalStillThere = (await driver.buildBootPack(r)).memories.length === 2;
-    await driver.destroyResident(r);
+    const canonicalTree = (nodes: readonly HistoryNode[]) =>
+      JSON.stringify([...nodes].sort((a, b) => a.id.localeCompare(b.id)));
+    const packIdentical = canonicalPack(packBefore) === canonicalPack(packAfter);
+    // #16 二轮裁定 A：留底的树也是住户态，迁移丢树判不过
+    const treeIdentical = canonicalTree(treeBefore) === canonicalTree(treeAfter);
+    // 销毁导入件后复查原件——回滚的最低含义是导入件的生死不牵连原件
     await driver.destroyResident(r2);
-    const pass = identical && originalStillThere;
+    const originalIntact =
+      canonicalPack(await driver.buildBootPack(r)) === canonicalPack(packBefore) &&
+      canonicalTree(await driver.history(r)) === canonicalTree(treeBefore);
+    await driver.destroyResident(r);
+    const pass = packIdentical && treeIdentical && originalIntact;
     return {
       pass,
       detail: pass
-        ? "导入件与原件启动包等价，原件未被迁移动过"
-        : `identical=${identical} originalIntact=${originalStillThere}`,
+        ? "启动包与消息树均等价，销毁导入件后原件完好"
+        : `packIdentical=${packIdentical} treeIdentical=${treeIdentical} originalIntact=${originalIntact}`,
     };
   },
 };
