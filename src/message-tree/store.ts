@@ -120,12 +120,104 @@ export class MessageTreeStore {
     return nodes;
   }
 
+  /** 迁移桥读树：语义同 history()，按插入序返回全树副本。 */
+  exportTree(residentId: string): HistoryNode[] {
+    return this.history(residentId);
+  }
+
+  /**
+   * 批量导入。整批先校验，任何一条不过就零写入；全过才按数组顺序逐条插入。
+   * 不代建房——房间生命周期仍走 createRoom，防止拼错 id 长出幽灵房。
+   */
+  importTree(residentId: string, nodes: HistoryNode[]): void {
+    const room = this.mustRoom(residentId);
+    const prepared: HistoryNode[] = [];
+    const batchIds = new Set<string>();
+
+    for (const node of nodes) {
+      this.assertContractNode(node);
+      if (room.nodes.has(node.id) || batchIds.has(node.id)) {
+        throw new MessageTreeError(`节点 id 冲突，拒绝覆盖历史：${node.id}`);
+      }
+      batchIds.add(node.id);
+      prepared.push(
+        Object.freeze({
+          id: node.id,
+          parentId: node.parentId,
+          role: node.role,
+          content: node.content,
+          createdAt: node.createdAt,
+        }),
+      );
+    }
+
+    for (const node of prepared) {
+      if (
+        node.parentId !== null &&
+        !room.nodes.has(node.parentId) &&
+        !batchIds.has(node.parentId)
+      ) {
+        throw nodeUnavailable();
+      }
+    }
+
+    const orderBefore = room.order.length;
+    try {
+      for (const node of prepared) {
+        this.insert(room, node);
+      }
+    } catch (error) {
+      for (const node of prepared) {
+        room.nodes.delete(node.id);
+      }
+      room.order.length = orderBefore;
+      throw error;
+    }
+  }
+
   private mustRoom(residentId: string): Room {
     const room = this.rooms.get(residentId);
     if (room === undefined) {
       throw new MessageTreeError(`未知住户：${residentId}`);
     }
     return room;
+  }
+
+  private static readonly CONTRACT_KEYS = ["content", "createdAt", "id", "parentId", "role"];
+
+  /**
+   * 导入节点的契约闸：恰好五字段，role 只能是 user/assistant/system。
+   * 多一个键、少一个键、或类型不对，都整批拒绝——不把调用方的附加字段冻进历史。
+   */
+  private assertContractNode(node: HistoryNode): void {
+    if (typeof node !== "object" || node === null || Array.isArray(node)) {
+      throw new MessageTreeError("节点不可导入");
+    }
+    const keys = Object.keys(node).sort();
+    if (
+      keys.length !== MessageTreeStore.CONTRACT_KEYS.length ||
+      keys.some((key, index) => key !== MessageTreeStore.CONTRACT_KEYS[index])
+    ) {
+      throw new MessageTreeError("节点不可导入");
+    }
+    if (typeof node.id !== "string" || node.id.length === 0) {
+      throw new MessageTreeError("节点不可导入");
+    }
+    if (
+      node.parentId !== null &&
+      (typeof node.parentId !== "string" || node.parentId.length === 0)
+    ) {
+      throw new MessageTreeError("节点不可导入");
+    }
+    if (node.role !== "user" && node.role !== "assistant" && node.role !== "system") {
+      throw new MessageTreeError("节点不可导入");
+    }
+    if (typeof node.content !== "string") {
+      throw new MessageTreeError("节点不可导入");
+    }
+    if (typeof node.createdAt !== "string") {
+      throw new MessageTreeError("节点不可导入");
+    }
   }
 
   private build(parentId: string | null, role: HistoryNode["role"], content: string): HistoryNode {
