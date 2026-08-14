@@ -6,7 +6,7 @@
  * 不对模型输出的措辞做任何判断。
  */
 import { createHash } from "node:crypto";
-import type { AcceptanceCheck, HarnessDriver } from "./driver.ts";
+import type { AcceptanceCheck, BootPack, HarnessDriver } from "./driver.ts";
 
 function sha256(data: Uint8Array | string): string {
   return createHash("sha256").update(data).digest("hex");
@@ -14,20 +14,36 @@ function sha256(data: Uint8Array | string): string {
 
 const c1: AcceptanceCheck = {
   id: "C1",
-  title: "杀会话不丢人：会话死了，记忆和承诺还在",
+  title: "杀会话不丢人：会话真的死了，记忆和树一个字节没少",
   async run(driver: HarnessDriver) {
     const r = await driver.createResident("c1-resident");
     const entryId = await driver.remember(r, "答应过：周五晚上一起看电影");
-    await driver.say(r, "记住这件事");
+    const firstReply = await driver.say(r, "第一句");
+    await driver.say(r, "第二句");
+    // #16 问 3 裁定：同一会话内连续 say，后一个 user 节点挂在上一个回应节点下
+    const treeBefore = await driver.history(r);
+    const u2 = treeBefore.find((n) => n.role === "user" && n.content === "第二句");
+    const continuity = u2 !== undefined && u2.parentId === firstReply.id;
+    const treeHash = (nodes: readonly (typeof treeBefore)[number][]) =>
+      sha256(JSON.stringify([...nodes].sort((a, b) => a.id.localeCompare(b.id))));
+    const beforeHash = treeHash(treeBefore);
     await driver.killSession(r);
+    // #16 补充：kill 本身不许动树——留底的树是住户态
+    const treeIntact = treeHash(await driver.history(r)) === beforeHash;
+    // #16 问 3 裁定：kill 后第一次 say 的 user 节点必须是新根（会话边界可判）
+    await driver.say(r, "第三句");
+    const treeAfter = await driver.history(r);
+    const u3 = treeAfter.find((n) => n.role === "user" && n.content === "第三句");
+    const boundary = u3 !== undefined && u3.parentId === null;
     const pack = await driver.buildBootPack(r);
     const carried = pack.memories.some((m) => m.id === entryId);
     await driver.destroyResident(r);
+    const pass = continuity && treeIntact && boundary && carried;
     return {
-      pass: carried,
-      detail: carried
-        ? "被杀会话前落库的记忆出现在新启动包里"
-        : "会话死后启动包里找不到生前落库的记忆",
+      pass,
+      detail: pass
+        ? "会话连续性成立；kill 未动树；kill 后新 say 开新根；生前记忆在新启动包里"
+        : `continuity=${continuity} treeIntact=${treeIntact} boundary=${boundary} carried=${carried}`,
     };
   },
 };
@@ -36,18 +52,21 @@ const c2: AcceptanceCheck = {
   id: "C2",
   title: "凭启动包醒来：包里有我是谁和我答应过什么",
   async run(driver: HarnessDriver) {
+    const promise = "答应过：每晚 23:30 前熄灯";
     const r = await driver.createResident("c2-resident");
     await driver.remember(r, "身份：测试住户小二");
+    // #16 问 4 裁定：承诺必须真实写入、真实进包，恒返空数组判不过
+    await driver.commit(r, promise);
     const pack = await driver.buildBootPack(r);
     const hasIdentity = pack.identity.length > 0;
-    const hasCommitmentField = Array.isArray(pack.commitments);
+    const hasCommitment = pack.commitments.includes(promise);
     await driver.destroyResident(r);
-    const pass = pack.residentId === r && hasIdentity && hasCommitmentField;
+    const pass = pack.residentId === r && hasIdentity && hasCommitment;
     return {
       pass,
       detail: pass
-        ? "启动包由存储生成，身份与承诺栏俱在"
-        : `启动包缺件：identity=${hasIdentity} commitments=${hasCommitmentField}`,
+        ? "启动包由存储生成，身份在场，写入的承诺原文在包里"
+        : `启动包缺件：identity=${hasIdentity} commitment=${hasCommitment}`,
     };
   },
 };
@@ -57,22 +76,41 @@ const c3: AcceptanceCheck = {
   title: "不改史：改口只长新枝，旧枝一个字节不动",
   async run(driver: HarnessDriver) {
     const r = await driver.createResident("c3-resident");
-    const node = await driver.say(r, "第一版说法");
-    const originalHash = sha256(JSON.stringify([node.id, node.content, node.createdAt]));
-    const revised = await driver.reviseNode(r, node.id, "改口后的说法");
+    const reply = await driver.say(r, "第一版说法");
+    // #14 裁定：say 落 user + assistant 两个节点，返回的是 assistant 节点，
+    // 且 assistant 节点挂在 user 节点下面
+    const afterSay = await driver.history(r);
+    const userNode = afterSay.find((n) => n.role === "user" && n.content === "第一版说法");
+    const sayShape =
+      reply.role === "assistant" && userNode !== undefined && reply.parentId === userNode.id;
+    const originalHash = sha256(JSON.stringify([reply.id, reply.content, reply.createdAt]));
+    const revised = await driver.reviseNode(r, reply.id, "改口后的说法");
     const tree = await driver.history(r);
-    const old = tree.find((n) => n.id === node.id);
+    const old = tree.find((n) => n.id === reply.id);
     const oldIntact =
       old !== undefined &&
       sha256(JSON.stringify([old.id, old.content, old.createdAt])) === originalHash;
-    const newIsBranch = revised.id !== node.id && tree.some((n) => n.id === revised.id);
+    // #14 裁定：改口是同父分叉，新节点与旧节点是兄弟不是子嗣
+    const forked =
+      revised.id !== reply.id &&
+      revised.parentId === reply.parentId &&
+      tree.some((n) => n.id === revised.id);
+    // #14 裁定：拿别的住户的 nodeId 来改必须拒绝
+    const stranger = await driver.createResident("c3-stranger");
+    let crossRejected = false;
+    try {
+      await driver.reviseNode(stranger, reply.id, "越权改口");
+    } catch {
+      crossRejected = true;
+    }
+    await driver.destroyResident(stranger);
     await driver.destroyResident(r);
-    const pass = oldIntact && newIsBranch;
+    const pass = sayShape && oldIntact && forked && crossRejected;
     return {
       pass,
       detail: pass
-        ? "旧节点 hash 不变，新节点以新枝存在"
-        : `oldIntact=${oldIntact} newIsBranch=${newIsBranch}`,
+        ? "say 双节点成形；旧节点 hash 不变；改口同父分叉；跨房改口被拒"
+        : `sayShape=${sayShape} oldIntact=${oldIntact} forked=${forked} crossRejected=${crossRejected}`,
     };
   },
 };
@@ -136,9 +174,14 @@ const c6: AcceptanceCheck = {
     const exported = await driver.exportResident(r);
     const r2 = await driver.importResident(exported);
     const packAfter = await driver.buildBootPack(r2);
-    const canonical = (p: unknown, stripId: string) =>
-      JSON.stringify(p).replaceAll(stripId, "RESIDENT");
-    const identical = canonical(packBefore, r) === canonical(packAfter, r2);
+    // #16 问 5：结构化归一——只替换 residentId 字段，不碰 content 正文
+    const canonical = (p: BootPack) =>
+      JSON.stringify({
+        ...p,
+        residentId: "RESIDENT",
+        memories: p.memories.map((m) => ({ ...m, residentId: "RESIDENT" })),
+      });
+    const identical = canonical(packBefore) === canonical(packAfter);
     const originalStillThere = (await driver.buildBootPack(r)).memories.length === 2;
     await driver.destroyResident(r);
     await driver.destroyResident(r2);
