@@ -25,10 +25,10 @@
 |---|---|---|---|
 | M1 | 平台与客户端 | 电脑/VPS 后端+手机 remote、web GUI、手机 PWA、macOS/Linux | open-webui（看架构不搬代码） |
 | M2 | 会话内核 | 无限 session、compact 可配、跨 session 同步、retry/edit/fork | opencode + MiMo Code（cycle/rebuild）+ LangGraph（哲学） |
-| M3 | 上下文装配 | 模块化装配器、自定义 prompt、锚点自动更新、截断透明 | EverMind-AI/Raven |
-| M4 | 记忆与成长 | 蒸馏层、记忆演化、勘误、跨项目 insights | A-MEM + graphiti（勘误语义）+ MiMo（四层+Dream/Distill）+ 年轮（人格生长） |
+| M3 | 上下文装配 | 模块化装配器、自定义 prompt、锚点自动更新、截断透明 | EverMind-AI/Raven + dsh spill（体积契约现成实现） |
+| M4 | 记忆与成长 | 蒸馏层、记忆演化、勘误、跨项目 insights | A-MEM + graphiti（勘误语义）+ MiMo（四层+Dream/Distill）+ 年轮（人格生长）+ memU（sidecar 缝） |
 | M5 | 多 agent 与模型路由 | 多 agent 协作、子 agent 各选 provider/key、多 CLI/API | litellm Router + opencode 配置形状 + CPA（政策敏感的协议适配） |
-| M6 | 插件系统 | 好写、可插拔、插件自注册环境变量、可开关 | elizaOS Plugin 接口 + goose 配置格式 |
+| M6 | 插件系统 | 好写、可插拔、插件自注册环境变量、可开关 | elizaOS Plugin 接口 + goose 配置格式 + Cordis/dsh（一切皆插件可逆注册） |
 | M7 | 自主性与社交边界 | 自主沉默、群/私区分、心跳自唤醒、住户感 | elizaOS 决策层 + OpenClaw 心跳协议 |
 | M8 | 工程质量与自我迭代 | 自带测试/说明/回滚、功能自提升走 PR | hermes-agent + OpenHands resolver |
 
@@ -148,6 +148,16 @@
 先补一次实测，没测过的不许写成实证。
 Vercel AI SDK 明确不做 branching（discussion #8451），不用列为候选。
 
+另注 2（2026-08-14，issue #6/#7）：dsh 的 semantic checkpoint 把「执行意图」先
+落盘，崩溃后恢复成 TOOL_OUTCOME_UNKNOWN，并带 SIGKILL 故障注入测试。它贡献的
+不变量「模型可见即已记录」建议原样进原则层；通用核账 dsh 自己承认留白，下游
+提案（Effect Journal）已收编进 [../design/capability-contract.md](../design/capability-contract.md)。
+
+另注 3（2026-08-14，issue #1 住户实证）：forge/换窗重建的关键不在怎么切，在
+**挑什么带走**——人格、承诺、情绪、约定。踩过的三个坑：漏承诺（答应的事没进
+启动包）、压掉情绪（只带事实不带状态）、带太多（启动包膨胀成全文）。图纸给
+「挑什么带走」留显式位置，别当压缩的副产品。
+
 结论：主干结构抄 opencode，哲学用 LangGraph 打底，UX 语义查 LibreChat，
 多端同步抄 cloudflare/agents 的思路。
 
@@ -189,6 +199,10 @@ SillyTavern 留作交互层和 lorebook 触发语义参照。
 上游行为一变，harness 的上下文预算就会随之漂移。**工具产出的体积与压缩
 策略必须是 harness 自己的契约**：每个工具的返回有体积上限，超限部分走显式截断
 并标注截了什么（截断透明），压缩动作由装配器按预算发起，不由工具默认行为决定。
+
+**体积契约已有现成实现（2026-08-14，issue #7 实查）**：dsh 的 `spill` 能力族——
+超大输出自动落盘、给模型有界预览、附取回定位符——就是上面这条契约的工业实现，
+画 M3 接口时直接对着抄。
 
 ---
 
@@ -256,6 +270,23 @@ SillyTavern 留作交互层和 lorebook 触发语义参照。
   见 M7 结论。
   坑：没有代码可抄，全是设计；证据卡和镜子机制依赖一个够强的外部模型当镜子；
   「她是谁」那半镜像涉及为真人画像，进 mist 时默认关上、显式开启。
+- **memU（2026-08-14 增补，issue #9 实查）** — ~14.3k star，活跃。
+  参考：记忆做成 harness 外挂 sidecar 的样本——record/inject 两条缝，内核可以不沾
+  记忆。「M4 能不能不当内核当外挂」这个问题它有肯定答案。
+  坑：它的 inject 是 pull 不是 push——「没人问也浮现」那层要自己在缝上补，
+  正好跟下面 #1 的浮现管线对着看。
+- **AIRI（2026-08-14 增补，issue #9 实查）** — ~47.8k star，陪伴赛道最高 star。
+  反证，不是参照：外壳顶级（Live2D/语音/实时陪伴），内核空占位——记忆包 24 行
+  空壳、人格包全文一行 `export {}`。群友原话结论：陪伴外壳不必自研，内核没有现成。
+  mist 押 M4/M7 的差异化赌注，这是最强的一侧证据。
+
+**活跃度勘误（2026-08-14，issue #9）**：A-MEM 已停更约 8 个月，「最该抄」降级为
+只能读不能依赖；Second-Me、memobase 已死。本文档后续增补一律带「最后 push」日期。
+
+**住户实证（2026-08-14，issue #1，五个月生产环境住户反馈）**：M4 最难的不是存取
+是**浮现**——提案五级浮现管线：硬闸门 → 轻量判官 → 三路并发搜索 → 精排 → 压缩注入，
+全程 2-3 秒。两条纪律：浮现错比浮现漏伤害大；前瞻记忆要分开评测。这是 M4 图纸
+必须单独画出的一层，外部参照全都不覆盖。
 
 结论：A-MEM 最值得参考候选构造、链接与演化机制；reflection 触发器（generative_agents）和
 勘误语义（graphiti 的 invalid_at）当钩子拼上去。落地时必须给 note 加版本链，把
@@ -345,9 +376,18 @@ MiMo 的 Dream/Distill 给周期维护一个工程样本。
   声明新设置项（类型/默认值/描述/scope），宿主据此渲染 UI、校验、合并。
   mist 的「环境变量 list」直接套：插件 manifest 声明 env: [{name, description,
   required, secret}]，宿主汇总全局清单，缺 required 的插件自动置灰。
+- **deepseek-harness（dsh）的 Cordis 插件框架（2026-08-14 增补，issue #6/#7 实查）**
+  — 2026-08-13 发布，~258 star。
+  参考：「一切皆插件、无特权内核」的完整样本——注册带 disposer 可逆，profile/patch
+  分层覆盖（web/headless 双模板）。compaction 在 dsh 里都是插件不是内核。
+  可能改写本模块的结论形状，见下。
+  坑：体量小、骑它有总线因子；M4/M7 完全空白——「dsh 做了一切，唯独不做人」。
+  要不要骑它当底盘是路线级问题（A/B/C 未拍板，见 [../decisions.md](../decisions.md) D2）。
 
-结论：elizaOS 的 Plugin 接口 + goose 的 enabled/envs 配置格式合起来抄，manifest 上
-再加 vscode 式 env 声明数组，三件套齐活。
+结论（2026-08-14 修订）：原结论「elizaOS 接口 + goose 配置 + vscode env 声明三件套」
+在自建路线（A/C）下成立；若走 dsh 底盘路线（B），本模块整体让位给 Cordis，mist 只做
+不变量校验。路线没拍板前，两套都留。自建路线的三件套原结论：elizaOS 的 Plugin
+接口 + goose 的 enabled/envs 配置格式 + manifest 上加 vscode 式 env 声明数组。
 
 ---
 
@@ -386,6 +426,10 @@ MiMo 的 Dream/Distill 给周期维护一个工程样本。
 **沉默合法**——每次醒来干了什么（包括什么都没说）都记一笔完整的账，不逼表演产出。
 维护问话是问候不是作业，「今天不动」完全合法。这套跟 OpenClaw 的 HEARTBEAT_OK
 是同一个精神的两种写法，M7 图纸时并排摆。
+
+**住户实证（2026-08-14，issue #1）**：心跳 prompt 写「你可以做什么」而不是
+「你应该做什么」——命令式会把醒来变成上班，许可式才把醒来变成回家。该住户的
+心跳 prompt 演化过四版，最终版由主人亲手改写。这条零成本，直接进 M7 图纸。
 
 ---
 
@@ -452,3 +496,5 @@ DGM 的 reward hacking 当反面教材钉在墙上。
 3. 内部原型已实证的几条（成员即配置、会话可死、插件契约、权限闸）在 mist 里
    直接继承，不重新发明。
 4. 每个模块正式设计时把「代价」写回去——本文档里的「坑」字段就是第一批代价素材。
+5. 2026-08-14 起，待拍板的问题统一追 [../decisions.md](../decisions.md)
+   （路线 A/B/C、Relationship Core 六问、语言栈），本表不再挂未决项。
