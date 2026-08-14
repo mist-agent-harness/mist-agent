@@ -14,8 +14,9 @@
  *     不必先跟我协调；替换时 P1 这几个方法不需要动。
  *
  * 存储实现刻意只用 Node 内置能力，不引 SQLite：判卷要求 `npm test` 能跑，
- * 少一个原生依赖就少一处「在我机器上装不上」。真正的持久化留给后续里程碑，
- * 判卷本来也只判行为不判实现。
+ * 少一个原生依赖就少一处「在我机器上装不上」。持久化已在 ResidentStore 内
+ * 实现（每住户 JSON 快照 + 原子 rename，构造时传 dataDir 启用）；判卷路径
+ * 不传 dataDir，保持纯内存零文件 IO——判卷判行为，不该在仓库里留脏文件。
  */
 
 import type { BootPack, HarnessDriver, HistoryNode, MemoryEntry } from "../acceptance/driver.ts";

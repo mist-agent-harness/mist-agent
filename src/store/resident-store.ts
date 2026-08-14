@@ -13,6 +13,18 @@
  * 那是显式的越权动作，review 时看得见。
  */
 
+import {
+  closeSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  writeSync,
+} from "node:fs";
+import { join } from "node:path";
 import type { HistoryNode, MemoryEntry } from "../../acceptance/driver.ts";
 
 /** 一个住户的全部状态。房间之间不共享任何可变结构。 */
@@ -56,9 +68,54 @@ export class ResidentNotFoundError extends Error {
   }
 }
 
+/**
+ * 落盘记录：`<dataDir>/<residentId>.json` 的文件内容。
+ *
+ * 跟 ResidentSnapshot（迁移信封）刻意是两个形状：信封抹掉 residentId 由导入方
+ * 重发身份证，落盘记录带着 residentId 因为它就是这个人自己的房间存档。
+ * 改这个形状必须 bump SCHEMA_VERSION —— 启动时版本对不上会显式失败，
+ * 绝不静默跳过（静默跳过 = 某个住户无声消失，那是最坏的一种丢人方式）。
+ */
+interface RoomRecord {
+  schemaVersion: number;
+  residentId: string;
+  name: string;
+  createdAt: string;
+  memories: MemoryEntry[];
+  nodes: HistoryNode[];
+  commitments: string[];
+}
+
+const SCHEMA_VERSION = 1;
+
 export class ResidentStore {
   readonly #rooms = new Map<string, ResidentRoom>();
+
+  /**
+   * 落盘目录；null = 纯内存（判卷和单元测试的默认形态，不产生任何文件）。
+   *
+   * 持久化方案（2026-08-14 小卷定稿，task_mist-p1-p2-p5）：
+   * 每住户一份带 schema_version 的 JSON 快照，文件为权威、Map 只是内存视图。
+   * 每次住户态变更：写同目录临时文件 → fsync → 原子 rename，成功才返回。
+   * 按 residentId 分文件保持物理隔离；启动时校验并重建，坏 schema 显式失败。
+   * 写入天然串行（同步写，单写者）。
+   *
+   * 不上 SQLite：node:sqlite 22.5 才引入、22.13 才免 flag，而 engines 只要求
+   * >=22，引入会破坏「clone 即跑」。等多进程/写放大真来了再换，形状藏在
+   * 这个类的接口后面，调用方不用动。
+   * 认下的代价：每写 O(room size)、单写者——这不冒充长期并发方案。
+   */
+  readonly #dataDir: string | null;
+
   #seq = 0;
+
+  constructor(options: { dataDir?: string } = {}) {
+    this.#dataDir = options.dataDir ?? null;
+    if (this.#dataDir !== null) {
+      mkdirSync(this.#dataDir, { recursive: true });
+      this.#restore(this.#dataDir);
+    }
+  }
 
   /**
    * 单调递增的 id。不用 Date.now() 或随机数：
@@ -81,6 +138,91 @@ export class ResidentStore {
     return new Date(this.#lastStamp).toISOString();
   }
 
+  // --- 持久化（dataDir 未设时整段短路，判卷路径零文件 IO）---
+
+  /**
+   * 把一个房间写进它自己的快照文件。同步写：返回即已落盘。
+   *
+   * 临时文件 → fsync → rename 的顺序保证任何时刻磁盘上都有一份完整快照：
+   * 进程死在 rename 前，留下的是残缺 .tmp + 完好旧档；死在 rename 后，
+   * 新档已经原子就位。没有中间态。
+   */
+  #persist(residentId: string): void {
+    if (this.#dataDir === null) return;
+    const room = this.#rooms.get(residentId);
+    if (room === undefined) return;
+    // id 全部出自 #nextId，这条断言防的是「将来某个改动让外部输入流进文件名」。
+    if (!/^[a-z0-9-]+$/.test(residentId)) {
+      throw new Error(`resident id 不可作为文件名: ${residentId}`);
+    }
+    const record: RoomRecord = {
+      schemaVersion: SCHEMA_VERSION,
+      residentId: room.residentId,
+      name: room.name,
+      createdAt: room.createdAt,
+      memories: [...room.memories.values()],
+      nodes: [...room.nodes.values()],
+      commitments: [...room.commitments],
+    };
+    const finalPath = join(this.#dataDir, `${residentId}.json`);
+    const tmpPath = `${finalPath}.tmp`;
+    const fd = openSync(tmpPath, "w");
+    try {
+      writeSync(fd, JSON.stringify(record));
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmpPath, finalPath);
+  }
+
+  /** 启动恢复：读全部快照重建内存视图，并把 id/时间戳序列推进到存量之后。 */
+  #restore(dataDir: string): void {
+    for (const file of readdirSync(dataDir).sort()) {
+      // .tmp 是没写完的一次写入，旧 .json 才是权威——跳过即可，下次写会覆盖。
+      if (!file.endsWith(".json")) continue;
+      const record = JSON.parse(readFileSync(join(dataDir, file), "utf8")) as RoomRecord;
+      if (record.schemaVersion !== SCHEMA_VERSION) {
+        throw new Error(
+          `快照 ${file} 的 schema_version=${record.schemaVersion}，本进程只认 ${SCHEMA_VERSION}——显式失败等人来迁移，不静默跳过（跳过 = 这个住户无声消失）`,
+        );
+      }
+      if (`${record.residentId}.json` !== file) {
+        throw new Error(`快照 ${file} 内容声称自己是 ${record.residentId}，文件名与身份对不上`);
+      }
+      this.#rooms.set(record.residentId, {
+        residentId: record.residentId,
+        name: record.name,
+        createdAt: record.createdAt,
+        memories: new Map(record.memories.map((m) => [m.id, m])),
+        nodes: new Map(record.nodes.map((n) => [n.id, n])),
+        commitments: [...record.commitments],
+      });
+      // 序列必须推进到存量之后：#seq 撞号会让 Map.set 静默覆盖旧条目，
+      // #lastStamp 倒退会破坏 createdAt 单调——两样都是无声丢数据。
+      this.#bumpSeq(record.residentId);
+      this.#bumpStamp(record.createdAt);
+      for (const m of record.memories) {
+        this.#bumpSeq(m.id);
+        this.#bumpStamp(m.createdAt);
+      }
+      for (const n of record.nodes) {
+        this.#bumpSeq(n.id);
+        this.#bumpStamp(n.createdAt);
+      }
+    }
+  }
+
+  #bumpSeq(id: string): void {
+    const n = Number.parseInt(id.slice(id.lastIndexOf("-") + 1), 36);
+    if (Number.isFinite(n) && n > this.#seq) this.#seq = n;
+  }
+
+  #bumpStamp(createdAt: string): void {
+    const t = Date.parse(createdAt);
+    if (Number.isFinite(t) && t > this.#lastStamp) this.#lastStamp = t;
+  }
+
   createResident(name: string): string {
     const residentId = this.#nextId("resident");
     this.#rooms.set(residentId, {
@@ -91,6 +233,7 @@ export class ResidentStore {
       nodes: new Map(),
       commitments: [],
     });
+    this.#persist(residentId);
     return residentId;
   }
 
@@ -101,6 +244,7 @@ export class ResidentStore {
    */
   commit(residentId: string, commitment: string): void {
     this.room(residentId).commitments.push(commitment);
+    this.#persist(residentId);
   }
 
   /** 承诺账本的只读视图。 */
@@ -121,6 +265,10 @@ export class ResidentStore {
 
   destroyResident(residentId: string): void {
     this.#rooms.delete(residentId);
+    if (this.#dataDir !== null) {
+      // 拆房连档案一起销：留着文件，重启后人会诈尸回来。
+      rmSync(join(this.#dataDir, `${residentId}.json`), { force: true });
+    }
   }
 
   // --- 记忆库 ---
@@ -135,6 +283,7 @@ export class ResidentStore {
       supersededBy: null,
       createdAt: this.#nextStamp(),
     });
+    this.#persist(residentId);
     return id;
   }
 
@@ -156,6 +305,7 @@ export class ResidentStore {
     const newId = this.remember(residentId, correction);
     // 只动 supersededBy 这一个字段；content / createdAt / id 原样不碰。
     room.memories.set(entryId, { ...old, supersededBy: newId });
+    this.#persist(residentId);
     return newId;
   }
 
@@ -198,6 +348,7 @@ export class ResidentStore {
       createdAt: this.#nextStamp(),
     };
     room.nodes.set(node.id, node);
+    this.#persist(residentId);
     return node;
   }
 
@@ -233,10 +384,16 @@ export class ResidentStore {
     const memories = new Map<string, MemoryEntry>();
     for (const m of snapshot.memories) {
       memories.set(m.id, { ...m, residentId });
+      // 迁移保 id，而快照可能来自另一台机器——那边发的序号要是比本机 #seq 大，
+      // 不推进的话之后 #nextId 会撞上导入条目，Map.set 静默覆盖，人丢一块。
+      this.#bumpSeq(m.id);
+      this.#bumpStamp(m.createdAt);
     }
     const nodes = new Map<string, HistoryNode>();
     for (const n of snapshot.nodes) {
       nodes.set(n.id, { ...n });
+      this.#bumpSeq(n.id);
+      this.#bumpStamp(n.createdAt);
     }
     this.#rooms.set(residentId, {
       residentId,
@@ -247,6 +404,7 @@ export class ResidentStore {
       // 承诺跟着人走：搬了家，答应过的事还算数。
       commitments: [...snapshot.commitments],
     });
+    this.#persist(residentId);
     return residentId;
   }
 }
