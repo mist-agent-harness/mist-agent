@@ -37,8 +37,46 @@ describe("SessionRegistry", () => {
     expect(sessions.isActive("resident-a")).toBe(false);
     expect(sessions.get("resident-b")).toEqual({
       residentId: "resident-b",
+      generation: 1,
       headId: "node-b",
       context: ["b"],
     });
+  });
+
+  it("advances the head inside one active generation", () => {
+    const sessions = new SessionRegistry<null>();
+    const session = sessions.open("resident-a", null, null);
+
+    sessions.setHead("resident-a", "reply-1");
+
+    expect(sessions.get("resident-a")).toEqual({
+      ...session,
+      headId: "reply-1",
+    });
+  });
+
+  it("rejects setting a head when no session is active", () => {
+    const sessions = new SessionRegistry<null>();
+
+    expect(() => sessions.setHead("resident-a", "reply-1")).toThrow(/no active session/);
+  });
+
+  it("marks stale dispatch receipts as not belonging to the active session after kill", () => {
+    const sessions = new SessionRegistry<null>();
+    sessions.open("resident-a", null, null);
+    const stale = sessions.issueDispatch("resident-a");
+
+    sessions.kill("resident-a");
+    sessions.open("resident-a", null, null);
+
+    expect(sessions.belongsToActiveSession(stale)).toBe(false);
+  });
+
+  it("keeps current-generation dispatch receipts valid while the session is still active", () => {
+    const sessions = new SessionRegistry<null>();
+    sessions.open("resident-a", null, null);
+    const receipt = sessions.issueDispatch("resident-a");
+
+    expect(sessions.belongsToActiveSession(receipt)).toBe(true);
   });
 });

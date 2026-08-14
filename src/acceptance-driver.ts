@@ -20,7 +20,8 @@
  */
 
 import type { BootPack, HarnessDriver, HistoryNode, MemoryEntry } from "../acceptance/driver.ts";
-import { type ResidentSnapshot, ResidentStore, type SessionState } from "./store/resident-store.ts";
+import { SessionRegistry } from "./session/session-registry.ts";
+import { type ResidentSnapshot, ResidentStore } from "./store/resident-store.ts";
 
 class MistDriver implements HarnessDriver {
   readonly #store = new ResidentStore();
@@ -33,15 +34,10 @@ class MistDriver implements HarnessDriver {
    * 分开放，是让「会话死人不死」这件事在数据结构上就成立，而不是靠约定。
    * 合龙时由 P4 的 SessionRegistry 接管这张表。
    */
-  readonly #sessions = new Map<string, SessionState>();
+  readonly #sessions = new SessionRegistry<null>();
 
-  #session(residentId: string): SessionState {
-    let s = this.#sessions.get(residentId);
-    if (s === undefined) {
-      s = { head: null, alive: false };
-      this.#sessions.set(residentId, s);
-    }
-    return s;
+  #session(residentId: string) {
+    return this.#sessions.get(residentId) ?? this.#sessions.open(residentId, null, null);
   }
 
   // --- P1：记忆库存储（本 issue 的认领范围）---
@@ -76,15 +72,12 @@ class MistDriver implements HarnessDriver {
     // 先确认住户真的在（拿不到会抛）——会话态自己那张表没有隔离语义。
     this.#store.room(residentId);
     const session = this.#session(residentId);
-    if (!session.alive) {
-      // 没有活会话就开一个：alive=true，head 保持 null。
-      // #16 问 3 裁定：kill 之后第一次说话的 user 节点必须是新根
-      // （parentId === null），会话边界才是可判的——否则「会话死了」
-      // 这件事在树上看不出来，killSession 写成空函数也能蒙混过关。
-      // 旧枝一个字节不动，人和历史都还在，只是这段对话从头起。
-      session.alive = true;
-    }
-    const userNode = this.#store.appendNode(residentId, session.head, "user", message);
+    // 没有活会话时 #session 会开一个新 generation，headId 为 null。
+    // #16 问 3 裁定：kill 之后第一次说话的 user 节点必须是新根
+    // （parentId === null），会话边界才是可判的——否则「会话死了」
+    // 这件事在树上看不出来，killSession 写成空函数也能蒙混过关。
+    // 旧枝一个字节不动，人和历史都还在，只是这段对话从头起。
+    const userNode = this.#store.appendNode(residentId, session.headId, "user", message);
     // TODO(P2)：M0 阶段回应是固定文本，判卷只看树结构不看措辞。
     const replyNode = this.#store.appendNode(
       residentId,
@@ -92,7 +85,7 @@ class MistDriver implements HarnessDriver {
       "assistant",
       `收到：${message}`,
     );
-    session.head = replyNode.id;
+    this.#sessions.setHead(residentId, replyNode.id);
     return replyNode;
   }
 
@@ -134,8 +127,9 @@ class MistDriver implements HarnessDriver {
     this.#store.room(residentId);
     // 只动会话态那张表，一个字节都不碰 nodes / memories / commitments：
     // 会话死，人不能死（C1 验 kill 前后整棵树的 hash 不变）。
-    // head 清空 —— 下一句 say 开新根，这就是会话边界在树上的形状。
-    this.#sessions.set(residentId, { head: null, alive: false });
+    // 删除活会话 —— 下一句 say 会开新 generation、新根；旧 generation 的迟到
+    // effect receipt 也不能再被视为当前会话，H1 的 Effect Journal 会接这条线。
+    this.#sessions.kill(residentId);
   }
 
   // --- P5：迁移（TODO(P5) 认领者替换）---
