@@ -160,6 +160,46 @@ describe("importTree parent 悬空", () => {
   });
 });
 
+describe("importTree 树形拓扑", () => {
+  it("自引用节点不是树：整批拒绝，零写入", () => {
+    const store = new MessageTreeStore();
+    store.createRoom("r");
+    expect(() => store.importTree("r", [node("self", "self", "user", "自环")])).toThrow(
+      MessageTreeError,
+    );
+    expect(store.history("r")).toEqual([]);
+  });
+
+  it("批内互指成环不是树：整批拒绝，既有树不动", () => {
+    const store = new MessageTreeStore();
+    store.createRoom("r");
+    store.importTree("r", [node("keep", null, "system", "已有")]);
+    const before = snapshot(store, "r");
+
+    expect(() =>
+      store.importTree("r", [node("a", "b", "user", "A"), node("b", "a", "assistant", "B")]),
+    ).toThrow(MessageTreeError);
+
+    expect(snapshot(store, "r")).toBe(before);
+  });
+
+  it("接到房内既有节点的批次仍合法", () => {
+    const store = new MessageTreeStore();
+    store.createRoom("r");
+    store.importTree("r", [node("root", null, "system", "已有根")]);
+    store.importTree("r", [
+      node("leaf", "mid", "assistant", "叶"),
+      node("mid", "root", "user", "中间"),
+    ]);
+
+    expect(store.exportTree("r").map((item) => [item.id, item.parentId])).toEqual([
+      ["root", null],
+      ["leaf", "mid"],
+      ["mid", "root"],
+    ]);
+  });
+});
+
 describe("export → import → export", () => {
   it("逐字节等价，且按给定数组顺序插入", () => {
     const store = new MessageTreeStore({

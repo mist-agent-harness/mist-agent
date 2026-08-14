@@ -160,6 +160,7 @@ export class MessageTreeStore {
         throw nodeUnavailable();
       }
     }
+    this.assertAcyclicImport(room, prepared);
 
     const orderBefore = room.order.length;
     try {
@@ -217,6 +218,29 @@ export class MessageTreeStore {
     }
     if (typeof node.createdAt !== "string") {
       throw new MessageTreeError("节点不可导入");
+    }
+  }
+
+  /**
+   * 迁移包能带来 appendPair/appendSibling 平时长不出的形状。
+   * 每个导入节点必须能沿 parentId 在有限步内回到根，或接到房内既有节点。
+   */
+  private assertAcyclicImport(room: Room, nodes: HistoryNode[]): void {
+    const batchParents = new Map(nodes.map((node) => [node.id, node.parentId]));
+    for (const node of nodes) {
+      const seen = new Set<string>();
+      let cursor: string | null = node.id;
+      while (cursor !== null && !room.nodes.has(cursor)) {
+        if (seen.has(cursor)) {
+          throw new MessageTreeError("节点不可导入");
+        }
+        seen.add(cursor);
+        const parentId = batchParents.get(cursor);
+        if (parentId === undefined) {
+          throw nodeUnavailable();
+        }
+        cursor = parentId;
+      }
     }
   }
 
