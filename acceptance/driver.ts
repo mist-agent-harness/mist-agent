@@ -110,5 +110,10 @@ export interface CheckResult {
 export interface AcceptanceCheck {
   id: string;
   title: string;
+  /**
+   * 这条验收会调用的驱动方法清单。runner 拿它对照驱动申报的 STUBBED 名单，
+   * 区分真灯与桩灯——依赖桩方法跑绿的灯不计入里程碑。
+   */
+  uses: (keyof HarnessDriver)[];
   run(driver: HarnessDriver): Promise<CheckResult>;
 }

@@ -154,3 +154,17 @@ class MistDriver implements HarnessDriver {
 export function createDriver(): HarnessDriver {
   return new MistDriver();
 }
+
+/**
+ * 判卷桩申报（#16 裁定 1 的执行）：以下方法当前是 P1 代写的最小实现，
+ * 各认领包交付时从名单里划掉自己那几个。隐瞒申报按伪证论。
+ */
+export const STUBBED = [
+  "say",
+  "history",
+  "reviseNode",
+  "buildBootPack",
+  "killSession",
+  "exportResident",
+  "importResident",
+];

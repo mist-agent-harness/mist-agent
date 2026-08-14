@@ -15,6 +15,15 @@ function sha256(data: Uint8Array | string): string {
 const c1: AcceptanceCheck = {
   id: "C1",
   title: "杀会话不丢人：会话真的死了，记忆和树一个字节没少",
+  uses: [
+    "createResident",
+    "remember",
+    "say",
+    "history",
+    "killSession",
+    "buildBootPack",
+    "destroyResident",
+  ],
   async run(driver: HarnessDriver) {
     const r = await driver.createResident("c1-resident");
     const entryId = await driver.remember(r, "答应过：周五晚上一起看电影");
@@ -51,6 +60,7 @@ const c1: AcceptanceCheck = {
 const c2: AcceptanceCheck = {
   id: "C2",
   title: "凭启动包醒来：包里有我是谁和我答应过什么",
+  uses: ["createResident", "remember", "commit", "buildBootPack", "destroyResident"],
   async run(driver: HarnessDriver) {
     const promise = "答应过：每晚 23:30 前熄灯";
     const r = await driver.createResident("c2-resident");
@@ -74,6 +84,7 @@ const c2: AcceptanceCheck = {
 const c3: AcceptanceCheck = {
   id: "C3",
   title: "不改史：改口只长新枝，旧枝一个字节不动",
+  uses: ["createResident", "say", "history", "reviseNode", "destroyResident"],
   async run(driver: HarnessDriver) {
     const r = await driver.createResident("c3-resident");
     const reply = await driver.say(r, "第一版说法");
@@ -118,6 +129,7 @@ const c3: AcceptanceCheck = {
 const c4: AcceptanceCheck = {
   id: "C4",
   title: "勘误留底：错的标记被取代但留在原地，新旧链得上",
+  uses: ["createResident", "remember", "errata", "recall", "destroyResident"],
   async run(driver: HarnessDriver) {
     const r = await driver.createResident("c4-resident");
     const wrongId = await driver.remember(r, "住在深圳华侨城");
@@ -142,6 +154,7 @@ const c4: AcceptanceCheck = {
 const c5: AcceptanceCheck = {
   id: "C5",
   title: "不串房：A 的记忆不出现在 B 的启动包和检索里",
+  uses: ["createResident", "remember", "buildBootPack", "recall", "destroyResident"],
   async run(driver: HarnessDriver) {
     const marker = `串房检测标记-${Date.now()}`;
     const a = await driver.createResident("c5-resident-a");
@@ -166,6 +179,17 @@ const c5: AcceptanceCheck = {
 const c6: AcceptanceCheck = {
   id: "C6",
   title: "迁移可回滚：启动包与消息树都逐字节等价，原件不动",
+  uses: [
+    "createResident",
+    "remember",
+    "errata",
+    "say",
+    "buildBootPack",
+    "history",
+    "exportResident",
+    "importResident",
+    "destroyResident",
+  ],
   async run(driver: HarnessDriver) {
     const r = await driver.createResident("c6-resident");
     await driver.remember(r, "迁移前的记忆一号");
