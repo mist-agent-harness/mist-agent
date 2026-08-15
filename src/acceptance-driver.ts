@@ -22,6 +22,7 @@
 import type { BootPack, HarnessDriver, HistoryNode, MemoryEntry } from "../acceptance/driver.ts";
 import { buildBootPack as assembleBootPack } from "./bootpack.ts";
 import {
+  type AssistantReply,
   MessageTreeService,
   MessageTreeStore,
   type SessionHeadPort,
@@ -30,18 +31,18 @@ import { createResidentMigrationService } from "./migration/resident-store-migra
 import { SessionRegistry } from "./session/session-registry.ts";
 import { ResidentStore } from "./store/resident-store.ts";
 
+export interface CreateDriverOptions {
+  dataDir?: string;
+  reply?: AssistantReply;
+}
+
 class MistDriver implements HarnessDriver {
-  readonly #store = new ResidentStore();
-  readonly #messageTreeStore = new MessageTreeStore();
-  readonly #messageTree = new MessageTreeService(
-    this.#messageTreeStore,
-    {
-      getHead: (residentId) => this.#session(residentId).headId,
-      setHead: (residentId, headId) => this.#sessions.setHead(residentId, headId),
-    } satisfies SessionHeadPort,
-    { assistantReply: (_residentId, message) => `收到：${message}` },
-  );
-  readonly #migration = createResidentMigrationService(this.#store, this.#messageTreeStore);
+  readonly #store: ResidentStore;
+  readonly #messageTreeStore: MessageTreeStore;
+  readonly #messageTree: MessageTreeService;
+  readonly #migration: ReturnType<typeof createResidentMigrationService>;
+  // 本集合只缓存本 driver 亲手建过的 P2 room；任何拆房入口必须同步清掉。
+  readonly #messageRooms = new Set<string>();
 
   /**
    * 会话态注册表 —— 跟住户存储分开的一张表（#16 问 2 裁定）。
@@ -53,15 +54,48 @@ class MistDriver implements HarnessDriver {
    */
   readonly #sessions = new SessionRegistry<null>();
 
+  constructor(options: CreateDriverOptions = {}) {
+    this.#store = new ResidentStore(
+      options.dataDir === undefined ? undefined : { dataDir: options.dataDir },
+    );
+    this.#messageTreeStore = new MessageTreeStore();
+    this.#messageTree = new MessageTreeService(
+      this.#messageTreeStore,
+      {
+        getHead: (residentId) => this.#session(residentId).headId,
+        setHead: (residentId, headId) => this.#sessions.setHead(residentId, headId),
+      } satisfies SessionHeadPort,
+      { assistantReply: options.reply ?? ((_residentId, message) => `收到：${message}`) },
+    );
+    this.#migration = createResidentMigrationService(this.#store, this.#messageTreeStore);
+  }
+
   #session(residentId: string) {
     return this.#sessions.get(residentId) ?? this.#sessions.open(residentId, null, null);
+  }
+
+  #createMessageRoom(residentId: string): void {
+    this.#messageTreeStore.createRoom(residentId);
+    this.#messageRooms.add(residentId);
+  }
+
+  #ensureMessageRoom(residentId: string, unknownResident: "resident" | "tree" = "resident"): void {
+    if (this.#messageRooms.has(residentId)) return;
+    if (!this.#store.has(residentId)) {
+      if (unknownResident === "tree") {
+        this.#messageTreeStore.history(residentId);
+      }
+      this.#store.room(residentId);
+    }
+    // 住户回来了，消息房间补一个空房间；对话树不伪装恢复。
+    this.#createMessageRoom(residentId);
   }
 
   // --- P1：记忆库存储（本 issue 的认领范围）---
 
   async createResident(name: string): Promise<string> {
     const residentId = this.#store.createResident(name);
-    this.#messageTreeStore.createRoom(residentId);
+    this.#createMessageRoom(residentId);
     return residentId;
   }
 
@@ -82,24 +116,34 @@ class MistDriver implements HarnessDriver {
   }
 
   async destroyResident(residentId: string): Promise<void> {
+    if (!this.#store.has(residentId)) {
+      this.#sessions.kill(residentId);
+      this.#messageRooms.delete(residentId);
+      this.#messageTreeStore.destroyRoom(residentId);
+      this.#store.destroyResident(residentId);
+      return;
+    }
     this.#sessions.kill(residentId);
-    this.#messageTreeStore.destroyRoom(residentId);
+    if (this.#messageRooms.delete(residentId)) {
+      this.#messageTreeStore.destroyRoom(residentId);
+    }
     this.#store.destroyResident(residentId);
   }
 
   // --- P2：消息树 ---
 
   async say(residentId: string, message: string): Promise<HistoryNode> {
-    this.#store.room(residentId);
+    this.#ensureMessageRoom(residentId);
     return this.#messageTree.say(residentId, message);
   }
 
   async history(residentId: string): Promise<HistoryNode[]> {
+    this.#ensureMessageRoom(residentId, "tree");
     return this.#messageTree.history(residentId);
   }
 
   async reviseNode(residentId: string, nodeId: string, newContent: string): Promise<HistoryNode> {
-    this.#store.room(residentId);
+    this.#ensureMessageRoom(residentId);
     return this.#messageTree.reviseNode(residentId, nodeId, newContent);
   }
 
@@ -123,16 +167,19 @@ class MistDriver implements HarnessDriver {
   // --- P5：迁移 ---
 
   async exportResident(residentId: string): Promise<Uint8Array> {
+    this.#ensureMessageRoom(residentId);
     return this.#migration.exportResident(residentId);
   }
 
   async importResident(pack: Uint8Array): Promise<string> {
-    return this.#migration.importResident(pack);
+    const residentId = await this.#migration.importResident(pack);
+    this.#messageRooms.add(residentId);
+    return residentId;
   }
 }
 
-export function createDriver(): HarnessDriver {
-  return new MistDriver();
+export function createDriver(options: CreateDriverOptions = {}): HarnessDriver {
+  return new MistDriver(options);
 }
 
 /**
