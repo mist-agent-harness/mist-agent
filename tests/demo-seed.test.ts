@@ -131,6 +131,38 @@ describe("demo seed", () => {
     expect(readdirSync(join(dataRoot, "residents"))).toEqual([`${first.residentId}.json`]);
   });
 
+  it("合法 JSON 但 schemaVersion 不符时 fail closed", async () => {
+    const dataRoot = freshDir();
+    mkdirForManifest(dataRoot);
+    writeFileSync(
+      join(dataRoot, "seed-manifest.json"),
+      JSON.stringify({
+        schemaVersion: 999,
+        seedId: "mist-rough-house-v1",
+        residentId: "resident-existing",
+      }),
+    );
+
+    await expect(seedDemoResident({ dataRoot })).rejects.toThrow(/形状或版本不受支持/);
+    expect(readdirSync(join(dataRoot, "residents"))).toEqual([]);
+  });
+
+  it("合法 JSON 但 seedId 属于另一套种子时 fail closed", async () => {
+    const dataRoot = freshDir();
+    mkdirForManifest(dataRoot);
+    writeFileSync(
+      join(dataRoot, "seed-manifest.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        seedId: "another-demo-seed",
+        residentId: "resident-existing",
+      }),
+    );
+
+    await expect(seedDemoResident({ dataRoot })).rejects.toThrow(/形状或版本不受支持/);
+    expect(readdirSync(join(dataRoot, "residents"))).toEqual([]);
+  });
+
   it("manifest 指向不存在的住户时拒绝另建一位", async () => {
     const dataRoot = freshDir();
     mkdirForManifest(dataRoot);
