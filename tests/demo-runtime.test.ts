@@ -17,6 +17,7 @@ afterEach(() => {
 });
 
 const seed = {
+  id: "runtime-test-seed",
   name: "编造的住户",
   memories: ["记得纸船是蓝色的。"],
   commitments: ["答应重启后仍认得纸船。"],
@@ -63,13 +64,18 @@ describe("persistent demo runtime", () => {
     );
     const state = JSON.parse(readFileSync(join(dataDir, "demo-state.json"), "utf8"));
     expect(state.residentId).toBe(newResidentId);
+    expect(state.seedId).toBe(seed.id);
+    expect(state.schemaVersion).toBe(2);
   });
 
   it("fails closed for corrupt state and for snapshots without an identity pointer", async () => {
     const corrupt = freshDir();
-    writeFileSync(join(corrupt, "demo-state.json"), JSON.stringify({ schemaVersion: 99 }));
+    writeFileSync(
+      join(corrupt, "demo-state.json"),
+      JSON.stringify({ schemaVersion: 99, seedId: seed.id, residentId: "resident-missing" }),
+    );
     await expect(createPersistentDemoRuntime({ dataDir: corrupt, seed })).rejects.toThrow(
-      /unknown or missing fields/,
+      /unsupported demo state schema/,
     );
 
     const orphaned = freshDir();
@@ -87,7 +93,7 @@ describe("persistent demo runtime", () => {
     const existingSnapshot = `${first.inspect().residentId}.json`;
     writeFileSync(
       join(dataDir, "demo-state.json"),
-      JSON.stringify({ schemaVersion: 1, residentId: "resident-missing" }),
+      JSON.stringify({ schemaVersion: 2, seedId: seed.id, residentId: "resident-missing" }),
     );
 
     await expect(createPersistentDemoRuntime({ dataDir, seed })).rejects.toThrow();
