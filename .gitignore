@@ -17,4 +17,5 @@ node_modules/
 
 # Data & local state
 data/
+.mist-demo/
 *.local

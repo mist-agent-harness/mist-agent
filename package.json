@@ -8,6 +8,7 @@
   },
   "scripts": {
     "demo": "tsx demo/main.ts",
+    "demo:seed": "tsx demo/seed.ts",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
