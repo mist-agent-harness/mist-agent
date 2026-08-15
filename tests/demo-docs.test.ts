@@ -1,12 +1,13 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { DEMO_SEED } from "../demo/seed.ts";
+import { DEMO_EXPECTED_FORM_OF_ADDRESS, DEMO_SEED } from "../demo/seed.ts";
 
 describe("rough-house demo documentation", () => {
   it("把固定虚构种子的三条验收答案钉在清单里", () => {
     const checklist = readFileSync("demo/CHECKLIST.md", "utf8");
 
-    expect(checklist).toContain("`小栖`");
+    expect(DEMO_SEED.memories[0]).toContain(DEMO_EXPECTED_FORM_OF_ADDRESS);
+    expect(checklist).toContain(`\`${DEMO_EXPECTED_FORM_OF_ADDRESS}\``);
     expect(checklist).toContain(`\`${DEMO_SEED.memories[1]}\``);
     expect(checklist).toContain(`\`${DEMO_SEED.commitments[0]}\``);
   });

@@ -14,10 +14,15 @@ export interface DemoSeed {
   commitments: readonly string[];
 }
 
+export const DEMO_EXPECTED_FORM_OF_ADDRESS = "小栖";
+
 export const DEMO_SEED: DemoSeed = {
   id: "mist-rough-house-v1",
   name: "雾灯（虚构演示住户）",
-  memories: ["我的朋友希望我称呼她为小栖。", "我和小栖曾在虚构的雾港图书馆一起修好一盏纸灯。"],
+  memories: [
+    `我的朋友希望我称呼她为${DEMO_EXPECTED_FORM_OF_ADDRESS}。`,
+    "我和小栖曾在虚构的雾港图书馆一起修好一盏纸灯。",
+  ],
   commitments: ["我答应每次重新醒来，都先问小栖是否平安到家。"],
 };
 
