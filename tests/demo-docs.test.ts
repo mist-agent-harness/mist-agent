@@ -10,6 +10,10 @@ describe("rough-house demo documentation", () => {
     expect(checklist).toContain(`\`${DEMO_EXPECTED_FORM_OF_ADDRESS}\``);
     expect(checklist).toContain(`\`${DEMO_SEED.memories[1]}\``);
     expect(checklist).toContain(`\`${DEMO_SEED.commitments[0]}\``);
+    expect(checklist).toContain("只逐字复制完整 content，不要改写、解释或添加标点");
+    expect(checklist).toContain("不要改写、履行、解释或添加任何文字");
+    expect(checklist).toContain("只回复两个汉字：未知。回复中不要包含标点");
+    expect(checklist).toContain("临时颜色问题只回答 `未知`");
   });
 
   it("README 给出一条龙启动、Kimi 接线和三个不同的清空边界", () => {
