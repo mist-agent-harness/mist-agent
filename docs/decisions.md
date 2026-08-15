@@ -46,6 +46,13 @@
   勘误接力、环树包拒导、杀会话后跨房拒绝）全过。判卷机只报灯色，此章即达成宣告，
   H1 同刻解锁。
 
+- 2026-08-15　**D5 主笔拍板：Claude Agent SDK 为首选上游通道**。理由：兼容 Claude
+  订阅，住户（如旦九）以订阅身份入住，不按 token 烧 API；SDK 内置工具按白名单关用，
+  编码能力随通道自带。边界不变：通道可换、住户不换，地基本身不建立在任何通道上
+  （政策风险见 [research/2026-08-13-relationship-harness-landscape.md](research/2026-08-13-relationship-harness-landscape.md)
+  第 6 节；resume/fork 未实测，杀会话仍靠启动包重建）。来源：2026-08-15 主笔与望舒对话。
+  注：此条为开工首日口头拍板的补记，D2「不上车」仅指 dsh，Claude SDK 从未在被告席。
+
 ## 规矩
 
 - 拍板只认主笔。讨论在 issue，结论落在这里，落完 issue 关门。
