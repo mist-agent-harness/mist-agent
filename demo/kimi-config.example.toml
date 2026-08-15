@@ -1,0 +1,11 @@
+# Append these two tables to ~/.kimi-code/config.toml. Do not replace the file.
+[providers.mist-demo]
+type = "openai"
+base_url = "http://127.0.0.1:4317/v1"
+api_key = "local-demo-placeholder"
+
+[models.mist-demo]
+provider = "mist-demo"
+model = "mist-demo"
+max_context_size = 200000
+display_name = "Mist Demo"

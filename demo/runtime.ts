@@ -13,17 +13,12 @@ import {
 import { join, resolve } from "node:path";
 import type { BootPack, HarnessDriver } from "../acceptance/driver.ts";
 import { type CreateDriverOptions, createDriver } from "../src/acceptance-driver.ts";
+import { DEMO_SEED, type DemoSeed, assertDemoSeed, seedDemoResident } from "./seed.ts";
 import type { DemoResident, DemoRuntime } from "./server.ts";
 
-const STATE_SCHEMA_VERSION = 1;
+const STATE_SCHEMA_VERSION = 2;
 const STATE_FILE = "demo-state.json";
 const RESIDENTS_DIR = "residents";
-
-export interface DemoSeed {
-  name: string;
-  memories: readonly string[];
-  commitments: readonly string[];
-}
 
 export interface PersistentDemoRuntimeOptions {
   /** Dedicated demo directory. It must not be shared with another Mist process. */
@@ -43,14 +38,9 @@ export interface PersistentDemoRuntime extends DemoRuntime {
 
 interface DemoState {
   schemaVersion: number;
+  seedId: string;
   residentId: string;
 }
-
-const DEFAULT_SEED: DemoSeed = {
-  name: "Mist 演示住户",
-  memories: ["我住在一间编造的演示房间。"],
-  commitments: ["每次醒来先确认自己是谁。"],
-};
 
 function statePath(dataDir: string): string {
   return join(dataDir, STATE_FILE);
@@ -67,7 +57,7 @@ function parseState(path: string): DemoState {
   }
   const state = value as Record<string, unknown>;
   const keys = Object.keys(state).sort();
-  if (keys.join(",") !== "residentId,schemaVersion") {
+  if (keys.join(",") !== "residentId,schemaVersion,seedId") {
     throw new Error("demo state has unknown or missing fields");
   }
   if (state.schemaVersion !== STATE_SCHEMA_VERSION) {
@@ -76,13 +66,20 @@ function parseState(path: string): DemoState {
   if (typeof state.residentId !== "string" || !/^resident-[a-z0-9]+$/.test(state.residentId)) {
     throw new Error("demo state has an invalid residentId");
   }
-  return { schemaVersion: STATE_SCHEMA_VERSION, residentId: state.residentId };
+  if (typeof state.seedId !== "string" || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(state.seedId)) {
+    throw new Error("demo state has an invalid seedId");
+  }
+  return {
+    schemaVersion: STATE_SCHEMA_VERSION,
+    seedId: state.seedId,
+    residentId: state.residentId,
+  };
 }
 
-function persistState(dataDir: string, residentId: string): void {
+function persistState(dataDir: string, seedId: string, residentId: string): void {
   const finalPath = statePath(dataDir);
   const temporaryPath = `${finalPath}.tmp`;
-  const body = JSON.stringify({ schemaVersion: STATE_SCHEMA_VERSION, residentId });
+  const body = JSON.stringify({ schemaVersion: STATE_SCHEMA_VERSION, seedId, residentId });
   let descriptor: number | null = null;
   try {
     descriptor = openSync(temporaryPath, "w", 0o600);
@@ -110,18 +107,6 @@ function openDriver(dataDir: string, reply: CreateDriverOptions["reply"]): Harne
   return createDriver(options);
 }
 
-async function seedResident(driver: HarnessDriver, seed: DemoSeed): Promise<string> {
-  const residentId = await driver.createResident(seed.name);
-  try {
-    for (const memory of seed.memories) await driver.remember(residentId, memory);
-    for (const commitment of seed.commitments) await driver.commit(residentId, commitment);
-  } catch (error) {
-    await driver.destroyResident(residentId);
-    throw error;
-  }
-  return residentId;
-}
-
 function removeOrphanSnapshots(dataDir: string, residentId: string): void {
   const residents = residentDataDir(dataDir);
   for (const file of readdirSync(residents)) {
@@ -140,12 +125,17 @@ export async function createPersistentDemoRuntime(
 ): Promise<PersistentDemoRuntime> {
   if (options.dataDir.trim().length === 0) throw new Error("dataDir is required");
   const dataDir = resolve(options.dataDir);
-  const seed = options.seed ?? DEFAULT_SEED;
-  if (seed.name.trim().length === 0) throw new Error("seed name is required");
+  const seed = options.seed ?? DEMO_SEED;
+  assertDemoSeed(seed);
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(residentDataDir(dataDir), { recursive: true });
 
   const savedState = existsSync(statePath(dataDir)) ? parseState(statePath(dataDir)) : null;
+  if (savedState !== null && savedState.seedId !== seed.id) {
+    throw new Error(
+      `demo state belongs to seed ${savedState.seedId}, but this run requested ${seed.id}`,
+    );
+  }
   let driver = openDriver(dataDir, options.reply);
   let residentId: string;
   if (savedState === null) {
@@ -155,8 +145,8 @@ export async function createPersistentDemoRuntime(
     if (existingSnapshots.length > 0) {
       throw new Error("demo resident snapshots exist without demo-state.json");
     }
-    residentId = await seedResident(driver, seed);
-    persistState(dataDir, residentId);
+    residentId = await seedDemoResident(driver, seed);
+    persistState(dataDir, seed.id, residentId);
   } else {
     residentId = savedState.residentId;
     await driver.buildBootPack(residentId);
@@ -178,8 +168,8 @@ export async function createPersistentDemoRuntime(
     async reset() {
       const previousDriver = driver;
       const previousResidentId = residentId;
-      const nextResidentId = await seedResident(previousDriver, seed);
-      persistState(dataDir, nextResidentId);
+      const nextResidentId = await seedDemoResident(previousDriver, seed);
+      persistState(dataDir, seed.id, nextResidentId);
       residentId = nextResidentId;
       await previousDriver.destroyResident(previousResidentId);
       // Re-open from disk so reset exercises the same recovery path as a process restart.

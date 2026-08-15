@@ -1,6 +1,9 @@
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { anthropicMessagesAdapter } from "./adapters/anthropic.ts";
 import { openAiChatCompletionsAdapter } from "./adapters/openai.ts";
-import { createPersistentDemoRuntime } from "./runtime.ts";
+import { type ClaudeQueryRunner, createClaudeReply } from "./brain-claude.ts";
+import { type PersistentDemoRuntime, createPersistentDemoRuntime } from "./runtime.ts";
 import { createDemoServer } from "./server.ts";
 
 interface CliOptions {
@@ -9,7 +12,7 @@ interface CliOptions {
 }
 
 function usage(): string {
-  return "Usage: npm run demo -- --data-dir <directory> [--port <0-65535>]";
+  return "Usage: npm run demo -- [--data-dir <directory>] [--port <0-65535>]";
 }
 
 function parsePort(value: string): number {
@@ -21,7 +24,7 @@ function parsePort(value: string): number {
 }
 
 function parseArgs(argv: readonly string[]): CliOptions {
-  let dataDir = process.env.MIST_DEMO_DATA_DIR ?? "";
+  let dataDir = process.env.MIST_DEMO_DATA_DIR ?? ".mist-demo";
   let port = parsePort(process.env.MIST_DEMO_PORT ?? "4317");
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
@@ -41,15 +44,41 @@ function parseArgs(argv: readonly string[]): CliOptions {
     }
     throw new Error(`unknown argument: ${argument}`);
   }
-  if (dataDir.trim().length === 0) throw new Error("--data-dir is required");
+  if (dataDir.trim().length === 0) throw new Error("--data-dir cannot be empty");
   return { dataDir, port };
+}
+
+export interface CreateClaudeDemoRuntimeOptions {
+  dataDir: string;
+  model?: string;
+  runQuery?: ClaudeQueryRunner;
+}
+
+/** E2 brain + E3 persistent runtime 的唯一装配点。 */
+export async function createClaudeDemoRuntime(
+  options: CreateClaudeDemoRuntimeOptions,
+): Promise<PersistentDemoRuntime> {
+  const runtimeCell: { current?: PersistentDemoRuntime } = {};
+  const reply = createClaudeReply({
+    buildBootPack: async (residentId) => {
+      if (runtimeCell.current === undefined) throw new Error("demo runtime is not ready");
+      return runtimeCell.current.inspect().driver.buildBootPack(residentId);
+    },
+    ...(options.model === undefined ? {} : { model: options.model }),
+    ...(options.runQuery === undefined ? {} : { runQuery: options.runQuery }),
+  });
+  const runtime = await createPersistentDemoRuntime({ dataDir: options.dataDir, reply });
+  runtimeCell.current = runtime;
+  return runtime;
 }
 
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
-  const runtime = await createPersistentDemoRuntime({
+  const runtime = await createClaudeDemoRuntime({
     dataDir: options.dataDir,
-    reply: async (_residentId, message) => `Mist 演示回应：${message}`,
+    ...(process.env.MIST_DEMO_CLAUDE_MODEL === undefined
+      ? {}
+      : { model: process.env.MIST_DEMO_CLAUDE_MODEL }),
   });
   const server = createDemoServer({
     runtime,
@@ -69,7 +98,11 @@ async function main(): Promise<void> {
   process.once("SIGTERM", () => void stop());
 }
 
-main().catch((error: unknown) => {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-  process.exitCode = 1;
-});
+const invokedPath =
+  process.argv[1] === undefined ? null : pathToFileURL(resolve(process.argv[1])).href;
+if (invokedPath === import.meta.url) {
+  main().catch((error: unknown) => {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 1;
+  });
+}
