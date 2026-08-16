@@ -1,3 +1,4 @@
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import {
   type IncomingHttpHeaders,
   type IncomingMessage,
@@ -5,6 +6,7 @@ import {
   createServer,
 } from "node:http";
 import type { AddressInfo } from "node:net";
+import { ClaudeAuthenticationError } from "./brain-claude.ts";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
@@ -79,6 +81,8 @@ export interface DemoServerOptions {
 }
 
 export interface DemoServer {
+  /** Per-process secret required by destructive control routes. */
+  readonly controlToken: string;
   /** Starts on loopback only. No public-bind escape hatch is exposed. */
   start(port: number): Promise<AddressInfo>;
   stop(): Promise<void>;
@@ -102,6 +106,16 @@ function pathnameOf(url: string): string {
   } catch {
     return url;
   }
+}
+
+function hasControlAuthorization(headers: IncomingHttpHeaders, token: string): boolean {
+  const authorization = headers.authorization;
+  if (typeof authorization !== "string") return false;
+  const match = /^Bearer ([A-Za-z0-9_-]+)$/i.exec(authorization);
+  if (match?.[1] === undefined) return false;
+  const actual = Buffer.from(match[1]);
+  const expected = Buffer.from(token);
+  return actual.byteLength === expected.byteLength && timingSafeEqual(actual, expected);
 }
 
 function latestUserMessage(messages: readonly DemoMessage[]): string | null {
@@ -174,6 +188,7 @@ function serialExecutor() {
 
 export function createDemoServer(options: DemoServerOptions): DemoServer {
   const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
+  const controlToken = randomBytes(32).toString("base64url");
   if (!Number.isSafeInteger(maxBodyBytes) || maxBodyBytes <= 0) {
     throw new RangeError("maxBodyBytes must be a positive safe integer");
   }
@@ -193,6 +208,11 @@ export function createDemoServer(options: DemoServerOptions): DemoServer {
           sendJson(response, 405, { error: "method_not_allowed" });
           return;
         }
+        if (!hasControlAuthorization(view.headers, controlToken)) {
+          response.setHeader("www-authenticate", 'Bearer realm="mist-demo-control"');
+          sendJson(response, 401, { error: "control_token_required" });
+          return;
+        }
         await runSerial(async () => {
           const { driver, residentId } = options.runtime.current();
           await driver.killSession(residentId);
@@ -206,6 +226,11 @@ export function createDemoServer(options: DemoServerOptions): DemoServer {
         if (view.method !== "POST") {
           response.setHeader("allow", "POST");
           sendJson(response, 405, { error: "method_not_allowed" });
+          return;
+        }
+        if (!hasControlAuthorization(view.headers, controlToken)) {
+          response.setHeader("www-authenticate", 'Bearer realm="mist-demo-control"');
+          sendJson(response, 401, { error: "control_token_required" });
           return;
         }
         await runSerial(() => options.runtime.reset());
@@ -250,12 +275,20 @@ export function createDemoServer(options: DemoServerOptions): DemoServer {
         sendJson(response, 400, { error: "bad_request" });
         return;
       }
+      if (error instanceof ClaudeAuthenticationError) {
+        sendJson(response, 503, {
+          error: "claude_authentication_required",
+          message: error.message,
+        });
+        return;
+      }
       options.onError?.(error);
       sendJson(response, 500, { error: "internal_error" });
     });
   });
 
   return {
+    controlToken,
     start(port) {
       if (!Number.isInteger(port) || port < 0 || port > 65_535) {
         return Promise.reject(new RangeError("port must be an integer from 0 through 65535"));

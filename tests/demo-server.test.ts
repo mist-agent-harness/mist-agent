@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ClaudeAuthenticationError } from "../demo/brain-claude.ts";
 import {
   type DemoChatAdapter,
   type DemoDriver,
@@ -27,7 +28,10 @@ afterEach(async () => {
   await Promise.all(servers.splice(0).map((server) => server.stop()));
 });
 
-async function start(runtime: DemoRuntime, options: { maxBodyBytes?: number } = {}) {
+async function start(
+  runtime: DemoRuntime,
+  options: { maxBodyBytes?: number; onError?: (error: unknown) => void } = {},
+) {
   const server = createDemoServer({ runtime, adapters: [adapter], ...options });
   servers.push(server);
   const address = await server.start(0);
@@ -71,7 +75,7 @@ describe("demo server core", () => {
       current: () => ({ driver, residentId }),
       reset: vi.fn(async () => undefined),
     };
-    const { baseUrl } = await start(runtime);
+    const { server, baseUrl } = await start(runtime);
 
     for (const content of ["before clear one", "before clear two"]) {
       expect(
@@ -82,7 +86,10 @@ describe("demo server core", () => {
       ).toHaveProperty("status", 200);
     }
 
-    const clearResponse = await fetch(`${baseUrl}/demo/clear`, { method: "POST" });
+    const clearResponse = await fetch(`${baseUrl}/demo/clear`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${server.controlToken}` },
+    });
     expect(clearResponse.status).toBe(204);
     await fetch(`${baseUrl}/wire/chat`, {
       method: "POST",
@@ -111,9 +118,12 @@ describe("demo server core", () => {
         residentId = "resident-reseeded";
       }),
     };
-    const { baseUrl } = await start(runtime);
+    const { server, baseUrl } = await start(runtime);
 
-    const resetResponse = await fetch(`${baseUrl}/demo/reset`, { method: "POST" });
+    const resetResponse = await fetch(`${baseUrl}/demo/reset`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${server.controlToken}` },
+    });
     expect(resetResponse.status).toBe(204);
     await fetch(`${baseUrl}/wire/chat`, {
       method: "POST",
@@ -162,6 +172,78 @@ describe("demo server core", () => {
     expect(malformed.status).toBe(400);
     expect(oversized.status).toBe(413);
     expect(say).not.toHaveBeenCalled();
+  });
+
+  it("requires the per-run bearer token for cross-origin control posts but not chat", async () => {
+    const driver: DemoDriver = {
+      say: vi.fn(async () => ({ content: "ok" })),
+      killSession: vi.fn(async () => undefined),
+    };
+    const runtime: DemoRuntime = {
+      current: () => ({ driver, residentId: "resident-demo" }),
+      reset: vi.fn(async () => undefined),
+    };
+    const { server, baseUrl } = await start(runtime);
+
+    const clear = await fetch(`${baseUrl}/demo/clear`, {
+      method: "POST",
+      headers: { origin: "https://attacker.invalid" },
+    });
+    const reset = await fetch(`${baseUrl}/demo/reset`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wrong-token",
+        origin: "https://attacker.invalid",
+      },
+    });
+    const chat = await fetch(`${baseUrl}/wire/chat`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: "https://attacker.invalid",
+      },
+      body: JSON.stringify({ messages: [{ role: "user", content: "hello" }] }),
+    });
+
+    expect(clear.status).toBe(401);
+    expect(await clear.json()).toEqual({ error: "control_token_required" });
+    expect(reset.status).toBe(401);
+    expect(driver.killSession).not.toHaveBeenCalled();
+    expect(runtime.reset).not.toHaveBeenCalled();
+    expect(chat.status).toBe(200);
+    expect(server.controlToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(createDemoServer({ runtime, adapters: [adapter] }).controlToken).not.toBe(
+      server.controlToken,
+    );
+  });
+
+  it("returns an explicit 503 JSON error when the Claude SDK is not authenticated", async () => {
+    const onError = vi.fn();
+    const driver: DemoDriver = {
+      say: vi.fn(async () => {
+        throw new ClaudeAuthenticationError();
+      }),
+      killSession: vi.fn(async () => undefined),
+    };
+    const { baseUrl } = await start(
+      {
+        current: () => ({ driver, residentId: "resident-demo" }),
+        reset: vi.fn(async () => undefined),
+      },
+      { onError },
+    );
+
+    const response = await fetch(`${baseUrl}/wire/chat`, {
+      method: "POST",
+      body: JSON.stringify({ messages: [{ role: "user", content: "hello" }] }),
+    });
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({
+      error: "claude_authentication_required",
+      message: "Claude Agent SDK is not authenticated; run /login before using the demo",
+    });
+    expect(onError).not.toHaveBeenCalled();
   });
 
   it("keeps management methods narrow and returns 404 for unknown routes", async () => {

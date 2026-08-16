@@ -6,8 +6,48 @@
  * 也不代表跨房访问会老实报错而不是返回空数组。
  */
 
+import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { ResidentNotFoundError, ResidentStore } from "../src/store/resident-store.ts";
+
+describe("持久化权限", () => {
+  it("在 umask 022 下新快照和覆盖旧临时文件都保持 0600", () => {
+    const moduleUrl = new URL("../src/store/resident-store.ts", import.meta.url).href;
+    const probe = `
+import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+const { ResidentStore } = await import(${JSON.stringify(moduleUrl)});
+const dataDir = mkdtempSync(join(tmpdir(), "mist-resident-permissions-"));
+process.umask(0o022);
+try {
+  const store = new ResidentStore({ dataDir });
+  const residentId = store.createResident("private");
+  const snapshotPath = join(dataDir, \`\${residentId}.json\`);
+  const initialMode = statSync(snapshotPath).mode & 0o777;
+  const staleTemporaryPath = \`\${snapshotPath}.tmp\`;
+  writeFileSync(staleTemporaryPath, "old exposed temporary file", { mode: 0o644 });
+  chmodSync(staleTemporaryPath, 0o644);
+  store.remember(residentId, "同机其他用户不可读");
+  const rewrittenMode = statSync(snapshotPath).mode & 0o777;
+  console.log(JSON.stringify({ initialMode, rewrittenMode }));
+} finally {
+  rmSync(dataDir, { recursive: true, force: true });
+}
+`;
+    const result = spawnSync(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "-e", probe],
+      { encoding: "utf8" },
+    );
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      initialMode: 0o600,
+      rewrittenMode: 0o600,
+    });
+  });
+});
 
 describe("房间隔离", () => {
   it("跨房读抛错，而不是返回空数组", () => {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { BootPack } from "../acceptance/driver.ts";
 import {
+  ClaudeAuthenticationError,
   ClaudeBrainError,
   type ClaudeQueryMessage,
   type ClaudeQueryRequest,
@@ -114,5 +115,36 @@ describe("Claude Agent SDK brain", () => {
       "Claude Agent SDK ended without a result message",
     );
     await expect(failedDriver.say(failedResidentId, "hi")).rejects.toBeInstanceOf(ClaudeBrainError);
+  });
+
+  it("把未登录的 assistant error 和假 success 识别为认证失败", async () => {
+    const structured = createClaudeReply({
+      buildBootPack: async () => bootPack,
+      runQuery: () =>
+        messages(
+          { type: "assistant", error: "authentication_failed" },
+          {
+            type: "result",
+            subtype: "success",
+            result: "Not logged in · Please run /login",
+          },
+        ),
+    });
+    const resultOnly = createClaudeReply({
+      buildBootPack: async () => bootPack,
+      runQuery: () =>
+        messages({
+          type: "result",
+          subtype: "success",
+          result: "Not logged in",
+        }),
+    });
+
+    await expect(structured("resident-demo", "hi")).rejects.toBeInstanceOf(
+      ClaudeAuthenticationError,
+    );
+    await expect(resultOnly("resident-demo", "hi")).rejects.toBeInstanceOf(
+      ClaudeAuthenticationError,
+    );
   });
 });
