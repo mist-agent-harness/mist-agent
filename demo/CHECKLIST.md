@@ -20,6 +20,7 @@ Mist 的启动包里认得自己的长期状态。
 - Node.js：`________________`
 - Kimi Code：`________________`
 - Mist 启动行里的 `residentId`：`________________`
+- Mist 启动行里的 `controlToken`：`________________`（每次启动都会换，照抄本次的）
 
 确认下面三项后再继续：
 
@@ -50,13 +51,14 @@ Mist 的启动包里认得自己的长期状态。
 
 ## 3. 杀掉 Mist 会话
 
-在另一个终端运行：
+在另一个终端运行（把 `<controlToken>` 换成第 0 步记下的那串）：
 
 ```bash
-curl -i -X POST http://127.0.0.1:4317/demo/clear
+curl -i -X POST http://127.0.0.1:4317/demo/clear -H "Authorization: Bearer <controlToken>"
 ```
 
-应看到 `HTTP/1.1 204 No Content`。然后在 Kimi Web 再输入一次 `/clear`，依次发送三条探针。
+应看到 `HTTP/1.1 204 No Content`。如果看到 401，是 token 没带或带错，回第 0 步核对。
+然后在 Kimi Web 再输入一次 `/clear`，依次发送三条探针。
 
 - [ ] HTTP 返回 204。
 - [ ] P1 逐字命中。
@@ -68,7 +70,8 @@ curl -i -X POST http://127.0.0.1:4317/demo/clear
 ## 4. 杀进程再重开
 
 1. 先发送：`这句话只属于旧会话：蓝色纸船。请只回复收到。`
-2. 回到运行 Mist 的终端，按 `Ctrl-C`。
+2. 回到运行 Mist 的终端，按 `Ctrl-C`。**必须在跑 Mist 的那个终端里按**——从别的终端
+   kill 单个 pid 会留下孤儿子进程还持着锁，下次启动会被自己的陈尸挡在门外。
 3. 再运行 `npm run demo`，记下新的启动行。
 4. 确认新启动行里的 `residentId` 与第 0 步完全相同。
 5. 在 Kimi Web 输入 `/clear`，再问：`上一轮临时说的颜色是什么？如果启动包里没有相关记录，只回复两个汉字：未知。回复中不要包含标点。`

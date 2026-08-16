@@ -141,7 +141,9 @@ kimi web
 几个动作不要混淆：
 
 - Kimi Web 的 `/clear`（也叫 `/new`）清掉聊天壳的当前上下文。
-- `POST /demo/clear` 杀掉 Mist 当前会话，但不删住户、记忆或承诺。
+- `POST /demo/clear` 杀掉 Mist 当前会话，但不删住户、记忆或承诺。这条和 `/demo/reset`
+  都要带启动行里打印的 `controlToken`（`Authorization: Bearer <controlToken>`），
+  每次启动都会换；裸打会收到 401，这不是坏了。
 - `Ctrl-C` 后重新运行 `npm run demo` 会重建服务；`residentId` 应保持相同，对话从新根开始。
 - `POST /demo/reset` 是重置整位演示住户，不属于连续性验收。
 
