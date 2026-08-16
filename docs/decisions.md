@@ -52,6 +52,13 @@
   （政策风险见 [research/2026-08-13-relationship-harness-landscape.md](research/2026-08-13-relationship-harness-landscape.md)
   第 6 节；resume/fork 未实测，杀会话仍靠启动包重建）。来源：2026-08-15 主笔与望舒对话。
   注：此条为开工首日口头拍板的补记，D2「不上车」仅指 dsh，Claude SDK 从未在被告席。
+- 2026-08-16　**D6 主笔拍板：通道分工与派活权**。
+  一、家里日常：除 Claude 订阅外一律走 pi 通道（Claude API、Codex 订阅也走 pi）；
+  Claude SDK 专职 Claude 订阅与 coding 重活。
+  二、派活权归住户：每位住户有权分派使用 Claude SDK / pi SDK 的 subagent，
+  允许与主 agent 异源（也可同源）——通道分配是住户内部事务，不打扰用户。
+  三、面板配置区分主 agent 与 sub agent，用户可自由配置。
+  来源：2026-08-16 主笔与望舒对话。
 
 ## 规矩
 
