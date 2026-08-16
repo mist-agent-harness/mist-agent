@@ -21,6 +21,7 @@ export interface ClaudeQueryMessage {
   subtype?: string;
   result?: string;
   errors?: string[];
+  error?: string;
 }
 
 export type ClaudeQueryRunner = (request: ClaudeQueryRequest) => AsyncIterable<ClaudeQueryMessage>;
@@ -44,7 +45,22 @@ export class ClaudeBrainError extends Error {
   }
 }
 
+export class ClaudeAuthenticationError extends ClaudeBrainError {
+  constructor() {
+    super("Claude Agent SDK is not authenticated; run /login before using the demo");
+    this.name = "ClaudeAuthenticationError";
+  }
+}
+
 const defaultQueryRunner: ClaudeQueryRunner = (request) => query(request);
+
+function isAuthenticationFailureText(value: string): boolean {
+  const normalized = value.trim();
+  return (
+    normalized === "authentication_failed" ||
+    /(?:^|:\s*)Not logged in(?:\s*[·:—-]\s*Please run \/login)?$/i.test(normalized)
+  );
+}
 
 /**
  * 生成 E1 约定的 reply(residentId, message)。
@@ -58,21 +74,37 @@ export function createClaudeReply(options: CreateClaudeReplyOptions): AssistantR
     const bootPack = await options.buildBootPack(residentId);
     const queryOptions = buildClaudeQueryOptions(bootPack, options.model);
 
-    for await (const event of runQuery({ prompt: message, options: queryOptions })) {
-      if (event.type !== "result") continue;
+    try {
+      for await (const event of runQuery({ prompt: message, options: queryOptions })) {
+        if (event.type === "assistant" && event.error === "authentication_failed") {
+          throw new ClaudeAuthenticationError();
+        }
+        if (event.type !== "result") continue;
 
-      if (event.subtype === "success") {
-        const reply = event.result?.trim();
-        if (reply) return reply;
-        throw new ClaudeBrainError("Claude Agent SDK returned an empty reply");
+        if (event.subtype === "success") {
+          const reply = event.result?.trim();
+          if (reply !== undefined && isAuthenticationFailureText(reply)) {
+            throw new ClaudeAuthenticationError();
+          }
+          if (reply) return reply;
+          throw new ClaudeBrainError("Claude Agent SDK returned an empty reply");
+        }
+
+        const errors = event.errors?.filter(Boolean) ?? [];
+        if (errors.some(isAuthenticationFailureText)) throw new ClaudeAuthenticationError();
+        const detail = errors.join("; ");
+        throw new ClaudeBrainError(
+          detail
+            ? `Claude Agent SDK failed (${event.subtype ?? "unknown"}): ${detail}`
+            : `Claude Agent SDK failed (${event.subtype ?? "unknown"})`,
+        );
       }
-
-      const detail = event.errors?.filter(Boolean).join("; ");
-      throw new ClaudeBrainError(
-        detail
-          ? `Claude Agent SDK failed (${event.subtype ?? "unknown"}): ${detail}`
-          : `Claude Agent SDK failed (${event.subtype ?? "unknown"})`,
-      );
+    } catch (error) {
+      if (error instanceof ClaudeBrainError) throw error;
+      if (error instanceof Error && isAuthenticationFailureText(error.message)) {
+        throw new ClaudeAuthenticationError();
+      }
+      throw error;
     }
 
     throw new ClaudeBrainError("Claude Agent SDK ended without a result message");

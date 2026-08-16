@@ -3,11 +3,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { HarnessDriver } from "../acceptance/driver.ts";
-import { createPersistentDemoRuntime } from "../demo/runtime.ts";
+import {
+  type PersistentDemoRuntime,
+  type PersistentDemoRuntimeOptions,
+  createPersistentDemoRuntime,
+} from "../demo/runtime.ts";
 import { DEMO_SEED, DemoSeedError, assertDemoSeed, seedDemoResident } from "../demo/seed.ts";
 import { createDriver } from "../src/acceptance-driver.ts";
 
 const dirs: string[] = [];
+const runtimes: PersistentDemoRuntime[] = [];
 
 function freshDir(): string {
   const directory = mkdtempSync(join(tmpdir(), "mist-demo-seed-"));
@@ -15,7 +20,14 @@ function freshDir(): string {
   return directory;
 }
 
+async function openRuntime(options: PersistentDemoRuntimeOptions): Promise<PersistentDemoRuntime> {
+  const runtime = await createPersistentDemoRuntime(options);
+  runtimes.push(runtime);
+  return runtime;
+}
+
 afterEach(() => {
+  for (const runtime of runtimes.splice(0)) runtime.close();
   for (const directory of dirs.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
@@ -33,7 +45,7 @@ describe("demo seed", () => {
 
   it("runtime 首次启动播种，后续启动复用同一住户且零字节重复写入", async () => {
     const dataDir = freshDir();
-    const first = await createPersistentDemoRuntime({ dataDir });
+    const first = await openRuntime({ dataDir });
     const residentId = first.inspect().residentId;
     const residentPath = join(dataDir, "residents", `${residentId}.json`);
     const statePath = join(dataDir, "demo-state.json");
@@ -43,7 +55,8 @@ describe("demo seed", () => {
       files: readdirSync(join(dataDir, "residents")),
     };
 
-    const second = await createPersistentDemoRuntime({ dataDir });
+    first.close();
+    const second = await openRuntime({ dataDir });
 
     expect(second.inspect().residentId).toBe(residentId);
     expect(readFileSync(residentPath)).toEqual(before.resident);
@@ -58,7 +71,7 @@ describe("demo seed", () => {
 
   it("状态属于另一套 seed 时 fail closed，不换住户也不改字节", async () => {
     const dataDir = freshDir();
-    const first = await createPersistentDemoRuntime({ dataDir });
+    const first = await openRuntime({ dataDir });
     const residentId = first.inspect().residentId;
     const residentPath = join(dataDir, "residents", `${residentId}.json`);
     const statePath = join(dataDir, "demo-state.json");
@@ -67,6 +80,7 @@ describe("demo seed", () => {
       state: readFileSync(statePath),
     };
 
+    first.close();
     await expect(
       createPersistentDemoRuntime({
         dataDir,

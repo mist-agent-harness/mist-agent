@@ -15,6 +15,7 @@
 
 import {
   closeSync,
+  fchmodSync,
   fsyncSync,
   mkdirSync,
   openSync,
@@ -201,7 +202,8 @@ export class ResidentStore {
     const tmpPath = `${finalPath}.tmp`;
     let fd: number | null = null;
     try {
-      fd = openSync(tmpPath, "w");
+      fd = openSync(tmpPath, "w", 0o600);
+      fchmodSync(fd, 0o600);
       writeSync(fd, JSON.stringify(record));
       fsyncSync(fd);
       closeSync(fd);

@@ -84,18 +84,30 @@ async function main(): Promise<void> {
     runtime,
     adapters: [openAiChatCompletionsAdapter, anthropicMessagesAdapter],
   });
-  const address = await server.start(options.port);
-  const { residentId } = runtime.inspect();
-  process.stdout.write(
-    `${JSON.stringify({ ok: true, host: address.address, port: address.port, residentId })}\n`,
-  );
+  try {
+    const address = await server.start(options.port);
+    const { residentId } = runtime.inspect();
+    process.stdout.write(
+      `${JSON.stringify({
+        ok: true,
+        host: address.address,
+        port: address.port,
+        residentId,
+        controlToken: server.controlToken,
+      })}\n`,
+    );
 
-  const stop = async () => {
-    await server.stop();
-    process.exit(0);
-  };
-  process.once("SIGINT", () => void stop());
-  process.once("SIGTERM", () => void stop());
+    const stop = async () => {
+      await server.stop();
+      runtime.close();
+      process.exit(0);
+    };
+    process.once("SIGINT", () => void stop());
+    process.once("SIGTERM", () => void stop());
+  } catch (error) {
+    runtime.close();
+    throw error;
+  }
 }
 
 const invokedPath =
