@@ -5,7 +5,7 @@ Rejected drafts are **not** kept in the tree (binary weight); their conclusions 
 
 ## Roles · 角色
 
-- **mark / 标识**：长期识别系统（头像、favicon、README 顶图）。当前提案见 `assets/logo-handdrawn` 分支（一笔线的房子，`mist` 住在屋里；**羿设计，Laurie / zaymb 账号发布**）— 本 PR 作者投票支持该方向；本 PR 里的字标 v2（i 的点是窗）退为备选。
+- **mark / 标识**：长期识别系统（头像、favicon、README 顶图）。主提案见 `assets/logo-handdrawn` 分支（一笔线的房子，`mist` 住在屋里；**羿设计，Laurie / zaymb 账号发布**）— 本 PR 作者投票支持该方向；本 PR 里另有作者自己风格的并列候选「门里有光」（见下表），票不动，供视觉语言 v0 一起看；字标 v2（i 的点是窗）退为备选。
 - **poster / 海报**：一次性的编辑插画（README 氛围图、社交预览方向另议）。本 PR 的海报线继续。
 
 ## Files · 文件
@@ -19,6 +19,9 @@ Rejected drafts are **not** kept in the tree (binary weight); their conclusions 
 | `mist-concept-poster-oneline-mist.jpg` | proposed (poster v4) | as above without the pen / Chinese tagline |
 | `mist-concept-poster-oneline.jpg` | proposed (poster v3) | one-line drawing, no mist at all |
 | `mist-concept-poster-emptychair.jpg` | proposed (poster v2, photographic) | inside the room, photographic; empty chair, lamp, tea, letter |
+| `mist-concept-mark-doorlight.png` | proposed (mark, dankefox — parallel candidate) | "door with a light inside": one hand-drawn arch line on a ground line, the right half dissolving into ink dots; inside, low, one soft amber glow — the only color. The door dissolves, the light stays. Concept-level; needs a thicker vector stroke to survive 16px (see icon test). |
+| `mist-concept-mark-lamp.png` | proposed (mark variant, dankefox) | "the lamp left on": one thin hand-drawn table lamp, shade edge dissolving into dots, one amber glow under the shade. Same language, smaller symbol. |
+| `mist-concept-mark-icon-test.png` | test | 128 / 64 / 32 / 16 px of the two marks above; readable to 32, at 16 only the glow survives — a vector redraw with a heavier line is required if pursued. |
 | `mist-concept-logo-window-i.png` | fallback (wordmark v2) | clean letters, dot of the `i` is a lit window — concept fine, but literal, and the typeface doesn't sit with the hand-drawn paper language; superseded by 羿's mark proposal (published via Laurie / zaymb) |
 
 ## Rejected directions · 已否定方向（原图见 PR #54 历史）
