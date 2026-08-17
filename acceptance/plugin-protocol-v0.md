@@ -64,6 +64,9 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 - [ ] **PV0-B12 secret 不经插件产物进入模型**：恶意 fixture 分别从工具返回值和已声明
   context injection 回显执行边界解析过的 secret 标记；两条都在装入模型上下文前返回
   `SENSITIVE_OUTPUT_BLOCKED`，上下文、后续摘要输入和记忆候选中均无该标记。
+- [ ] **PV0-B13 注入随停用与卸载撤下**：active 插件分别装入 resident/session 注入后，将
+  `enabled` 切为 false 并完成 dispose；住户上下文快照、启动包及下一次会话重建输入均不含
+  该 plugin id 的注入段。工具与资源已消失但守则仍留在 wakepack 时本条变红。
 
 ## C. 事务注册、隔离与注销
 
@@ -87,9 +90,13 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
   计数器在观察窗内保持不变。
 - [ ] **PV0-C10 生命周期中断可恢复**：分别在 ① activate 已创建资源但 active 终态写盘前、
   ② dispose 已撤销部分资源时杀死宿主进程。重启后先执行操作日志协调且插件入口始终不可达：
-  前者按持久化注册日志回滚到 disposed，后者从撤销回执继续逆序清理；失败则 quarantined。
-  `operationId`、剩余资源 id 与 quarantined 记录跨重启仍可枚举，协调期间返回
-  `LIFECYCLE_RECOVERY_PENDING`，不得把任一孤儿中间态恢复成 ready。
+  前者按持久化注册日志回滚后停在 `blocked + ACTIVATE_FAILED`，保留 plugin id、operationId、
+  `enabled: true` 的启用意图、配置与绑定，等待显式重试或停用；后者从撤销回执继续逆序清理，
+  失败则 quarantined。剩余资源 id 与 quarantined 记录跨重启仍可枚举，协调期间返回
+  `LIFECYCLE_RECOVERY_PENDING`，不得把任一孤儿中间态恢复成 ready 或假装从未安装。
+- [ ] **PV0-C11 权威状态先于公开索引**：在 active 四元组原子提交前、提交后但公开前、公开后
+  三个时点分别杀死宿主；每次重启后，可枚举入口、路由索引与工具目录都必须是已持久化
+  `{active, config, bindings, verifiedScope}` 的子集。先持久化路由索引再写 active 记录时本条变红。
 
 ## D. 绑定、角色与凭证类型
 
@@ -176,6 +183,7 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 | B10 | 注入包外或无来源标记的上下文正文 | B10 |
 | B11 | 静默采用 server 漂移后的 instructions | B11 |
 | B12 | 允许工具返回值把已知 secret 带入模型上下文 | B12 |
+| B13 | 停用或卸载后仍把该插件守则留在 wakepack | B13 |
 | C01 | prepare 阶段提前公开首个资源 | C01 |
 | C02 | 第三个 register 失败后保留前两个 handle | C02 |
 | C03 | activate 失败后跳过 rollback | C03 |
@@ -185,7 +193,8 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 | C07 | revoke 失败后仍报告 disposed/ready | C07 |
 | C08 | 把插件运行时异常抛到宿主顶层 | C08 |
 | C09 | 失败后在无显式操作时自动循环重试 | C09 |
-| C10 | 重启时清空操作日志或 quarantined，并把孤儿中间态当 ready | C10 |
+| C10 | activate 中断回滚后清除失败记录并假装未安装，或把孤儿中间态当 ready | C10 |
+| C11 | 先持久化公开路由索引，再写 active 四元组 | C11 |
 | D01 | 仅以 lane 为键，忽略 residentId | D01 |
 | D02 | 给 subagent 挂载住户记忆 | D02 |
 | D03 | 显式换道时沿用原车道权限结果 | D03 |

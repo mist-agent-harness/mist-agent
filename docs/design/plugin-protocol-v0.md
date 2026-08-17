@@ -59,7 +59,6 @@ interface ContextInjectionDeclaration {
   id: string;                  // 插件内稳定 id
   source: string;              // 包内 UTF-8 文本相对路径，不得逃出插件根
   scope: "resident" | "session";
-  injectionMode: InjectionMode;
 }
 
 interface EnvironmentDeclaration {
@@ -107,7 +106,9 @@ interface EnvironmentBinding {
 来源标记。MCP `instructions` 或其他运行期文本只有与已声明源文件逐字一致时才能采用；
 未声明或漂移的文本必须显式拒绝并返回 `CONTEXT_INJECTION_MISMATCH`，不得静默采用或静默
 丢弃。`resident` scope 可以随住户重建再次装配，`session` scope 只属于当前会话；两者都
-不是人格或记忆写权限，插件不能借注入修改住户私有文件。
+不是人格或记忆写权限，插件不能借注入修改住户私有文件。`InjectionMode` 只描述工具 schema
+的容量策略，不适用于上下文注入正文；插件 active 时，已声明正文按 scope 装配，不允许实现
+自行猜测 lazy/eager 语义。
 
 `operations` 必须是宿主能力契约中已登记的操作名。带副作用的操作如果存在可收窄参数，
 manifest 必须把允许值声明到字面量级；例如只能触发换窗的桥接应声明
@@ -178,7 +179,7 @@ interface DisposeReport {
 discovered → validated → prepared → active → disposing → disposed
      │           │           │          │          │
      └───────────┴───────────┴──────────┴──────────┴→ blocked
-                             └─ rollback → disposed
+                             └─ rollback → blocked（保留启用意图）
                                         dispose 不完整 → quarantined
 ```
 
@@ -191,19 +192,25 @@ discovered → validated → prepared → active → disposing → disposed
 生命周期事务必须跨宿主进程边界可恢复。宿主在执行第一个生命周期副作用前，先持久化带
 `operationId` 的操作日志；日志至少记录 plugin id、操作种类（activate/dispose）、当前阶段、
 已登记资源 id 与已完成撤销回执。active 终态必须先与配置、绑定和 verified scope 原子写盘，
-再公开路由与能力；因此不存在“已经公开但没有权威 active 记录”的合法顺序。
+再公开路由与能力；因此不存在“已经公开但没有权威 active 记录”的合法顺序。任何可枚举的
+插件入口、路由索引与工具目录都必须是已持久化 active 四元组的子集，不得把公开索引作为一笔
+更早、更独立的提交。
 
 宿主启动时必须先协调未完成操作，再发布任何插件入口：中断在 activate 提交前的操作保持
-不可达，并按持久化注册日志逆序回滚到 disposed；中断在 dispose 中途的操作保持不可达，
-从最后一笔撤销回执继续清理。清理失败则进入 quarantined。`quarantined`、剩余资源 id、
-reason code 与操作日志都必须跨重启保留；不得因重启清空内存态而把孤儿中间态投影为 ready。
-协调结束前，该插件以 `LIFECYCLE_RECOVERY_PENDING` 显式 blocked，不允许自动执行普通
-prepare/activate/call 路径。
+不可达，并按持久化注册日志逆序回滚；协调完成后停在 `blocked + ACTIVATE_FAILED`，保留
+plugin id、`operationId`、`enabled: true` 的启用意图、配置与绑定，直到显式重试，或住户把
+`enabled` 改为 false 后进入 disposed。不能把一次失败启用擦成“从没安装过”。中断在 dispose
+中途的操作保持不可达，从最后一笔撤销回执继续清理；失败则进入 quarantined。
+`quarantined`、剩余资源 id、reason code 与操作日志都必须跨重启保留；不得因重启清空内存态
+而把孤儿中间态投影为 ready。协调结束前，该插件以 `LIFECYCLE_RECOVERY_PENDING` 显式
+blocked，不允许自动执行普通 prepare/activate/call 路径。
 
-卸载顺序固定为：先从路由和能力目录撤销可达性，拒绝新调用；再等待或取消在途调用；
+卸载顺序固定为：先从路由和能力目录撤销可达性，并按 plugin id 从住户模型上下文、启动包及
+后续重建输入中撤下全部 `contextInjections`，拒绝新调用与新注入；再等待或取消在途调用；
 最后逆序撤销资源并调用 `dispose`。重复卸载必须返回同一终态。某个撤销失败时，插件状态
 进入 `quarantined`，相关路由继续 fail-closed，宿主记录资源 id 和稳定 reason code；
-不得为了“看起来卸载成功”留下任何已登记或经宿主管理的监听器、出站连接、定时器或工具。
+不得为了“看起来卸载成功”留下任何已登记或经宿主管理的监听器、出站连接、定时器、工具或
+上下文守则。
 
 代价：事务注册需要宿主持久化操作日志、撤销回执和终态，并在启动时先做协调；协议要求插件
 作者把 import-time 副作用改造进 prepare/activate 生命周期，但 v0 的同进程信任边界不能
@@ -356,7 +363,7 @@ scope 的 ready。
 | `CREDENTIAL_ISSUER_UNAVAILABLE` | credential ref 无可用签发方或来源不可验证 | 不展示入口，拒绝绑定 |
 | `PERMISSION_DENIED` | 操作、参数或字面量未授权 | 当前调用失败，无副作用 |
 | `PREPARE_FAILED` | prepare 抛错、超时或返回无效 | 全量 rollback，未公开 |
-| `ACTIVATE_FAILED` | activate 失败 | 全量 rollback，未公开 |
+| `ACTIVATE_FAILED` | activate 失败或其中断恢复完成 | 全量 rollback，blocked 且未公开；保留启用意图，等待显式重试或停用 |
 | `MIGRATION_FAILED` | 迁移或目标 schema 校验失败 | 旧版本保持 ready |
 | `DISPOSE_INCOMPLETE` | 任一资源撤销失败 | quarantined，对外入口关闭 |
 | `LIFECYCLE_RECOVERY_PENDING` | 检出未完成的 activate/dispose 操作日志 | blocked 且入口关闭；启动协调完成后才进入确定终态 |
@@ -375,8 +382,8 @@ scope 的 ready。
 | RFC 规范面 | 验收区 | 主要红灯 |
 |---|---|---|
 | manifest、启停、host 兼容 | A | import 前拒装、停用后资源仍可达 |
-| 权限、secret、skill/MCP 翻译与上下文注入 | B | 越权、secret 进上下文、翻译扩权、未声明注入 |
-| 生命周期、事务注册、故障隔离 | C | 半注册、重复清理、注销留活线、拖死地基 |
+| 权限、secret、skill/MCP 翻译与上下文注入 | B | 越权、secret 进上下文、翻译扩权、未声明或卸载后残留注入 |
+| 生命周期、事务注册、故障隔离 | C | 半注册、公开早于权威提交、重复清理、注销留活线、拖死地基 |
 | 住户×车道、角色、凭证约束 | D | 串房、角色混维、错凭证覆盖好绑定 |
 | 版本升级、配置迁移、回滚 | E | 原地改配置、失败后 v1 不可用 |
 | readiness scope、不变量与变异验证 | F | 假 ready、无稳定原因码、约束删掉仍全绿 |
