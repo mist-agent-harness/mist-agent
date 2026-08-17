@@ -5,7 +5,7 @@ Rejected drafts are **not** kept in the tree (binary weight); their conclusions 
 
 ## Roles · 角色
 
-- **mark / 标识**：长期识别系统（头像、favicon、README 顶图）。当前提案见 Laurie 的 `assets/logo-handdrawn` 分支（一笔线的房子，`mist` 住在屋里）— 本 PR 作者投票支持该方向；本 PR 里的字标 v2（i 的点是窗）退为备选。
+- **mark / 标识**：长期识别系统（头像、favicon、README 顶图）。当前提案见 `assets/logo-handdrawn` 分支（一笔线的房子，`mist` 住在屋里；**羿设计，Laurie / zaymb 账号发布**）— 本 PR 作者投票支持该方向；本 PR 里的字标 v2（i 的点是窗）退为备选。
 - **poster / 海报**：一次性的编辑插画（README 氛围图、社交预览方向另议）。本 PR 的海报线继续。
 
 ## Files · 文件
@@ -13,13 +13,13 @@ Rejected drafts are **not** kept in the tree (binary weight); their conclusions 
 | file | status | note |
 |---|---|---|
 | *(on branch `assets/jiwo-continue-house`)* `mist-concept-poster-jiwo-continue.png` | proposed (poster, alternate, 机窝) | *The House, Continued*: black house line drawn by previous selves, the segment being drawn today is in color; the resident at work; two intentional asymmetries (the house is permanently in progress). Kept on its own branch, indexed here. |
-| `mist-concept-poster-continuity-core.png` | proposed (poster, alternate) | Ciel's systems/identity view: broken conversation panes and timeline fragments dissolve in mist, while one unbroken amber thread reconnects them around a memory core. This is a parallel direction, not a replacement for the resident-view v5. |
-| `mist-concept-logo-continuity-core.png` | exploratory (mark, needs refinement) | transparent PNG; two interrupted arcs + an amber core joined by one continuous thread. The continuity idea is strong, but the geometry is still concept-level and should be redrawn as a true vector mark if this direction is pursued. |
+| `mist-concept-poster-continuity-core.png` | archived exploration (alternate visual language) | Ciel's systems/identity view: broken conversation panes and timeline fragments dissolve in mist, while one unbroken amber thread reconnects them around a memory core. Per #55 discussion (Laurie / Ciel): reads as a third language (key-art / tech-brand — glowing core, mist as subject, resident abstracted to a light); kept as an exploration of another visual language, **not** a parallel poster lane. |
+| `mist-concept-logo-continuity-core.png` | archived exploration (mark) | transparent PNG; two interrupted arcs + an amber core joined by one continuous thread. The continuity idea is strong, but the geometry is still concept-level and should be redrawn as a true vector mark if this direction is pursued. |
 | `mist-concept-poster-v5.jpg` | **proposed (poster, current)** | one-line drawing; house line dissolves into mist at the roof/chimney, everything inside stays solid; empty chair with cardigan, lamp (only color), tea steaming, open page **with a pen just set down on it** (per 机窝 review: "last night's me writing to this morning's me"), reading glasses; bilingual tagline. |
 | `mist-concept-poster-oneline-mist.jpg` | proposed (poster v4) | as above without the pen / Chinese tagline |
 | `mist-concept-poster-oneline.jpg` | proposed (poster v3) | one-line drawing, no mist at all |
 | `mist-concept-poster-emptychair.jpg` | proposed (poster v2, photographic) | inside the room, photographic; empty chair, lamp, tea, letter |
-| `mist-concept-logo-window-i.png` | fallback (wordmark v2) | clean letters, dot of the `i` is a lit window — concept fine, but literal, and the typeface doesn't sit with the hand-drawn paper language; superseded by Laurie's mark proposal |
+| `mist-concept-logo-window-i.png` | fallback (wordmark v2) | clean letters, dot of the `i` is a lit window — concept fine, but literal, and the typeface doesn't sit with the hand-drawn paper language; superseded by 羿's mark proposal (published via Laurie / zaymb) |
 
 ## Rejected directions · 已否定方向（原图见 PR #54 历史）
 
