@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">mist open house logo</title>
+  <desc id="desc">A hand-drawn open house outline with the word mist living inside.</desc>
+  <style>
+    .house {
+      fill: none;
+      stroke: #252525;
+      stroke-width: 6;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .wordmark {
+      fill: none;
+      stroke: #8eadd7;
+      stroke-width: 6;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+  </style>
+  <g id="house" class="house">
+    <path d="M92 243 C98 237 103 231 110 226 L135 204 L160 177 L185 157 L210 130 L235 109 C243 101 247 96 254 98 C257 99 259 101 262 104 L280 120 L299 141 L317 156 C322 161 327 159 327 152 L327 137 C327 131 331 127 337 127 C343 126 349 127 355 127 C361 128 365 131 365 138 L364 150 L365 163 L365 174 C365 185 368 193 376 201 L386 209 L397 222 L407 231 C413 237 417 242 419 249"/>
+    <path d="M109 227 C114 233 115 239 116 249 L115 278 L117 305 L115 331 L116 354 C115 369 122 383 133 388 C140 392 148 391 155 392 L190 391 L220 394 L260 391 L298 390 L332 393 L373 392"/>
+  </g>
+  <g id="wordmark" class="wordmark">
+    <path d="M174 324 C175 310 174 299 178 295 C181 292 186 294 188 299 C190 304 189 313 189 321 C190 308 192 300 197 296 C201 293 205 295 207 300 C210 306 208 315 208 323"/>
+    <path d="M231 302 L231 323"/>
+    <path d="M231 289 L231 288"/>
+    <path d="M270 299 C266 294 255 295 253 301 C249 310 270 306 269 316 C268 324 257 326 252 321"/>
+    <path d="M305 282 C305 298 304 311 306 323"/>
+    <path d="M294 300 C302 299 311 299 318 300"/>
+  </g>
+</svg>
