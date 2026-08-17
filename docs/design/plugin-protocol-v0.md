@@ -188,13 +188,26 @@ discovered → validated → prepared → active → disposing → disposed
 以一次原子提交公开整批资源；中途失败则按注册逆序撤销全部句柄并调用 `rollback`。部分
 成功不得泄漏为半个 active 插件。
 
+生命周期事务必须跨宿主进程边界可恢复。宿主在执行第一个生命周期副作用前，先持久化带
+`operationId` 的操作日志；日志至少记录 plugin id、操作种类（activate/dispose）、当前阶段、
+已登记资源 id 与已完成撤销回执。active 终态必须先与配置、绑定和 verified scope 原子写盘，
+再公开路由与能力；因此不存在“已经公开但没有权威 active 记录”的合法顺序。
+
+宿主启动时必须先协调未完成操作，再发布任何插件入口：中断在 activate 提交前的操作保持
+不可达，并按持久化注册日志逆序回滚到 disposed；中断在 dispose 中途的操作保持不可达，
+从最后一笔撤销回执继续清理。清理失败则进入 quarantined。`quarantined`、剩余资源 id、
+reason code 与操作日志都必须跨重启保留；不得因重启清空内存态而把孤儿中间态投影为 ready。
+协调结束前，该插件以 `LIFECYCLE_RECOVERY_PENDING` 显式 blocked，不允许自动执行普通
+prepare/activate/call 路径。
+
 卸载顺序固定为：先从路由和能力目录撤销可达性，拒绝新调用；再等待或取消在途调用；
 最后逆序撤销资源并调用 `dispose`。重复卸载必须返回同一终态。某个撤销失败时，插件状态
 进入 `quarantined`，相关路由继续 fail-closed，宿主记录资源 id 和稳定 reason code；
 不得为了“看起来卸载成功”留下任何已登记或经宿主管理的监听器、出站连接、定时器或工具。
 
-代价：事务注册需要宿主保存注册日志和终态；协议要求插件作者把 import-time 副作用改造进
-prepare/activate 生命周期，但 v0 的同进程信任边界不能机械拦截故意绕开的 Node 原生调用。
+代价：事务注册需要宿主持久化操作日志、撤销回执和终态，并在启动时先做协调；协议要求插件
+作者把 import-time 副作用改造进 prepare/activate 生命周期，但 v0 的同进程信任边界不能
+机械拦截故意绕开的 Node 原生调用。
 
 ## 4. 故障只影响插件，不拖死地基
 
@@ -346,6 +359,7 @@ scope 的 ready。
 | `ACTIVATE_FAILED` | activate 失败 | 全量 rollback，未公开 |
 | `MIGRATION_FAILED` | 迁移或目标 schema 校验失败 | 旧版本保持 ready |
 | `DISPOSE_INCOMPLETE` | 任一资源撤销失败 | quarantined，对外入口关闭 |
+| `LIFECYCLE_RECOVERY_PENDING` | 检出未完成的 activate/dispose 操作日志 | blocked 且入口关闭；启动协调完成后才进入确定终态 |
 | `PLUGIN_RUNTIME_FAILED` | active 插件调用抛错或超时 | 当前调用失败；按策略降级或 blocked |
 | `CONTEXT_INJECTION_MISMATCH` | 运行期注入未声明或与包内正文不一致 | 拒绝注入；degraded/blocked |
 | `SENSITIVE_OUTPUT_BLOCKED` | 插件输出或注入试图把已知 secret 带入模型上下文 | 当前调用失败；按策略降级或 blocked |

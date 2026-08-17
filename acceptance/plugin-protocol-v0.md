@@ -85,6 +85,11 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
   调用返回 `PLUGIN_RUNTIME_FAILED`，另一插件、住户存储和 boot-time 不变量仍可读写。
 - [ ] **PV0-C09 不自动重试风暴**：失败插件在无显式操作时不再次 prepare/activate/call；
   计数器在观察窗内保持不变。
+- [ ] **PV0-C10 生命周期中断可恢复**：分别在 ① activate 已创建资源但 active 终态写盘前、
+  ② dispose 已撤销部分资源时杀死宿主进程。重启后先执行操作日志协调且插件入口始终不可达：
+  前者按持久化注册日志回滚到 disposed，后者从撤销回执继续逆序清理；失败则 quarantined。
+  `operationId`、剩余资源 id 与 quarantined 记录跨重启仍可枚举，协调期间返回
+  `LIFECYCLE_RECOVERY_PENDING`，不得把任一孤儿中间态恢复成 ready。
 
 ## D. 绑定、角色与凭证类型
 
@@ -120,7 +125,7 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 - [ ] **PV0-E03 坏目标 schema 回到 v1**：migrate 返回不符合 v2 schema 的配置；结果同
   E02，不能留下被改写的旧配置。
 - [ ] **PV0-E04 v2 激活失败回到 v1**：迁移与 prepare 成功、activate 失败；新版本资源
-  全撤销，v1 恢复 ready，返回 `ACTIVATE_FAILED`。
+  全撤销，v1 的原配置、原绑定和原 verified scope 恢复 ready，返回 `ACTIVATE_FAILED`。
 - [ ] **PV0-E05 缺迁移路径拒绝升级**：config schema 改变但插件无对应 migrate；返回
   `MIGRATION_FAILED`，不尝试猜字段或原地升级。
 - [ ] **PV0-E06 迁移不接触 secret 值**：migrate 输入只有配置副本与 credential refs；
@@ -180,6 +185,7 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 | C07 | revoke 失败后仍报告 disposed/ready | C07 |
 | C08 | 把插件运行时异常抛到宿主顶层 | C08 |
 | C09 | 失败后在无显式操作时自动循环重试 | C09 |
+| C10 | 重启时清空操作日志或 quarantined，并把孤儿中间态当 ready | C10 |
 | D01 | 仅以 lane 为键，忽略 residentId | D01 |
 | D02 | 给 subagent 挂载住户记忆 | D02 |
 | D03 | 显式换道时沿用原车道权限结果 | D03 |
@@ -193,7 +199,7 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 | E01 | v2 active 前把调用切到新版本 | E01 |
 | E02 | migrate 抛错后留下被改写的 v1 配置 | E02 |
 | E03 | 跳过 v2 schema 校验并提交坏配置 | E03 |
-| E04 | v2 activate 失败后不恢复 v1 ready | E04 |
+| E04 | v2 activate 失败后以缩水的 verified scope 恢复 v1 ready | E04 |
 | E05 | 缺 migrate 时猜字段并原地升级 | E05 |
 | E06 | 给 migrate 暴露读取凭证值的接口 | E06 |
 | F01 | 把一个车道的 ready 投影到所有 scope | F01 |
