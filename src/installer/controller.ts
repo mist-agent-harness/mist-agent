@@ -47,7 +47,7 @@ export class InstallerController {
       this.#draft = existing;
       return cloneDraft(existing);
     }
-    if (existing !== null) this.#store.discardDraft();
+    if (existing !== null) this.#store.discardDraft(existing.draftId);
     const draft = createInstallerDraft(residentId);
     this.#store.saveDraft(draft);
     this.#draft = draft;
@@ -93,9 +93,9 @@ export class InstallerController {
     for (const entry of entries) {
       const secretRef = credentialSecretRef(entry.credential.ref);
       if (entry.secret !== undefined) {
-        this.#store.stageSecret(secretRef, entry.secret);
+        this.#store.stageSecret(draft.draftId, secretRef, entry.secret);
       }
-      const status = this.#store.hasStagedSecret(secretRef) ? "ready" : "incomplete";
+      const status = this.#store.hasStagedSecret(draft.draftId, secretRef) ? "ready" : "incomplete";
       credentials.push({ ...entry.credential, ref: { ...entry.credential.ref }, status });
     }
     draft.credentials = credentials;
@@ -130,7 +130,9 @@ export class InstallerController {
     }
     draft.memory = { ...memory };
     draft.sideEffects =
-      memory.kind === "create" ? [{ kind: "memory_dir_created", path: memory.path }] : [];
+      memory.kind === "create"
+        ? [{ kind: "memory_dir_created", path: memory.path, ownerDraftId: draft.draftId }]
+        : [];
     completeStep(draft, "memory", "review");
     this.#persist(draft);
     return cloneDraft(draft);
@@ -147,7 +149,7 @@ export class InstallerController {
   }
 
   discard(): void {
-    this.#store.discardDraft();
+    this.#store.discardDraft(this.#requireDraft().draftId);
     this.#draft = null;
   }
 

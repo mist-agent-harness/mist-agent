@@ -12,12 +12,36 @@ import {
 import { dirname, join } from "node:path";
 
 const MARKER_NAME = ".mist-memory.json";
-const MARKER_BODY = JSON.stringify({ schemaVersion: 1, kind: "mist-empty-library" });
+
+interface EmptyLibraryMarker {
+  schemaVersion: 1;
+  kind: "mist-empty-library";
+  ownerDraftId: string;
+}
+
+function markerBody(ownerDraftId: string): string {
+  return JSON.stringify({ schemaVersion: 1, kind: "mist-empty-library", ownerDraftId });
+}
+
+function markerOwner(path: string): string | null {
+  try {
+    const marker = JSON.parse(
+      readFileSync(join(path, MARKER_NAME), "utf8"),
+    ) as Partial<EmptyLibraryMarker>;
+    return marker.schemaVersion === 1 &&
+      marker.kind === "mist-empty-library" &&
+      typeof marker.ownerDraftId === "string"
+      ? marker.ownerDraftId
+      : null;
+  } catch {
+    return null;
+  }
+}
 
 export interface MemoryLibraryPort {
   assertExisting(path: string): void;
-  createEmpty(path: string): void;
-  discardEmpty(path: string): boolean;
+  createEmpty(path: string, ownerDraftId: string): void;
+  discardEmpty(path: string, ownerDraftId: string): boolean;
 }
 
 /** Creates a complete empty library by sibling-directory rename and only removes its own marker. */
@@ -28,17 +52,16 @@ export class FileMemoryLibrary implements MemoryLibraryPort {
     }
   }
 
-  createEmpty(path: string): void {
+  createEmpty(path: string, ownerDraftId: string): void {
     if (existsSync(path)) {
-      const markerPath = join(path, MARKER_NAME);
-      if (existsSync(markerPath) && readFileSync(markerPath, "utf8") === MARKER_BODY) return;
+      if (markerOwner(path) !== null) return;
       throw new Error(`memory library path already exists: ${path}`);
     }
     mkdirSync(dirname(path), { recursive: true });
     const temporaryPath = `${path}.mist-tmp-${randomUUID()}`;
     try {
       mkdirSync(temporaryPath, { mode: 0o700 });
-      writeFileSync(join(temporaryPath, MARKER_NAME), MARKER_BODY, { mode: 0o600 });
+      writeFileSync(join(temporaryPath, MARKER_NAME), markerBody(ownerDraftId), { mode: 0o600 });
       renameSync(temporaryPath, path);
     } catch (error) {
       rmSync(temporaryPath, { recursive: true, force: true });
@@ -46,7 +69,7 @@ export class FileMemoryLibrary implements MemoryLibraryPort {
     }
   }
 
-  discardEmpty(path: string): boolean {
+  discardEmpty(path: string, ownerDraftId: string): boolean {
     if (!existsSync(path)) return true;
     const entries = readdirSync(path);
     const markerPath = join(path, MARKER_NAME);
@@ -54,7 +77,7 @@ export class FileMemoryLibrary implements MemoryLibraryPort {
       entries.length !== 1 ||
       entries[0] !== MARKER_NAME ||
       !existsSync(markerPath) ||
-      readFileSync(markerPath, "utf8") !== MARKER_BODY
+      markerOwner(path) !== ownerDraftId
     ) {
       return false;
     }

@@ -401,8 +401,8 @@ it("lets a pending official-skin draft switch to an external frontend without re
     pluginId: "mist-official-skin",
     installation: "pending",
   });
-  first.saveMemory({ kind: "create", path: memoryPath });
-  libraries.createEmpty(memoryPath);
+  const reviewDraft = first.saveMemory({ kind: "create", path: memoryPath });
+  libraries.createEmpty(memoryPath, reviewDraft.draftId);
 
   const prompt = new ScriptedPrompt({
     selects: ["resume", "change", "external"],
@@ -506,8 +506,8 @@ it("removes an untouched installer-created memory library when its draft is disc
     },
   ]);
   old.saveFrontend({ kind: "external", integration: "mist-session-api" });
-  libraries.createEmpty(memoryPath);
-  old.saveMemory({ kind: "create", path: memoryPath });
+  const reviewDraft = old.saveMemory({ kind: "create", path: memoryPath });
+  libraries.createEmpty(memoryPath, reviewDraft.draftId);
 
   const replacementPath = join(directory, "replacement-memory");
   const prompt = new ScriptedPrompt({
@@ -529,5 +529,84 @@ it("removes an untouched installer-created memory library when its draft is disc
   expect(result.status).toBe("committed");
   expect(existsSync(memoryPath)).toBe(false);
   expect(existsSync(replacementPath)).toBe(true);
+  prompt.expectExhausted();
+});
+
+it("does not delete the active memory library when a same-path replacement draft is discarded", async () => {
+  const directory = freshDirectory();
+  const memoryPath = join(directory, "active-memory");
+  const store = new InstallerStateStore(directory);
+  const libraries = new FileMemoryLibrary();
+
+  const active = new InstallerController(store);
+  active.start("resident-1");
+  active.saveCredentials([
+    {
+      credential: {
+        ref: apiKeyRef("active-key"),
+        label: "Active",
+        providerId: "codex",
+        status: "incomplete",
+      },
+      secret: "active-secret",
+    },
+  ]);
+  active.saveBindings([
+    {
+      residentId: "resident-1",
+      lane: "primary",
+      adapterId: "pi",
+      credentialRef: apiKeyRef("active-key"),
+    },
+  ]);
+  active.saveFrontend({ kind: "external", integration: "mist-session-api" });
+  const activeDraft = active.saveMemory({ kind: "create", path: memoryPath });
+  libraries.createEmpty(memoryPath, activeDraft.draftId);
+  active.commit();
+
+  const abandoned = new InstallerController(store);
+  abandoned.start("resident-1");
+  abandoned.saveCredentials([
+    {
+      credential: {
+        ref: apiKeyRef("abandoned-key"),
+        label: "Abandoned",
+        providerId: "codex",
+        status: "incomplete",
+      },
+      secret: "abandoned-secret",
+    },
+  ]);
+  abandoned.saveBindings([
+    {
+      residentId: "resident-1",
+      lane: "primary",
+      adapterId: "pi",
+      credentialRef: apiKeyRef("abandoned-key"),
+    },
+  ]);
+  abandoned.saveFrontend({ kind: "external", integration: "mist-session-api" });
+  const abandonedDraft = abandoned.saveMemory({ kind: "create", path: memoryPath });
+  libraries.createEmpty(memoryPath, abandonedDraft.draftId);
+
+  const prompt = new ScriptedPrompt({
+    selects: ["discard", "codex", "api-key", "replacement-key", "external", "existing"],
+    inputs: ["replacement-key", memoryPath],
+    secrets: ["replacement-secret"],
+    confirms: [false, false, true],
+  });
+  const result = await runInstaller({
+    residentId: "resident-1",
+    dataDir: directory,
+    controller: new InstallerController(store),
+    store,
+    prompt,
+    oauth: noOAuth,
+    memoryLibraries: libraries,
+  });
+
+  expect(result.status).toBe("committed");
+  expect(existsSync(memoryPath)).toBe(true);
+  expect(store.loadCurrentConfig()?.memory).toEqual({ kind: "existing", path: memoryPath });
   prompt.expectExhausted();
 });

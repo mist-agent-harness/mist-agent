@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import {
+  INSTALLER_DRAFT_SCHEMA_VERSION,
   type InstallCommitReceipt,
   type InstallerDraft,
   InstallerValidationError,
@@ -24,6 +25,7 @@ import {
 interface CurrentPointer {
   schemaVersion: 1;
   snapshotId: string;
+  sourceDraftId?: string;
 }
 
 function fsyncDirectory(path: string): void {
@@ -91,10 +93,34 @@ export class InstallerStateStore {
   loadDraft(): InstallerDraft | null {
     try {
       const draft = parseJson<InstallerDraft>(this.#draftPath);
-      if (draft.schemaVersion !== 1 || !Array.isArray(draft.credentials)) {
+      if (
+        draft.schemaVersion !== INSTALLER_DRAFT_SCHEMA_VERSION ||
+        typeof draft.draftId !== "string" ||
+        !Array.isArray(draft.credentials)
+      ) {
         throw new InstallerValidationError("installer draft has an unsupported shape");
       }
+      assertSafeInstallerId(draft.draftId, "draft id");
       if (!Array.isArray(draft.sideEffects)) draft.sideEffects = [];
+      for (const sideEffect of draft.sideEffects) {
+        if (
+          sideEffect.kind !== "memory_dir_created" ||
+          typeof sideEffect.path !== "string" ||
+          sideEffect.path.trim().length === 0 ||
+          sideEffect.ownerDraftId !== draft.draftId
+        ) {
+          throw new InstallerValidationError("installer draft has an invalid side-effect receipt");
+        }
+      }
+      const pointer = this.#loadCurrentPointer();
+      if (pointer?.sourceDraftId === draft.draftId) {
+        try {
+          this.discardDraft(draft.draftId);
+        } catch {
+          // The current pointer proves this draft committed. Never expose it as resumable.
+        }
+        return null;
+      }
       return draft;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
@@ -106,19 +132,22 @@ export class InstallerStateStore {
     writePrivateFile(this.#draftPath, JSON.stringify(draft, null, 2));
   }
 
-  stageSecret(secretRef: string, secret: string): void {
+  stageSecret(draftId: string, secretRef: string, secret: string): void {
+    assertSafeInstallerId(draftId, "draft id");
     assertSafeInstallerId(secretRef, "credential secretRef");
     if (secret.length === 0) {
       throw new InstallerValidationError("credential secret must not be empty");
     }
-    mkdirSync(this.#draftSecretsDir, { recursive: true, mode: 0o700 });
-    writePrivateFile(join(this.#draftSecretsDir, secretRef), secret);
+    const draftSecrets = join(this.#draftSecretsDir, draftId);
+    mkdirSync(draftSecrets, { recursive: true, mode: 0o700 });
+    writePrivateFile(join(draftSecrets, secretRef), secret);
   }
 
-  hasStagedSecret(secretRef: string): boolean {
+  hasStagedSecret(draftId: string, secretRef: string): boolean {
+    assertSafeInstallerId(draftId, "draft id");
     assertSafeInstallerId(secretRef, "credential secretRef");
     try {
-      readFileSync(join(this.#draftSecretsDir, secretRef));
+      readFileSync(join(this.#draftSecretsDir, draftId, secretRef));
       return true;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
@@ -126,16 +155,27 @@ export class InstallerStateStore {
     }
   }
 
-  discardDraft(): void {
-    rmSync(this.#draftPath, { force: true });
-    rmSync(this.#draftSecretsDir, { recursive: true, force: true });
+  discardDraft(expectedDraftId: string): void {
+    assertSafeInstallerId(expectedDraftId, "draft id");
+    try {
+      const stored = parseJson<InstallerDraft>(this.#draftPath);
+      if (stored.draftId !== expectedDraftId) {
+        throw new InstallerValidationError(
+          `refusing to discard draft ${stored.draftId}; expected ${expectedDraftId}`,
+        );
+      }
+      rmSync(this.#draftPath, { force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    rmSync(join(this.#draftSecretsDir, expectedDraftId), { recursive: true, force: true });
   }
 
   commit(draft: InstallerDraft): InstallCommitReceipt {
     const config = validateReadyDraft(draft);
     for (const credential of draft.credentials) {
       const secretRef = credentialSecretRef(credential.ref);
-      if (!this.hasStagedSecret(secretRef)) {
+      if (!this.hasStagedSecret(draft.draftId, secretRef)) {
         throw new InstallerValidationError(
           `credential ${credential.ref.id} has no staged secret material`,
         );
@@ -151,12 +191,16 @@ export class InstallerStateStore {
       writePrivateFile(join(temporarySnapshot, "config.json"), JSON.stringify(config, null, 2));
       for (const credential of draft.credentials) {
         const secretRef = credentialSecretRef(credential.ref);
-        const secret = readFileSync(join(this.#draftSecretsDir, secretRef), "utf8");
+        const secret = readFileSync(join(this.#draftSecretsDir, draft.draftId, secretRef), "utf8");
         writePrivateFile(join(credentialsDirectory, secretRef), secret);
       }
       renameSync(temporarySnapshot, finalSnapshot);
       fsyncDirectory(this.#snapshotsDir);
-      const pointer: CurrentPointer = { schemaVersion: 1, snapshotId };
+      const pointer: CurrentPointer = {
+        schemaVersion: 1,
+        snapshotId,
+        sourceDraftId: draft.draftId,
+      };
       writePrivateFile(this.#currentPath, JSON.stringify(pointer));
     } catch (error) {
       rmSync(temporarySnapshot, { recursive: true, force: true });
@@ -166,21 +210,17 @@ export class InstallerStateStore {
     // The new snapshot is already authoritative. Cleanup must never turn a successful commit
     // into a reported failure, because callers might retry and create a second installation.
     try {
-      this.discardDraft();
+      this.discardDraft(draft.draftId);
     } catch {
-      // A stale draft is harmless: current.json remains the single authoritative pointer.
+      // loadDraft reconciles sourceDraftId against current.json and never resumes this stale draft.
     }
     return { snapshotId, config };
   }
 
   loadCurrentConfig(): MistInstallConfigV0 | null {
     try {
-      const pointer = parseJson<CurrentPointer>(this.#currentPath);
-      if (pointer.schemaVersion !== 1) {
-        throw new InstallerValidationError(
-          `unsupported current pointer schemaVersion: ${pointer.schemaVersion}`,
-        );
-      }
+      const pointer = this.#loadCurrentPointer();
+      if (pointer === null) return null;
       assertSafeInstallerId(pointer.snapshotId, "snapshot id");
       return parseJson<MistInstallConfigV0>(
         join(this.#snapshotsDir, pointer.snapshotId, "config.json"),
@@ -198,5 +238,23 @@ export class InstallerStateStore {
       join(this.#snapshotsDir, pointer.snapshotId, "credentials", secretRef),
       "utf8",
     );
+  }
+
+  #loadCurrentPointer(): CurrentPointer | null {
+    try {
+      const pointer = parseJson<CurrentPointer>(this.#currentPath);
+      if (pointer.schemaVersion !== 1) {
+        throw new InstallerValidationError(
+          `unsupported current pointer schemaVersion: ${pointer.schemaVersion}`,
+        );
+      }
+      if (pointer.sourceDraftId !== undefined) {
+        assertSafeInstallerId(pointer.sourceDraftId, "source draft id");
+      }
+      return pointer;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
   }
 }

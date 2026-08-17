@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -48,6 +48,15 @@ function completeDraft(controller: InstallerController): InstallerDraft {
   controller.saveBindings([primaryBinding()]);
   controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
   return controller.saveMemory({ kind: "create", path: "/tmp/mist-memory" });
+}
+
+class CleanupFailingStore extends InstallerStateStore {
+  failCleanup = false;
+
+  override discardDraft(expectedDraftId: string): void {
+    if (this.failCleanup) throw new Error("injected cleanup failure");
+    super.discardDraft(expectedDraftId);
+  }
 }
 
 describe("installer controller", () => {
@@ -111,11 +120,12 @@ describe("installer controller", () => {
     const controller = new InstallerController(new InstallerStateStore(directory));
     controller.start("resident-1");
     controller.saveCredentials([{ credential: apiCredential(), secret: "secret-value" }]);
+    const draftId = controller.current().draftId;
     controller.discard();
 
     const store = new InstallerStateStore(directory);
     expect(store.loadDraft()).toBeNull();
-    expect(store.hasStagedSecret("codex-main.credential")).toBe(false);
+    expect(store.hasStagedSecret(draftId, "codex-main.credential")).toBe(false);
   });
 
   it("commits a complete snapshot without putting secret text in config or draft", () => {
@@ -130,6 +140,24 @@ describe("installer controller", () => {
     expect(store.readCredentialSecret("codex-main")).toBe("secret-value");
     expect(JSON.stringify(receipt.config)).not.toContain("secret-value");
     expect(readFileSync(join(directory, "current.json"), "utf8")).not.toContain("secret-value");
+  });
+
+  it("reconciles a committed current pointer even when draft cleanup fails", () => {
+    const directory = freshDirectory();
+    const store = new CleanupFailingStore(directory);
+    const controller = new InstallerController(store);
+    const committedDraft = completeDraft(controller);
+    store.failCleanup = true;
+
+    const receipt = controller.commit();
+
+    expect(existsSync(join(directory, "installer-draft.json"))).toBe(true);
+    expect(store.loadCurrentConfig()).toEqual(receipt.config);
+    expect(store.loadDraft()).toBeNull();
+
+    const replacement = new InstallerController(store).start("resident-1");
+    expect(replacement.draftId).not.toBe(committedDraft.draftId);
+    expect(store.hasStagedSecret(replacement.draftId, "codex-main.credential")).toBe(false);
   });
 
   it("writes draft, config, pointer, and credential files with owner-only permissions", () => {
@@ -174,7 +202,113 @@ describe("installer controller", () => {
     controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
     controller.saveMemory({ kind: "existing", path: "/tmp/existing" });
 
-    expect(() => controller.commit()).toThrow(/requires adapter claude-agent-sdk/);
+    expect(() => controller.commit()).toThrow(/does not accept credential type claude_oauth/);
+  });
+
+  it("refuses a binding for a different resident at commit time", () => {
+    const directory = freshDirectory();
+    const controller = new InstallerController(new InstallerStateStore(directory));
+    controller.start("resident-1");
+    controller.saveCredentials([{ credential: apiCredential(), secret: "secret-value" }]);
+    controller.saveBindings([{ ...primaryBinding(), residentId: "other-resident" }]);
+    controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
+    controller.saveMemory({ kind: "existing", path: "/tmp/existing" });
+
+    expect(() => controller.commit()).toThrow(/does not match draft resident/);
+  });
+
+  it("enforces each adapter's declared credential types at commit time", () => {
+    const directory = freshDirectory();
+    const controller = new InstallerController(new InstallerStateStore(directory));
+    controller.start("resident-1");
+    controller.saveCredentials([
+      {
+        credential: {
+          ...apiCredential("codex-login"),
+          ref: { id: "codex-login", type: "codex_oauth", issuerId: "pi" },
+        },
+        secret: "oauth-material",
+      },
+    ]);
+    controller.saveBindings([
+      {
+        residentId: "resident-1",
+        lane: "primary",
+        adapterId: "claude-agent-sdk",
+        credentialRef: { id: "codex-login", type: "codex_oauth", issuerId: "pi" },
+      },
+    ]);
+    controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
+    controller.saveMemory({ kind: "existing", path: "/tmp/existing" });
+
+    expect(() => controller.commit()).toThrow(
+      /claude-agent-sdk does not accept credential type codex_oauth/,
+    );
+  });
+
+  it.each([
+    {
+      name: "credential type",
+      mutate(draft: InstallerDraft) {
+        const credential = draft.credentials[0];
+        const binding = draft.bindings[0];
+        if (credential === undefined || binding === undefined) throw new Error("missing fixture");
+        credential.ref.type = "future_oauth" as never;
+        binding.credentialRef.type = "future_oauth" as never;
+      },
+      error: /unsupported type/,
+    },
+    {
+      name: "credential status",
+      mutate(draft: InstallerDraft) {
+        const credential = draft.credentials[0];
+        if (credential === undefined) throw new Error("missing fixture");
+        credential.status = "unknown" as never;
+      },
+      error: /unsupported status/,
+    },
+    {
+      name: "lane",
+      mutate(draft: InstallerDraft) {
+        const binding = draft.bindings[0];
+        if (binding === undefined) throw new Error("missing fixture");
+        binding.lane = "sideways" as never;
+      },
+      error: /unsupported binding lane/,
+    },
+    {
+      name: "adapter",
+      mutate(draft: InstallerDraft) {
+        const binding = draft.bindings[0];
+        if (binding === undefined) throw new Error("missing fixture");
+        binding.adapterId = "unknown-adapter";
+      },
+      error: /unsupported binding adapter/,
+    },
+  ])("rejects a corrupted runtime $name enum", ({ mutate, error }) => {
+    const directory = freshDirectory();
+    const store = new InstallerStateStore(directory);
+    const controller = new InstallerController(store);
+    const draft = completeDraft(controller);
+    mutate(draft);
+    store.saveDraft(draft);
+    const resumed = new InstallerController(store);
+    resumed.start("resident-1", "resume");
+
+    expect(() => resumed.commit()).toThrow(error);
+  });
+
+  it("rejects a corrupted memory ownership receipt before it can be discarded", () => {
+    const directory = freshDirectory();
+    const store = new InstallerStateStore(directory);
+    const controller = new InstallerController(store);
+    const draft = completeDraft(controller);
+    const sideEffect = draft.sideEffects[0];
+    if (sideEffect === undefined) throw new Error("missing fixture");
+    sideEffect.ownerDraftId = "another-draft";
+    store.saveDraft(draft);
+
+    expect(() => store.loadDraft()).toThrow(/invalid side-effect receipt/);
   });
 
   it("refuses a binding whose issuer does not match the stored credential ref", () => {

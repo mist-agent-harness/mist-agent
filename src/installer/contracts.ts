@@ -1,4 +1,6 @@
-export const INSTALLER_DRAFT_SCHEMA_VERSION = 1;
+import { randomUUID } from "node:crypto";
+
+export const INSTALLER_DRAFT_SCHEMA_VERSION = 2;
 export const INSTALL_CONFIG_SCHEMA_VERSION = 1;
 
 export type InstallerStep = "credentials" | "bindings" | "frontend" | "memory" | "review";
@@ -65,6 +67,7 @@ export interface InstallerProgress {
 export type InstallerSideEffect = {
   kind: "memory_dir_created";
   path: string;
+  ownerDraftId: string;
 };
 
 /**
@@ -76,6 +79,7 @@ export type InstallerSideEffect = {
  */
 export interface InstallerDraft {
   schemaVersion: typeof INSTALLER_DRAFT_SCHEMA_VERSION;
+  draftId: string;
   residentId: string;
   credentials: InstallerCredential[];
   bindings: LaneBinding[];
@@ -127,6 +131,7 @@ export function createInstallerDraft(residentId: string): InstallerDraft {
   }
   return {
     schemaVersion: INSTALLER_DRAFT_SCHEMA_VERSION,
+    draftId: randomUUID(),
     residentId,
     credentials: [],
     bindings: [],
@@ -156,6 +161,32 @@ function validateCredentialIssuer(credential: InstallerCredential): void {
   }
 }
 
+const CREDENTIAL_TYPES = new Set<CredentialType>([
+  "claude_oauth",
+  "codex_oauth",
+  "grok_oauth",
+  "api_key",
+]);
+const CREDENTIAL_STATUSES = new Set<CredentialStatus>(["ready", "incomplete"]);
+const LANES = new Set<Lane>(["primary", "coding"]);
+const ADAPTER_CREDENTIAL_TYPES = {
+  pi: new Set<CredentialType>(["codex_oauth", "grok_oauth", "api_key"]),
+  "claude-agent-sdk": new Set<CredentialType>(["claude_oauth", "api_key"]),
+} as const;
+
+function validateCredentialEnums(credential: InstallerCredential): void {
+  if (!CREDENTIAL_TYPES.has(credential.ref.type)) {
+    throw new InstallerValidationError(
+      `credential ${credential.ref.id} has unsupported type: ${String(credential.ref.type)}`,
+    );
+  }
+  if (!CREDENTIAL_STATUSES.has(credential.status)) {
+    throw new InstallerValidationError(
+      `credential ${credential.ref.id} has unsupported status: ${String(credential.status)}`,
+    );
+  }
+}
+
 function validateBindingCredential(
   binding: LaneBinding,
   credentials: ReadonlyMap<string, InstallerCredential>,
@@ -174,9 +205,14 @@ function validateBindingCredential(
       `binding credential type or issuer does not match stored ref: ${binding.credentialRef.id}`,
     );
   }
-  if (credential.ref.type === "claude_oauth" && binding.adapterId !== "claude-agent-sdk") {
+  const acceptedTypes =
+    ADAPTER_CREDENTIAL_TYPES[binding.adapterId as keyof typeof ADAPTER_CREDENTIAL_TYPES];
+  if (acceptedTypes === undefined) {
+    throw new InstallerValidationError(`unsupported binding adapter: ${binding.adapterId}`);
+  }
+  if (!acceptedTypes.has(credential.ref.type)) {
     throw new InstallerValidationError(
-      `credential ${credential.ref.id} requires adapter claude-agent-sdk`,
+      `adapter ${binding.adapterId} does not accept credential type ${credential.ref.type}`,
     );
   }
 }
@@ -187,6 +223,7 @@ export function validateReadyDraft(draft: InstallerDraft): MistInstallConfigV0 {
       `unsupported installer draft schemaVersion: ${draft.schemaVersion}`,
     );
   }
+  assertSafeInstallerId(draft.draftId, "draft id");
   requireNonEmpty(draft.residentId, "residentId");
   if (draft.credentials.length === 0) {
     throw new InstallerValidationError("at least one credential is required");
@@ -198,6 +235,7 @@ export function validateReadyDraft(draft: InstallerDraft): MistInstallConfigV0 {
     requireNonEmpty(credential.label, `credential ${credential.ref.id} label`);
     requireNonEmpty(credential.providerId, `credential ${credential.ref.id} providerId`);
     requireNonEmpty(credential.ref.issuerId, `credential ${credential.ref.id} issuerId`);
+    validateCredentialEnums(credential);
     validateCredentialIssuer(credential);
     if (credential.status !== "ready") {
       throw new InstallerValidationError(`credential ${credential.ref.id} is incomplete`);
@@ -211,6 +249,14 @@ export function validateReadyDraft(draft: InstallerDraft): MistInstallConfigV0 {
   const bindings = new Set<string>();
   for (const binding of draft.bindings) {
     requireNonEmpty(binding.residentId, "binding residentId");
+    if (binding.residentId !== draft.residentId) {
+      throw new InstallerValidationError(
+        `binding resident ${binding.residentId} does not match draft resident ${draft.residentId}`,
+      );
+    }
+    if (!LANES.has(binding.lane)) {
+      throw new InstallerValidationError(`unsupported binding lane: ${String(binding.lane)}`);
+    }
     requireNonEmpty(binding.adapterId, "binding adapterId");
     const bindingKey = `${binding.residentId}\u0000${binding.lane}`;
     if (bindings.has(bindingKey)) {

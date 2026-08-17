@@ -253,8 +253,8 @@ async function collectMemory(options: RunInstallerOptions): Promise<void> {
   }
   // Record the intended side effect before creating it. If the process dies between these
   // operations, resume can safely recreate it; discard still knows exactly what may be removed.
-  options.controller.saveMemory({ kind, path });
-  options.memoryLibraries.createEmpty(path);
+  const draft = options.controller.saveMemory({ kind, path });
+  options.memoryLibraries.createEmpty(path, draft.draftId);
 }
 
 export async function runInstaller(options: RunInstallerOptions): Promise<RunInstallerResult> {
@@ -290,7 +290,7 @@ export async function runInstaller(options: RunInstallerOptions): Promise<RunIns
   if (existing !== null && choice === "discard") {
     for (const sideEffect of existing.sideEffects) {
       if (sideEffect.kind === "memory_dir_created") {
-        options.memoryLibraries.discardEmpty(sideEffect.path);
+        options.memoryLibraries.discardEmpty(sideEffect.path, sideEffect.ownerDraftId);
       }
     }
   }
@@ -321,7 +321,7 @@ export async function runInstaller(options: RunInstallerOptions): Promise<RunIns
       case "review": {
         if (draft.memory?.kind === "create") {
           // Idempotently finish a creation interrupted after the draft was persisted.
-          options.memoryLibraries.createEmpty(draft.memory.path);
+          options.memoryLibraries.createEmpty(draft.memory.path, draft.draftId);
         }
         options.prompt.info(formatReview(draft));
         if (draft.frontend?.kind === "official-skin" && draft.frontend.installation === "pending") {
