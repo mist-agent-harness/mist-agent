@@ -9,6 +9,7 @@ import type {
   LaneBinding,
   MemoryChoice,
 } from "./contracts.ts";
+import { installerAdapterAcceptsCredentialType } from "./contracts.ts";
 import type { InstallerController } from "./controller.ts";
 import type { MemoryLibraryPort } from "./memory-library.ts";
 import type { OAuthLoginPort } from "./pi-login.ts";
@@ -117,10 +118,9 @@ function compatibleCredentials(
   draft: InstallerDraft,
   adapterId: "pi" | "claude-agent-sdk",
 ): InstallerCredential[] {
-  return draft.credentials.filter((credential) => {
-    if (adapterId === "pi") return credential.ref.type !== "claude_oauth";
-    return credential.ref.type === "claude_oauth" || credential.ref.type === "api_key";
-  });
+  return draft.credentials.filter((credential) =>
+    installerAdapterAcceptsCredentialType(adapterId, credential.ref.type),
+  );
 }
 
 async function chooseCredential(
@@ -324,7 +324,7 @@ export async function runInstaller(options: RunInstallerOptions): Promise<RunIns
           options.memoryLibraries.createEmpty(draft.memory.path, draft.draftId);
         }
         options.prompt.info(formatReview(draft));
-        if (draft.frontend?.kind === "official-skin" && draft.frontend.installation === "pending") {
+        if (draft.frontend?.kind === "official-skin") {
           options.prompt.info(
             "The official skin is not installed: issues #49 and #51 are still pending. This draft was kept and no active config changed.",
           );

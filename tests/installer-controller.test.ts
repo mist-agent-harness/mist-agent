@@ -322,6 +322,31 @@ describe("installer controller", () => {
       error: /unsupported installation/,
     },
     {
+      name: "official frontend installed stub",
+      mutate(draft: InstallerDraft) {
+        draft.frontend = {
+          kind: "official-skin",
+          pluginId: "mist-official-skin",
+          installation: "installed",
+        };
+      },
+      error: /cannot be activated yet/,
+    },
+    {
+      name: "deferred Grok OAuth credential",
+      mutate(draft: InstallerDraft) {
+        const credential = draft.credentials[0];
+        const binding = draft.bindings[0];
+        if (credential === undefined || binding === undefined) throw new Error("missing fixture");
+        credential.ref.type = "grok_oauth";
+        credential.ref.issuerId = "pi";
+        credential.providerId = "grok";
+        binding.credentialRef.type = "grok_oauth";
+        binding.credentialRef.issuerId = "pi";
+      },
+      error: /unsupported type/,
+    },
+    {
       name: "memory kind",
       mutate(draft: InstallerDraft) {
         draft.memory = { kind: "future-memory", path: "/tmp/existing" } as never;

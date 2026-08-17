@@ -221,21 +221,27 @@ function validateCredentialIssuer(credential: InstallerCredential): void {
   }
 }
 
-const CREDENTIAL_TYPES = new Set<CredentialType>([
+const INSTALLER_CREDENTIAL_TYPES = new Set<CredentialType>([
   "claude_oauth",
   "codex_oauth",
-  "grok_oauth",
   "api_key",
 ]);
 const CREDENTIAL_STATUSES = new Set<CredentialStatus>(["ready", "incomplete"]);
 const LANES = new Set<Lane>(["primary", "coding"]);
 const ADAPTER_CREDENTIAL_TYPES = {
-  pi: new Set<CredentialType>(["codex_oauth", "grok_oauth", "api_key"]),
+  pi: new Set<CredentialType>(["codex_oauth", "api_key"]),
   "claude-agent-sdk": new Set<CredentialType>(["claude_oauth", "api_key"]),
 } as const;
 
+export function installerAdapterAcceptsCredentialType(
+  adapterId: keyof typeof ADAPTER_CREDENTIAL_TYPES,
+  type: CredentialType,
+): boolean {
+  return ADAPTER_CREDENTIAL_TYPES[adapterId].has(type);
+}
+
 function validateCredentialEnums(credential: InstallerCredential): void {
-  if (!CREDENTIAL_TYPES.has(credential.ref.type)) {
+  if (!INSTALLER_CREDENTIAL_TYPES.has(credential.ref.type)) {
     throw new InstallerValidationError(
       `credential ${credential.ref.id} has unsupported type: ${String(credential.ref.type)}`,
     );
@@ -385,7 +391,7 @@ export function validateReadyDraft(draft: InstallerDraft): MistInstallConfigV0 {
     throw new InstallerValidationError("frontend choice is required");
   }
   const frontend = validateFrontendChoice(draft.frontend);
-  if (frontend.kind === "official-skin" && frontend.installation !== "installed") {
+  if (frontend.kind === "official-skin") {
     throw new InstallerValidationError(
       "official skin is pending issues #49 and #51 and cannot be activated yet",
     );
