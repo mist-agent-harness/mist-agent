@@ -30,6 +30,7 @@ schema 版本、插件类别、权限种类、能力种类或版本范围语法�
 ```ts
 type PluginKind = "channel_adapter" | "frontend" | "tool_capability" | "bridge";
 type Effect = "read" | "reversible" | "irreversible";
+type InjectionMode = "eager" | "lazy";
 
 interface PluginManifestV0 {
   manifestSchemaVersion: 0;
@@ -40,6 +41,7 @@ interface PluginManifestV0 {
   kinds: readonly PluginKind[];
   configSchemaVersion: number; // 非负整数，只能经 migrate 改变
   capabilities: readonly CapabilityDeclaration[];
+  contextInjections: readonly ContextInjectionDeclaration[];
   env: readonly EnvironmentDeclaration[];
   credentials: readonly CredentialRequirement[];
   permissions: readonly PermissionGrant[];
@@ -50,6 +52,14 @@ interface CapabilityDeclaration {
   description: string;
   effect: Effect;
   operations: readonly string[];
+  injectionMode: InjectionMode; // eager=完整 schema；lazy=目录项，按需取 schema
+}
+
+interface ContextInjectionDeclaration {
+  id: string;                  // 插件内稳定 id
+  source: string;              // 包内 UTF-8 文本相对路径，不得逃出插件根
+  scope: "resident" | "session";
+  injectionMode: InjectionMode;
 }
 
 interface EnvironmentDeclaration {
@@ -91,6 +101,13 @@ interface EnvironmentBinding {
 `id` 必须匹配 `^[a-z0-9]+(?:[._-][a-z0-9]+)*$`，不得包含路径分隔符、空白或大写字母。
 同一宿主内 id 全局唯一：普通安装遇到已有 id 返回 `PLUGIN_ID_CONFLICT`；只有显式 upgrade
 操作可以用同一 id 的新版本进入第 7 节事务，不能靠后装覆盖前装。
+
+`contextInjections` 是所有插件来源非工具文本的完整清单。宿主在 import 前读取 `source`，
+路径校验与 entrypoint 相同；正文随包版本冻结并带 plugin id、注入 id、源路径和 scope 的
+来源标记。MCP `instructions` 或其他运行期文本只有与已声明源文件逐字一致时才能采用；
+未声明或漂移的文本必须显式拒绝并返回 `CONTEXT_INJECTION_MISMATCH`，不得静默采用或静默
+丢弃。`resident` scope 可以随住户重建再次装配，`session` scope 只属于当前会话；两者都
+不是人格或记忆写权限，插件不能借注入修改住户私有文件。
 
 `operations` 必须是宿主能力契约中已登记的操作名。带副作用的操作如果存在可收窄参数，
 manifest 必须把允许值声明到字面量级；例如只能触发换窗的桥接应声明
@@ -193,7 +210,10 @@ prepare/activate 生命周期，但 v0 的同进程信任边界不能机械拦�
 - `quarantined`：撤销不完整或运行时越界，所有对外入口已关闭。
 
 状态必须带 `verifiedScope`，只说明在哪个住户、车道、操作集合与时间点验证过；不得把
-“进程活着”投影成所有绑定可用。
+“进程活着”投影成所有绑定可用。每项暴露为 ready 的 capability 还必须在该 scope 留下一份
+确定性可用性收据，例如 server initialize 握手、版本查询或无副作用探针；拿不到收据返回
+`CAPABILITY_UNVERIFIED` 并进入 degraded/blocked。该收据只证明当前声明的能力可用，不证明
+二进制来源真实或代码可信；签名与供应链认证仍不属于 v0。
 
 代价：隔离会把一部分错误从崩溃变成显式降级，运维面必须展示 blocked/quarantined，
 否则故障只会从停机变成静默缺能力。
@@ -258,13 +278,21 @@ issuer 规则接入，本协议不把登录步骤写进地基。
 ## 6. skill 与 MCP 都是工具能力
 
 skill 和 MCP 统一归 `tool_capability` 插件，manifest 必须声明提供的能力、操作和副作用
-等级。它们不是绕过权限契约的两条特权通道。
+等级。它们不是绕过权限契约的两条特权通道。工具权限与上下文容量正交：
+`injectionMode: eager` 可以在 active 时装入完整 schema；`lazy` 只把 capability id、来源和
+单行 description 放入可发现目录，完整 schema 经宿主取回通道按需加载。取回不能改变原
+权限判定，也不能把 lazy 静默升级为 eager。
 
 适配器负责翻译注入方式：
 
 - Claude SDK：原生挂载 skills 目录和 `mcp_servers`；
 - pi：skill 转为有来源标记、可裁剪的 prompt 段；
 - MCP：由 mist host 收编 server 暴露的工具，再按住户、角色和任务工具策略分发。
+
+skill prompt、MCP `instructions` 等非工具文本统一走 `contextInjections`。适配器只能注入
+包内已声明正文并保留来源标记；运行期 server 下发未声明或与包内正文不一致的文本时，
+该文本不得进入住户上下文，capability 显式 degraded/blocked。宿主必须让住户看见“哪段
+注入因何被拒”，不能让住户在不知情的残缺守则上继续判断。
 
 翻译后必须保留稳定的原始 capability id、来源 plugin id、effect 和权限约束。对一个
 verified scope，翻译输出的工具与已授权源操作必须逐项可逆映射：无来源工具、额外操作和
@@ -273,6 +301,8 @@ verified scope，翻译输出的工具与已授权源操作必须逐项可逆映
 
 代价：同一 skill 在不同适配器上的呈现不保证字节相同，只保证能力与权限语义等价；
 适配器测试要覆盖每一种翻译，而不能只测源 manifest。
+lazy 模式增加一次 schema 取回，并要求适配器维护可发现目录；显式上下文注入则牺牲运行期
+随服务端即时改 instruction 的便利，换取安装前可读、升级可 diff、出事可追溯。
 
 ## 7. 版本兼容与升级迁移
 
@@ -317,16 +347,21 @@ scope 的 ready。
 | `MIGRATION_FAILED` | 迁移或目标 schema 校验失败 | 旧版本保持 ready |
 | `DISPOSE_INCOMPLETE` | 任一资源撤销失败 | quarantined，对外入口关闭 |
 | `PLUGIN_RUNTIME_FAILED` | active 插件调用抛错或超时 | 当前调用失败；按策略降级或 blocked |
+| `CONTEXT_INJECTION_MISMATCH` | 运行期注入未声明或与包内正文不一致 | 拒绝注入；degraded/blocked |
+| `SENSITIVE_OUTPUT_BLOCKED` | 插件输出或注入试图把已知 secret 带入模型上下文 | 当前调用失败；按策略降级或 blocked |
+| `CAPABILITY_UNVERIFIED` | capability 无法取得当前 scope 的确定性可用性收据 | degraded/blocked，不进入 ready 工具集 |
 
 诊断事件只能记录 plugin id、版本、资源 id、reason code、verified scope 和脱敏详情；
-不得记录 secret env、token、OAuth 内容或完整用户输入。
+不得记录 secret env、token、OAuth 内容或完整用户输入。插件工具返回、上下文注入和适配器
+翻译产物在进入模型可见上下文前还必须经过敏感值闸：命中当前执行边界已解析的 secret 值
+时以 `SENSITIVE_OUTPUT_BLOCKED` 拒绝，不能指望后续摘要或记忆层替插件擦除。
 
 ## 9. 规范到判卷的对应
 
 | RFC 规范面 | 验收区 | 主要红灯 |
 |---|---|---|
 | manifest、启停、host 兼容 | A | import 前拒装、停用后资源仍可达 |
-| 权限、secret、skill/MCP 翻译 | B | 越权操作执行、secret 落字、翻译扩权 |
+| 权限、secret、skill/MCP 翻译与上下文注入 | B | 越权、secret 进上下文、翻译扩权、未声明注入 |
 | 生命周期、事务注册、故障隔离 | C | 半注册、重复清理、注销留活线、拖死地基 |
 | 住户×车道、角色、凭证约束 | D | 串房、角色混维、错凭证覆盖好绑定 |
 | 版本升级、配置迁移、回滚 | E | 原地改配置、失败后 v1 不可用 |
@@ -336,6 +371,7 @@ scope 的 ready。
 
 - 不实现任何具体插件或适配器；
 - 不定义插件发现站、签名分发、评分、市场或自动更新服务；
+- 不以可用性探针冒充二进制身份、签名或供应链认证；
 - 不承诺第三方插件代码是可信沙箱；
 - 不把住户人格、记忆或聊天内容放进插件包；
 - 不允许插件协议改写已决的通道政策、住户连续性或权限审批点。

@@ -6,7 +6,7 @@
 
 每条测试记录四件事：fixture、动作、确定性断言、失败时的 reason code。含敏感值的
 fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置快照、日志、事件和
-错误输出。
+错误输出；凡插件产物会进入模型，还要扫描带来源标记的住户上下文快照。
 
 ## A. Manifest 与兼容性
 
@@ -16,8 +16,9 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
   未加载、无资源注册，返回 `HOST_INCOMPATIBLE`。
 - [ ] **PV0-A03 requiresMist 不可猜**：分别使用不匹配范围和不可解析字符串；两者均在
   加载代码前返回 `HOST_INCOMPATIBLE`。
-- [ ] **PV0-A04 路径与枚举封口**：entrypoint 逃出插件根、未知 kind、未知 effect、重复
-  capability id 分别返回 `MANIFEST_INVALID`，且无部分注册。
+- [ ] **PV0-A04 路径与枚举封口**：entrypoint 或 context injection source 逃出插件根、
+  未知 kind/effect/injection mode、重复 capability/context injection id 分别返回
+  `MANIFEST_INVALID`，且无部分注册。
 - [ ] **PV0-A05 缺要求不降级装**：删除 required env、配置或 credential ref；返回
   `REQUIREMENT_MISSING`。optional 缺失则可继续，但 readiness 明列缺失 scope。
 - [ ] **PV0-A06 manifest 无需执行代码**：插件 entrypoint 顶层放置会抛错的探针；校验
@@ -39,7 +40,8 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 - [ ] **PV0-B03 effect 不可降级**：插件把已登记 irreversible 操作声明成 read；manifest
   校验返回 `MANIFEST_INVALID`，不能以插件声明覆盖宿主能力契约。
 - [ ] **PV0-B04 secret 全面不落字**：将唯一标记放入 secret env 和凭证值，覆盖成功、
-  prepare 失败、运行时失败、dispose 失败四条路径；配置快照、日志、事件、错误文本均不含标记。
+  prepare 失败、运行时失败、dispose 失败四条路径；配置快照、日志、事件、错误文本和带
+  来源标记的住户上下文快照均不含标记。
 - [ ] **PV0-B05 翻译不扩权**：同一 tool capability 分别经 Claude SDK 和 pi 适配器翻译；
   输出仍带原 capability/plugin id、effect、operations 与 literals，未授权操作不可达。
 - [ ] **PV0-B06 MCP 经 host 收编**：MCP server 暴露声明外工具；该工具不进入住户工具集，
@@ -48,7 +50,20 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
   `run_arbitrary`，或静默漏掉一个已授权操作；前者因无源工具、后者因映射不完整而使该
   capability 非 ready，输出集必须与 verified scope 的源操作逐项对应。
 - [ ] **PV0-B08 完整用户输入不进诊断**：使用独立随机长句作为住户原话探针，覆盖成功、
-  prepare 失败、运行时失败、dispose 失败四条路径；日志、事件和错误文本均不得含完整探针。
+  prepare 失败、运行时失败、dispose 失败四条路径；日志、事件、错误文本及插件来源的诊断
+  注入段均不得含完整探针。原始住户消息本身不属于插件泄漏，断言必须按来源区分。
+- [ ] **PV0-B09 lazy 不预注入 schema**：声明 lazy capability，active 后住户目录只含 id、
+  plugin 来源和单行 description，不含完整 operations schema；按需取回后可以调用，且取回前后
+  权限结果一致。把 lazy 当 eager 全量铺入上下文时本条变红。
+- [ ] **PV0-B10 注入正文安装前可审计**：声明 resident/session 两种 context injection；
+  模型上下文中的正文逐字来自包内 source，并带 plugin id、注入 id、路径和 scope。换包版本后
+  diff 可见，session 注入不跨会话残留。
+- [ ] **PV0-B11 未声明或漂移的注入显式拒绝**：MCP server 下发 manifest 未声明的
+  instructions，或把已声明正文改一个字；文本不进入住户上下文，返回
+  `CONTEXT_INJECTION_MISMATCH`，capability 非 ready，住户能看见拒绝原因而非静默截断。
+- [ ] **PV0-B12 secret 不经插件产物进入模型**：恶意 fixture 分别从工具返回值和已声明
+  context injection 回显执行边界解析过的 secret 标记；两条都在装入模型上下文前返回
+  `SENSITIVE_OUTPUT_BLOCKED`，上下文、后续摘要输入和记忆候选中均无该标记。
 
 ## C. 事务注册、隔离与注销
 
@@ -124,6 +139,9 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
   安装在 validate 阶段被拒，现有不变量仍可用。
 - [ ] **PV0-F05 壳共享魂私有**：插件包、manifest、配置导出和诊断中扫描住户人格、记忆、
   聊天 fixture 标记；均不得出现，插件只能经受控 capability 在当前 scope 临时访问。
+- [ ] **PV0-F06 ready 必须有当前 scope 的可用性收据**：分别用 initialize 握手、版本查询
+  和无副作用探针验证三类 capability；未运行探针、探针超时或返回身份不符时返回
+  `CAPABILITY_UNVERIFIED` 且不进 ready 工具集。断言只证明可用性，不声称签名或供应链可信。
 
 ## 逐项 mutation 台账
 
@@ -135,7 +153,7 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 | A01 | validated 前把能力放进目录 | A01 |
 | A02 | 接受未知 manifest schema | A02 |
 | A03 | 把不可解析 `requiresMist` 当兼容 | A03 |
-| A04 | 允许 entrypoint 逃逸或未知枚举 | A04 |
+| A04 | 允许 entrypoint/context source 逃逸或未知枚举 | A04 |
 | A05 | required 缺失时继续 ready | A05 |
 | A06 | manifest 校验前 import entrypoint | A06 |
 | A07 | enabled=false 只隐藏 UI、不 dispose | A07 |
@@ -149,6 +167,10 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 | B06 | 让 MCP 声明外工具进入住户工具集 | B06 |
 | B07 | 翻译结果额外加入无源 `run_arbitrary` | B07 |
 | B08 | 在诊断中输出完整住户原话探针 | B08 |
+| B09 | 把 lazy capability 当 eager 全量注入 schema | B09 |
+| B10 | 注入包外或无来源标记的上下文正文 | B10 |
+| B11 | 静默采用 server 漂移后的 instructions | B11 |
+| B12 | 允许工具返回值把已知 secret 带入模型上下文 | B12 |
 | C01 | prepare 阶段提前公开首个资源 | C01 |
 | C02 | 第三个 register 失败后保留前两个 handle | C02 |
 | C03 | activate 失败后跳过 rollback | C03 |
@@ -179,6 +201,7 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 | F03 | mutation runner 接受“任意测试变红” | F03 |
 | F04 | 允许插件覆盖 boot-time 权限闸 | F04 |
 | F05 | 把住户人格 fixture 写入插件配置导出 | F05 |
+| F06 | 未取得 capability 可用性收据仍标 ready | F06 |
 
 ## 完成定义
 
