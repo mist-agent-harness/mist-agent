@@ -354,6 +354,48 @@ describe("installer controller", () => {
     expect(() => store.loadDraft()).toThrow(/invalid side-effect receipt/);
   });
 
+  it("rebuilds active config from whitelisted nested fields", () => {
+    const directory = freshDirectory();
+    const store = new InstallerStateStore(directory);
+    const controller = new InstallerController(store);
+    const draft = completeDraft(controller);
+    const credential = draft.credentials[0];
+    const binding = draft.bindings[0];
+    if (credential === undefined || binding === undefined) throw new Error("missing fixture");
+
+    Object.assign(credential.ref, { secretMaterial: "should-not-persist" });
+    Object.assign(binding, { unexpected: "should-not-persist" });
+    Object.assign(binding.credentialRef, { secretMaterial: "should-not-persist" });
+    const tokenCredentialRef = {
+      ...credential.ref,
+      type: "api_key" as const,
+      issuerId: "mist-installer-api-key",
+    };
+    Object.assign(tokenCredentialRef, { secretMaterial: "should-not-persist" });
+    binding.adapterConfig = {
+      baseUrl: "https://gateway.example.test",
+      tokenCredentialRef,
+      unexpected: "should-not-persist",
+    } as never;
+    store.saveDraft(draft);
+
+    const resumed = new InstallerController(store);
+    resumed.start("resident-1", "resume");
+    const receipt = resumed.commit();
+
+    expect(JSON.stringify(receipt.config)).not.toContain("should-not-persist");
+    expect(receipt.config.credentialRefs).toEqual([apiCredential().ref]);
+    expect(receipt.config.bindings).toEqual([
+      {
+        ...primaryBinding(),
+        adapterConfig: {
+          baseUrl: "https://gateway.example.test",
+          tokenCredentialRef: apiCredential().ref,
+        },
+      },
+    ]);
+  });
+
   it("refuses a binding whose issuer does not match the stored credential ref", () => {
     const directory = freshDirectory();
     const controller = new InstallerController(new InstallerStateStore(directory));

@@ -277,6 +277,37 @@ function validateBindingCredential(
   }
 }
 
+function toCredentialRef(ref: CredentialRef): CredentialRef {
+  return {
+    id: ref.id,
+    type: ref.type,
+    issuerId: ref.issuerId,
+  };
+}
+
+function toLaneBinding(binding: LaneBinding): LaneBinding {
+  return {
+    residentId: binding.residentId,
+    lane: binding.lane,
+    adapterId: binding.adapterId,
+    credentialRef: toCredentialRef(binding.credentialRef),
+    ...(binding.adapterConfig === undefined
+      ? {}
+      : {
+          adapterConfig: {
+            ...(binding.adapterConfig.baseUrl === undefined
+              ? {}
+              : { baseUrl: binding.adapterConfig.baseUrl }),
+            ...(binding.adapterConfig.tokenCredentialRef === undefined
+              ? {}
+              : {
+                  tokenCredentialRef: toCredentialRef(binding.adapterConfig.tokenCredentialRef),
+                }),
+          },
+        }),
+  };
+}
+
 export function validateReadyDraft(draft: InstallerDraft): MistInstallConfigV0 {
   if (draft.schemaVersion !== INSTALLER_DRAFT_SCHEMA_VERSION) {
     throw new InstallerValidationError(
@@ -367,8 +398,8 @@ export function validateReadyDraft(draft: InstallerDraft): MistInstallConfigV0 {
   return {
     schemaVersion: INSTALL_CONFIG_SCHEMA_VERSION,
     residentId: draft.residentId,
-    credentialRefs: draft.credentials.map((credential) => ({ ...credential.ref })),
-    bindings: draft.bindings.map((binding) => structuredClone(binding)),
+    credentialRefs: draft.credentials.map((credential) => toCredentialRef(credential.ref)),
+    bindings: draft.bindings.map(toLaneBinding),
     frontend,
     memory,
   };
