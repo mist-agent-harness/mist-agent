@@ -17,7 +17,9 @@ v0 支持四类插件：`channel_adapter`、`frontend`、`tool_capability`、`br
 
 代价：v0 把校验、事务注册、权限和故障隔离放进宿主，插件作者要写更多声明；协议保证
 的是宿主边界内的 fail-closed，不把同进程插件伪装成安全沙箱。需要抵御恶意原生代码时，
-实现必须另加进程或沙箱边界。
+实现必须另加进程或沙箱边界。v0 把同进程插件代码视为受信任代码：宿主能完整追踪并撤销
+经 `PluginPrepareContext` 登记的资源，但无法检测插件绕过 context 直接调用 Node 原生 API
+制造的计时器、文件句柄或网络连接。此类未登记资源违反作者约定，却不在 v0 的机制保证内。
 
 ## 2. Manifest 是安装前唯一入口
 
@@ -86,6 +88,10 @@ interface EnvironmentBinding {
 }
 ```
 
+`id` 必须匹配 `^[a-z0-9]+(?:[._-][a-z0-9]+)*$`，不得包含路径分隔符、空白或大写字母。
+同一宿主内 id 全局唯一：普通安装遇到已有 id 返回 `PLUGIN_ID_CONFLICT`；只有显式 upgrade
+操作可以用同一 id 的新版本进入第 7 节事务，不能靠后装覆盖前装。
+
 `operations` 必须是宿主能力契约中已登记的操作名。带副作用的操作如果存在可收窄参数，
 manifest 必须把允许值声明到字面量级；例如只能触发换窗的桥接应声明
 `literals: { text: ["/new"] }`，不能申请任意 `terminal_send`。宿主拒绝未声明的操作、
@@ -125,6 +131,7 @@ interface ResourceDeclaration {
   readonly id: string;
   readonly kind: ResourceKind;
   readonly capabilityId?: string;
+  activate(): Promise<void>; // 由宿主在原子提交阶段调用；prepare 时不得已对外可达
   dispose(): Promise<void>;
 }
 
@@ -159,17 +166,18 @@ discovered → validated → prepared → active → disposing → disposed
 ```
 
 `prepare` 期间的每次 `register` 都先写入宿主拥有的注册日志，并返回宿主同样持有的
-`DisposableHandle`。插件不能制造未登记的对外资源。`activate` 成功后，宿主以一次原子
-提交公开整批资源；中途失败则按注册逆序撤销全部句柄并调用 `rollback`。部分成功不得
-泄漏为半个 active 插件。
+`DisposableHandle`。协议合规插件应当只经 context 创建对外资源；v0 对宿主管理资源提供
+事务保证，不声称能拦截受信任同进程代码直接调用 Node 原生 API。`activate` 成功后，宿主
+以一次原子提交公开整批资源；中途失败则按注册逆序撤销全部句柄并调用 `rollback`。部分
+成功不得泄漏为半个 active 插件。
 
 卸载顺序固定为：先从路由和能力目录撤销可达性，拒绝新调用；再等待或取消在途调用；
 最后逆序撤销资源并调用 `dispose`。重复卸载必须返回同一终态。某个撤销失败时，插件状态
 进入 `quarantined`，相关路由继续 fail-closed，宿主记录资源 id 和稳定 reason code；
-不得为了“看起来卸载成功”留下无人认领的监听器、出站连接、定时器或工具。
+不得为了“看起来卸载成功”留下任何已登记或经宿主管理的监听器、出站连接、定时器或工具。
 
-代价：事务注册需要宿主保存注册日志和终态；插件不能在加载时偷偷做副作用，旧式
-“import 即启动”的扩展必须包进 prepare/activate 生命周期。
+代价：事务注册需要宿主保存注册日志和终态；协议要求插件作者把 import-time 副作用改造进
+prepare/activate 生命周期，但 v0 的同进程信任边界不能机械拦截故意绕开的 Node 原生调用。
 
 ## 4. 故障只影响插件，不拖死地基
 
@@ -199,6 +207,7 @@ discovered → validated → prepared → active → disposing → disposed
 interface CredentialRef {
   readonly id: string;
   readonly type: CredentialType;
+  readonly issuerId: string;
 }
 
 type AgentRole = "main" | "subagent";
@@ -222,7 +231,8 @@ interface DispatchRequest {
 }
 ```
 
-绑定的键是 `residentId × lane`。`main` / `subagent` 是运行角色，不得编码进车道名或凭证。
+绑定的键是 `residentId × lane`。`main` / `subagent` 是运行角色；宿主不得从 lane 名、适配器
+或凭证类型推导角色，角色只取自已经过授权的 `DispatchRequest.role`。
 主 agent 挂住户生命周期和记忆，默认工具集精简；subagent 不挂住户记忆，工具按当前任务
 显式开放。subagent 未指定车道时继承主请求的车道；显式换道时必须重新过绑定、权限和
 工具策略校验。
@@ -231,6 +241,13 @@ interface DispatchRequest {
 `codex_oauth`、`grok_oauth` 和 `api_key` 不受这一条专属限制，但仍要满足适配器声明的
 凭证类型。Claude SDK 适配器必须接受可选 `baseUrl + tokenCredentialRef`，以支持兼容
 Claude 协议的网关；token 仍由凭证引用提供，不得内联。
+
+凭证类型是 wire type，不等于宿主一定能签发。宿主只展示当前 active credential issuer
+明确提供的获取类型，创建 `CredentialRef` 时记录 `issuerId`；issuer 不存在时，TUI/API
+不得展示对应登录入口，外部导入的 ref 也必须能回指现役 issuer。RFC 起草时的
+[pi provider 表](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/providers.md)
+已列出 Claude、OpenAI Codex 与 xAI/Grok subscription OAuth；未来类型或外部流程仍按同一
+issuer 规则接入，本协议不把登录步骤写进地基。
 
 绑定校验发生在持久化前；失败不能覆盖上一份可用绑定。删除适配器或凭证前，宿主必须
 列出受影响绑定并先解除或迁移，不能制造悬空引用。
@@ -249,8 +266,10 @@ skill 和 MCP 统一归 `tool_capability` 插件，manifest 必须声明提供�
 - pi：skill 转为有来源标记、可裁剪的 prompt 段；
 - MCP：由 mist host 收编 server 暴露的工具，再按住户、角色和任务工具策略分发。
 
-翻译后必须保留稳定的原始 capability id、来源 plugin id、effect 和权限约束。适配器不能
-把多个受限操作折叠成一个万能工具，也不能因为目标通道缺少原生概念就扩大权限。
+翻译后必须保留稳定的原始 capability id、来源 plugin id、effect 和权限约束。对一个
+verified scope，翻译输出的工具与已授权源操作必须逐项可逆映射：无来源工具、额外操作和
+静默丢失都不允许；目标通道不支持某项时，该 capability 进入 degraded/blocked，而不是
+折叠成万能工具或假装完整 ready。
 
 代价：同一 skill 在不同适配器上的呈现不保证字节相同，只保证能力与权限语义等价；
 适配器测试要覆盖每一种翻译，而不能只测源 manifest。
@@ -287,8 +306,11 @@ scope 的 ready。
 |---|---|---|
 | `MANIFEST_INVALID` | 字段、路径、枚举或重复 id 无效 | blocked，未加载代码 |
 | `HOST_INCOMPATIBLE` | schema / `requiresMist` 不兼容或不可解析 | blocked，未加载代码 |
+| `PLUGIN_ID_CONFLICT` | 普通安装与现役插件 id 冲突 | blocked，现役插件不变 |
+| `CONFIG_INVALID` | instance config、env 绑定形状或 schema 无效 | blocked，未解析 secret |
 | `REQUIREMENT_MISSING` | 必需 env、配置或凭证引用缺失 | blocked |
 | `CREDENTIAL_TYPE_MISMATCH` | 凭证类型与适配器或槽位不符 | 旧绑定不变 |
+| `CREDENTIAL_ISSUER_UNAVAILABLE` | credential ref 无可用签发方或来源不可验证 | 不展示入口，拒绝绑定 |
 | `PERMISSION_DENIED` | 操作、参数或字面量未授权 | 当前调用失败，无副作用 |
 | `PREPARE_FAILED` | prepare 抛错、超时或返回无效 | 全量 rollback，未公开 |
 | `ACTIVATE_FAILED` | activate 失败 | 全量 rollback，未公开 |

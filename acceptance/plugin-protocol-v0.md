@@ -24,6 +24,12 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
   非法 `mist-plugin.json` 时探针计数为零，证明宿主在 import 前完成拒装。
 - [ ] **PV0-A07 停用是真卸载**：enabled 从 true 切到 false 后完整经过 dispose，能力与
   资源不可达但设置仍在；重新启用时重新 validate/prepare/activate，不复用旧 handle。
+- [ ] **PV0-A08 plugin id 封口**：大写、空白、路径分隔符和 `../evil` 均返回
+  `MANIFEST_INVALID` 且不加载代码；普通安装复用现役 id 返回 `PLUGIN_ID_CONFLICT`，
+  只有显式 upgrade 能携同 id 进入 E 区事务。
+- [ ] **PV0-A09 env 绑定形状不可混用**：逐一测试 secret×value、secret×secretRef、
+  plain×value、plain×secretRef；只有中间两种匹配组合中的 secret×secretRef 与
+  plain×value 通过，错配返回 `CONFIG_INVALID`，明文 secret 不进入配置快照。
 
 ## B. 权限、secret 与工具翻译
 
@@ -38,6 +44,11 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
   输出仍带原 capability/plugin id、effect、operations 与 literals，未授权操作不可达。
 - [ ] **PV0-B06 MCP 经 host 收编**：MCP server 暴露声明外工具；该工具不进入住户工具集，
   主 agent 精简集和 subagent 任务集只包含各自策略交集。
+- [ ] **PV0-B07 翻译输出是闭集**：坏适配器在完整保留 metadata 的同时额外暴露
+  `run_arbitrary`，或静默漏掉一个已授权操作；前者因无源工具、后者因映射不完整而使该
+  capability 非 ready，输出集必须与 verified scope 的源操作逐项对应。
+- [ ] **PV0-B08 完整用户输入不进诊断**：使用独立随机长句作为住户原话探针，覆盖成功、
+  prepare 失败、运行时失败、dispose 失败四条路径；日志、事件和错误文本均不得含完整探针。
 
 ## C. 事务注册、隔离与注销
 
@@ -52,7 +63,7 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 - [ ] **PV0-C05 dispose 幂等**：同一 active 插件连续 dispose 两次；每个资源最多实际撤销
   一次，两次返回同一终态，无异常、无新资源。
 - [ ] **PV0-C06 注销先断路**：制造一个在途调用后发起卸载；新调用立即拒绝，待在途调用
-  结束或取消后逆序清理，卸载后所有路由、监听器、定时器和出站连接不可达。
+  结束或取消后逆序清理，卸载后所有已登记或经宿主管理的路由、监听器、定时器和出站连接不可达。
 - [ ] **PV0-C07 清理失败 fail-closed**：让一个 handle.revoke 失败；返回
   `DISPOSE_INCOMPLETE`，状态为 quarantined，资源 id 留在隔离记录，但任何住户都不能再调用。
 - [ ] **PV0-C08 单插件故障不拖地基**：插件运行时同步抛错、异步拒绝、超时各一次；当前
@@ -78,6 +89,12 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
   解除或迁移绑定后才能删除。
 - [ ] **PV0-D08 错绑定不覆盖好绑定**：对现有 ready 车道提交无效新绑定；持久化失败后旧绑定
   仍可 dispatch，verified scope 不变。
+- [ ] **PV0-D09 角色不从名字推导**：分别建立名为 `main`、`subagent`、`coding-subagent`
+  的车道并交叉发送两种 role；最终角色只等于已授权 `DispatchRequest.role`，lane 名、适配器
+  和凭证类型都不能改变角色或记忆挂载规则。
+- [ ] **PV0-D10 凭证获取入口有签发方**：credential type 只在 active issuer 声明后出现在
+  TUI/API；移除 issuer 后入口消失，新建或导入无法回指 issuer 的 ref 返回
+  `CREDENTIAL_ISSUER_UNAVAILABLE`，现役有效 ref 的值不泄漏。
 
 ## E. 升级、迁移与回滚
 
@@ -100,15 +117,72 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
   返回 resident、lane、operations 和验证时间；换住户或车道后不能沿用旧 ready。
 - [ ] **PV0-F02 原因码稳定可判**：A–E 每条失败路径只以 RFC 第 8 节 reason code 之一
   作为机器判决，附加文本变化不影响断言。
-- [ ] **PV0-F03 每条约束都有红格**：对 manifest、权限、生命周期、绑定、迁移各做一次
-  变异（删校验或扩大权限）；至少一个对应 PV0 条目必须由绿变红，否则协议验收不完整。
+- [ ] **PV0-F03 每条约束都有指定红格**：逐项执行下表登记的 mutation；实测失败集合必须
+  包含该 mutation 指定的 PV0 id，不能用“任意一格变红”代替。fixture 的宪法常量独立于
+  实现配置，不能跟着被测常量一起变化。
 - [ ] **PV0-F04 boot-time 不变量不可卸载**：伪插件尝试覆盖权限闸或事件留史 provider；
   安装在 validate 阶段被拒，现有不变量仍可用。
 - [ ] **PV0-F05 壳共享魂私有**：插件包、manifest、配置导出和诊断中扫描住户人格、记忆、
   聊天 fixture 标记；均不得出现，插件只能经受控 capability 在当前 scope 临时访问。
 
+## 逐项 mutation 台账
+
+实现阶段每项都要把下列变异真的施加到测试替身或实现分支；“预期红格”未出现在失败集合
+就算 mutation 验证失败。变异描述是稳定验收输入，不得从被测实现的常量反向生成。
+
+| PV0 id | mutation：故意删掉或改坏的约束 | 预期红格 |
+|---|---|---|
+| A01 | validated 前把能力放进目录 | A01 |
+| A02 | 接受未知 manifest schema | A02 |
+| A03 | 把不可解析 `requiresMist` 当兼容 | A03 |
+| A04 | 允许 entrypoint 逃逸或未知枚举 | A04 |
+| A05 | required 缺失时继续 ready | A05 |
+| A06 | manifest 校验前 import entrypoint | A06 |
+| A07 | enabled=false 只隐藏 UI、不 dispose | A07 |
+| A08 | 允许非法/冲突 plugin id 覆盖现役 | A08 |
+| A09 | 允许 secret env 使用明文 value | A09 |
+| B01 | 把 `/new` 字面量约束改成任意文本 | B01 |
+| B02 | 把空 operations/literals 解释为通配 | B02 |
+| B03 | 以插件的 read 覆盖宿主 irreversible | B03 |
+| B04 | 在任一诊断路径输出 secret 探针 | B04 |
+| B05 | 翻译时删除 effect 或 literals metadata | B05 |
+| B06 | 让 MCP 声明外工具进入住户工具集 | B06 |
+| B07 | 翻译结果额外加入无源 `run_arbitrary` | B07 |
+| B08 | 在诊断中输出完整住户原话探针 | B08 |
+| C01 | prepare 阶段提前公开首个资源 | C01 |
+| C02 | 第三个 register 失败后保留前两个 handle | C02 |
+| C03 | activate 失败后跳过 rollback | C03 |
+| C04 | 逐个而非原子公开资源批次 | C04 |
+| C05 | 第二次 dispose 再次执行真实撤销 | C05 |
+| C06 | 卸载清理前仍接受新调用 | C06 |
+| C07 | revoke 失败后仍报告 disposed/ready | C07 |
+| C08 | 把插件运行时异常抛到宿主顶层 | C08 |
+| C09 | 失败后在无显式操作时自动循环重试 | C09 |
+| D01 | 仅以 lane 为键，忽略 residentId | D01 |
+| D02 | 给 subagent 挂载住户记忆 | D02 |
+| D03 | 显式换道时沿用原车道权限结果 | D03 |
+| D04 | 允许 claude_oauth 绑定 pi | D04 |
+| D05 | 忽略适配器 accepts 接受任意凭证类型 | D05 |
+| D06 | 把网关 token 值内联进 adapterConfig | D06 |
+| D07 | 删除凭证时不检查现役绑定 | D07 |
+| D08 | 无效新绑定覆盖原 ready 绑定 | D08 |
+| D09 | 从 lane 名推导 main/subagent 角色 | D09 |
+| D10 | 无 active issuer 仍展示或签发 credential type | D10 |
+| E01 | v2 active 前把调用切到新版本 | E01 |
+| E02 | migrate 抛错后留下被改写的 v1 配置 | E02 |
+| E03 | 跳过 v2 schema 校验并提交坏配置 | E03 |
+| E04 | v2 activate 失败后不恢复 v1 ready | E04 |
+| E05 | 缺 migrate 时猜字段并原地升级 | E05 |
+| E06 | 给 migrate 暴露读取凭证值的接口 | E06 |
+| F01 | 把一个车道的 ready 投影到所有 scope | F01 |
+| F02 | 只返回自由文本错误、不返回稳定 code | F02 |
+| F03 | mutation runner 接受“任意测试变红” | F03 |
+| F04 | 允许插件覆盖 boot-time 权限闸 | F04 |
+| F05 | 把住户人格 fixture 写入插件配置导出 | F05 |
+
 ## 完成定义
 
-协议实现完成必须同时满足：A–F 全部自动化并全绿；至少执行一次 F03 变异验证；
+协议实现完成必须同时满足：A–F 全部自动化并全绿；逐项执行 mutation 台账且每个预期红格
+都实际变红；
 `npm run lint && npm run typecheck && npm test && npm run acceptance:strict` 全绿；评审能从
 每个 RFC 约束直接指到一个 PV0 id，并从每个 PV0 id 指回唯一规范段落。
