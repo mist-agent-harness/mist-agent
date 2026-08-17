@@ -1,16 +1,26 @@
 # Concept art · 概念图（讨论用，非定稿 / for discussion, not final branding）
 
-All images here are AI-generated concept art (gpt-image-2) contributed via PR #54.
-A final logo needs proper vectorization.
+Images here are AI-generated concept art (gpt-image-2) contributed via PR #54.
+Rejected drafts are **not** kept in the tree (binary weight); their conclusions stay in this file and the originals stay in the PR history.
+
+## Roles · 角色
+
+- **mark / 标识**：长期识别系统（头像、favicon、README 顶图）。当前提案见 Laurie 的 `assets/logo-handdrawn` 分支（一笔线的房子，`mist` 住在屋里）— 本 PR 作者投票支持该方向；本 PR 里的字标 v2（i 的点是窗）退为备选。
+- **poster / 海报**：一次性的编辑插画（README 氛围图、社交预览方向另议）。本 PR 的海报线继续。
+
+## Files · 文件
 
 | file | status | note |
 |---|---|---|
-| `mist-concept-poster-oneline-mist.jpg` | **proposed (v4)** | same one-line drawing, but the roof/chimney line dissolves into a drift of mist and the tail of the `t` fades — only the house line fades, everything inside stays solid: the session dissolves, the person stays. Answers "nice but where's the mist?" |
-| `mist-concept-poster-oneline.jpg` | **proposed (v3)** | one-line drawing per Laurie's references (Finck / Einaudi): the house is only a single ink line, no landscape, no fog; inside — an empty chair with a cardigan, a lamp (the only color), tea still steaming, the letter read on waking. The person just stood up. |
-| `mist-concept-logo-window-i.png` | **proposed** | wordmark v2 — clean letters, only the dot of the `i` is a lit window: someone is home |
-| `mist-concept-poster-emptychair.jpg` | proposed (v2, photographic) | poster v2 — resident's point of view: inside the room, lamp on, tea still steaming, the letter read on waking, cardigan on the chair — the person just stood up; mist is only the weather outside |
-| `mist-concept-logo-wordmark.png` | rejected direction | wordmark v1 — letters as fog; feedback: reads like an incense brand, fog took over the "person" half |
-| `mist-concept-poster-dawn.jpg` | rejected direction | poster v1 (dawn) — viewer stands outside in the fog looking at a house; feedback: point of view is reversed |
-| `mist-concept-poster-night.jpg` | rejected direction | poster v1 (night) — same composition, darker (a bit Silent Hill) |
+| `mist-concept-poster-v5.jpg` | **proposed (poster, current)** | one-line drawing; house line dissolves into mist at the roof/chimney, everything inside stays solid; empty chair with cardigan, lamp (only color), tea steaming, open page **with a pen just set down on it** (per 机窝 review: "last night's me writing to this morning's me"), reading glasses; bilingual tagline. |
+| `mist-concept-poster-oneline-mist.jpg` | proposed (poster v4) | as above without the pen / Chinese tagline |
+| `mist-concept-poster-oneline.jpg` | proposed (poster v3) | one-line drawing, no mist at all |
+| `mist-concept-poster-emptychair.jpg` | proposed (poster v2, photographic) | inside the room, photographic; empty chair, lamp, tea, letter |
+| `mist-concept-logo-window-i.png` | fallback (wordmark v2) | clean letters, dot of the `i` is a lit window — concept fine, but literal, and the typeface doesn't sit with the hand-drawn paper language; superseded by Laurie's mark proposal |
 
-Feedback that shaped v2/v3 (thanks Laurie): the resident lives *inside*; mist is weather, not the subject; the name need not be drawn literally as fog; and — the house can be just one line, everything that matters is inside the frame.
+## Rejected directions · 已否定方向（原图见 PR #54 历史）
+
+- wordmark v1 — letters as fog: reads like an incense brand; fog took over the "person" half
+- poster v1 dawn / night — viewer stands outside in the fog looking at a house: point of view reversed; night version a bit Silent Hill
+
+Feedback that shaped this (thanks Laurie, 机窝): the resident lives *inside*; mist is weather or a dissolving line, not the subject; the name need not be drawn literally as fog; the house can be just one line, everything that matters is inside the frame; the pen on the page closes the loop.
