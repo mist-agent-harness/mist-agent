@@ -84,6 +84,14 @@ const noOAuth: OAuthLoginPort = {
   },
 };
 
+function apiKeyRef(id: string) {
+  return { id, type: "api_key" as const, issuerId: "mist-installer-api-key" };
+}
+
+function oauthRef(id: string, type: "claude_oauth" | "codex_oauth" | "grok_oauth") {
+  return { id, type, issuerId: "pi" };
+}
+
 describe.each([
   { frontend: "external", memory: "existing", expectedStatus: "committed" },
   { frontend: "external", memory: "create", expectedStatus: "committed" },
@@ -178,19 +186,51 @@ it("writes primary Pi and coding Claude SDK bindings to separate lanes", async (
       residentId: "resident-1",
       lane: "primary",
       adapterId: "pi",
-      credentialRef: { id: "codex-key", type: "api_key" },
+      credentialRef: apiKeyRef("codex-key"),
     },
     {
       residentId: "resident-1",
       lane: "coding",
       adapterId: "claude-agent-sdk",
-      credentialRef: { id: "claude-login", type: "claude_oauth" },
+      credentialRef: oauthRef("claude-login", "claude_oauth"),
       adapterConfig: {
         baseUrl: "https://gateway.example.test",
-        tokenCredentialRef: { id: "codex-key", type: "api_key" },
+        tokenCredentialRef: apiKeyRef("codex-key"),
       },
     },
   ]);
+  prompt.expectExhausted();
+});
+
+it("records Pi as the issuer for Grok subscription OAuth", async () => {
+  const directory = freshDirectory();
+  const store = new InstallerStateStore(directory);
+  const prompt = new ScriptedPrompt({
+    selects: ["grok", "oauth", "grok-login", "external", "create"],
+    inputs: ["grok-login", join(directory, "memory")],
+    secrets: [],
+    confirms: [false, false, true],
+  });
+  const oauth: OAuthLoginPort = {
+    async login(provider) {
+      expect(provider.piAuthKey).toBe("xai");
+      return { locator: "pi-auth://xai" };
+    },
+  };
+
+  const result = await runInstaller({
+    residentId: "resident-1",
+    dataDir: directory,
+    controller: new InstallerController(store),
+    store,
+    prompt,
+    oauth,
+    memoryLibraries: new FileMemoryLibrary(),
+  });
+
+  expect(result.status).toBe("committed");
+  if (result.status !== "committed") throw new Error("expected committed setup");
+  expect(result.receipt.config.credentialRefs).toEqual([oauthRef("grok-login", "grok_oauth")]);
   prompt.expectExhausted();
 });
 
@@ -202,7 +242,7 @@ it("resumes from the persisted next step instead of asking for credentials again
   first.saveCredentials([
     {
       credential: {
-        ref: { id: "codex-login", type: "codex_oauth" },
+        ref: oauthRef("codex-login", "codex_oauth"),
         label: "Codex",
         providerId: "codex",
         status: "incomplete",
@@ -239,7 +279,7 @@ it("returns to credentials when the primary lane has no compatible credential", 
   first.saveCredentials([
     {
       credential: {
-        ref: { id: "claude-login", type: "claude_oauth" },
+        ref: oauthRef("claude-login", "claude_oauth"),
         label: "Claude login",
         providerId: "claude",
         status: "incomplete",
@@ -267,8 +307,8 @@ it("returns to credentials when the primary lane has no compatible credential", 
   expect(result.status).toBe("committed");
   if (result.status !== "committed") throw new Error("expected committed setup");
   expect(result.receipt.config.credentialRefs).toEqual([
-    { id: "claude-login", type: "claude_oauth" },
-    { id: "codex-key", type: "api_key" },
+    oauthRef("claude-login", "claude_oauth"),
+    apiKeyRef("codex-key"),
   ]);
   expect(result.receipt.config.bindings.map((binding) => binding.lane)).toEqual([
     "primary",
@@ -288,7 +328,7 @@ it("keeps the exact review draft when commit is declined", async () => {
   controller.saveCredentials([
     {
       credential: {
-        ref: { id: "codex-key", type: "api_key" },
+        ref: apiKeyRef("codex-key"),
         label: "Codex",
         providerId: "codex",
         status: "incomplete",
@@ -301,7 +341,7 @@ it("keeps the exact review draft when commit is declined", async () => {
       residentId: "resident-1",
       lane: "primary",
       adapterId: "pi",
-      credentialRef: { id: "codex-key", type: "api_key" },
+      credentialRef: apiKeyRef("codex-key"),
     },
   ]);
   controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
@@ -340,7 +380,7 @@ it("lets a pending official-skin draft switch to an external frontend without re
   first.saveCredentials([
     {
       credential: {
-        ref: { id: "codex-key", type: "api_key" },
+        ref: apiKeyRef("codex-key"),
         label: "Codex",
         providerId: "codex",
         status: "incomplete",
@@ -353,7 +393,7 @@ it("lets a pending official-skin draft switch to an external frontend without re
       residentId: "resident-1",
       lane: "primary",
       adapterId: "pi",
-      credentialRef: { id: "codex-key", type: "api_key" },
+      credentialRef: apiKeyRef("codex-key"),
     },
   ]);
   first.saveFrontend({
@@ -398,7 +438,7 @@ it("keeps an existing installation by default instead of creating a second snaps
   controller.saveCredentials([
     {
       credential: {
-        ref: { id: "codex-key", type: "api_key" },
+        ref: apiKeyRef("codex-key"),
         label: "Codex",
         providerId: "codex",
         status: "incomplete",
@@ -411,7 +451,7 @@ it("keeps an existing installation by default instead of creating a second snaps
       residentId: "resident-1",
       lane: "primary",
       adapterId: "pi",
-      credentialRef: { id: "codex-key", type: "api_key" },
+      credentialRef: apiKeyRef("codex-key"),
     },
   ]);
   controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
@@ -449,7 +489,7 @@ it("removes an untouched installer-created memory library when its draft is disc
   old.saveCredentials([
     {
       credential: {
-        ref: { id: "old-key", type: "api_key" },
+        ref: apiKeyRef("old-key"),
         label: "Old",
         providerId: "codex",
         status: "incomplete",
@@ -462,7 +502,7 @@ it("removes an untouched installer-created memory library when its draft is disc
       residentId: "resident-1",
       lane: "primary",
       adapterId: "pi",
-      credentialRef: { id: "old-key", type: "api_key" },
+      credentialRef: apiKeyRef("old-key"),
     },
   ]);
   old.saveFrontend({ kind: "external", integration: "mist-session-api" });

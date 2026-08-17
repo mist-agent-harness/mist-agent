@@ -26,7 +26,7 @@ afterEach(() => {
 
 function apiCredential(id = "codex-main"): InstallerCredential {
   return {
-    ref: { id, type: "api_key" },
+    ref: { id, type: "api_key", issuerId: "mist-installer-api-key" },
     label: "Codex main",
     providerId: "codex",
     status: "incomplete",
@@ -38,7 +38,7 @@ function primaryBinding(id = "codex-main"): LaneBinding {
     residentId: "resident-1",
     lane: "primary",
     adapterId: "pi",
-    credentialRef: { id, type: "api_key" },
+    credentialRef: { id, type: "api_key", issuerId: "mist-installer-api-key" },
   };
 }
 
@@ -157,7 +157,7 @@ describe("installer controller", () => {
       {
         credential: {
           ...apiCredential("claude-login"),
-          ref: { id: "claude-login", type: "claude_oauth" },
+          ref: { id: "claude-login", type: "claude_oauth", issuerId: "pi" },
           providerId: "claude",
         },
         secret: "oauth-material",
@@ -168,13 +168,53 @@ describe("installer controller", () => {
         residentId: "resident-1",
         lane: "primary",
         adapterId: "pi",
-        credentialRef: { id: "claude-login", type: "claude_oauth" },
+        credentialRef: { id: "claude-login", type: "claude_oauth", issuerId: "pi" },
       },
     ]);
     controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
     controller.saveMemory({ kind: "existing", path: "/tmp/existing" });
 
     expect(() => controller.commit()).toThrow(/requires adapter claude-agent-sdk/);
+  });
+
+  it("refuses a binding whose issuer does not match the stored credential ref", () => {
+    const directory = freshDirectory();
+    const controller = new InstallerController(new InstallerStateStore(directory));
+    controller.start("resident-1");
+    controller.saveCredentials([{ credential: apiCredential(), secret: "secret-value" }]);
+    controller.saveBindings([
+      {
+        ...primaryBinding(),
+        credentialRef: {
+          id: "codex-main",
+          type: "api_key",
+          issuerId: "unregistered-issuer",
+        },
+      },
+    ]);
+    controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
+    controller.saveMemory({ kind: "existing", path: "/tmp/existing" });
+
+    expect(() => controller.commit()).toThrow(/type or issuer does not match/);
+  });
+
+  it("refuses a credential ref that cannot name an active issuer", () => {
+    const directory = freshDirectory();
+    const controller = new InstallerController(new InstallerStateStore(directory));
+    const credential = apiCredential();
+    credential.ref.issuerId = "unregistered-issuer";
+    controller.start("resident-1");
+    controller.saveCredentials([{ credential, secret: "secret-value" }]);
+    controller.saveBindings([
+      {
+        ...primaryBinding(),
+        credentialRef: { ...credential.ref },
+      },
+    ]);
+    controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
+    controller.saveMemory({ kind: "existing", path: "/tmp/existing" });
+
+    expect(() => controller.commit()).toThrow(/issuer is unavailable/);
   });
 
   it("rejects a second binding for the same resident and lane", () => {
@@ -187,13 +227,21 @@ describe("installer controller", () => {
         residentId: "resident-1",
         lane: "primary",
         adapterId: "pi",
-        credentialRef: { id: "codex-main", type: "api_key" },
+        credentialRef: {
+          id: "codex-main",
+          type: "api_key",
+          issuerId: "mist-installer-api-key",
+        },
       },
       {
         residentId: "resident-1",
         lane: "primary",
         adapterId: "other",
-        credentialRef: { id: "codex-main", type: "api_key" },
+        credentialRef: {
+          id: "codex-main",
+          type: "api_key",
+          issuerId: "mist-installer-api-key",
+        },
       },
     ]);
     controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
@@ -240,10 +288,18 @@ describe("installer controller", () => {
         residentId: "resident-1",
         lane: "coding",
         adapterId: "claude-agent-sdk",
-        credentialRef: { id: "codex-main", type: "api_key" },
+        credentialRef: {
+          id: "codex-main",
+          type: "api_key",
+          issuerId: "mist-installer-api-key",
+        },
         adapterConfig: {
           baseUrl: "https://gateway.example.test",
-          tokenCredentialRef: { id: "codex-main", type: "api_key" },
+          tokenCredentialRef: {
+            id: "codex-main",
+            type: "api_key",
+            issuerId: "mist-installer-api-key",
+          },
         },
       },
     ]);

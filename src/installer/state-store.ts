@@ -192,7 +192,7 @@ export class InstallerStateStore {
   }
 
   readCredentialSecret(credentialId: string): string {
-    const secretRef = credentialSecretRef({ id: credentialId, type: "api_key" });
+    const secretRef = credentialSecretRef({ id: credentialId });
     const pointer = parseJson<CurrentPointer>(this.#currentPath);
     return readFileSync(
       join(this.#snapshotsDir, pointer.snapshotId, "credentials", secretRef),

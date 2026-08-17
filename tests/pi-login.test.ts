@@ -50,11 +50,13 @@ describe("Pi interactive OAuth", () => {
     await expect(login.login(providerById("codex"))).rejects.toThrow(/without a Codex credential/);
   });
 
-  it("does not launch a dead OAuth path for Grok", async () => {
+  it("uses Pi's documented xAI issuer for Grok subscription OAuth", async () => {
+    const authPath = freshAuthPath();
+    writeFileSync(authPath, JSON.stringify({ xai: { access: "sensitive-token" } }));
     const launch = vi.fn(async () => undefined);
-    const login = new PiInteractiveLogin({ authPath: freshAuthPath(), launch });
+    const login = new PiInteractiveLogin({ authPath, launch, beforeLaunch: () => undefined });
 
-    await expect(login.login(providerById("grok"))).rejects.toThrow(/does not expose OAuth/);
-    expect(launch).not.toHaveBeenCalled();
+    await expect(login.login(providerById("grok"))).resolves.toEqual({ locator: "pi-auth://xai" });
+    expect(launch).toHaveBeenCalledOnce();
   });
 });

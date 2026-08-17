@@ -12,6 +12,7 @@ export type Lane = "primary" | "coding";
 export interface CredentialRef {
   id: string;
   type: CredentialType;
+  issuerId: string;
 }
 
 /** Installer-only metadata. This is never embedded in a lane binding or active config. */
@@ -115,7 +116,7 @@ export function assertSafeInstallerId(value: string, field: string): void {
   }
 }
 
-export function credentialSecretRef(credential: CredentialRef): string {
+export function credentialSecretRef(credential: Pick<CredentialRef, "id">): string {
   assertSafeInstallerId(credential.id, "credential id");
   return `${credential.id}.credential`;
 }
@@ -146,6 +147,15 @@ function requireNonEmpty(value: string, field: string): void {
   }
 }
 
+function validateCredentialIssuer(credential: InstallerCredential): void {
+  const expectedIssuer = credential.ref.type === "api_key" ? "mist-installer-api-key" : "pi";
+  if (credential.ref.issuerId !== expectedIssuer) {
+    throw new InstallerValidationError(
+      `credential ${credential.ref.id} issuer is unavailable for type ${credential.ref.type}`,
+    );
+  }
+}
+
 function validateBindingCredential(
   binding: LaneBinding,
   credentials: ReadonlyMap<string, InstallerCredential>,
@@ -156,9 +166,12 @@ function validateBindingCredential(
       `binding references unknown credential: ${binding.credentialRef.id}`,
     );
   }
-  if (credential.ref.type !== binding.credentialRef.type) {
+  if (
+    credential.ref.type !== binding.credentialRef.type ||
+    credential.ref.issuerId !== binding.credentialRef.issuerId
+  ) {
     throw new InstallerValidationError(
-      `binding credential type does not match stored ref: ${binding.credentialRef.id}`,
+      `binding credential type or issuer does not match stored ref: ${binding.credentialRef.id}`,
     );
   }
   if (credential.ref.type === "claude_oauth" && binding.adapterId !== "claude-agent-sdk") {
@@ -184,6 +197,8 @@ export function validateReadyDraft(draft: InstallerDraft): MistInstallConfigV0 {
     assertSafeInstallerId(credential.ref.id, "credential id");
     requireNonEmpty(credential.label, `credential ${credential.ref.id} label`);
     requireNonEmpty(credential.providerId, `credential ${credential.ref.id} providerId`);
+    requireNonEmpty(credential.ref.issuerId, `credential ${credential.ref.id} issuerId`);
+    validateCredentialIssuer(credential);
     if (credential.status !== "ready") {
       throw new InstallerValidationError(`credential ${credential.ref.id} is incomplete`);
     }
@@ -217,7 +232,8 @@ export function validateReadyDraft(draft: InstallerDraft): MistInstallConfigV0 {
       if (
         tokenCredential === undefined ||
         tokenCredential.ref.type !== "api_key" ||
-        adapterConfig.tokenCredentialRef.type !== "api_key"
+        adapterConfig.tokenCredentialRef.type !== "api_key" ||
+        tokenCredential.ref.issuerId !== adapterConfig.tokenCredentialRef.issuerId
       ) {
         throw new InstallerValidationError(
           `binding ${binding.lane} tokenCredentialRef must reference an api_key`,

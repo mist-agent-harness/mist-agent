@@ -11,8 +11,8 @@ export interface ProviderCapability {
 /**
  * Upstream capability table, not a wish list.
  *
- * Pi currently documents subscription OAuth for Claude and OpenAI Codex. xAI/Grok is
- * documented as API-key authentication, so the installer must not offer a dead OAuth path.
+ * Pi currently documents subscription OAuth and API-key paths for Claude, OpenAI Codex,
+ * and xAI/Grok. This table is the installer's active acquisition catalog.
  */
 export const PROVIDERS: readonly ProviderCapability[] = [
   {
@@ -32,7 +32,7 @@ export const PROVIDERS: readonly ProviderCapability[] = [
     id: "grok",
     label: "Grok / xAI",
     piAuthKey: "xai",
-    methods: ["api-key"],
+    methods: ["oauth", "api-key"],
   },
 ] as const;
 
@@ -53,6 +53,10 @@ export function credentialTypeFor(
     case "codex":
       return "codex_oauth";
     case "grok":
-      throw new Error("Grok OAuth has no installed credential issuer");
+      return "grok_oauth";
   }
+}
+
+export function credentialIssuerIdFor(method: CredentialMethod): string {
+  return method === "oauth" ? "pi" : "mist-installer-api-key";
 }

@@ -33,13 +33,13 @@
 ## 3. 第 1 步 · credentials（钥匙）
 
 流程（对应 `collectCredentials`）：
-1. `Choose a credential provider` —— 列表来自 `PROVIDERS`（能力表，不是愿望表）：`Claude`（OAuth / API key）、`Codex`（OAuth / API key）、`Grok / xAI`（只 API key；pi 没有 Grok OAuth，界面上就不给）。
+1. `Choose a credential provider` —— 列表来自 `PROVIDERS`（获取入口表，不是愿望表）：`Claude`、`Codex`、`Grok / xAI` 都有 Pi OAuth / API key。Grok 入口依据 Pi provider 表的 `/login xai` subscription 路径。
 2. `How should <provider> authenticate?` —— `Sign in through Pi` / `Enter an API key`。
 3. `Credential name` —— 默认 `<provider>-login` / `<provider>-key`，slug 化后成为 `id`，也是后面绑定时的引用名。
 4. OAuth 路径：屏幕先出 `Pi will open now. Run /login, choose <provider>, finish authorization, then quit Pi.`，然后把终端交给 pi；pi 退出后安装器只检查 `~/.pi/agent/auth.json` 里有没有该 provider 的 key，有 → 记 `pi-auth://<key>`；没有 → 报 `Pi exited without a <provider> credential in its auth store; the installer draft was kept`。
 5. API key 路径：`<provider> API key`（掩码输入），落进 `draft-secrets/<id>.credential`。
 6. `Add another credential?` —— 默认否。至少一把才能进第 2 步（validate 兜底）。
-7. `CredentialRef { id, type }` 与 PR #52 一致；Claude OAuth 的约束由 `type: "claude_oauth"` 表达，不另造 `adapterConstraint` 字段。它只在 Claude Agent SDK 下出现，收完时界面也会明说。
+7. `CredentialRef { id, type, issuerId }` 与 PR #52 一致；Pi OAuth 记 `issuerId: "pi"`，手填 API key 记 `issuerId: "mist-installer-api-key"`。Claude OAuth 的约束由 `type: "claude_oauth"` 表达，不另造 `adapterConstraint` 字段；它只在 Claude Agent SDK 下出现，收完时界面也会明说。
 
 ## 4. 第 2 步 · bindings（车道）
 

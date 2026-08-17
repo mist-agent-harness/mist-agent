@@ -13,7 +13,7 @@ import type { InstallerController } from "./controller.ts";
 import type { MemoryLibraryPort } from "./memory-library.ts";
 import type { OAuthLoginPort } from "./pi-login.ts";
 import type { PromptPort } from "./prompt-port.ts";
-import { PROVIDERS, credentialTypeFor, providerById } from "./providers.ts";
+import { PROVIDERS, credentialIssuerIdFor, credentialTypeFor, providerById } from "./providers.ts";
 import type { InstallerStateStore } from "./state-store.ts";
 
 export interface RunInstallerOptions {
@@ -93,7 +93,11 @@ async function collectCredentials(
     }
     entries.push({
       credential: {
-        ref: { id, type: credentialTypeFor(provider, method) },
+        ref: {
+          id,
+          type: credentialTypeFor(provider, method),
+          issuerId: credentialIssuerIdFor(method),
+        },
         label: name,
         providerId: provider.id,
         status: "incomplete",
@@ -354,7 +358,7 @@ function formatReview(draft: InstallerDraft): string {
   const credentials = draft.credentials
     .map(
       (credential) =>
-        `${credential.ref.id} (${credential.providerId}, ${credential.ref.type}, ${credential.status})`,
+        `${credential.ref.id} (${credential.providerId}, ${credential.ref.type}, ${credential.ref.issuerId}, ${credential.status})`,
     )
     .join(", ");
   const bindings = draft.bindings
