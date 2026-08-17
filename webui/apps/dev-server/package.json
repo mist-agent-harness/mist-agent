@@ -1,0 +1,23 @@
+{
+  "name": "@mist-webui/dev-server",
+  "description": "mist webui dev server: serves apps/web dist + /api dispatch + dual event downlinks; handler behind it is pluggable (default boot-stub, mock, or real mist orchestration)",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-host-apiproxy": "workspace:^",
+    "@mist-webui/mock-contract": "workspace:^",
+    "ws": "^8.21.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.10",
+    "tsx": "^4.22.4",
+    "vitest": "^4.1.8"
+  }
+}

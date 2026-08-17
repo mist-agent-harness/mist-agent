@@ -1,0 +1,43 @@
+/* GENERATED FROM skin.config.json by scripts/build-skin.mjs —— 请勿手改。
+ * 改皮肤请改配置后跑 npm run build:skin（根 build / dev:web 已挂生成钩）。
+ *
+ * mist 素皮 · 品牌 accent 换色层
+ *
+ * 上游 dsh 的品牌色全走 --dsw-static-deepseek-* 色阶：alias 层的按钮/业务
+ * 主色指向它，ChatView 的 shimmer 渐变和 StateDot 的进行中点也直读它。
+ * 自定义属性按层叠取胜，本表由 boot.tsx 在 base.css 之后引入，把整条
+ * deepseek 色阶重定义为雾灰蓝（保持各档明度角色不变，深浅的语义映射
+ * 在暗色块里自动跟随），一次换色覆盖所有消费方，组件零改动。
+ *
+ * 不从 base.css @import：该表有契约测试（base-styles.client.spec）要求
+ * 每个 sheet 都来自 ui-theme 包。本表是 shell 自有的 fork 皮肤层，
+ * 不进上游 token 包；归属桶（包名/LICENSE/注释）原样保留。
+ */
+body {
+  --dsw-static-deepseek-50: rgb(245, 247, 250);
+  --dsw-static-deepseek-100: rgb(233, 238, 243);
+  --dsw-static-deepseek-200: rgb(214, 223, 231);
+  --dsw-static-deepseek-300: rgb(181, 194, 206);
+  --dsw-static-deepseek-400: rgb(130, 149, 168);
+  --dsw-static-deepseek-450: rgb(106, 127, 147);
+  --dsw-static-deepseek-500: rgb(90, 110, 130);
+  --dsw-static-deepseek-600: rgb(70, 89, 108);
+  --dsw-static-deepseek-700-delete: rgb(55, 70, 87);
+  --dsw-static-deepseek-800: rgb(45, 56, 68);
+  --dsw-static-deepseek-900: rgb(37, 46, 56);
+
+  /* 字体两段：初值与 base.css 的 :root 默认一致（视觉零变化），改配置
+     即全局换字体；body 比 :root 继承链更近，同值定义即接管所有权。 */
+  --dsw-font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  --ds-font-family-code: 'SF Mono', 'JetBrains Mono', 'Fira Code', Consolas, 'Liberation Mono', Menlo, Courier, 'PingFang SC', 'Microsoft YaHei';
+
+  /* 品牌藏青标题色退化为普通主文字色（素皮不留品牌色相）；
+     label-primary 本身随明暗主题切换，本行两主题通用。 */
+  --dsw-alias-label-primary-bluish: var(--dsw-alias-label-primary);
+}
+
+/* 暗色块在 body[data-ds-dark-theme] 上重定义过 label-primary-bluish
+   （specificity 0,1,1 高于上面的 body 行），这里同权重后手压掉。 */
+body[data-ds-dark-theme] {
+  --dsw-alias-label-primary-bluish: var(--dsw-alias-label-primary);
+}
