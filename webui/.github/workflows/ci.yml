@@ -1,0 +1,20 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.1'
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build          # build:lib (tsc -b both faces + tsdown) + build:web
+      - run: pnpm run lint           # oxlint via scripts/run-oxlint.ts (panics on the 2c/4G LA box: docs/research/lint-environment.md)
+      - run: pnpm test               # root vitest, all projects

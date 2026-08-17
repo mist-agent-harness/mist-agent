@@ -1,0 +1,47 @@
+# mist-webui workspace — trimmed from upstream deepseek-harness pnpm-workspace.yaml
+# Upstream freeze: deepseek-ai/deepseek-harness @ 47f943859bef60e4160492346772ded9b24f765a (MIT)
+# Dropped members vs upstream: website, examples, python/sdk-runtime, apps/cli (native/landlock-run kept: sandbox-local workspace dep)
+packages:
+  - vendor/*
+  - packages/*/*
+  - native/landlock-run
+  - native/landlock-run/packages/*
+  - apps/*
+
+# Vendored framework packages keep their upstream semver ranges, while local
+# builds must resolve those matching names to this workspace's pinned sources.
+linkWorkspacePackages: true
+
+overrides:
+  '@deepseek-ai/cosmokit': 'link:vendor/cosmokit'
+  '@deepseek-ai/schemastery': 'link:vendor/schemastery'
+
+peerDependencyRules:
+  allowedVersions:
+    typescript: '>=5 <7'
+
+# pnpm strictDepBuilds: deny by default, allow only what we need.
+allowBuilds:
+  esbuild: true
+  lefthook: true
+  node-pty: true
+  '@google/genai': false
+  protobufjs: false
+  node-addon-require-builtin: false
+  koffi: true
+  '@deepseek-ai/dsh-subprocess-local@file:packages/subprocess/subprocess-local': true
+
+minimumReleaseAgeExclude:
+  - '@earendil-works/pi-ai@0.82.1'
+  - node-addon-native-custom-loader@0.1.4
+  - node-addon-require-builtin-darwin-arm64@0.1.4
+  - node-addon-require-builtin-darwin-x64@0.1.4
+  - node-addon-require-builtin-linux-arm64-gnu@0.1.4
+  - node-addon-require-builtin-linux-x64-gnu@0.1.4
+  - node-addon-require-builtin-win32-arm64-msvc@0.1.4
+  - node-addon-require-builtin-win32-ia32-msvc@0.1.4
+  - node-addon-require-builtin-win32-x64-msvc@0.1.4
+  - node-addon-require-builtin@0.1.4
+
+patchedDependencies:
+  node-pty@1.1.0: patches/node-pty@1.1.0.patch
