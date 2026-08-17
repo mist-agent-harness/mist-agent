@@ -6,6 +6,7 @@ import { InstallerController } from "../src/installer/controller.ts";
 import { FileMemoryLibrary } from "../src/installer/memory-library.ts";
 import type { OAuthLoginPort } from "../src/installer/pi-login.ts";
 import type { PromptPort } from "../src/installer/prompt-port.ts";
+import { PROVIDERS } from "../src/installer/providers.ts";
 import { runInstaller } from "../src/installer/run.ts";
 import { InstallerStateStore } from "../src/installer/state-store.ts";
 
@@ -202,36 +203,11 @@ it("writes primary Pi and coding Claude SDK bindings to separate lanes", async (
   prompt.expectExhausted();
 });
 
-it("records Pi as the issuer for Grok subscription OAuth", async () => {
-  const directory = freshDirectory();
-  const store = new InstallerStateStore(directory);
-  const prompt = new ScriptedPrompt({
-    selects: ["grok", "oauth", "grok-login", "external", "create"],
-    inputs: ["grok-login", join(directory, "memory")],
-    secrets: [],
-    confirms: [false, false, true],
-  });
-  const oauth: OAuthLoginPort = {
-    async login(provider) {
-      expect(provider.piAuthKey).toBe("xai");
-      return { locator: "pi-auth://xai" };
-    },
-  };
+it("keeps Grok OAuth out of the v0 installer acquisition catalog", () => {
+  const grok = PROVIDERS.find((provider) => provider.id === "grok");
 
-  const result = await runInstaller({
-    residentId: "resident-1",
-    dataDir: directory,
-    controller: new InstallerController(store),
-    store,
-    prompt,
-    oauth,
-    memoryLibraries: new FileMemoryLibrary(),
-  });
-
-  expect(result.status).toBe("committed");
-  if (result.status !== "committed") throw new Error("expected committed setup");
-  expect(result.receipt.config.credentialRefs).toEqual([oauthRef("grok-login", "grok_oauth")]);
-  prompt.expectExhausted();
+  expect(grok?.piAuthKey).toBe("xai");
+  expect(grok?.methods).toEqual(["api-key"]);
 });
 
 it("resumes from the persisted next step instead of asking for credentials again", async () => {

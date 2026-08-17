@@ -33,7 +33,7 @@
 ## 3. 第 1 步 · credentials（钥匙）
 
 流程（对应 `collectCredentials`）：
-1. `Choose a credential provider` —— 列表来自 `PROVIDERS`（获取入口表，不是愿望表）：`Claude`、`Codex`、`Grok / xAI` 都有 Pi OAuth / API key。Grok 入口依据 Pi provider 表的 `/login xai` subscription 路径。
+1. `Choose a credential provider` —— 列表来自 `PROVIDERS`（获取入口表，不是愿望表）：`Claude`、`Codex` 提供 Pi OAuth / API key；`Grok / xAI` 在 v0 只提供 API key。Pi 已支持 `/login xai`，但 #50 明确把 Grok OAuth 留给后续插件，不在本单接入。
 2. `How should <provider> authenticate?` —— `Sign in through Pi` / `Enter an API key`。
 3. `Credential name` —— 默认 `<provider>-login` / `<provider>-key`，slug 化后成为 `id`，也是后面绑定时的引用名。
 4. OAuth 路径：屏幕先出 `Pi will open now. Run /login, choose <provider>, finish authorization, then quit Pi.`，然后把终端交给 pi；pi 退出后安装器只检查 `~/.pi/agent/auth.json` 里有没有该 provider 的 key，有 → 记 `pi-auth://<key>`；没有 → 报 `Pi exited without a <provider> credential in its auth store; the installer draft was kept`。

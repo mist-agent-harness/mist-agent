@@ -152,6 +152,66 @@ function requireNonEmpty(value: string, field: string): void {
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function requireString(value: unknown, field: string): string {
+  if (typeof value !== "string") {
+    throw new InstallerValidationError(`${field} must be a string`);
+  }
+  requireNonEmpty(value, field);
+  return value;
+}
+
+function validateFrontendChoice(value: unknown): FrontendChoice {
+  if (!isRecord(value)) {
+    throw new InstallerValidationError("frontend choice has an unsupported shape");
+  }
+  switch (value.kind) {
+    case "external":
+      if (value.integration !== "mist-session-api") {
+        throw new InstallerValidationError(
+          `external frontend has unsupported integration: ${String(value.integration)}`,
+        );
+      }
+      return { kind: "external", integration: "mist-session-api" };
+    case "official-skin":
+      if (value.pluginId !== "mist-official-skin") {
+        throw new InstallerValidationError(
+          `official frontend has unsupported pluginId: ${String(value.pluginId)}`,
+        );
+      }
+      if (value.installation !== "pending" && value.installation !== "installed") {
+        throw new InstallerValidationError(
+          `official frontend has unsupported installation: ${String(value.installation)}`,
+        );
+      }
+      return {
+        kind: "official-skin",
+        pluginId: "mist-official-skin",
+        installation: value.installation,
+      };
+    default:
+      throw new InstallerValidationError(`unsupported frontend kind: ${String(value.kind)}`);
+  }
+}
+
+function validateMemoryChoice(value: unknown): MemoryChoice {
+  if (!isRecord(value)) {
+    throw new InstallerValidationError("memory choice has an unsupported shape");
+  }
+  const path = requireString(value.path, "memory path");
+  switch (value.kind) {
+    case "existing":
+      return { kind: "existing", path };
+    case "create":
+      return { kind: "create", path };
+    default:
+      throw new InstallerValidationError(`unsupported memory kind: ${String(value.kind)}`);
+  }
+}
+
 function validateCredentialIssuer(credential: InstallerCredential): void {
   const expectedIssuer = credential.ref.type === "api_key" ? "mist-installer-api-key" : "pi";
   if (credential.ref.issuerId !== expectedIssuer) {
@@ -293,7 +353,8 @@ export function validateReadyDraft(draft: InstallerDraft): MistInstallConfigV0 {
   if (draft.frontend === null) {
     throw new InstallerValidationError("frontend choice is required");
   }
-  if (draft.frontend.kind === "official-skin" && draft.frontend.installation !== "installed") {
+  const frontend = validateFrontendChoice(draft.frontend);
+  if (frontend.kind === "official-skin" && frontend.installation !== "installed") {
     throw new InstallerValidationError(
       "official skin is pending issues #49 and #51 and cannot be activated yet",
     );
@@ -301,14 +362,14 @@ export function validateReadyDraft(draft: InstallerDraft): MistInstallConfigV0 {
   if (draft.memory === null) {
     throw new InstallerValidationError("memory choice is required");
   }
-  requireNonEmpty(draft.memory.path, "memory path");
+  const memory = validateMemoryChoice(draft.memory);
 
   return {
     schemaVersion: INSTALL_CONFIG_SCHEMA_VERSION,
     residentId: draft.residentId,
     credentialRefs: draft.credentials.map((credential) => ({ ...credential.ref })),
     bindings: draft.bindings.map((binding) => structuredClone(binding)),
-    frontend: { ...draft.frontend },
-    memory: { ...draft.memory },
+    frontend,
+    memory,
   };
 }

@@ -11,8 +11,8 @@ export interface ProviderCapability {
 /**
  * Upstream capability table, not a wish list.
  *
- * Pi currently documents subscription OAuth and API-key paths for Claude, OpenAI Codex,
- * and xAI/Grok. This table is the installer's active acquisition catalog.
+ * This table is the installer's active acquisition catalog. Pi supports xAI/Grok OAuth,
+ * but issue #50 explicitly defers that path to a later plugin; v0 exposes Grok by API key only.
  */
 export const PROVIDERS: readonly ProviderCapability[] = [
   {
@@ -32,7 +32,7 @@ export const PROVIDERS: readonly ProviderCapability[] = [
     id: "grok",
     label: "Grok / xAI",
     piAuthKey: "xai",
-    methods: ["oauth", "api-key"],
+    methods: ["api-key"],
   },
 ] as const;
 

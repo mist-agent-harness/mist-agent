@@ -285,6 +285,49 @@ describe("installer controller", () => {
       },
       error: /unsupported binding adapter/,
     },
+    {
+      name: "frontend kind",
+      mutate(draft: InstallerDraft) {
+        draft.frontend = { kind: "future-frontend" } as never;
+      },
+      error: /unsupported frontend kind/,
+    },
+    {
+      name: "external frontend integration",
+      mutate(draft: InstallerDraft) {
+        draft.frontend = { kind: "external", integration: "future-api" } as never;
+      },
+      error: /unsupported integration/,
+    },
+    {
+      name: "official frontend plugin",
+      mutate(draft: InstallerDraft) {
+        draft.frontend = {
+          kind: "official-skin",
+          pluginId: "future-skin",
+          installation: "installed",
+        } as never;
+      },
+      error: /unsupported pluginId/,
+    },
+    {
+      name: "official frontend installation",
+      mutate(draft: InstallerDraft) {
+        draft.frontend = {
+          kind: "official-skin",
+          pluginId: "mist-official-skin",
+          installation: "future-state",
+        } as never;
+      },
+      error: /unsupported installation/,
+    },
+    {
+      name: "memory kind",
+      mutate(draft: InstallerDraft) {
+        draft.memory = { kind: "future-memory", path: "/tmp/existing" } as never;
+      },
+      error: /unsupported memory kind/,
+    },
   ])("rejects a corrupted runtime $name enum", ({ mutate, error }) => {
     const directory = freshDirectory();
     const store = new InstallerStateStore(directory);
