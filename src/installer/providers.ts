@@ -1,4 +1,4 @@
-import type { CredentialMethod } from "./contracts.ts";
+import type { CredentialMethod, CredentialType } from "./contracts.ts";
 
 export interface ProviderCapability {
   id: "claude" | "codex" | "grok";
@@ -40,4 +40,19 @@ export function providerById(providerId: string): ProviderCapability {
   const provider = PROVIDERS.find((candidate) => candidate.id === providerId);
   if (provider === undefined) throw new Error(`unsupported provider: ${providerId}`);
   return provider;
+}
+
+export function credentialTypeFor(
+  provider: ProviderCapability,
+  method: CredentialMethod,
+): CredentialType {
+  if (method === "api-key") return "api_key";
+  switch (provider.id) {
+    case "claude":
+      return "claude_oauth";
+    case "codex":
+      return "codex_oauth";
+    case "grok":
+      throw new Error("Grok OAuth has no installed credential issuer");
+  }
 }

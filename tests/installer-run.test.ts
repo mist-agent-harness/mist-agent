@@ -96,7 +96,10 @@ describe.each([
     const memoryPath = join(directory, "memory-choice");
     if (memory === "existing") mkdirSync(memoryPath);
     const prompt = new ScriptedPrompt({
-      selects: ["codex", "api-key", "pi", "codex-key", frontend, memory],
+      selects:
+        frontend === "official-skin"
+          ? ["codex", "api-key", "codex-key", frontend, memory, "keep"]
+          : ["codex", "api-key", "codex-key", frontend, memory],
       inputs: ["codex-key", memoryPath],
       secrets: ["credential-text"],
       confirms: frontend === "external" ? [false, false, true] : [false, false],
@@ -116,7 +119,7 @@ describe.each([
       expect(result.receipt.config.frontend.kind).toBe(frontend);
       expect(result.receipt.config.memory.kind).toBe(memory);
       expect(JSON.stringify(result.receipt.config)).not.toContain("credential-text");
-      expect(store.readCredentialSecret("codex-key.credential")).toBe("credential-text");
+      expect(store.readCredentialSecret("codex-key")).toBe("credential-text");
     } else if (result.status === "dependency-pending") {
       expect(result.draft.frontend?.kind).toBe("official-skin");
       expect(result.draft.memory?.kind).toBe(memory);
@@ -128,7 +131,7 @@ describe.each([
   });
 });
 
-it("writes main Pi and coding Claude SDK bindings to separate purposes", async () => {
+it("writes primary Pi and coding Claude SDK bindings to separate lanes", async () => {
   const directory = freshDirectory();
   const store = new InstallerStateStore(directory);
   const prompt = new ScriptedPrompt({
@@ -137,16 +140,20 @@ it("writes main Pi and coding Claude SDK bindings to separate purposes", async (
       "api-key",
       "claude",
       "oauth",
-      "pi",
       "codex-key",
-      "claude-agent-sdk",
       "claude-login",
+      "codex-key",
       "external",
       "create",
     ],
-    inputs: ["codex-key", "claude-login", join(directory, "memory")],
+    inputs: [
+      "codex-key",
+      "claude-login",
+      "https://gateway.example.test",
+      join(directory, "memory"),
+    ],
     secrets: ["codex-api-key"],
-    confirms: [true, false, true, true],
+    confirms: [true, false, true, true, true],
   });
   const oauth: OAuthLoginPort = {
     async login() {
@@ -169,15 +176,19 @@ it("writes main Pi and coding Claude SDK bindings to separate purposes", async (
   expect(result.receipt.config.bindings).toEqual([
     {
       residentId: "resident-1",
-      purpose: "main",
+      lane: "primary",
       adapterId: "pi",
-      credentialId: "codex-key",
+      credentialRef: { id: "codex-key", type: "api_key" },
     },
     {
       residentId: "resident-1",
-      purpose: "coding",
+      lane: "coding",
       adapterId: "claude-agent-sdk",
-      credentialId: "claude-login",
+      credentialRef: { id: "claude-login", type: "claude_oauth" },
+      adapterConfig: {
+        baseUrl: "https://gateway.example.test",
+        tokenCredentialRef: { id: "codex-key", type: "api_key" },
+      },
     },
   ]);
   prompt.expectExhausted();
@@ -190,12 +201,10 @@ it("resumes from the persisted next step instead of asking for credentials again
   first.start("resident-1");
   first.saveCredentials([
     {
-      ref: {
-        id: "codex-login",
+      credential: {
+        ref: { id: "codex-login", type: "codex_oauth" },
         label: "Codex",
         providerId: "codex",
-        method: "oauth",
-        secretRef: "codex-login.credential",
         status: "incomplete",
       },
       secret: "pi-auth://openai-codex",
@@ -203,7 +212,7 @@ it("resumes from the persisted next step instead of asking for credentials again
   ]);
 
   const prompt = new ScriptedPrompt({
-    selects: ["resume", "pi", "codex-login", "external", "create"],
+    selects: ["resume", "codex-login", "external", "create"],
     inputs: [join(directory, "memory")],
     secrets: [],
     confirms: [false, true],
@@ -222,6 +231,55 @@ it("resumes from the persisted next step instead of asking for credentials again
   prompt.expectExhausted();
 });
 
+it("returns to credentials when the primary lane has no compatible credential", async () => {
+  const directory = freshDirectory();
+  const store = new InstallerStateStore(directory);
+  const first = new InstallerController(store);
+  first.start("resident-1");
+  first.saveCredentials([
+    {
+      credential: {
+        ref: { id: "claude-login", type: "claude_oauth" },
+        label: "Claude login",
+        providerId: "claude",
+        status: "incomplete",
+      },
+      secret: "pi-auth://anthropic",
+    },
+  ]);
+
+  const prompt = new ScriptedPrompt({
+    selects: ["resume", "codex", "api-key", "codex-key", "claude-login", "external", "create"],
+    inputs: ["Codex key", join(directory, "memory")],
+    secrets: ["codex-secret"],
+    confirms: [false, true, false, true],
+  });
+  const result = await runInstaller({
+    residentId: "resident-1",
+    dataDir: directory,
+    controller: new InstallerController(store),
+    store,
+    prompt,
+    oauth: noOAuth,
+    memoryLibraries: new FileMemoryLibrary(),
+  });
+
+  expect(result.status).toBe("committed");
+  if (result.status !== "committed") throw new Error("expected committed setup");
+  expect(result.receipt.config.credentialRefs).toEqual([
+    { id: "claude-login", type: "claude_oauth" },
+    { id: "codex-key", type: "api_key" },
+  ]);
+  expect(result.receipt.config.bindings.map((binding) => binding.lane)).toEqual([
+    "primary",
+    "coding",
+  ]);
+  expect(prompt.infoMessages).toContain(
+    "No saved credential can be used with pi. Add one now — your draft is kept.",
+  );
+  prompt.expectExhausted();
+});
+
 it("keeps the exact review draft when commit is declined", async () => {
   const directory = freshDirectory();
   const store = new InstallerStateStore(directory);
@@ -229,12 +287,10 @@ it("keeps the exact review draft when commit is declined", async () => {
   controller.start("resident-1");
   controller.saveCredentials([
     {
-      ref: {
-        id: "codex-key",
+      credential: {
+        ref: { id: "codex-key", type: "api_key" },
         label: "Codex",
         providerId: "codex",
-        method: "api-key",
-        secretRef: "codex-key.credential",
         status: "incomplete",
       },
       secret: "credential-text",
@@ -243,9 +299,9 @@ it("keeps the exact review draft when commit is declined", async () => {
   controller.saveBindings([
     {
       residentId: "resident-1",
-      purpose: "main",
+      lane: "primary",
       adapterId: "pi",
-      credentialId: "codex-key",
+      credentialRef: { id: "codex-key", type: "api_key" },
     },
   ]);
   controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
@@ -269,6 +325,68 @@ it("keeps the exact review draft when commit is declined", async () => {
 
   expect(result.status).toBe("paused");
   expect(store.loadDraft()?.progress.currentStep).toBe("review");
+  expect(prompt.infoMessages.join("\n")).toContain("primary: pi · codex-key");
+  expect(prompt.infoMessages.join("\n")).not.toContain("credential-text");
+  prompt.expectExhausted();
+});
+
+it("lets a pending official-skin draft switch to an external frontend without redoing memory", async () => {
+  const directory = freshDirectory();
+  const store = new InstallerStateStore(directory);
+  const memoryPath = join(directory, "memory");
+  const libraries = new FileMemoryLibrary();
+  const first = new InstallerController(store);
+  first.start("resident-1");
+  first.saveCredentials([
+    {
+      credential: {
+        ref: { id: "codex-key", type: "api_key" },
+        label: "Codex",
+        providerId: "codex",
+        status: "incomplete",
+      },
+      secret: "credential-text",
+    },
+  ]);
+  first.saveBindings([
+    {
+      residentId: "resident-1",
+      lane: "primary",
+      adapterId: "pi",
+      credentialRef: { id: "codex-key", type: "api_key" },
+    },
+  ]);
+  first.saveFrontend({
+    kind: "official-skin",
+    pluginId: "mist-official-skin",
+    installation: "pending",
+  });
+  first.saveMemory({ kind: "create", path: memoryPath });
+  libraries.createEmpty(memoryPath);
+
+  const prompt = new ScriptedPrompt({
+    selects: ["resume", "change", "external"],
+    inputs: [],
+    secrets: [],
+    confirms: [true],
+  });
+  const result = await runInstaller({
+    residentId: "resident-1",
+    dataDir: directory,
+    controller: new InstallerController(store),
+    store,
+    prompt,
+    oauth: noOAuth,
+    memoryLibraries: libraries,
+  });
+
+  expect(result.status).toBe("committed");
+  if (result.status !== "committed") throw new Error("expected committed setup");
+  expect(result.receipt.config.frontend).toEqual({
+    kind: "external",
+    integration: "mist-session-api",
+  });
+  expect(result.receipt.config.memory.path).toBe(memoryPath);
   prompt.expectExhausted();
 });
 
@@ -279,12 +397,10 @@ it("keeps an existing installation by default instead of creating a second snaps
   controller.start("resident-1");
   controller.saveCredentials([
     {
-      ref: {
-        id: "codex-key",
+      credential: {
+        ref: { id: "codex-key", type: "api_key" },
         label: "Codex",
         providerId: "codex",
-        method: "api-key",
-        secretRef: "codex-key.credential",
         status: "incomplete",
       },
       secret: "credential-text",
@@ -293,9 +409,9 @@ it("keeps an existing installation by default instead of creating a second snaps
   controller.saveBindings([
     {
       residentId: "resident-1",
-      purpose: "main",
+      lane: "primary",
       adapterId: "pi",
-      credentialId: "codex-key",
+      credentialRef: { id: "codex-key", type: "api_key" },
     },
   ]);
   controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
@@ -332,12 +448,10 @@ it("removes an untouched installer-created memory library when its draft is disc
   old.start("resident-1");
   old.saveCredentials([
     {
-      ref: {
-        id: "old-key",
+      credential: {
+        ref: { id: "old-key", type: "api_key" },
         label: "Old",
         providerId: "codex",
-        method: "api-key",
-        secretRef: "old-key.credential",
         status: "incomplete",
       },
       secret: "old-secret",
@@ -346,9 +460,9 @@ it("removes an untouched installer-created memory library when its draft is disc
   old.saveBindings([
     {
       residentId: "resident-1",
-      purpose: "main",
+      lane: "primary",
       adapterId: "pi",
-      credentialId: "old-key",
+      credentialRef: { id: "old-key", type: "api_key" },
     },
   ]);
   old.saveFrontend({ kind: "external", integration: "mist-session-api" });
@@ -357,7 +471,7 @@ it("removes an untouched installer-created memory library when its draft is disc
 
   const replacementPath = join(directory, "replacement-memory");
   const prompt = new ScriptedPrompt({
-    selects: ["discard", "codex", "api-key", "pi", "new-key", "external", "create"],
+    selects: ["discard", "codex", "api-key", "new-key", "external", "create"],
     inputs: ["new-key", replacementPath],
     secrets: ["new-secret"],
     confirms: [false, false, true],

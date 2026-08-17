@@ -2,7 +2,11 @@ import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { CredentialRef, InstallerDraft } from "../src/installer/contracts.ts";
+import type {
+  InstallerCredential,
+  InstallerDraft,
+  LaneBinding,
+} from "../src/installer/contracts.ts";
 import { InstallerController } from "../src/installer/controller.ts";
 import { InstallerStateStore } from "../src/installer/state-store.ts";
 
@@ -20,28 +24,28 @@ afterEach(() => {
   }
 });
 
-function apiCredential(id = "codex-main"): CredentialRef {
+function apiCredential(id = "codex-main"): InstallerCredential {
   return {
-    id,
+    ref: { id, type: "api_key" },
     label: "Codex main",
     providerId: "codex",
-    method: "api-key",
-    secretRef: `${id}.token`,
     status: "incomplete",
+  };
+}
+
+function primaryBinding(id = "codex-main"): LaneBinding {
+  return {
+    residentId: "resident-1",
+    lane: "primary",
+    adapterId: "pi",
+    credentialRef: { id, type: "api_key" },
   };
 }
 
 function completeDraft(controller: InstallerController): InstallerDraft {
   controller.start("resident-1");
-  controller.saveCredentials([{ ref: apiCredential(), secret: "secret-value" }]);
-  controller.saveBindings([
-    {
-      residentId: "resident-1",
-      purpose: "main",
-      adapterId: "pi",
-      credentialId: "codex-main",
-    },
-  ]);
+  controller.saveCredentials([{ credential: apiCredential(), secret: "secret-value" }]);
+  controller.saveBindings([primaryBinding()]);
   controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
   return controller.saveMemory({ kind: "create", path: "/tmp/mist-memory" });
 }
@@ -51,33 +55,67 @@ describe("installer controller", () => {
     const directory = freshDirectory();
     const first = new InstallerController(new InstallerStateStore(directory));
     first.start("resident-1");
-    first.saveCredentials([{ ref: apiCredential(), secret: "secret-value" }]);
-    first.saveBindings([
-      {
-        residentId: "resident-1",
-        purpose: "main",
-        adapterId: "pi",
-        credentialId: "codex-main",
-      },
-    ]);
+    first.saveCredentials([{ credential: apiCredential(), secret: "secret-value" }]);
+    first.saveBindings([primaryBinding()]);
 
     const resumed = new InstallerController(new InstallerStateStore(directory));
     const draft = resumed.start("resident-1", "resume");
     expect(draft.progress.currentStep).toBe("frontend");
     expect(draft.progress.completedSteps).toEqual(["credentials", "bindings"]);
-    expect(draft.credentialRefs[0]?.status).toBe("ready");
+    expect(draft.credentials[0]?.status).toBe("ready");
+  });
+
+  it("returns to credentials without discarding saved credentials when a lane cannot be bound", () => {
+    const directory = freshDirectory();
+    const controller = new InstallerController(new InstallerStateStore(directory));
+    controller.start("resident-1");
+    controller.saveCredentials([{ credential: apiCredential(), secret: "secret-value" }]);
+    controller.saveBindings([primaryBinding()]);
+
+    const draft = controller.revisitCredentials();
+
+    expect(draft.progress.currentStep).toBe("credentials");
+    expect(draft.progress.completedSteps).toEqual([]);
+    expect(draft.credentials).toHaveLength(1);
+    expect(draft.credentials[0]?.ref.id).toBe("codex-main");
+    expect(draft.bindings).toEqual([]);
+  });
+
+  it("returns a pending review to frontend while preserving completed memory", () => {
+    const directory = freshDirectory();
+    const controller = new InstallerController(new InstallerStateStore(directory));
+    controller.start("resident-1");
+    controller.saveCredentials([{ credential: apiCredential(), secret: "secret-value" }]);
+    controller.saveBindings([primaryBinding()]);
+    controller.saveFrontend({
+      kind: "official-skin",
+      pluginId: "mist-official-skin",
+      installation: "pending",
+    });
+    controller.saveMemory({ kind: "create", path: "/tmp/mist-memory" });
+
+    const revisited = controller.revisitFrontend();
+    expect(revisited.progress.currentStep).toBe("frontend");
+    expect(revisited.memory).toEqual({ kind: "create", path: "/tmp/mist-memory" });
+
+    const changed = controller.saveFrontend({
+      kind: "external",
+      integration: "mist-session-api",
+    });
+    expect(changed.progress.currentStep).toBe("review");
+    expect(changed.memory).toEqual(revisited.memory);
   });
 
   it("discard removes both the visible draft and staged credential material", () => {
     const directory = freshDirectory();
     const controller = new InstallerController(new InstallerStateStore(directory));
     controller.start("resident-1");
-    controller.saveCredentials([{ ref: apiCredential(), secret: "secret-value" }]);
+    controller.saveCredentials([{ credential: apiCredential(), secret: "secret-value" }]);
     controller.discard();
 
     const store = new InstallerStateStore(directory);
     expect(store.loadDraft()).toBeNull();
-    expect(store.hasStagedSecret("codex-main.token")).toBe(false);
+    expect(store.hasStagedSecret("codex-main.credential")).toBe(false);
   });
 
   it("commits a complete snapshot without putting secret text in config or draft", () => {
@@ -89,7 +127,7 @@ describe("installer controller", () => {
 
     expect(store.loadDraft()).toBeNull();
     expect(store.loadCurrentConfig()).toEqual(receipt.config);
-    expect(store.readCredentialSecret("codex-main.token")).toBe("secret-value");
+    expect(store.readCredentialSecret("codex-main")).toBe("secret-value");
     expect(JSON.stringify(receipt.config)).not.toContain("secret-value");
     expect(readFileSync(join(directory, "current.json"), "utf8")).not.toContain("secret-value");
   });
@@ -105,8 +143,9 @@ describe("installer controller", () => {
       statSync(join(directory, "snapshots", receipt.snapshotId, "config.json")).mode & 0o777,
     ).toBe(0o600);
     expect(
-      statSync(join(directory, "snapshots", receipt.snapshotId, "credentials", "codex-main.token"))
-        .mode & 0o777,
+      statSync(
+        join(directory, "snapshots", receipt.snapshotId, "credentials", "codex-main.credential"),
+      ).mode & 0o777,
     ).toBe(0o600);
   });
 
@@ -116,11 +155,10 @@ describe("installer controller", () => {
     controller.start("resident-1");
     controller.saveCredentials([
       {
-        ref: {
+        credential: {
           ...apiCredential("claude-login"),
+          ref: { id: "claude-login", type: "claude_oauth" },
           providerId: "claude",
-          method: "oauth",
-          adapterConstraint: "claude-agent-sdk",
         },
         secret: "oauth-material",
       },
@@ -128,9 +166,9 @@ describe("installer controller", () => {
     controller.saveBindings([
       {
         residentId: "resident-1",
-        purpose: "main",
+        lane: "primary",
         adapterId: "pi",
-        credentialId: "claude-login",
+        credentialRef: { id: "claude-login", type: "claude_oauth" },
       },
     ]);
     controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
@@ -139,29 +177,29 @@ describe("installer controller", () => {
     expect(() => controller.commit()).toThrow(/requires adapter claude-agent-sdk/);
   });
 
-  it("rejects a second binding for the same resident and purpose", () => {
+  it("rejects a second binding for the same resident and lane", () => {
     const directory = freshDirectory();
     const controller = new InstallerController(new InstallerStateStore(directory));
     controller.start("resident-1");
-    controller.saveCredentials([{ ref: apiCredential(), secret: "secret-value" }]);
+    controller.saveCredentials([{ credential: apiCredential(), secret: "secret-value" }]);
     controller.saveBindings([
       {
         residentId: "resident-1",
-        purpose: "main",
+        lane: "primary",
         adapterId: "pi",
-        credentialId: "codex-main",
+        credentialRef: { id: "codex-main", type: "api_key" },
       },
       {
         residentId: "resident-1",
-        purpose: "main",
+        lane: "primary",
         adapterId: "other",
-        credentialId: "codex-main",
+        credentialRef: { id: "codex-main", type: "api_key" },
       },
     ]);
     controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
     controller.saveMemory({ kind: "existing", path: "/tmp/existing" });
 
-    expect(() => controller.commit()).toThrow(/duplicate main binding/);
+    expect(() => controller.commit()).toThrow(/duplicate primary binding/);
   });
 
   it("returns the same receipt when commit is retried in the same controller", () => {
@@ -179,15 +217,8 @@ describe("installer controller", () => {
     const directory = freshDirectory();
     const controller = new InstallerController(new InstallerStateStore(directory));
     controller.start("resident-1");
-    controller.saveCredentials([{ ref: apiCredential(), secret: "secret-value" }]);
-    controller.saveBindings([
-      {
-        residentId: "resident-1",
-        purpose: "main",
-        adapterId: "pi",
-        credentialId: "codex-main",
-      },
-    ]);
+    controller.saveCredentials([{ credential: apiCredential(), secret: "secret-value" }]);
+    controller.saveBindings([primaryBinding()]);
     controller.saveFrontend({
       kind: "official-skin",
       pluginId: "mist-official-skin",
@@ -196,5 +227,29 @@ describe("installer controller", () => {
     controller.saveMemory({ kind: "create", path: "/tmp/mist-memory" });
 
     expect(() => controller.commit()).toThrow(/cannot be activated yet/);
+  });
+
+  it("validates a Claude-compatible gateway using an API key reference", () => {
+    const directory = freshDirectory();
+    const controller = new InstallerController(new InstallerStateStore(directory));
+    controller.start("resident-1");
+    controller.saveCredentials([{ credential: apiCredential(), secret: "secret-value" }]);
+    controller.saveBindings([
+      primaryBinding(),
+      {
+        residentId: "resident-1",
+        lane: "coding",
+        adapterId: "claude-agent-sdk",
+        credentialRef: { id: "codex-main", type: "api_key" },
+        adapterConfig: {
+          baseUrl: "https://gateway.example.test",
+          tokenCredentialRef: { id: "codex-main", type: "api_key" },
+        },
+      },
+    ]);
+    controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
+    controller.saveMemory({ kind: "existing", path: "/tmp/existing" });
+
+    expect(() => controller.commit()).not.toThrow();
   });
 });

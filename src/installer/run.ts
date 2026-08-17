@@ -1,18 +1,19 @@
+import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
-  ChannelBinding,
   CredentialMethod,
-  CredentialRef,
   FrontendChoice,
   InstallCommitReceipt,
+  InstallerCredential,
   InstallerDraft,
+  LaneBinding,
   MemoryChoice,
 } from "./contracts.ts";
 import type { InstallerController } from "./controller.ts";
 import type { MemoryLibraryPort } from "./memory-library.ts";
 import type { OAuthLoginPort } from "./pi-login.ts";
 import type { PromptPort } from "./prompt-port.ts";
-import { PROVIDERS, providerById } from "./providers.ts";
+import { PROVIDERS, credentialTypeFor, providerById } from "./providers.ts";
 import type { InstallerStateStore } from "./state-store.ts";
 
 export interface RunInstallerOptions {
@@ -40,11 +41,26 @@ function slug(value: string): string {
   return normalized.length === 0 ? "credential" : normalized;
 }
 
-async function collectCredentials(options: RunInstallerOptions): Promise<void> {
-  const entries: { ref: CredentialRef; secret: string }[] = [];
+class MissingCompatibleCredentialError extends Error {
+  readonly adapterId: string;
+
+  constructor(adapterId: string) {
+    super(`no credential can be used with adapter ${adapterId}`);
+    this.name = "MissingCompatibleCredentialError";
+    this.adapterId = adapterId;
+  }
+}
+
+async function collectCredentials(
+  options: RunInstallerOptions,
+  draft: InstallerDraft,
+): Promise<void> {
+  const entries: { credential: InstallerCredential; secret?: string }[] = draft.credentials.map(
+    (credential) => ({ credential }),
+  );
   do {
     const providerId = await options.prompt.select({
-      message: "Choose a credential provider",
+      message: "Step 1/4 · Credential provider",
       choices: PROVIDERS.map((provider) => ({
         value: provider.id,
         name: provider.label,
@@ -64,10 +80,11 @@ async function collectCredentials(options: RunInstallerOptions): Promise<void> {
       default: provider.methods[0],
     });
     const suggestedId = `${provider.id}-${method === "oauth" ? "login" : "key"}`;
-    const id = slug(
-      await options.prompt.input({ message: "Credential name", default: suggestedId }),
-    );
-    const secretRef = `${id}.credential`;
+    const name = await options.prompt.input({
+      message: "Credential name",
+      default: suggestedId,
+    });
+    const id = slug(name);
     let secret: string;
     if (method === "oauth") {
       secret = (await options.oauth.login(provider)).locator;
@@ -75,72 +92,118 @@ async function collectCredentials(options: RunInstallerOptions): Promise<void> {
       secret = await options.prompt.secret({ message: `${provider.label} API key` });
     }
     entries.push({
-      ref: {
-        id,
-        label: provider.label,
+      credential: {
+        ref: { id, type: credentialTypeFor(provider, method) },
+        label: name,
         providerId: provider.id,
-        method,
-        secretRef,
         status: "incomplete",
-        ...(method === "oauth" && provider.oauthAdapterConstraint !== undefined
-          ? { adapterConstraint: provider.oauthAdapterConstraint }
-          : {}),
       },
       secret,
     });
+    if (provider.id === "claude" && method === "oauth") {
+      options.prompt.info(
+        `Saved as ${id}. A Claude subscription login can only run through the Claude Agent SDK adapter.`,
+      );
+    }
   } while (await options.prompt.confirm({ message: "Add another credential?", default: false }));
   options.controller.saveCredentials(entries);
 }
 
-async function chooseBinding(
+function compatibleCredentials(
+  draft: InstallerDraft,
+  adapterId: "pi" | "claude-agent-sdk",
+): InstallerCredential[] {
+  return draft.credentials.filter((credential) => {
+    if (adapterId === "pi") return credential.ref.type !== "claude_oauth";
+    return credential.ref.type === "claude_oauth" || credential.ref.type === "api_key";
+  });
+}
+
+async function chooseCredential(
   options: RunInstallerOptions,
   draft: InstallerDraft,
-  purpose: "main" | "coding",
-): Promise<ChannelBinding> {
-  const adapterId = await options.prompt.select({
-    message: purpose === "main" ? "Daily channel adapter" : "Coding channel adapter",
-    choices: [
-      { value: "pi", name: "Pi" },
-      { value: "claude-agent-sdk", name: "Claude Agent SDK" },
-    ],
-    default: purpose === "main" ? "pi" : "claude-agent-sdk",
-  });
-  const compatible = draft.credentialRefs.filter(
-    (credential) =>
-      credential.adapterConstraint === undefined || credential.adapterConstraint === adapterId,
-  );
+  adapterId: "pi" | "claude-agent-sdk",
+): Promise<InstallerCredential> {
+  const compatible = compatibleCredentials(draft, adapterId);
   if (compatible.length === 0) {
-    throw new Error(`no credential can be used with adapter ${adapterId}`);
+    throw new MissingCompatibleCredentialError(adapterId);
   }
   const defaultCredential = compatible[0];
   if (defaultCredential === undefined) {
     throw new Error(`no credential can be used with adapter ${adapterId}`);
   }
   const credentialId = await options.prompt.select({
-    message: "Credential",
+    message: "Step 2/4 · Primary/coding lane credential",
     choices: compatible.map((credential) => ({
-      value: credential.id,
+      value: credential.ref.id,
       name: credential.label,
-      description: credential.id,
+      description: `${credential.ref.id} · ${credential.ref.type}`,
     })),
-    default: defaultCredential.id,
+    default: defaultCredential.ref.id,
   });
-  return { residentId: draft.residentId, purpose, adapterId, credentialId };
+  const selected = compatible.find((credential) => credential.ref.id === credentialId);
+  if (selected === undefined) throw new Error(`unknown credential selection: ${credentialId}`);
+  return selected;
 }
 
 async function collectBindings(options: RunInstallerOptions, draft: InstallerDraft): Promise<void> {
-  const bindings: ChannelBinding[] = [await chooseBinding(options, draft, "main")];
+  const primaryCredential = await chooseCredential(options, draft, "pi");
+  const bindings: LaneBinding[] = [
+    {
+      residentId: draft.residentId,
+      lane: "primary",
+      adapterId: "pi",
+      credentialRef: { ...primaryCredential.ref },
+    },
+  ];
   if (
     await options.prompt.confirm({ message: "Configure a separate coding channel?", default: true })
   ) {
-    bindings.push(await chooseBinding(options, draft, "coding"));
+    const codingCredential = await chooseCredential(options, draft, "claude-agent-sdk");
+    const codingBinding: LaneBinding = {
+      residentId: draft.residentId,
+      lane: "coding",
+      adapterId: "claude-agent-sdk",
+      credentialRef: { ...codingCredential.ref },
+    };
+    if (
+      await options.prompt.confirm({
+        message: "Use a custom Claude-compatible gateway?",
+        default: false,
+      })
+    ) {
+      const apiKeys = draft.credentials.filter((credential) => credential.ref.type === "api_key");
+      const defaultToken = apiKeys[0];
+      if (defaultToken === undefined) {
+        throw new Error("a custom gateway requires an API key credential");
+      }
+      const baseUrl = await options.prompt.input({ message: "Gateway base URL" });
+      const tokenCredentialId = await options.prompt.select({
+        message: "Gateway token credential",
+        choices: apiKeys.map((credential) => ({
+          value: credential.ref.id,
+          name: credential.label,
+          description: credential.ref.id,
+        })),
+        default: defaultToken.ref.id,
+      });
+      const tokenCredential = apiKeys.find((credential) => credential.ref.id === tokenCredentialId);
+      if (tokenCredential === undefined) {
+        throw new Error(`unknown gateway token credential: ${tokenCredentialId}`);
+      }
+      codingBinding.adapterConfig = {
+        baseUrl,
+        tokenCredentialRef: { ...tokenCredential.ref },
+      };
+    }
+    bindings.push(codingBinding);
   }
   options.controller.saveBindings(bindings);
 }
 
 async function collectFrontend(options: RunInstallerOptions): Promise<void> {
   const kind = await options.prompt.select<FrontendChoice["kind"]>({
-    message: "Frontend",
+    message: "Step 3/4 · Frontend",
     choices: [
       { value: "official-skin", name: "Install the official Mist skin" },
       { value: "external", name: "Connect my own frontend" },
@@ -164,34 +227,40 @@ async function collectFrontend(options: RunInstallerOptions): Promise<void> {
 
 async function collectMemory(options: RunInstallerOptions): Promise<void> {
   const kind = await options.prompt.select<MemoryChoice["kind"]>({
-    message: "Memory library",
+    message: "Step 4/4 · Memory library",
     choices: [
       { value: "existing", name: "Use an existing memory library" },
       { value: "create", name: "Create an empty memory library" },
     ],
     default: "create",
   });
-  const path = await options.prompt.input({
+  const inputPath = await options.prompt.input({
     message: kind === "existing" ? "Existing memory path" : "New memory path",
     default: join(options.dataDir, "memory"),
   });
+  const path =
+    inputPath === "~" || inputPath.startsWith("~/")
+      ? join(homedir(), inputPath.slice(2))
+      : inputPath;
   if (kind === "existing") {
     options.memoryLibraries.assertExisting(path);
     options.controller.saveMemory({ kind, path });
     return;
   }
+  // Record the intended side effect before creating it. If the process dies between these
+  // operations, resume can safely recreate it; discard still knows exactly what may be removed.
+  options.controller.saveMemory({ kind, path });
   options.memoryLibraries.createEmpty(path);
-  try {
-    options.controller.saveMemory({ kind, path });
-  } catch (error) {
-    options.memoryLibraries.discardEmpty(path);
-    throw error;
-  }
 }
 
 export async function runInstaller(options: RunInstallerOptions): Promise<RunInstallerResult> {
   const existing = options.store.loadDraft();
   const current = options.store.loadCurrentConfig();
+  if (existing === null && current === null) {
+    options.prompt.info(
+      "Welcome to Mist setup. Four steps: credentials → channels → frontend → memory. You can quit any time; only a draft is kept until you confirm.",
+    );
+  }
   if (existing === null && current !== null) {
     const choice = await options.prompt.select({
       message: "Mist is already configured",
@@ -214,18 +283,30 @@ export async function runInstaller(options: RunInstallerOptions): Promise<RunIns
           ],
           default: "resume",
         });
-  if (existing !== null && choice === "discard" && existing.memory?.kind === "create") {
-    options.memoryLibraries.discardEmpty(existing.memory.path);
+  if (existing !== null && choice === "discard") {
+    for (const sideEffect of existing.sideEffects) {
+      if (sideEffect.kind === "memory_dir_created") {
+        options.memoryLibraries.discardEmpty(sideEffect.path);
+      }
+    }
   }
   let draft = options.controller.start(options.residentId, choice);
 
   while (true) {
     switch (draft.progress.currentStep) {
       case "credentials":
-        await collectCredentials(options);
+        await collectCredentials(options, draft);
         break;
       case "bindings":
-        await collectBindings(options, draft);
+        try {
+          await collectBindings(options, draft);
+        } catch (error) {
+          if (!(error instanceof MissingCompatibleCredentialError)) throw error;
+          options.prompt.info(
+            `No saved credential can be used with ${error.adapterId}. Add one now — your draft is kept.`,
+          );
+          options.controller.revisitCredentials();
+        }
         break;
       case "frontend":
         await collectFrontend(options);
@@ -234,11 +315,28 @@ export async function runInstaller(options: RunInstallerOptions): Promise<RunIns
         await collectMemory(options);
         break;
       case "review": {
+        if (draft.memory?.kind === "create") {
+          // Idempotently finish a creation interrupted after the draft was persisted.
+          options.memoryLibraries.createEmpty(draft.memory.path);
+        }
+        options.prompt.info(formatReview(draft));
         if (draft.frontend?.kind === "official-skin" && draft.frontend.installation === "pending") {
           options.prompt.info(
             "The official skin is not installed: issues #49 and #51 are still pending. This draft was kept and no active config changed.",
           );
-          return { status: "dependency-pending", draft, dependencies: ["#49", "#51"] };
+          const pendingChoice = await options.prompt.select({
+            message: "Official skin dependencies are still pending",
+            choices: [
+              { value: "keep", name: "Keep this draft and exit" },
+              { value: "change", name: "Choose a different frontend" },
+            ],
+            default: "keep",
+          });
+          if (pendingChoice === "keep") {
+            return { status: "dependency-pending", draft, dependencies: ["#49", "#51"] };
+          }
+          options.controller.revisitFrontend();
+          break;
         }
         const shouldCommit = await options.prompt.confirm({
           message: "Save this setup?",
@@ -250,4 +348,30 @@ export async function runInstaller(options: RunInstallerOptions): Promise<RunIns
     }
     draft = options.controller.current();
   }
+}
+
+function formatReview(draft: InstallerDraft): string {
+  const credentials = draft.credentials
+    .map(
+      (credential) =>
+        `${credential.ref.id} (${credential.providerId}, ${credential.ref.type}, ${credential.status})`,
+    )
+    .join(", ");
+  const bindings = draft.bindings
+    .map(
+      (binding) =>
+        `${binding.lane}: ${binding.adapterId} · ${binding.credentialRef.id}${
+          binding.adapterConfig?.baseUrl === undefined
+            ? ""
+            : ` · gateway ${binding.adapterConfig.baseUrl}`
+        }`,
+    )
+    .join("\n  ");
+  const frontend =
+    draft.frontend?.kind === "external"
+      ? "external · mist-session-api"
+      : "official-skin · pending #49/#51";
+  const memory =
+    draft.memory === null ? "not configured" : `${draft.memory.kind} · ${draft.memory.path}`;
+  return `Review your setup (active config is unchanged):\n  Credentials: ${credentials}\n  ${bindings}\n  Frontend: ${frontend}\n  Memory: ${memory}`;
 }

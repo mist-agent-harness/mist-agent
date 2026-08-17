@@ -17,6 +17,7 @@ import {
   InstallerValidationError,
   type MistInstallConfigV0,
   assertSafeInstallerId,
+  credentialSecretRef,
   validateReadyDraft,
 } from "./contracts.ts";
 
@@ -90,9 +91,10 @@ export class InstallerStateStore {
   loadDraft(): InstallerDraft | null {
     try {
       const draft = parseJson<InstallerDraft>(this.#draftPath);
-      if (draft.schemaVersion !== 1 || !Array.isArray(draft.credentialRefs)) {
+      if (draft.schemaVersion !== 1 || !Array.isArray(draft.credentials)) {
         throw new InstallerValidationError("installer draft has an unsupported shape");
       }
+      if (!Array.isArray(draft.sideEffects)) draft.sideEffects = [];
       return draft;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
@@ -131,10 +133,11 @@ export class InstallerStateStore {
 
   commit(draft: InstallerDraft): InstallCommitReceipt {
     const config = validateReadyDraft(draft);
-    for (const credential of config.credentialRefs) {
-      if (!this.hasStagedSecret(credential.secretRef)) {
+    for (const credential of draft.credentials) {
+      const secretRef = credentialSecretRef(credential.ref);
+      if (!this.hasStagedSecret(secretRef)) {
         throw new InstallerValidationError(
-          `credential ${credential.id} has no staged secret material`,
+          `credential ${credential.ref.id} has no staged secret material`,
         );
       }
     }
@@ -146,9 +149,10 @@ export class InstallerStateStore {
     mkdirSync(credentialsDirectory, { recursive: true, mode: 0o700 });
     try {
       writePrivateFile(join(temporarySnapshot, "config.json"), JSON.stringify(config, null, 2));
-      for (const credential of config.credentialRefs) {
-        const secret = readFileSync(join(this.#draftSecretsDir, credential.secretRef), "utf8");
-        writePrivateFile(join(credentialsDirectory, credential.secretRef), secret);
+      for (const credential of draft.credentials) {
+        const secretRef = credentialSecretRef(credential.ref);
+        const secret = readFileSync(join(this.#draftSecretsDir, secretRef), "utf8");
+        writePrivateFile(join(credentialsDirectory, secretRef), secret);
       }
       renameSync(temporarySnapshot, finalSnapshot);
       fsyncDirectory(this.#snapshotsDir);
@@ -187,8 +191,8 @@ export class InstallerStateStore {
     }
   }
 
-  readCredentialSecret(secretRef: string): string {
-    assertSafeInstallerId(secretRef, "credential secretRef");
+  readCredentialSecret(credentialId: string): string {
+    const secretRef = credentialSecretRef({ id: credentialId, type: "api_key" });
     const pointer = parseJson<CurrentPointer>(this.#currentPath);
     return readFileSync(
       join(this.#snapshotsDir, pointer.snapshotId, "credentials", secretRef),

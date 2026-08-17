@@ -5,24 +5,32 @@ export type InstallerStep = "credentials" | "bindings" | "frontend" | "memory" |
 
 export type CredentialMethod = "oauth" | "api-key";
 export type CredentialStatus = "ready" | "incomplete";
-export type BindingPurpose = "main" | "coding";
+export type CredentialType = "claude_oauth" | "codex_oauth" | "grok_oauth" | "api_key";
+export type Lane = "primary" | "coding";
 
+/** Public credential shape from plugin protocol v0. Secret material stays in the credential store. */
 export interface CredentialRef {
   id: string;
-  label: string;
-  providerId: string;
-  method: CredentialMethod;
-  secretRef: string;
-  status: CredentialStatus;
-  /** Claude OAuth may only execute through the Claude Agent SDK adapter. */
-  adapterConstraint?: "claude-agent-sdk";
+  type: CredentialType;
 }
 
-export interface ChannelBinding {
+/** Installer-only metadata. This is never embedded in a lane binding or active config. */
+export interface InstallerCredential {
+  ref: CredentialRef;
+  label: string;
+  providerId: string;
+  status: CredentialStatus;
+}
+
+export interface LaneBinding {
   residentId: string;
-  purpose: BindingPurpose;
+  lane: Lane;
   adapterId: string;
-  credentialId: string;
+  credentialRef: CredentialRef;
+  adapterConfig?: {
+    baseUrl?: string;
+    tokenCredentialRef?: CredentialRef;
+  };
 }
 
 export type FrontendChoice =
@@ -53,20 +61,26 @@ export interface InstallerProgress {
   status: "in-progress" | "ready-to-commit";
 }
 
+export type InstallerSideEffect = {
+  kind: "memory_dir_created";
+  path: string;
+};
+
 /**
  * Resumable installer state. It contains references only: secret material lives in the
  * draft credential store and never enters this JSON document.
  *
- * This is an installer-local contract, not the final plugin RFC from issue #51. The commit
- * boundary is the only place that will need to translate when that RFC freezes.
+ * This is an installer-local contract. Its public CredentialRef and LaneBinding fields match
+ * plugin protocol v0; the remaining draft-only fields do not claim to be plugin protocol.
  */
 export interface InstallerDraft {
   schemaVersion: typeof INSTALLER_DRAFT_SCHEMA_VERSION;
   residentId: string;
-  credentialRefs: CredentialRef[];
-  bindings: ChannelBinding[];
+  credentials: InstallerCredential[];
+  bindings: LaneBinding[];
   frontend: FrontendChoice | null;
   memory: MemoryChoice | null;
+  sideEffects: InstallerSideEffect[];
   progress: InstallerProgress;
 }
 
@@ -74,7 +88,7 @@ export interface MistInstallConfigV0 {
   schemaVersion: typeof INSTALL_CONFIG_SCHEMA_VERSION;
   residentId: string;
   credentialRefs: CredentialRef[];
-  bindings: ChannelBinding[];
+  bindings: LaneBinding[];
   frontend: FrontendChoice;
   memory: MemoryChoice;
 }
@@ -101,6 +115,11 @@ export function assertSafeInstallerId(value: string, field: string): void {
   }
 }
 
+export function credentialSecretRef(credential: CredentialRef): string {
+  assertSafeInstallerId(credential.id, "credential id");
+  return `${credential.id}.credential`;
+}
+
 export function createInstallerDraft(residentId: string): InstallerDraft {
   if (residentId.trim().length === 0) {
     throw new InstallerValidationError("residentId must not be empty");
@@ -108,10 +127,11 @@ export function createInstallerDraft(residentId: string): InstallerDraft {
   return {
     schemaVersion: INSTALLER_DRAFT_SCHEMA_VERSION,
     residentId,
-    credentialRefs: [],
+    credentials: [],
     bindings: [],
     frontend: null,
     memory: null,
+    sideEffects: [],
     progress: {
       currentStep: "credentials",
       completedSteps: [],
@@ -126,6 +146,28 @@ function requireNonEmpty(value: string, field: string): void {
   }
 }
 
+function validateBindingCredential(
+  binding: LaneBinding,
+  credentials: ReadonlyMap<string, InstallerCredential>,
+): void {
+  const credential = credentials.get(binding.credentialRef.id);
+  if (credential === undefined) {
+    throw new InstallerValidationError(
+      `binding references unknown credential: ${binding.credentialRef.id}`,
+    );
+  }
+  if (credential.ref.type !== binding.credentialRef.type) {
+    throw new InstallerValidationError(
+      `binding credential type does not match stored ref: ${binding.credentialRef.id}`,
+    );
+  }
+  if (credential.ref.type === "claude_oauth" && binding.adapterId !== "claude-agent-sdk") {
+    throw new InstallerValidationError(
+      `credential ${credential.ref.id} requires adapter claude-agent-sdk`,
+    );
+  }
+}
+
 export function validateReadyDraft(draft: InstallerDraft): MistInstallConfigV0 {
   if (draft.schemaVersion !== INSTALLER_DRAFT_SCHEMA_VERSION) {
     throw new InstallerValidationError(
@@ -133,58 +175,58 @@ export function validateReadyDraft(draft: InstallerDraft): MistInstallConfigV0 {
     );
   }
   requireNonEmpty(draft.residentId, "residentId");
-  if (draft.credentialRefs.length === 0) {
+  if (draft.credentials.length === 0) {
     throw new InstallerValidationError("at least one credential is required");
   }
 
-  const credentials = new Map<string, CredentialRef>();
-  const secretRefs = new Set<string>();
-  for (const credential of draft.credentialRefs) {
-    assertSafeInstallerId(credential.id, "credential id");
-    assertSafeInstallerId(credential.secretRef, "credential secretRef");
-    requireNonEmpty(credential.label, `credential ${credential.id} label`);
-    requireNonEmpty(credential.providerId, `credential ${credential.id} providerId`);
+  const credentials = new Map<string, InstallerCredential>();
+  for (const credential of draft.credentials) {
+    assertSafeInstallerId(credential.ref.id, "credential id");
+    requireNonEmpty(credential.label, `credential ${credential.ref.id} label`);
+    requireNonEmpty(credential.providerId, `credential ${credential.ref.id} providerId`);
     if (credential.status !== "ready") {
-      throw new InstallerValidationError(`credential ${credential.id} is incomplete`);
+      throw new InstallerValidationError(`credential ${credential.ref.id} is incomplete`);
     }
-    if (credentials.has(credential.id)) {
-      throw new InstallerValidationError(`duplicate credential id: ${credential.id}`);
+    if (credentials.has(credential.ref.id)) {
+      throw new InstallerValidationError(`duplicate credential id: ${credential.ref.id}`);
     }
-    if (secretRefs.has(credential.secretRef)) {
-      throw new InstallerValidationError(`duplicate credential secretRef: ${credential.secretRef}`);
-    }
-    credentials.set(credential.id, credential);
-    secretRefs.add(credential.secretRef);
+    credentials.set(credential.ref.id, credential);
   }
 
   const bindings = new Set<string>();
   for (const binding of draft.bindings) {
     requireNonEmpty(binding.residentId, "binding residentId");
     requireNonEmpty(binding.adapterId, "binding adapterId");
-    const bindingKey = `${binding.residentId}\u0000${binding.purpose}`;
+    const bindingKey = `${binding.residentId}\u0000${binding.lane}`;
     if (bindings.has(bindingKey)) {
       throw new InstallerValidationError(
-        `duplicate ${binding.purpose} binding for resident ${binding.residentId}`,
+        `duplicate ${binding.lane} binding for resident ${binding.residentId}`,
       );
     }
     bindings.add(bindingKey);
-    const credential = credentials.get(binding.credentialId);
-    if (credential === undefined) {
-      throw new InstallerValidationError(
-        `binding references unknown credential: ${binding.credentialId}`,
-      );
-    }
-    if (
-      credential.adapterConstraint !== undefined &&
-      credential.adapterConstraint !== binding.adapterId
-    ) {
-      throw new InstallerValidationError(
-        `credential ${credential.id} requires adapter ${credential.adapterConstraint}`,
-      );
+    validateBindingCredential(binding, credentials);
+    const adapterConfig = binding.adapterConfig;
+    if (adapterConfig !== undefined) {
+      if (adapterConfig.baseUrl === undefined || adapterConfig.tokenCredentialRef === undefined) {
+        throw new InstallerValidationError(
+          `binding ${binding.lane} custom gateway requires baseUrl and tokenCredentialRef`,
+        );
+      }
+      requireNonEmpty(adapterConfig.baseUrl, `binding ${binding.lane} baseUrl`);
+      const tokenCredential = credentials.get(adapterConfig.tokenCredentialRef.id);
+      if (
+        tokenCredential === undefined ||
+        tokenCredential.ref.type !== "api_key" ||
+        adapterConfig.tokenCredentialRef.type !== "api_key"
+      ) {
+        throw new InstallerValidationError(
+          `binding ${binding.lane} tokenCredentialRef must reference an api_key`,
+        );
+      }
     }
   }
-  if (!draft.bindings.some((binding) => binding.purpose === "main")) {
-    throw new InstallerValidationError("a main channel binding is required");
+  if (!draft.bindings.some((binding) => binding.lane === "primary")) {
+    throw new InstallerValidationError("a primary lane binding is required");
   }
   if (draft.frontend === null) {
     throw new InstallerValidationError("frontend choice is required");
@@ -202,8 +244,8 @@ export function validateReadyDraft(draft: InstallerDraft): MistInstallConfigV0 {
   return {
     schemaVersion: INSTALL_CONFIG_SCHEMA_VERSION,
     residentId: draft.residentId,
-    credentialRefs: draft.credentialRefs.map((credential) => ({ ...credential })),
-    bindings: draft.bindings.map((binding) => ({ ...binding })),
+    credentialRefs: draft.credentials.map((credential) => ({ ...credential.ref })),
+    bindings: draft.bindings.map((binding) => structuredClone(binding)),
     frontend: { ...draft.frontend },
     memory: { ...draft.memory },
   };

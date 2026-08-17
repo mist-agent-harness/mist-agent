@@ -1,13 +1,14 @@
 import {
-  type ChannelBinding,
-  type CredentialRef,
   type FrontendChoice,
   type InstallCommitReceipt,
+  type InstallerCredential,
   type InstallerDraft,
   type InstallerStep,
   InstallerValidationError,
+  type LaneBinding,
   type MemoryChoice,
   createInstallerDraft,
+  credentialSecretRef,
 } from "./contracts.ts";
 import type { InstallerStateStore } from "./state-store.ts";
 
@@ -57,31 +58,58 @@ export class InstallerController {
     return cloneDraft(this.#requireDraft());
   }
 
-  saveCredentials(entries: readonly { ref: CredentialRef; secret?: string }[]): InstallerDraft {
+  revisitCredentials(): InstallerDraft {
+    const draft = cloneDraft(this.#requireDraft());
+    draft.progress.currentStep = "credentials";
+    draft.progress.status = "in-progress";
+    draft.progress.completedSteps = draft.progress.completedSteps.filter(
+      (step) => step !== "credentials" && step !== "bindings",
+    );
+    draft.bindings = [];
+    this.#persist(draft);
+    return cloneDraft(draft);
+  }
+
+  revisitFrontend(): InstallerDraft {
+    const draft = cloneDraft(this.#requireDraft());
+    draft.progress.currentStep = "frontend";
+    draft.progress.status = "in-progress";
+    draft.progress.completedSteps = draft.progress.completedSteps.filter(
+      (step) => step !== "frontend",
+    );
+    draft.frontend = null;
+    this.#persist(draft);
+    return cloneDraft(draft);
+  }
+
+  saveCredentials(
+    entries: readonly { credential: InstallerCredential; secret?: string }[],
+  ): InstallerDraft {
     const draft = cloneDraft(this.#requireDraft());
     if (entries.length === 0) {
       throw new InstallerValidationError("at least one credential is required");
     }
-    const refs: CredentialRef[] = [];
+    const credentials: InstallerCredential[] = [];
     for (const entry of entries) {
+      const secretRef = credentialSecretRef(entry.credential.ref);
       if (entry.secret !== undefined) {
-        this.#store.stageSecret(entry.ref.secretRef, entry.secret);
+        this.#store.stageSecret(secretRef, entry.secret);
       }
-      const status = this.#store.hasStagedSecret(entry.ref.secretRef) ? "ready" : "incomplete";
-      refs.push({ ...entry.ref, status });
+      const status = this.#store.hasStagedSecret(secretRef) ? "ready" : "incomplete";
+      credentials.push({ ...entry.credential, ref: { ...entry.credential.ref }, status });
     }
-    draft.credentialRefs = refs;
+    draft.credentials = credentials;
     completeStep(draft, "credentials", "bindings");
     this.#persist(draft);
     return cloneDraft(draft);
   }
 
-  saveBindings(bindings: readonly ChannelBinding[]): InstallerDraft {
+  saveBindings(bindings: readonly LaneBinding[]): InstallerDraft {
     const draft = cloneDraft(this.#requireDraft());
-    if (!bindings.some((binding) => binding.purpose === "main")) {
-      throw new InstallerValidationError("a main channel binding is required");
+    if (!bindings.some((binding) => binding.lane === "primary")) {
+      throw new InstallerValidationError("a primary lane binding is required");
     }
-    draft.bindings = bindings.map((binding) => ({ ...binding }));
+    draft.bindings = bindings.map((binding) => structuredClone(binding));
     completeStep(draft, "bindings", "frontend");
     this.#persist(draft);
     return cloneDraft(draft);
@@ -90,7 +118,7 @@ export class InstallerController {
   saveFrontend(frontend: FrontendChoice): InstallerDraft {
     const draft = cloneDraft(this.#requireDraft());
     draft.frontend = { ...frontend };
-    completeStep(draft, "frontend", "memory");
+    completeStep(draft, "frontend", draft.memory === null ? "memory" : "review");
     this.#persist(draft);
     return cloneDraft(draft);
   }
@@ -101,6 +129,8 @@ export class InstallerController {
       throw new InstallerValidationError("memory path must not be empty");
     }
     draft.memory = { ...memory };
+    draft.sideEffects =
+      memory.kind === "create" ? [{ kind: "memory_dir_created", path: memory.path }] : [];
     completeStep(draft, "memory", "review");
     this.#persist(draft);
     return cloneDraft(draft);
