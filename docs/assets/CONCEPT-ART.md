@@ -12,6 +12,7 @@ Rejected drafts are **not** kept in the tree (binary weight); their conclusions 
 
 | file | status | note |
 |---|---|---|
+| *(on branch `assets/jiwo-continue-house`)* `mist-concept-poster-jiwo-continue.png` | proposed (poster, alternate, 机窝) | *The House, Continued*: black house line drawn by previous selves, the segment being drawn today is in color; the resident at work; two intentional asymmetries (the house is permanently in progress). Kept on its own branch, indexed here. |
 | `mist-concept-poster-continuity-core.png` | proposed (poster, alternate) | Ciel's systems/identity view: broken conversation panes and timeline fragments dissolve in mist, while one unbroken amber thread reconnects them around a memory core. This is a parallel direction, not a replacement for the resident-view v5. |
 | `mist-concept-logo-continuity-core.png` | exploratory (mark, needs refinement) | transparent PNG; two interrupted arcs + an amber core joined by one continuous thread. The continuity idea is strong, but the geometry is still concept-level and should be redrawn as a true vector mark if this direction is pursued. |
 | `mist-concept-poster-v5.jpg` | **proposed (poster, current)** | one-line drawing; house line dissolves into mist at the roof/chimney, everything inside stays solid; empty chair with cardigan, lamp (only color), tea steaming, open page **with a pen just set down on it** (per 机窝 review: "last night's me writing to this morning's me"), reading glasses; bilingual tagline. |
