@@ -1,6 +1,6 @@
 {
   "manifestSchemaVersion": 0,
-  "id": "mist-webui",
+  "id": "mist-official-skin",
   "version": "0.1.0",
   "requiresMist": ">=0.0.0",
   "entrypoint": "mist-plugin.ts",

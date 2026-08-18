@@ -25,7 +25,7 @@ function makeHost(config: unknown): FakeHost {
   return {
     registered,
     context: {
-      pluginId: 'mist-webui',
+      pluginId: 'mist-official-skin',
       config,
       register: (resource) => {
         registered.push(resource)
@@ -42,6 +42,9 @@ describe('manifest', () => {
     const manifest = JSON.parse(readFileSync(join(ROOT, 'mist-plugin.json'), 'utf8')) as Record<string, unknown>
     expect(manifest['manifestSchemaVersion']).toBe(0)
     expect(manifest['id']).toMatch(/^[a-z0-9]+(?:[._-][a-z0-9]+)*$/)
+    // Pinned to the host installer contract (mist-agent src/installer/contracts.ts): the
+    // official-skin branch validates this exact id — drifting would make installs refuse.
+    expect(manifest['id']).toBe('mist-official-skin')
     expect(manifest['kinds']).toEqual(['frontend'])
     expect(manifest['entrypoint']).toBe('mist-plugin.ts')
     expect(manifest['contextInjections']).toEqual([])
