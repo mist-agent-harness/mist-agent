@@ -267,18 +267,27 @@ export function createDevServer(options: DevServerOptions): DevServer {
       })
     },
     close(): Promise<void> {
-      for (const [ws, cleanup] of socketCleanups) {
-        cleanup()
-        ws.terminate()
-      }
-      socketCleanups.clear()
       return new Promise((resolve, reject) => {
-        wss.close(() => {
-          httpServer.close((error) => {
-            if (error === undefined) resolve()
-            else reject(error)
-          })
-        })
+        let pending = 2
+        let firstError: Error | undefined
+        const settle = (error?: Error): void => {
+          firstError ??= error
+          pending -= 1
+          if (pending !== 0) return
+          if (firstError === undefined) resolve()
+          else reject(firstError)
+        }
+
+        // Withdraw reachability before touching upgraded sockets: close() stops
+        // accepting new HTTP connections synchronously, while its callback
+        // waits for ordinary in-flight requests to drain.
+        httpServer.close(settle)
+        for (const [ws, cleanup] of socketCleanups) {
+          cleanup()
+          ws.terminate()
+        }
+        socketCleanups.clear()
+        wss.close(settle)
       })
     },
   }

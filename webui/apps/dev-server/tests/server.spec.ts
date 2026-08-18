@@ -6,8 +6,8 @@
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { request as httpRequest } from 'node:http'
-import { afterEach, describe, expect, it } from 'vitest'
+import { request as httpRequest, Server as HttpServer } from 'node:http'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
 import { createDevServer, type DevServer } from '../src/server.ts'
 import { createBootStubHandler } from '../src/default-handler.ts'
@@ -121,6 +121,31 @@ describe('respond', () => {
 })
 
 describe('downlinks', () => {
+  it('withdraws HTTP reachability before terminating WebSocket clients', async () => {
+    const closingServer = createDevServer({ handler: createBootStubHandler() })
+    const address = await closingServer.listen(0)
+    const base = `http://127.0.0.1:${address.port}`
+    const socket = new WebSocket(`${base.replace('http', 'ws')}/api/events.mux`)
+    await new Promise<void>((resolve) => { socket.on('open', () => { resolve() }) })
+
+    const httpClose = vi.spyOn(HttpServer.prototype, 'close')
+    const wsTerminate = vi.spyOn(WebSocket.prototype, 'terminate')
+    try {
+      const closing = closingServer.close()
+      expect(httpClose).toHaveBeenCalledOnce()
+      expect(wsTerminate).toHaveBeenCalledOnce()
+      expect(httpClose.mock.invocationCallOrder[0])
+        .toBeLessThan(wsTerminate.mock.invocationCallOrder[0] as number)
+      await expect(fetch(base)).rejects.toThrow()
+      await closing
+    } finally {
+      httpClose.mockRestore()
+      wsTerminate.mockRestore()
+      socket.terminate()
+      await closingServer.close().catch(() => undefined)
+    }
+  })
+
   it('delivers published frames as server-request envelopes on the matching stream only', async () => {
     let emitMux: ((frame: DownlinkFrame) => void) | undefined
     const handler: MistHandler = {
