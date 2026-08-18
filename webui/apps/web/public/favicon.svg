@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="50" height="50" viewBox="0 0 50 50" fill="none">
+	<style>
+		@media (prefers-color-scheme: dark) {
+			.ink { fill: #fff; }
+		}
+	</style>
+	<g class="ink" fill="#000" transform="translate(1.2 6.6) scale(2.07)">
+		<circle cx="6.8" cy="10" r="4.5" />
+		<circle cx="12.5" cy="8" r="5.5" />
+		<circle cx="17.5" cy="11" r="3.5" />
+		<rect x="2.3" y="11.5" width="18.7" height="3" rx="1.5" />
+	</g>
+</svg>

@@ -1,0 +1,14 @@
+{
+  "manifestSchemaVersion": 0,
+  "id": "mist-official-skin",
+  "version": "0.1.0",
+  "requiresMist": ">=0.0.0",
+  "entrypoint": "mist-plugin.ts",
+  "kinds": ["frontend"],
+  "configSchemaVersion": 0,
+  "capabilities": [],
+  "contextInjections": [],
+  "env": [],
+  "credentials": [],
+  "permissions": []
+}
