@@ -100,6 +100,12 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
   本条与 C10 的主证据都由 Vitest 集成测试提供：测试启动真实宿主子进程，在指定时点将其杀死并
   重新拉起，再断言可枚举结果；进程内状态快照对比只能作辅证，不得替代 kill/restart，也不得
   用 mock 重启、清空内存态或临时脚本冒充。
+- [ ] **PV0-C12 quarantined 只能显式清理重试**：制造一次部分撤销失败，确认插件进入
+  `quarantined` 且所有入口保持 fail-closed；无显式操作时不得再次调用清理。重复调用
+  `dispose` 不是显式重试，必须幂等返回同一 `quarantined` 终态且不再次执行清理；只有宿主
+  独立的显式清理重试（例如 `retryCleanup(pluginId)`）才能继续撤销。重试且全部剩余资源
+  撤销成功时进入 `disposed`；重试再次失败时仍为 `quarantined`，剩余资源 id、reason code、
+  操作记录和人工处理清单均保留，不得伪装成 `disposed` 或恢复为 `ready`。
 
 ## D. 绑定、角色与凭证类型
 
@@ -140,6 +146,12 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
   `MIGRATION_FAILED`，不尝试猜字段或原地升级。
 - [ ] **PV0-E06 迁移不接触 secret 值**：migrate 输入只有配置副本与 credential refs；
   用探针凭证库证明迁移函数没有读取凭证值的调用权限。
+- [ ] **PV0-E07 升级扩权须显式确认**：用同一插件的 v1/v2 manifest 覆盖新增 capability、
+  提高 effect、新增 operation、新增 literal 值和移除 v1 literal 限制五种扩权；v2 完成
+  migrate 与目标 schema 校验后、activate 前返回 `UPGRADE_PERMISSION_CONFIRMATION_REQUIRED`，
+  展示 v1/v2 权限差集，v1 插件、绑定、路由和原 verified scope 继续 ready，v2 不得激活或公开。
+  对本次升级给出显式人工确认后，才允许继续 E01 的原子切换；没有扩权的 v2 不弹额外确认，
+  直接走原升级流程。
 
 ## F. Readiness、投影与闭环
 
@@ -198,6 +210,7 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 | C09 | 失败后在无显式操作时自动循环重试 | C09 |
 | C10 | activate 中断回滚后清除失败记录并假装未安装，或把孤儿中间态当 ready | C10 |
 | C11 | 先持久化公开路由索引，再写 active 四元组 | C11 |
+| C12 | quarantined 进入后自动重试、把重复 dispose 当作显式清理重试、把重试失败当 disposed，或清掉剩余资源/人工处理记录 | C12 |
 | D01 | 仅以 lane 为键，忽略 residentId | D01 |
 | D02 | 给 subagent 挂载住户记忆 | D02 |
 | D03 | 显式换道时沿用原车道权限结果 | D03 |
@@ -214,6 +227,7 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 | E04 | v2 activate 失败后以缩水的 verified scope 恢复 v1 ready | E04 |
 | E05 | 缺 migrate 时猜字段并原地升级 | E05 |
 | E06 | 给 migrate 暴露读取凭证值的接口 | E06 |
+| E07 | 跳过 v1/v2 PermissionGrant 比对，或把未确认的扩权升级直接激活 | E07 |
 | F01 | 把一个车道的 ready 投影到所有 scope | F01 |
 | F02 | 只返回自由文本错误、不返回稳定 code | F02 |
 | F03 | mutation runner 接受“任意测试变红” | F03 |

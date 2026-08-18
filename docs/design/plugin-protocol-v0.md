@@ -181,6 +181,9 @@ discovered → validated → prepared → active → disposing → disposed
      └───────────┴───────────┴──────────┴──────────┴→ blocked
                              └─ rollback → blocked（保留启用意图）
                                         dispose 不完整 → quarantined
+                                                          │
+                                 显式清理重试成功 ─────────┘→ disposed
+                                 显式清理重试失败 ───────────→ quarantined
 ```
 
 `prepare` 期间的每次 `register` 都先写入宿主拥有的注册日志，并返回宿主同样持有的
@@ -205,12 +208,21 @@ plugin id、`operationId`、`enabled: true` 的启用意图、配置与绑定，
 而把孤儿中间态投影为 ready。协调结束前，该插件以 `LIFECYCLE_RECOVERY_PENDING` 显式
 blocked，不允许自动执行普通 prepare/activate/call 路径。
 
+`quarantined` 的恢复只能由宿主提供的显式清理重试触发，不属于启动协调，也不重新经过
+prepare/activate/call。重试从持久化的剩余资源清单和撤销回执继续：全部资源撤销成功后进入
+`disposed`；任一资源再次撤销失败则继续留在 `quarantined`，追加本次失败的 reason code、
+资源 id 和人工处理路径/残留清单。没有显式操作时不得自动重试，更不得把失败重试伪装成
+`disposed`。显式清理重试是宿主独立的操作（例如 `retryCleanup(pluginId)`），不等于再次调用
+`dispose`；`quarantined` 下重复 `dispose` 必须幂等返回 `quarantined`，不能触发重试。
+
 卸载顺序固定为：先从路由和能力目录撤销可达性，并按 plugin id 从住户模型上下文、启动包及
 后续重建输入中撤下全部 `contextInjections`，拒绝新调用与新注入；再等待或取消在途调用；
 最后逆序撤销资源并调用 `dispose`。重复卸载必须返回同一终态。某个撤销失败时，插件状态
 进入 `quarantined`，相关路由继续 fail-closed，宿主记录资源 id 和稳定 reason code；
 不得为了“看起来卸载成功”留下任何已登记或经宿主管理的监听器、出站连接、定时器、工具或
-上下文守则。
+上下文守则。处于 `quarantined` 时，宿主只允许走显式清理重试这一条出边；重复 `dispose`
+仍返回同一 `quarantined` 终态，不算显式重试。独立重试成功才可进入 `disposed`，重试失败
+继续保留隔离记录和人工处理清单。
 
 代价：事务注册需要宿主持久化操作日志、撤销回执和终态，并在启动时先做协调；协议要求插件
 作者把 import-time 副作用改造进 prepare/activate 生命周期，但 v0 的同进程信任边界不能
@@ -330,6 +342,19 @@ lazy 模式增加一次 schema 取回，并要求适配器维护可发现目录�
 版本范围解析失败一律视为不兼容。升级使用 copy-on-write：旧插件、旧配置和旧绑定在新版本
 active 前保持可恢复，新版本不得原地改写旧配置。
 
+升级时，宿主必须在目标 schema 校验完成后、v2 `activate` 之前，取得现役 v1 的有效
+`PermissionGrant` 集合并与 v2 manifest 逐项比较。比较以 `capabilityId` 为键；`effect` 的
+风险顺序固定为 `read < reversible < irreversible`，`operations` 和 `literals` 的允许值按
+集合包含关系比较。v2 出现 v1 没有的 capability、提高 effect、增加 operation、增加 literal
+值，或移除 v1 原有的 literal 限制，均属于扩权。比较必须基于宿主能力契约归一化后的授权结果，
+不能用插件自报描述、版本号或配置文件差异替代权限比较。
+
+没有扩权时，升级继续走原有流程，不增加额外确认。出现扩权时，宿主必须展示 v1/v2 的权限
+差集，并针对本次升级取得显式人工确认；确认之前不得激活或公开 v2，v1 的插件、绑定、路由和
+原 verified scope 继续保持 ready。没有确认时，升级事务返回 `UPGRADE_PERMISSION_CONFIRMATION_REQUIRED`
+并保持 blocked；不得把配置写入、启动重试或过去的确认记录当作本次确认。确认后才可继续
+copy-on-write 的 prepare/activate 和原子切换，后续失败仍按本节既有回滚路径处理。
+
 ```ts
 interface MigrationRequest {
   readonly fromVersion: number;
@@ -365,7 +390,8 @@ scope 的 ready。
 | `PREPARE_FAILED` | prepare 抛错、超时或返回无效 | 全量 rollback，未公开 |
 | `ACTIVATE_FAILED` | activate 失败或其中断恢复完成 | 全量 rollback，blocked 且未公开；保留启用意图，等待显式重试或停用 |
 | `MIGRATION_FAILED` | 迁移或目标 schema 校验失败 | 旧版本保持 ready |
-| `DISPOSE_INCOMPLETE` | 任一资源撤销失败 | quarantined，对外入口关闭 |
+| `UPGRADE_PERMISSION_CONFIRMATION_REQUIRED` | v2 `PermissionGrant` 相对 v1 扩权且本次升级未获显式人工确认 | 升级事务 blocked；v1 保持 ready，v2 未激活 |
+| `DISPOSE_INCOMPLETE` | 任一资源撤销失败 | quarantined，对外入口关闭；只能由显式清理重试进入 disposed，重试失败继续隔离并保留案底 |
 | `LIFECYCLE_RECOVERY_PENDING` | 检出未完成的 activate/dispose 操作日志 | blocked 且入口关闭；启动协调完成后才进入确定终态 |
 | `PLUGIN_RUNTIME_FAILED` | active 插件调用抛错或超时 | 当前调用失败；按策略降级或 blocked |
 | `CONTEXT_INJECTION_MISMATCH` | 运行期注入未声明或与包内正文不一致 | 拒绝注入；degraded/blocked |
