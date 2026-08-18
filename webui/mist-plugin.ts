@@ -124,6 +124,10 @@ export async function prepare(context: PluginPrepareContext): Promise<PreparedWe
   const bind = config.bind ?? '127.0.0.1'
   // #12/#49 deployment shape: the gate is mandatory at every process-entry surface, loopback
   // included — an absent config token means auto-generate, never gate-off (小鉴 P2, PR #13).
+  // Secret-delivery caveat (maintainer ruling B, #61): a settings-supplied `config.token`
+  // lands in host config snapshots, which conflicts with RFC §2's secret clause. Kept as-is
+  // for now; migrates to the env/secret delivery channel once #62 (env via context.env)
+  // lands — until then hosts must not persist this key into snapshots (debt tracked on #62).
   const token = config.token ?? randomBytes(24).toString('base64url')
   const server: DevServer = createDevServer({
     handler: createMockMistHandler(),

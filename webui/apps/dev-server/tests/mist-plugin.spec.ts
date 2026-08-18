@@ -50,9 +50,9 @@ describe('manifest', () => {
     expect(manifest['contextInjections']).toEqual([])
     expect(manifest['capabilities']).toEqual([])
     expect(manifest['permissions']).toEqual([])
-    // Config is the only settings source: no env bindings until the RFC defines env delivery
-    // (Review-seat ⑦, #61) — declaring them would be dead promises the plugin never reads.
-    expect(manifest['env']).toBeUndefined()
+    // Config is the only settings source until env delivery lands (#62): the RFC §2 manifest
+    // shape requires the `env` field, so it is present and empty — zero promises, valid shape.
+    expect(manifest['env']).toEqual([])
   })
 })
 

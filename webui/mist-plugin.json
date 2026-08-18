@@ -8,6 +8,7 @@
   "configSchemaVersion": 0,
   "capabilities": [],
   "contextInjections": [],
+  "env": [],
   "credentials": [],
   "permissions": []
 }
