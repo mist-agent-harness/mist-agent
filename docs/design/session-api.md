@@ -25,6 +25,8 @@ mist 不替前端保管任何东西。前端连的是"住户当前这一次活�
 
 **待主笔拍板（转 ready 前置）：** 本页描述的是 `SessionRegistry` 的模型——一位住户同一时刻只有一个活会话、以代际隔离。#49 官方素皮走的 `mist-wire-contract.md` P0 是另一套：`session.list` / `session.create` / `session.history`，按消息树 heads 列多个会话。两套不能同时写成"external 必须遵守"。需要主笔定一句：external 前端接的是 SessionRegistry（一住户一活会话），还是 webui 的多会话信封；定了之后 §2 只写那一套，另一套在此页只留一行差异说明。
 
+**08-18 主笔倾向（家群讨论，未最终定案）：** 产品层不做"多条对话"的会话栏——用户面对的是同一个住户，会话结束只是换壳，回来还是这个人；旧 transcript 作为只读日志／导出证据存在，不做成可切换的对话列表。这条路成立的三个前置：①跨会话连续性可靠（记忆真的接得上）；②reset／forget 有明确入口；③断线与换会话能无缝续上——三者缺一，"没有历史栏"看起来就不是设计哲学而是记录丢了。因此 §2 暂不把多会话接口写死；接口待素皮（#49）与本页对齐后再定。webui P0 里的 `session.list/create/history` 是内部用还是砍掉，需另开讨论。
+
 ## 2. 线协议（端点 / 鉴权 / 信封）—— 待上游
 
 真源：`chez-nous-home/mist-webui` → `docs/research/mist-wire-contract.md`（线协议契约 v0，含信封协议、双下行流、seq/断线语义、token 门与部署形状）。
