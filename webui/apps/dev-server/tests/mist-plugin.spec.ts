@@ -1,8 +1,9 @@
 /**
  * Plugin-protocol v0 lifecycle contract for the root mist-plugin entrypoint (#158, route ①):
  * prepare registers exactly the four declared resources and stays unreachable; publication is
- * one atomic step after the host commits every resource; dispose revokes reachability first and
- * is idempotent; rollback is the prepare-phase reversal. Manifest shape is pinned alongside.
+ * one atomic step after the host commits every resource; dispose is idempotent and reports the
+ * revoked/failed id sets; a never-published teardown is clean bookkeeping, never a failure;
+ * rollback is the prepare-phase reversal. Manifest shape is pinned alongside.
  */
 
 import { readFileSync } from 'node:fs'
@@ -46,19 +47,43 @@ describe('manifest', () => {
     expect(manifest['contextInjections']).toEqual([])
     expect(manifest['capabilities']).toEqual([])
     expect(manifest['permissions']).toEqual([])
-    const env = manifest['env'] as { name: string; secret: boolean }[]
-    expect(env.find(entry => entry.name === 'TOKEN')?.secret).toBe(true)
+    // Config is the only settings source: no env bindings until the RFC defines env delivery
+    // (Review-seat ⑦, #61) — declaring them would be dead promises the plugin never reads.
+    expect(manifest['env']).toBeUndefined()
   })
 })
 
 describe('lifecycle transaction', () => {
   it('registers exactly the four declared resources during prepare, none reachable yet', async () => {
-    const host = makeHost({ token: TOKEN })
+    // Fixed port so unreachability is actually probed, not just asserted by title.
+    const port = 45113
+    const host = makeHost({ token: TOKEN, port })
     const prepared = await prepare(host.context)
     expect(host.registered.map(resource => `${resource.kind}:${resource.id}`).sort()).toEqual([
       'connection:events-ws', 'route:api-dispatch', 'route:plugins-index', 'route:static-root',
     ])
+    await expect(fetch(`http://127.0.0.1:${port}/`)).rejects.toThrow()
     await prepared.rollback()
+  })
+
+  it('rejects malformed config loudly before any resource exists', async () => {
+    for (const config of [
+      42,
+      { port: 'not-a-number' },
+      { port: 1.5 },
+      { bind: 7 },
+      { trustedHosts: ['ok', 3] },
+    ]) {
+      const host = makeHost(config)
+      await expect(prepare(host.context)).rejects.toThrow('CONFIG_INVALID')
+      expect(host.registered).toEqual([])
+    }
+  })
+
+  it('fails loud at prepare when the built web app is missing', async () => {
+    const host = makeHost({ token: TOKEN, distDir: join(ROOT, 'no-such-dist') })
+    await expect(prepare(host.context)).rejects.toThrow('PREPARE_FAILED')
+    expect(host.registered).toEqual([])
   })
 
   it('refuses publication before the host committed every registered resource', async () => {
@@ -103,5 +128,23 @@ describe('lifecycle transaction', () => {
     await prepared.rollback()
     await prepared.rollback()
     await expect(prepared.activate()).rejects.toThrow('ACTIVATE_FAILED')
+  })
+
+  it('revoking a prepared, never-published plugin is clean bookkeeping — not a failure', async () => {
+    // Review-seat ③/④ pin (#61): never-listened teardown must record revoked (not
+    // DISPOSE_INCOMPLETE), and the host revoke path must therefore resolve, idempotently.
+    const host = makeHost({ token: TOKEN })
+    const prepared = await prepare(host.context)
+    await host.registered[0].dispose()
+    await host.registered[1].dispose()
+    await expect(prepared.activate()).rejects.toThrow('ACTIVATE_FAILED')
+  })
+
+  it('rollback of a never-published plugin leaves a clean terminal report on every handle', async () => {
+    const host = makeHost({ token: TOKEN })
+    const prepared = await prepare(host.context)
+    await prepared.rollback()
+    // With the ④ fix, any recorded teardown failure would surface here as a rejection.
+    for (const resource of host.registered) await resource.dispose()
   })
 })

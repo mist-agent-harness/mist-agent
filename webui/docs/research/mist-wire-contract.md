@@ -108,3 +108,9 @@ mock 锁定的 turn 映射如下：
 - **反代 ≠ 鉴权**：前置 nginx/CDN 只做转发，应用层始终自行验 token。野外已存在 dsh 反代后无密码公网部署（#49 楼内 wusaki0723 报），本形状即为堵此缺口。
 - 测试/CI 逃生口：`INSECURE_NO_TOKEN=1` 仅限本机与 CI；不出现在任何部署示例中。
 - 库合同不变：`createDevServer` 显式注入 token 供测试穿闸；auto-token 在非 loopback 兜底——强制默认活在 CLI 进程边界，不动库语义。
+
+## 插件装载边界（#61 核验采纳 · 2026-08-18）
+
+- **按插件协议 v0 装载后，webui 服务的仍是 mock 数据**：`PluginPrepareContext` v0 只有 `pluginId / config / register`，没有宿主向 frontend 插件交付服务实现的通道，`mist-plugin.ts` 的 handler 因此固定为 `createMockMistHandler()`。「真身：mist 会话编排层背同一套 /api」要等 RFC v0.1 定义 handler 交付通道后另出适配（协议侧欠账，Review 席自领 follow-up）。
+- **装载前提是完整 build**：`pnpm run build` 的四步顺序不可拆着跑——跳过 `build:lib:host` 直接 `build:lib:client` 会因 typert 生成的 `/remote` 类型缺 host 面而报错（Review 席 2026-08-18 实测 31 个 TS 错）；`mist-plugin.ts` 的 `prepare` 对缺 dist fail-loud。
+- **配置唯一来源是 `context.config`**：manifest 不声明 `env` 绑定（v0 未定义 env 值如何交付给插件，声明即死承诺）；RFC 补齐 env 交付语义后再回来声明。

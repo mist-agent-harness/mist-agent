@@ -4,9 +4,14 @@
  * Contract (RFC v0 §3): `prepare` registers every outward resource through the host context and
  * MUST NOT be publicly reachable; the host calls each resource's `activate()` during its atomic
  * commit, then `PreparedPlugin.activate()` performs the single publication step (binding the
- * listener). `dispose` revokes reachability first, then terminates live sockets, then closes —
- * idempotent, reporting per-resource outcomes. The 35 internal client modules stay implementation
- * detail behind this one plugin (Review-seat口径, #56).
+ * listener). `dispose` is idempotent and reports the revoked/failed id sets; teardown delegates
+ * to `server.close()`, which terminates live sockets and then closes the listener — the RFC
+ * revoke-reachability-first ordering inside close() is dev-server work, tracked in 基建075/⑤.
+ * Plugin-side C10/C11 obligations are met here (unreachable prepare, listen only in activate,
+ * idempotent dispose); the C10/C11 verdicts themselves judge the host implementation.
+ * Config is this plugin's only settings source — the manifest deliberately declares no `env`
+ * bindings until the RFC defines env delivery (Review-seat ⑦, #61). The 35 internal client
+ * modules stay implementation detail behind this one plugin (Review-seat口径, #56).
  */
 
 import { dirname, join } from 'node:path'
@@ -133,18 +138,25 @@ export async function prepare(context: PluginPrepareContext): Promise<PreparedWe
   const hostActivated = new Set<string>()
   const revoked = new Set<string>()
   let phase: 'prepared' | 'active' | 'rolled-back' | 'disposed' = 'prepared'
+  let listened = false
   let terminalReport: DisposeReport | undefined
 
   const teardown = async (): Promise<DisposeReport> => {
     if (terminalReport !== undefined) return terminalReport
     const failed: { id: string; reasonCode: string }[] = []
-    try {
-      // Reachability falls first (listener + sockets), before any per-resource bookkeeping.
-      await server.close()
+    if (!listened) {
+      // Never published: no listener or socket exists, so this is a pure bookkeeping reversal —
+      // closing a never-listened server would reject ERR_SERVER_NOT_RUNNING (Review-seat ③, #61).
       for (const { id } of RESOURCES) revoked.add(id)
-    } catch {
-      for (const { id } of RESOURCES) {
-        if (!revoked.has(id)) failed.push({ id, reasonCode: 'DISPOSE_INCOMPLETE' })
+    } else {
+      try {
+        // Sockets and listener fall via server.close() before any per-resource bookkeeping.
+        await server.close()
+        for (const { id } of RESOURCES) revoked.add(id)
+      } catch {
+        for (const { id } of RESOURCES) {
+          if (!revoked.has(id)) failed.push({ id, reasonCode: 'DISPOSE_INCOMPLETE' })
+        }
       }
     }
     terminalReport = { revoked: [...revoked], failed }
@@ -161,7 +173,14 @@ export async function prepare(context: PluginPrepareContext): Promise<PreparedWe
         return Promise.resolve()
       },
       dispose: async () => {
-        await teardown()
+        // A swallowed teardown failure would project a quarantine-worthy state as a clean
+        // unload on the host's revoke path — surface it instead (Review-seat ④, #61).
+        const report = await teardown()
+        if (report.failed.length > 0) {
+          throw new Error(
+            `DISPOSE_INCOMPLETE: teardown left ${report.failed.map(entry => entry.id).join(', ')} unreleased`,
+          )
+        }
       },
     })
   }
@@ -173,6 +192,7 @@ export async function prepare(context: PluginPrepareContext): Promise<PreparedWe
         throw new Error('ACTIVATE_FAILED: host must commit all registered resources before publication')
       }
       const address = await server.listen(config.port ?? 0)
+      listened = true
       phase = 'active'
       return {
         address,

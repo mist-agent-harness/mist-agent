@@ -8,12 +8,6 @@
   "configSchemaVersion": 0,
   "capabilities": [],
   "contextInjections": [],
-  "env": [
-    { "name": "PORT", "description": "HTTP port for the webui server (default 4700)", "required": false, "secret": false },
-    { "name": "BIND", "description": "Bind host; non-loopback always requires a token (default 127.0.0.1)", "required": false, "secret": false },
-    { "name": "TOKEN", "description": "Access token; omitted = host/CLI auto-generates a strong secret", "required": false, "secret": true },
-    { "name": "TRUSTED_HOSTS", "description": "Comma-separated extra Host header allowlist (rebinding fence)", "required": false, "secret": false }
-  ],
   "credentials": [],
   "permissions": []
 }
