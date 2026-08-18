@@ -7,9 +7,7 @@
   },
   "files": {
     "ignoreUnknown": true,
-    "ignore": [
-      "webui/**"
-    ]
+    "ignore": ["webui/**"]
   },
   "formatter": {
     "enabled": true,
