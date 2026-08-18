@@ -5,12 +5,15 @@
  * MUST NOT be publicly reachable; the host calls each resource's `activate()` during its atomic
  * commit, then `PreparedPlugin.activate()` performs the single publication step (binding the
  * listener). `dispose` is idempotent and reports the revoked/failed id sets; teardown delegates
- * to `server.close()`, which terminates live sockets and then closes the listener — the RFC
- * revoke-reachability-first ordering inside close() is dev-server work, tracked in 基建075/⑤.
+ * to `server.close()`, which withdraws HTTP reachability first and then terminates live
+ * sockets (基建076, landed). Dispose failure has two deliberate contracts: the host revoke
+ * path (`ResourceDeclaration.dispose`, void) throws DISPOSE_INCOMPLETE, while
+ * `ActivePlugin.dispose` returns the DisposeReport — hosts on that path MUST inspect
+ * `failed[]`; only an empty set is a clean unload (C07; 朝灯 #61 复验-③).
  * Plugin-side C10/C11 obligations are met here (unreachable prepare, listen only in activate,
  * idempotent dispose); the C10/C11 verdicts themselves judge the host implementation.
- * Config is this plugin's only settings source — the manifest deliberately declares no `env`
- * bindings until the RFC defines env delivery (Review-seat ⑦, #61). The 35 internal client
+ * Config is this plugin's only settings source — the manifest declares `env: []` (RFC §2
+ * shape, zero claims; the env/secret delivery channel is #62 work). The 35 internal client
  * modules stay implementation detail behind this one plugin (Review-seat口径, #56).
  */
 
@@ -49,6 +52,7 @@ interface DisposeReport {
 }
 
 interface ActivePlugin {
+  /** Terminal DisposeReport — callers MUST inspect `failed[]`; only empty is a clean unload (C07). */
   dispose(): Promise<DisposeReport>
 }
 
@@ -201,6 +205,7 @@ export async function prepare(context: PluginPrepareContext): Promise<PreparedWe
       return {
         address,
         token,
+        // Report-contract path: caller reads `failed[]`; the throwing variant is the revoke path above.
         dispose: teardown,
       }
     },
