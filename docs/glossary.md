@@ -63,6 +63,8 @@
 它不是普通工具返回值，也不是人格文件：正文必须在插件包内随 manifest 声明、可 diff、
 可追溯来源；运行期服务端不得用未声明或漂移的文本静默改写住户上下文。停用或卸载插件时，
 对应注入必须同时从现役上下文、启动包和后续重建输入撤下，不能留下“卸不掉的守则”。
+升级比较的唯一 canonical 形状是 `{id, source, scope, body}`：manifest `id` 是唯一键，不得另设、
+接受或推导第二键或别名；`source` 是规范化的包内相对路径，`body` 是精确 UTF-8 正文。
 
 **注入模式（injection mode）**
 工具能力 schema 的容量策略。`eager` 在能力 active 时装入完整 schema；`lazy` 只装入可发现的
@@ -79,28 +81,49 @@ reason code 跨重启保留；重启不能把它洗成 ready。显式清理重�
 所有剩余资源撤销成功时才能进入 `disposed`；重试失败继续留在 `quarantined`，并保留操作记录
 和人工处理清单。
 
+**blocked**
+插件因校验、权限、迁移或 activate 失败而不能提供能力的持久状态，不是可自动恢复的 ready
+前置态。它只能由显式修复或用户重试重新从 `discovered` 走完整生命周期，或由显式停用进入
+清理；不得自动回 ready 或直达 active。启动时的未完成 activate/dispose 日志协调属于 C10 恢复，
+不是用户重试；`quarantined` 只有独立的 `retryCleanup` 显式清理重试可出，重复 `dispose` 不算。
+
 **升级扩权闸**
-升级时宿主将 v2 manifest 的 `PermissionGrant` 与现役 v1 的有效授权集合逐项比较的控制点。
-新增 capability、提高 effect、增加 operation、增加 literal 值或移除原有 literal 限制都算扩权；
-扩权必须展示差集并取得本次升级的显式人工确认，确认前 v1 保持 ready，v2 不得激活。没有扩权
-时沿用原升级流程，不额外打扰人类。
+升级时宿主将 v2 manifest 的 `PermissionGrant` 和包内 canonical context injection 四元组
+`{id, source, scope, body}` 与现役 v1 有效集合逐项比较的控制点；`id` 是唯一键。新增 capability、
+提高 effect、增加 operation、增加 literal 值、移除原有 literal 限制，以及新增 `id`、只改变
+`body`、只改变 `source`、`session → resident` 都算扩权；删除 `id` 或 `resident → session` 是收窄。扩权必须展示
+可审计差集并取得本次升级的显式人工确认，确认前 v1 保持 ready，v2 不得激活、公开或注入新正文；
+不得使用插件 description、历史确认或任意 TTL 取代本次包内比较。重启、显式取消或新升级会丢弃
+未确认 v2 副本；没有扩权时沿用原升级流程，不额外打扰人类。
 
 **适配器（adapter）**
 把 mist 的统一调用形状翻译给某个执行通道的插件。适配器只负责协议翻译和执行，
 不拥有住户身份、记忆或生命周期；通道可以换，住户不换。
 
 **用途车道（lane）**
-住户选择执行通道时的用途槽，例如 `primary`、`coding`。绑定以
-「住户 × 用途车道」为键，指向适配器和凭证引用。主 agent / subagent 是运行角色，
-不是车道；两者是正交维度。
+住户选择执行通道时的用途槽，例如 `primary`、`coding`。lane 值必须来自宿主 capability contract，
+并按大小写精确比较；未知、错拼、大小写不同或带空白的 lane 在绑定/dispatch 前返回
+`CONFIG_INVALID` 并 fail-closed，且无效新绑定不得覆盖旧绑定。绑定以「住户 × 用途车道」为键，
+指向适配器和凭证引用。role 不声明 lane，也不得推导 lane；主 agent / subagent 只来自已授权
+`DispatchRequest.role`，role 与 lane 是正交维度。
 
 **凭证引用（credential reference）**
-指向独立凭证库记录的不透明 id。配置、绑定、日志和插件 manifest 只能携带引用与类型，
-不能携带密钥值。登录流程不属于插件协议。
+指向独立凭证库记录的不透明 id，不能携带密钥值。manifest 只声明 credential slot 与可接受类型；
+实例配置和绑定携带 opaque credential ref。没有 active issuer 时不展示入口、不得新建或导入无法
+回指该 issuer 的 ref，也不得制造悬空引用。v0 不定义 secretRef 后端、加密、轮换或 issuer 删除后
+现役 ref 的产品处置/迁移语义；登录流程不属于插件协议。
 
-**disposer**
-注册成功后用于撤销该次注册所产生资源的幂等句柄。宿主先撤销可达性再清理资源；
-重复调用必须安全，清理失败必须显式留下隔离记录，不能留下无人认领的活线。
+**DisposableHandle.revoke**
+宿主注册日志持有的**单个资源**撤销句柄。它幂等；宿主先撤销可达性再清理资源，失败留下
+资源级隔离记录，不能留下无人认领的活线。
+
+**PreparedPlugin.rollback**
+一次 prepare 的**整次逆操作**。它幂等，用于 activate 失败或中断前撤销本次 prepare 的资源；
+它不是单资源 `revoke`，也不是整插件 `dispose`。
+
+**ActivePlugin.dispose**
+active 插件的**整插件卸载**操作。它幂等；撤销不完整时进入 `quarantined`，而非把失败当作
+`disposed`。它不是 `retryCleanup`：quarantined 下重复 dispose 只返回同一隔离态。
 
 **许愿区 / 决定区**
 设计文档的两个分区。写得出代价的进决定区，写不出的进愿望区。
