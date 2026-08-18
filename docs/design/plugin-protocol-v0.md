@@ -130,6 +130,14 @@ trim、套别名或模糊纠错，也不得从 adapter、credential 或 role 推
 事件正文。凭证比普通 secret env 更严格：manifest 只声明槽位与可接受类型，实际绑定只
 传 `credentialRef`，插件永远看不到凭证库的枚举能力。
 
+env 值只经 `PluginPrepareContext.env` 交付：宿主在 `prepare` 前解析
+`PluginInstanceConfig.environment`（`value` 直接采用，`secretRef` 在执行边界解析为值），
+以只读映射交给插件，键集合必须恰好是 manifest `env` 已声明的 `name`——未声明的名字不得
+出现，声明了但未绑定的可选项不出现，`required: true` 缺失在 validate 阶段即
+`REQUIREMENT_MISSING`。插件不得从 `process.env` 读取声明项：同进程多插件共享进程环境，
+按名字读会串值，也绕过了宿主的 secret 追踪。manifest 声明了 env 却不从 `context.env`
+读取的插件视为声明失实，宿主可以在 readiness 里标出。
+
 `value` 与 `secretRef` 必须二选一并与 manifest 的 `secret` 标志一致。`enabled: false`
 保留设置但不进入 prepare；从 true 切到 false 必须走完整卸载，从 false 切到 true 必须
 重新校验并走完整注册事务，不能靠隐藏 UI 冒充停用。
@@ -152,6 +160,7 @@ interface PluginModuleV0 {
 interface PluginPrepareContext {
   readonly pluginId: string;
   readonly config: unknown;
+  readonly env: Readonly<Record<string, string>>; // 只含 manifest 已声明且已绑定的 name，见第 2 节
   register(resource: ResourceDeclaration): DisposableHandle;
 }
 
@@ -212,6 +221,16 @@ blocked ─显式停用并清理→ disposing → disposed / quarantined
 事务保证，不声称能拦截受信任同进程代码直接调用 Node 原生 API。`activate` 成功后，宿主
 以一次原子提交公开整批资源；中途失败则按注册逆序撤销全部句柄并调用 `rollback`。部分
 成功不得泄漏为半个 active 插件。
+
+activate 阶段有两个 `activate()`，顺序固定、不得颠倒：宿主先按注册顺序逐个调用
+`ResourceDeclaration.activate()`，它只把该资源置为「已提交、就绪」，此时仍不得对外可达；
+全部资源就绪并完成 active 终态写盘后，宿主调用一次 `PreparedPlugin.activate()`，这是
+唯一的对外发布步骤（例如绑定监听器、把路由挂进索引），返回的 `ActivePlugin` 出现即表示
+已可达。任一 `ResourceDeclaration.activate()` 失败，或 `PreparedPlugin.activate()` 失败，
+都按注册逆序 `revoke` 已就绪资源并调用 `rollback`，终态 `blocked + ACTIVATE_FAILED`；
+已写盘的 active 记录按操作日志改回 `blocked`。插件可以在 `PreparedPlugin.activate()` 中
+拒绝「尚有资源未经宿主提交」的调用并返回 `ACTIVATE_FAILED`，宿主不得把这种拒绝当作
+插件缺陷绕过。
 
 生命周期事务必须跨宿主进程边界可恢复。宿主在执行第一个生命周期副作用前，先持久化带
 `operationId` 的操作日志；日志至少记录 plugin id、操作种类（activate/dispose）、当前阶段、
@@ -479,3 +498,13 @@ scope 的 ready。
   协议只保留不透明 ref，不落 secret。没有 active issuer 时不得展示对应入口、不得新建或导入
   无法回指现役 issuer 的 ref，也不得制造悬空 ref；现役 ref 的删除语义由产品另行决定；
 - 不允许插件协议改写已决的通道政策、住户连续性或权限审批点。
+
+## 11. v0 已登记、留待 v0.1 的缺口
+
+由首个真实消费者（#61，webui 整包 `frontend` 插件）暴露、本稿明确不在 v0 设计的空白：
+
+- `frontend` 插件的宿主服务通道：v0 的 `PluginPrepareContext` 不向 `frontend` 插件交付
+  宿主已 active 的服务实现（例如会话编排层背后的 `/api` handler），插件只能自带实现或
+  桩。在 v0.1 定义交付形状（候选：`context.services.get(capabilityId)` 返回随 dispose
+  一起撤销的只读句柄）之前，`frontend` 插件的 manifest 与文档必须明示其后端为何物，
+  不得让「已按协议装载」被读成「已接上宿主真身」。

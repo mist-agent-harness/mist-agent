@@ -31,6 +31,11 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 - [ ] **[PV0-A09](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s2) env 绑定形状不可混用**：逐一测试 secret×value、secret×secretRef、
   plain×value、plain×secretRef；只有中间两种匹配组合中的 secret×secretRef 与
   plain×value 通过，错配返回 `CONFIG_INVALID`，明文 secret 不进入配置快照。
+- [ ] **PV0-A10 env 只经 context 交付**：manifest 声明 plain `A`、secret `B`、可选未绑定
+  `C`；插件 prepare 时记录 `context.env` 的键集合，并另设 `process.env.D` 探针。断言
+  `context.env` 恰为 `{A, B}`（`B` 为已解析值）、不含 `C`/`D`；配置快照、日志与事件中
+  `B` 的值不出现（`SECRET_SHOULD_NEVER_APPEAR`）；宿主向插件交付未声明名字或漏交
+  `required` 项时本条变红，后者返回 `REQUIREMENT_MISSING`。
 
 ## B. 权限、secret 与工具翻译
 
@@ -111,6 +116,11 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
   独立的显式清理重试（例如 `retryCleanup(pluginId)`）才能继续撤销。重试且全部剩余资源
   撤销成功时进入 `disposed`；重试再次失败时仍为 `quarantined`，剩余资源 id、reason code、
   操作记录和人工处理清单均保留，不得伪装成 `disposed` 或恢复为 `ready`。
+- [ ] **[PV0-C13](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s3) 两个 activate 顺序固定**：prepare 注册三个资源，每个 `ResourceDeclaration.activate()`
+  记录调用序号并保持不可达探针为零；`PreparedPlugin.activate()` 内部断言三个资源均已提交、
+  且 active 四元组已写盘。断言：三个资源 activate 全部先于唯一一次 `PreparedPlugin.activate()`；
+  发布前所有可达性探针为零；发布后探针为正。宿主先调 `PreparedPlugin.activate()` 再逐资源提交、
+  或在任一资源 activate 失败后仍发布，本条变红，返回 `ACTIVATE_FAILED` 且全量 rollback。
 
 ## D. 绑定、角色与凭证类型
 
@@ -211,6 +221,7 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 | A07 | enabled=false 只隐藏 UI、不 dispose | A07 |
 | A08 | 允许非法/冲突 plugin id 覆盖现役 | A08 |
 | A09 | 允许 secret env 使用明文 value | A09 |
+| A10 | 把未声明的 env 交给插件，或让插件从 process.env 取声明项 | A10 |
 | B01 | 把 `/new` 字面量约束改成任意文本 | B01 |
 | B02 | 把空 operations/literals 解释为通配 | B02 |
 | B03 | 以插件的 read 覆盖宿主 irreversible | B03 |
@@ -236,6 +247,7 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 | C10 | 把启动时 activate/dispose 日志协调当用户重试、协调后自动 ready/active，或清除失败记录并假装未安装 | C10 |
 | C11 | 先持久化公开路由索引，再写 active 四元组 | C11 |
 | C12 | quarantined 进入后自动重试、把重复 dispose 当作宿主 `retryCleanup` 显式清理重试、把重试失败当 disposed，或清掉剩余资源/人工处理记录 | C12 |
+| C13 | 先调 `PreparedPlugin.activate()` 发布，再逐资源提交 | C13 |
 | D01 | 仅以 lane 为键，忽略 residentId | D01 |
 | D02 | 给 subagent 挂载住户记忆 | D02 |
 | D03 | 显式换道时沿用原车道权限结果 | D03 |
