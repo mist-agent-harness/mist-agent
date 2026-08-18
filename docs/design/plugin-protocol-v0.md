@@ -221,7 +221,7 @@ prepare/activate/call。重试从持久化的剩余资源清单和撤销回执�
 进入 `quarantined`，相关路由继续 fail-closed，宿主记录资源 id 和稳定 reason code；
 不得为了“看起来卸载成功”留下任何已登记或经宿主管理的监听器、出站连接、定时器、工具或
 上下文守则。处于 `quarantined` 时，宿主只允许走显式清理重试这一条出边；重复 `dispose`
-仍返回同一 `quarantined` 终态，不算显式重试。独立重试成功才可进入 `disposed`，重试失败
+仍返回同一 `quarantined` 隔离态，不算显式重试。独立重试成功才可进入 `disposed`，重试失败
 继续保留隔离记录和人工处理清单。
 
 代价：事务注册需要宿主持久化操作日志、撤销回执和终态，并在启动时先做协调；协议要求插件
@@ -354,6 +354,10 @@ active 前保持可恢复，新版本不得原地改写旧配置。
 原 verified scope 继续保持 ready。没有确认时，升级事务返回 `UPGRADE_PERMISSION_CONFIRMATION_REQUIRED`
 并保持 blocked；不得把配置写入、启动重试或过去的确认记录当作本次确认。确认后才可继续
 copy-on-write 的 prepare/activate 和原子切换，后续失败仍按本节既有回滚路径处理。
+
+`UPGRADE_PERMISSION_CONFIRMATION_REQUIRED` 不属于启动协调可恢复的 activate/dispose 操作；宿主
+重启后，待确认的 v2 升级副本和本次确认资格一并作废，v1 继续保持 ready，用户必须重新发起升级、
+重新计算权限差集并取得本次显式确认。
 
 ```ts
 interface MigrationRequest {

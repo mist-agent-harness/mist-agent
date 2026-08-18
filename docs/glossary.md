@@ -75,7 +75,7 @@
 **quarantined**
 插件资源撤销不完整或运行时越界后的持久隔离态。全部对外入口保持关闭，剩余资源 id 与稳定
 reason code 跨重启保留；重启不能把它洗成 ready。显式清理重试是宿主独立操作，不等于重复
-调用 `dispose`；`quarantined` 下重复 `dispose` 幂等返回同一隔离终态。只有显式清理重试且
+调用 `dispose`；`quarantined` 下重复 `dispose` 幂等返回同一隔离态。只有显式清理重试且
 所有剩余资源撤销成功时才能进入 `disposed`；重试失败继续留在 `quarantined`，并保留操作记录
 和人工处理清单。
 

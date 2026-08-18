@@ -102,7 +102,7 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
   用 mock 重启、清空内存态或临时脚本冒充。
 - [ ] **PV0-C12 quarantined 只能显式清理重试**：制造一次部分撤销失败，确认插件进入
   `quarantined` 且所有入口保持 fail-closed；无显式操作时不得再次调用清理。重复调用
-  `dispose` 不是显式重试，必须幂等返回同一 `quarantined` 终态且不再次执行清理；只有宿主
+  `dispose` 不是显式重试，必须幂等返回同一 `quarantined` 隔离态且不再次执行清理；只有宿主
   独立的显式清理重试（例如 `retryCleanup(pluginId)`）才能继续撤销。重试且全部剩余资源
   撤销成功时进入 `disposed`；重试再次失败时仍为 `quarantined`，剩余资源 id、reason code、
   操作记录和人工处理清单均保留，不得伪装成 `disposed` 或恢复为 `ready`。
