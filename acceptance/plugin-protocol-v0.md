@@ -117,10 +117,15 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
   撤销成功时进入 `disposed`；重试再次失败时仍为 `quarantined`，剩余资源 id、reason code、
   操作记录和人工处理清单均保留，不得伪装成 `disposed` 或恢复为 `ready`。
 - [ ] **[PV0-C13](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s3) 两个 activate 顺序固定**：prepare 注册三个资源，每个 `ResourceDeclaration.activate()`
-  记录调用序号并保持不可达探针为零；`PreparedPlugin.activate()` 内部断言三个资源均已提交、
-  且 active 四元组已写盘。断言：三个资源 activate 全部先于唯一一次 `PreparedPlugin.activate()`；
-  发布前所有可达性探针为零；发布后探针为正。宿主先调 `PreparedPlugin.activate()` 再逐资源提交、
-  或在任一资源 activate 失败后仍发布，本条变红，返回 `ACTIVATE_FAILED` 且全量 rollback。
+  记录调用序号并保持不可达探针为零。**两侧断言分主语**——宿主的持久化对插件不可观测，
+  插件只能断言自己记得的提交集合：
+  - 插件侧（`PreparedPlugin.activate()` 内部）：断言自己声明的三个资源均已收到宿主提交，
+    否则拒绝发布；三个资源 activate 全部先于唯一一次 `PreparedPlugin.activate()`；
+    发布前所有可达性探针为零，发布后探针为正。
+  - 宿主侧（测试夹具，非插件）：断言 active 四元组写盘先于调用 `PreparedPlugin.activate()`。
+
+  宿主先调 `PreparedPlugin.activate()` 再逐资源提交、或在任一资源 activate 失败后仍发布，
+  本条变红，返回 `ACTIVATE_FAILED` 且全量 rollback。
 
 ## D. 绑定、角色与凭证类型
 
