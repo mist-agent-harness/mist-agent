@@ -58,7 +58,15 @@ export class InstallerController {
     return cloneDraft(this.#requireDraft());
   }
 
-  revisitCredentials(): InstallerDraft {
+  /**
+   * Rewinds to the credential step.
+   *
+   * `reset` clears the collected credentials as well, for the case where the saved
+   * set is itself what got rejected: the runner re-collects from `draft.credentials`,
+   * so keeping a rejected set would replay the same rejection. The default keeps
+   * them, which is what the "no compatible credential for this adapter" path wants.
+   */
+  revisitCredentials(options: { reset?: boolean } = {}): InstallerDraft {
     const draft = cloneDraft(this.#requireDraft());
     draft.progress.currentStep = "credentials";
     draft.progress.status = "in-progress";
@@ -66,6 +74,26 @@ export class InstallerController {
       (step) => step !== "credentials" && step !== "bindings",
     );
     draft.bindings = [];
+    if (options.reset === true) draft.credentials = [];
+    this.#persist(draft);
+    return cloneDraft(draft);
+  }
+
+  /**
+   * Sends a stuck review back to the memory step so another path can be chosen.
+   *
+   * `revisitFrontend` cannot stand in for this: it only rewinds to frontend, and
+   * once frontend is saved again the still-populated memory step is skipped and the
+   * draft lands back on review — where the unusable path fails again.
+   */
+  revisitMemory(): InstallerDraft {
+    const draft = cloneDraft(this.#requireDraft());
+    draft.progress.currentStep = "memory";
+    draft.progress.status = "in-progress";
+    draft.progress.completedSteps = draft.progress.completedSteps.filter(
+      (step) => step !== "memory",
+    );
+    draft.memory = null;
     this.#persist(draft);
     return cloneDraft(draft);
   }
@@ -88,6 +116,18 @@ export class InstallerController {
     const draft = cloneDraft(this.#requireDraft());
     if (entries.length === 0) {
       throw new InstallerValidationError("at least one credential is required");
+    }
+    // Reject duplicate ids here, with the same rule and wording commit uses.
+    // Leaving it to commit strands the draft at review: commit throws, and review
+    // has no way back to step 1, so the only exit is discarding everything.
+    // Checked before staging so a rejected batch leaves no orphan secret.
+    const seenIds = new Set<string>();
+    for (const entry of entries) {
+      const id = entry.credential.ref.id;
+      if (seenIds.has(id)) {
+        throw new InstallerValidationError(`duplicate credential id: ${id}`);
+      }
+      seenIds.add(id);
     }
     const credentials: InstallerCredential[] = [];
     for (const entry of entries) {

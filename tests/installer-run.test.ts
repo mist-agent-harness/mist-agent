@@ -586,3 +586,216 @@ it("does not delete the active memory library when a same-path replacement draft
   expect(store.loadCurrentConfig()?.memory).toEqual({ kind: "existing", path: memoryPath });
   prompt.expectExhausted();
 });
+
+// ── #58 第 1、2 条：恢复路径的两个死锁 ──────────────────────────────
+
+function reviewReadyDraft(
+  store: InstallerStateStore,
+  overrides: {
+    credentials: { ref: ReturnType<typeof apiKeyRef>; label: string }[];
+    memory: { kind: "existing" | "create"; path: string };
+  },
+): void {
+  const seeded = new InstallerController(store);
+  const draft = seeded.start("resident-1");
+  store.saveDraft({
+    ...draft,
+    credentials: overrides.credentials.map((entry) => ({
+      ref: entry.ref,
+      label: entry.label,
+      providerId: "codex",
+      status: "ready",
+    })),
+    bindings: [
+      {
+        residentId: "resident-1",
+        lane: "primary",
+        adapterId: "pi",
+        credentialRef: overrides.credentials[0]?.ref ?? apiKeyRef("codex-key"),
+      },
+    ],
+    frontend: { kind: "external", integration: "mist-session-api" },
+    memory: overrides.memory,
+    progress: {
+      currentStep: "review",
+      status: "in-progress",
+      completedSteps: ["credentials", "bindings", "frontend", "memory"],
+    },
+  });
+}
+
+it("saveCredentials rejects a duplicate id instead of leaving it for commit", () => {
+  const directory = freshDirectory();
+  const store = new InstallerStateStore(directory);
+  const controller = new InstallerController(store);
+  controller.start("resident-1");
+
+  expect(() =>
+    controller.saveCredentials([
+      {
+        credential: {
+          ref: apiKeyRef("codex-key"),
+          label: "First",
+          providerId: "codex",
+          status: "incomplete",
+        },
+        secret: "first-secret",
+      },
+      {
+        credential: {
+          ref: apiKeyRef("codex-key"),
+          label: "Second",
+          providerId: "codex",
+          status: "incomplete",
+        },
+        secret: "second-secret",
+      },
+    ]),
+  ).toThrow(/duplicate credential id: codex-key/);
+
+  // Rejected before staging: no orphan secret, and the draft stays on step 1.
+  expect(existsSync(join(directory, "drafts", "secrets"))).toBe(false);
+  expect(store.loadDraft()?.progress.currentStep).toBe("credentials");
+});
+
+it("offers a way back to credentials when commit rejects a draft written by an older build", async () => {
+  const directory = freshDirectory();
+  const store = new InstallerStateStore(directory);
+  const memoryPath = join(directory, "memory-choice");
+  mkdirSync(memoryPath);
+  // saveCredentials now refuses this shape, but drafts written before the fix are
+  // still on disk; commit stays the last line of defence and must not be a dead end.
+  reviewReadyDraft(store, {
+    credentials: [
+      { ref: apiKeyRef("codex-key"), label: "First" },
+      { ref: apiKeyRef("codex-key"), label: "Second" },
+    ],
+    memory: { kind: "existing", path: memoryPath },
+  });
+
+  const prompt = new ScriptedPrompt({
+    // review confirm -> commit throws -> back to credentials -> redo steps 1..3.
+    // The memory step is not asked again: it stays completed, which is exactly why
+    // rewinding to frontend could never clear a bad memory path (see #58 item 2).
+    selects: ["resume", "credentials", "codex", "api-key", "codex-key", "external"],
+    inputs: ["codex-key"],
+    secrets: ["credential-text"],
+    confirms: [true, false, false, true],
+  });
+
+  const result = await runInstaller({
+    residentId: "resident-1",
+    dataDir: directory,
+    controller: new InstallerController(store),
+    store,
+    prompt,
+    oauth: noOAuth,
+    memoryLibraries: new FileMemoryLibrary(),
+  });
+
+  expect(result.status).toBe("committed");
+  expect(prompt.infoMessages.some((message) => message.includes("duplicate credential id"))).toBe(
+    true,
+  );
+  expect(store.loadCurrentConfig()?.credentialRefs).toHaveLength(1);
+  prompt.expectExhausted();
+});
+
+it("keeps the draft when a rejected commit is not fixed on the spot", async () => {
+  const directory = freshDirectory();
+  const store = new InstallerStateStore(directory);
+  const memoryPath = join(directory, "memory-choice");
+  mkdirSync(memoryPath);
+  reviewReadyDraft(store, {
+    credentials: [
+      { ref: apiKeyRef("dup"), label: "First" },
+      { ref: apiKeyRef("dup"), label: "Second" },
+    ],
+    memory: { kind: "existing", path: memoryPath },
+  });
+
+  const prompt = new ScriptedPrompt({
+    selects: ["resume", "keep"],
+    inputs: [],
+    secrets: [],
+    confirms: [true],
+  });
+
+  const result = await runInstaller({
+    residentId: "resident-1",
+    dataDir: directory,
+    controller: new InstallerController(store),
+    store,
+    prompt,
+    oauth: noOAuth,
+    memoryLibraries: new FileMemoryLibrary(),
+  });
+
+  expect(result.status).toBe("paused");
+  expect(store.loadCurrentConfig()).toBeNull();
+  expect(store.loadDraft()?.credentials).toHaveLength(2);
+  prompt.expectExhausted();
+});
+
+it("lets the user pick another path when the memory library location is occupied", async () => {
+  const directory = freshDirectory();
+  const store = new InstallerStateStore(directory);
+  const occupied = join(directory, "occupied-memory");
+  const replacement = join(directory, "fresh-memory");
+  // A directory mist did not create: no marker, so createEmpty refuses to adopt it.
+  // This is the state a resume finds after the first attempt failed on that path.
+  mkdirSync(occupied);
+  mkdirSync(join(occupied, "someone-elses-data"));
+  // Built through the normal API: the draft records the create path but the
+  // directory was never made by mist, which is what a resume finds after the
+  // first attempt failed on that path.
+  const seeded = new InstallerController(store);
+  seeded.start("resident-1");
+  seeded.saveCredentials([
+    {
+      credential: {
+        ref: apiKeyRef("codex-key"),
+        label: "Codex",
+        providerId: "codex",
+        status: "incomplete",
+      },
+      secret: "credential-text",
+    },
+  ]);
+  seeded.saveBindings([
+    {
+      residentId: "resident-1",
+      lane: "primary",
+      adapterId: "pi",
+      credentialRef: apiKeyRef("codex-key"),
+    },
+  ]);
+  seeded.saveFrontend({ kind: "external", integration: "mist-session-api" });
+  seeded.saveMemory({ kind: "create", path: occupied });
+
+  const prompt = new ScriptedPrompt({
+    // resume lands on review -> createEmpty fails -> memory step again -> new path
+    selects: ["resume", "create"],
+    inputs: [replacement],
+    secrets: [],
+    confirms: [true],
+  });
+
+  const result = await runInstaller({
+    residentId: "resident-1",
+    dataDir: directory,
+    controller: new InstallerController(store),
+    store,
+    prompt,
+    oauth: noOAuth,
+    memoryLibraries: new FileMemoryLibrary(),
+  });
+
+  expect(result.status).toBe("committed");
+  expect(prompt.infoMessages.some((message) => message.includes("cannot be created"))).toBe(true);
+  expect(store.loadCurrentConfig()?.memory).toEqual({ kind: "create", path: replacement });
+  expect(existsSync(join(replacement, ".mist-memory.json"))).toBe(true);
+  // The occupied directory is left exactly as it was.
+  expect(existsSync(join(occupied, "someone-elses-data"))).toBe(true);
+  prompt.expectExhausted();
+});

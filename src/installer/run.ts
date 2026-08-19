@@ -9,7 +9,7 @@ import type {
   LaneBinding,
   MemoryChoice,
 } from "./contracts.ts";
-import { installerAdapterAcceptsCredentialType } from "./contracts.ts";
+import { InstallerValidationError, installerAdapterAcceptsCredentialType } from "./contracts.ts";
 import type { InstallerController } from "./controller.ts";
 import type { MemoryLibraryPort } from "./memory-library.ts";
 import type { OAuthLoginPort } from "./pi-login.ts";
@@ -321,7 +321,20 @@ export async function runInstaller(options: RunInstallerOptions): Promise<RunIns
       case "review": {
         if (draft.memory?.kind === "create") {
           // Idempotently finish a creation interrupted after the draft was persisted.
-          options.memoryLibraries.createEmpty(draft.memory.path, draft.draftId);
+          try {
+            options.memoryLibraries.createEmpty(draft.memory.path, draft.draftId);
+          } catch (error) {
+            // The path is taken by a directory mist did not create, so createEmpty
+            // refuses. Letting this escape strands the draft for good: every later
+            // resume lands on review again and re-runs this same call.
+            options.prompt.info(
+              `The memory library at ${draft.memory.path} cannot be created: ${
+                error instanceof Error ? error.message : String(error)
+              }. Your draft is kept — choose another path.`,
+            );
+            options.controller.revisitMemory();
+            break;
+          }
         }
         options.prompt.info(formatReview(draft));
         if (draft.frontend?.kind === "official-skin") {
@@ -347,7 +360,29 @@ export async function runInstaller(options: RunInstallerOptions): Promise<RunIns
           default: true,
         });
         if (!shouldCommit) return { status: "paused", draft };
-        return { status: "committed", receipt: options.controller.commit() };
+        try {
+          return { status: "committed", receipt: options.controller.commit() };
+        } catch (error) {
+          // Validation that only commit can see (duplicate ids being the known case)
+          // must not be a dead end: review had no way back to step 1, so the only
+          // exit was discarding the whole draft.
+          if (!(error instanceof InstallerValidationError)) throw error;
+          options.prompt.info(
+            `This setup cannot be saved: ${error.message}. Your draft is kept and no active config changed.`,
+          );
+          const fixChoice = await options.prompt.select({
+            message: "How do you want to continue?",
+            choices: [
+              { value: "credentials", name: "Go back to credentials and fix it" },
+              { value: "keep", name: "Keep this draft and exit" },
+            ],
+            default: "credentials",
+          });
+          if (fixChoice === "keep")
+            return { status: "paused", draft: options.controller.current() };
+          options.controller.revisitCredentials({ reset: true });
+          break;
+        }
       }
     }
     draft = options.controller.current();
