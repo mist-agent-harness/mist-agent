@@ -594,6 +594,7 @@ function reviewReadyDraft(
   overrides: {
     credentials: { ref: ReturnType<typeof apiKeyRef>; label: string }[];
     memory: { kind: "existing" | "create"; path: string };
+    bindingResidentId?: string;
   },
 ): void {
   const seeded = new InstallerController(store);
@@ -608,7 +609,7 @@ function reviewReadyDraft(
     })),
     bindings: [
       {
-        residentId: "resident-1",
+        residentId: overrides.bindingResidentId ?? "resident-1",
         lane: "primary",
         adapterId: "pi",
         credentialRef: overrides.credentials[0]?.ref ?? apiKeyRef("codex-key"),
@@ -674,10 +675,10 @@ it("offers a way back to credentials when commit rejects a draft written by an o
   });
 
   const prompt = new ScriptedPrompt({
-    // review confirm -> commit throws -> back to credentials -> redo steps 1..3.
-    // The memory step is not asked again: it stays completed, which is exactly why
-    // rewinding to frontend could never clear a bad memory path (see #58 item 2).
-    selects: ["resume", "credentials", "codex", "api-key", "codex-key", "external"],
+    // review confirm -> commit throws -> back to credentials -> redo steps 1..2.
+    // Frontend and memory are not asked again: they stay completed, which is exactly
+    // why rewinding to frontend could never clear a bad memory path (see #58 item 2).
+    selects: ["resume", "fix", "codex", "api-key", "codex-key"],
     inputs: ["codex-key"],
     secrets: ["credential-text"],
     confirms: [true, false, false, true],
@@ -797,5 +798,85 @@ it("lets the user pick another path when the memory library location is occupied
   expect(existsSync(join(replacement, ".mist-memory.json"))).toBe(true);
   // The occupied directory is left exactly as it was.
   expect(existsSync(join(occupied, "someone-elses-data"))).toBe(true);
+  prompt.expectExhausted();
+});
+
+it("a binding rejection at commit sends the user to bindings and keeps the credentials", async () => {
+  const directory = freshDirectory();
+  const store = new InstallerStateStore(directory);
+  const memoryPath = join(directory, "memory-choice");
+  mkdirSync(memoryPath);
+  // The credential set is fine; only the binding names the wrong resident. Review
+  // must not answer that by throwing away the credential (independent review of #74).
+  reviewReadyDraft(store, {
+    credentials: [{ ref: apiKeyRef("codex-key"), label: "Codex" }],
+    memory: { kind: "existing", path: memoryPath },
+    bindingResidentId: "different-resident",
+  });
+  store.stageSecret(store.loadDraft()?.draftId ?? "", "codex-key.credential", "credential-text");
+
+  const prompt = new ScriptedPrompt({
+    // review confirm -> commit throws (binding) -> back to bindings -> redo bindings only:
+    // pick the (still present) credential, decline a coding channel, confirm review.
+    selects: ["resume", "fix", "codex-key"],
+    inputs: [],
+    secrets: [],
+    confirms: [true, false, true],
+  });
+
+  const result = await runInstaller({
+    residentId: "resident-1",
+    dataDir: directory,
+    controller: new InstallerController(store),
+    store,
+    prompt,
+    oauth: noOAuth,
+    memoryLibraries: new FileMemoryLibrary(),
+  });
+
+  expect(result.status).toBe("committed");
+  expect(
+    prompt.infoMessages.some((message) => message.includes("does not match draft resident")),
+  ).toBe(true);
+  // The credential survived the round trip untouched: same id, same secret.
+  expect(store.loadCurrentConfig()?.credentialRefs.map((ref) => ref.id)).toEqual(["codex-key"]);
+  expect(store.readCredentialSecret("codex-key")).toBe("credential-text");
+  prompt.expectExhausted();
+});
+
+it("a second occupied memory path is caught at the memory step instead of crashing", async () => {
+  const directory = freshDirectory();
+  const store = new InstallerStateStore(directory);
+  const occupiedA = join(directory, "occupied-a");
+  const occupiedB = join(directory, "occupied-b");
+  const replacement = join(directory, "fresh-memory");
+  mkdirSync(join(occupiedA, "data"), { recursive: true });
+  mkdirSync(join(occupiedB, "data"), { recursive: true });
+
+  const prompt = new ScriptedPrompt({
+    // step 1..3, then memory: occupied A (caught) -> occupied B (caught) -> fresh
+    selects: ["codex", "api-key", "codex-key", "external", "create", "create", "create"],
+    inputs: ["codex-key", occupiedA, occupiedB, replacement],
+    secrets: ["credential-text"],
+    confirms: [false, false, true],
+  });
+
+  const result = await runInstaller({
+    residentId: "resident-1",
+    dataDir: directory,
+    controller: new InstallerController(store),
+    store,
+    prompt,
+    oauth: noOAuth,
+    memoryLibraries: new FileMemoryLibrary(),
+  });
+
+  expect(result.status).toBe("committed");
+  expect(
+    prompt.infoMessages.filter((message) => message.includes("cannot be created")),
+  ).toHaveLength(2);
+  expect(store.loadCurrentConfig()?.memory).toEqual({ kind: "create", path: replacement });
+  expect(existsSync(join(occupiedA, "data"))).toBe(true);
+  expect(existsSync(join(occupiedB, "data"))).toBe(true);
   prompt.expectExhausted();
 });

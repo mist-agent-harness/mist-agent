@@ -104,9 +104,29 @@ export interface InstallCommitReceipt {
 }
 
 export class InstallerValidationError extends Error {
-  constructor(message: string) {
+  /**
+   * The wizard step whose data caused the rejection, when known. `validateReadyDraft`
+   * stamps this so a runner can send the user back to the right step instead of
+   * guessing from the message. Undefined means the draft envelope itself is bad.
+   */
+  step: InstallerStep | undefined;
+
+  constructor(message: string, step?: InstallerStep) {
     super(message);
     this.name = "InstallerValidationError";
+    this.step = step;
+  }
+}
+
+/** Runs one validation section and stamps un-attributed rejections with its step. */
+function validateStep<T>(step: InstallerStep, run: () => T): T {
+  try {
+    return run();
+  } catch (error) {
+    if (error instanceof InstallerValidationError && error.step === undefined) {
+      error.step = step;
+    }
+    throw error;
   }
 }
 
@@ -322,84 +342,95 @@ export function validateReadyDraft(draft: InstallerDraft): MistInstallConfigV0 {
   }
   assertSafeInstallerId(draft.draftId, "draft id");
   requireNonEmpty(draft.residentId, "residentId");
-  if (draft.credentials.length === 0) {
-    throw new InstallerValidationError("at least one credential is required");
-  }
+  const credentials = validateStep("credentials", () => {
+    if (draft.credentials.length === 0) {
+      throw new InstallerValidationError("at least one credential is required");
+    }
+    const seen = new Map<string, InstallerCredential>();
+    for (const credential of draft.credentials) {
+      assertSafeInstallerId(credential.ref.id, "credential id");
+      requireNonEmpty(credential.label, `credential ${credential.ref.id} label`);
+      requireNonEmpty(credential.providerId, `credential ${credential.ref.id} providerId`);
+      requireNonEmpty(credential.ref.issuerId, `credential ${credential.ref.id} issuerId`);
+      validateCredentialEnums(credential);
+      validateCredentialIssuer(credential);
+      if (credential.status !== "ready") {
+        throw new InstallerValidationError(`credential ${credential.ref.id} is incomplete`);
+      }
+      if (seen.has(credential.ref.id)) {
+        throw new InstallerValidationError(`duplicate credential id: ${credential.ref.id}`);
+      }
+      seen.set(credential.ref.id, credential);
+    }
+    return seen;
+  });
 
-  const credentials = new Map<string, InstallerCredential>();
-  for (const credential of draft.credentials) {
-    assertSafeInstallerId(credential.ref.id, "credential id");
-    requireNonEmpty(credential.label, `credential ${credential.ref.id} label`);
-    requireNonEmpty(credential.providerId, `credential ${credential.ref.id} providerId`);
-    requireNonEmpty(credential.ref.issuerId, `credential ${credential.ref.id} issuerId`);
-    validateCredentialEnums(credential);
-    validateCredentialIssuer(credential);
-    if (credential.status !== "ready") {
-      throw new InstallerValidationError(`credential ${credential.ref.id} is incomplete`);
-    }
-    if (credentials.has(credential.ref.id)) {
-      throw new InstallerValidationError(`duplicate credential id: ${credential.ref.id}`);
-    }
-    credentials.set(credential.ref.id, credential);
-  }
-
-  const bindings = new Set<string>();
-  for (const binding of draft.bindings) {
-    requireNonEmpty(binding.residentId, "binding residentId");
-    if (binding.residentId !== draft.residentId) {
-      throw new InstallerValidationError(
-        `binding resident ${binding.residentId} does not match draft resident ${draft.residentId}`,
-      );
-    }
-    if (!LANES.has(binding.lane)) {
-      throw new InstallerValidationError(`unsupported binding lane: ${String(binding.lane)}`);
-    }
-    requireNonEmpty(binding.adapterId, "binding adapterId");
-    const bindingKey = `${binding.residentId}\u0000${binding.lane}`;
-    if (bindings.has(bindingKey)) {
-      throw new InstallerValidationError(
-        `duplicate ${binding.lane} binding for resident ${binding.residentId}`,
-      );
-    }
-    bindings.add(bindingKey);
-    validateBindingCredential(binding, credentials);
-    const adapterConfig = binding.adapterConfig;
-    if (adapterConfig !== undefined) {
-      if (adapterConfig.baseUrl === undefined || adapterConfig.tokenCredentialRef === undefined) {
+  validateStep("bindings", () => {
+    const bindings = new Set<string>();
+    for (const binding of draft.bindings) {
+      requireNonEmpty(binding.residentId, "binding residentId");
+      if (binding.residentId !== draft.residentId) {
         throw new InstallerValidationError(
-          `binding ${binding.lane} custom gateway requires baseUrl and tokenCredentialRef`,
+          `binding resident ${binding.residentId} does not match draft resident ${draft.residentId}`,
         );
       }
-      requireNonEmpty(adapterConfig.baseUrl, `binding ${binding.lane} baseUrl`);
-      const tokenCredential = credentials.get(adapterConfig.tokenCredentialRef.id);
-      if (
-        tokenCredential === undefined ||
-        tokenCredential.ref.type !== "api_key" ||
-        adapterConfig.tokenCredentialRef.type !== "api_key" ||
-        tokenCredential.ref.issuerId !== adapterConfig.tokenCredentialRef.issuerId
-      ) {
+      if (!LANES.has(binding.lane)) {
+        throw new InstallerValidationError(`unsupported binding lane: ${String(binding.lane)}`);
+      }
+      requireNonEmpty(binding.adapterId, "binding adapterId");
+      const bindingKey = `${binding.residentId}\u0000${binding.lane}`;
+      if (bindings.has(bindingKey)) {
         throw new InstallerValidationError(
-          `binding ${binding.lane} tokenCredentialRef must reference an api_key`,
+          `duplicate ${binding.lane} binding for resident ${binding.residentId}`,
         );
       }
+      bindings.add(bindingKey);
+      validateBindingCredential(binding, credentials);
+      const adapterConfig = binding.adapterConfig;
+      if (adapterConfig !== undefined) {
+        if (adapterConfig.baseUrl === undefined || adapterConfig.tokenCredentialRef === undefined) {
+          throw new InstallerValidationError(
+            `binding ${binding.lane} custom gateway requires baseUrl and tokenCredentialRef`,
+          );
+        }
+        requireNonEmpty(adapterConfig.baseUrl, `binding ${binding.lane} baseUrl`);
+        const tokenCredential = credentials.get(adapterConfig.tokenCredentialRef.id);
+        if (
+          tokenCredential === undefined ||
+          tokenCredential.ref.type !== "api_key" ||
+          adapterConfig.tokenCredentialRef.type !== "api_key" ||
+          tokenCredential.ref.issuerId !== adapterConfig.tokenCredentialRef.issuerId
+        ) {
+          throw new InstallerValidationError(
+            `binding ${binding.lane} tokenCredentialRef must reference an api_key`,
+          );
+        }
+      }
     }
-  }
-  if (!draft.bindings.some((binding) => binding.lane === "primary")) {
-    throw new InstallerValidationError("a primary lane binding is required");
-  }
-  if (draft.frontend === null) {
-    throw new InstallerValidationError("frontend choice is required");
-  }
-  const frontend = validateFrontendChoice(draft.frontend);
-  if (frontend.kind === "official-skin") {
-    throw new InstallerValidationError(
-      "official skin is pending issues #49 and #51 and cannot be activated yet",
-    );
-  }
-  if (draft.memory === null) {
-    throw new InstallerValidationError("memory choice is required");
-  }
-  const memory = validateMemoryChoice(draft.memory);
+    if (!draft.bindings.some((binding) => binding.lane === "primary")) {
+      throw new InstallerValidationError("a primary lane binding is required");
+    }
+  });
+
+  const frontend = validateStep("frontend", () => {
+    if (draft.frontend === null) {
+      throw new InstallerValidationError("frontend choice is required");
+    }
+    const choice = validateFrontendChoice(draft.frontend);
+    if (choice.kind === "official-skin") {
+      throw new InstallerValidationError(
+        "official skin is pending issues #49 and #51 and cannot be activated yet",
+      );
+    }
+    return choice;
+  });
+
+  const memory = validateStep("memory", () => {
+    if (draft.memory === null) {
+      throw new InstallerValidationError("memory choice is required");
+    }
+    return validateMemoryChoice(draft.memory);
+  });
 
   return {
     schemaVersion: INSTALL_CONFIG_SCHEMA_VERSION,

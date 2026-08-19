@@ -80,6 +80,25 @@ export class InstallerController {
   }
 
   /**
+   * Rewinds to the binding step, keeping the collected credentials.
+   *
+   * For a commit rejected because of a binding (wrong resident, missing primary lane,
+   * bad gateway config) the credentials are fine; sending the user back to step 1
+   * would throw away work that was never the problem.
+   */
+  revisitBindings(): InstallerDraft {
+    const draft = cloneDraft(this.#requireDraft());
+    draft.progress.currentStep = "bindings";
+    draft.progress.status = "in-progress";
+    draft.progress.completedSteps = draft.progress.completedSteps.filter(
+      (step) => step !== "bindings",
+    );
+    draft.bindings = [];
+    this.#persist(draft);
+    return cloneDraft(draft);
+  }
+
+  /**
    * Sends a stuck review back to the memory step so another path can be chosen.
    *
    * `revisitFrontend` cannot stand in for this: it only rewinds to frontend, and
@@ -150,7 +169,13 @@ export class InstallerController {
       throw new InstallerValidationError("a primary lane binding is required");
     }
     draft.bindings = bindings.map((binding) => structuredClone(binding));
-    completeStep(draft, "bindings", "frontend");
+    // After a rewind to bindings the later steps may still be filled in; skip them the
+    // same way saveFrontend already skips a filled-in memory step.
+    completeStep(
+      draft,
+      "bindings",
+      draft.frontend === null ? "frontend" : draft.memory === null ? "memory" : "review",
+    );
     this.#persist(draft);
     return cloneDraft(draft);
   }
