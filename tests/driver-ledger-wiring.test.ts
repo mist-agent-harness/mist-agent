@@ -491,7 +491,6 @@ describe("ResidentStore 与 FactLedger 同目录共存（阻塞二）", () => {
     store1.remember(residentId, "占位记忆");
     store1.commit(residentId, "占位承诺");
     ledger1.createLedger(residentId);
-    // 窗开在落账之前：ack 后 ackedSeq > baselineSeq，重启才认得出「已交付」。
     ledger1.openViewport(residentId, "w_probe");
     ledger1.append(residentId, { author: "main-thread", kind: "ruling", body: "占位裁定" });
     ledger1.ack(residentId, "w_probe", 1);
@@ -505,7 +504,12 @@ describe("ResidentStore 与 FactLedger 同目录共存（阻塞二）", () => {
     expect(ledger2.entries(residentId).map((entry) => entry.body)).toEqual(["占位裁定"]);
     expect(ledger2.currentSet(residentId)).toHaveLength(1);
     expect(ledger2.ackedSeq(residentId, "w_probe")).toBe(1);
-    // ack 前进过的窗按重启退化语义视为已交付，无 pending。
+    // PR #98 拍板：恢复出的确认位是历史轨迹，一律无 pending（不再区分
+    // ack 是否前进过）；新窗开窗时按当时 currentSet 重新冻结一份。
     expect(ledger2.pendingInitial(residentId, "w_probe")).toBeNull();
+    ledger2.openViewport(residentId, "w_fresh");
+    expect(ledger2.pendingInitial(residentId, "w_fresh")?.map((entry) => entry.body)).toEqual([
+      "占位裁定",
+    ]);
   });
 });

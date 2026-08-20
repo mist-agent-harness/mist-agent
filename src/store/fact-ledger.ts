@@ -379,8 +379,11 @@ export class FactLedger {
    *
    * 记 baseline 的同一同步截面，把当时的现行有效集冻结成这扇窗的初始快照
    * （pendingInitial）：初始事实按「开窗那一刻的样子」交付一次且仅一次——
-   * 交付通道只有启动包与首轮开工注入，开窗本身不算交付。快照纯内存态，
-   * 不落盘（重启退化语义见 #restore）。
+   * 交付通道只有启动包与首轮开工注入，开窗本身不算交付。快照纯内存态、
+   * 不落盘：exactly-once 只覆盖单个 viewport 的生命周期，不跨进程重启
+   * （2026-08-20 主笔在 PR #98 拍板）——进程重启后旧 active 窗不续接，
+   * 新窗（新 ULID windowId）按当时 currentSet 重新完成一次初始对齐；
+   * 与 D8 猝死语义一致（新代靠交接信 + 归档查询，不续旧窗）。
    *
    * viewportId 对账是不透明字符串；它的发号（w_ + ULID）是宿主的事，不在这里校验。
    */
@@ -407,6 +410,8 @@ export class FactLedger {
   /**
    * 这扇窗未交付的初始快照（开窗截面冻结的现行有效集）；已交付/已清理
    * 返回 null——「已交付」与「从来没有过」对调用方都是「不要注入」。
+   * 恢复出的历史窗行同样返回 null：确认位落盘是历史轨迹，不承担初始交付
+   * （PR #98 拍板：旧 active 窗不续接，新窗重新对齐）。
    * 返回副本：改返回值涂改不了快照。
    */
   pendingInitial(residentId: string, viewportId: string): LedgerEntry[] | null {
@@ -588,23 +593,11 @@ export class FactLedger {
             {
               baselineSeq: row.baselineSeq,
               ackedSeq: row.ackedSeq,
-              // 初始快照不落盘，重启退化语义：ackedSeq 还停在 baseline 的窗
-              // 视为「初始对齐从未交付」，按此刻的 live currentSet 重冻一份
-              // pending（幂等重交的近似——原始快照可能已被随后的 supersede
-              // 改变，重交的是「此刻的现行集」而不是「开窗那一刻的现行集」，
-              // 这是已认可的近似）；ackedSeq 前进过的窗视为已交付，无 pending。
-              pendingInitial:
-                row.ackedSeq === row.baselineSeq
-                  ? record.entries
-                      .filter(
-                        (entry) =>
-                          entry.kind !== "supersede" &&
-                          !record.entries.some(
-                            (s) => s.kind === "supersede" && s.supersedesSeq === entry.seq,
-                          ),
-                      )
-                      .map((entry) => Object.freeze({ ...entry }))
-                  : null,
+              // 初始快照不落盘，恢复出的窗行一律无 pending：确认位落盘是历史
+              // 轨迹，不承担初始交付（2026-08-20 主笔在 PR #98 拍板——旧
+              // active 窗不续接；新窗开窗时按当时 currentSet 重新冻结一份，
+              // 重新完成一次初始对齐，与 D8 猝死语义同向）。
+              pendingInitial: null,
             },
           ]),
         ),

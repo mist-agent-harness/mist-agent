@@ -306,7 +306,7 @@ describe("拉式缺口与回执（MV-C01/C02/C05 账侧）", () => {
     ledger.openViewport("r", "w-a");
     ledger.openViewport("r", "w-b");
     const ruling = ledger.append("r", { author: "main", kind: "ruling", body: "新裁定" });
-    // 推送全灭也不影响正确性——账侧根本没有推送，拉是唯一通道（C02 的落点）。
+    // 无推送通道，拉是唯一正确性来源——账侧只有拉与回执两个动作（C02 的落点）。
     expect(ledger.gap("r", "w-b")).toEqual({ latestSeq: 1, ackedSeq: 0 });
     const missing = ledger.gapEntries("r", "w-b");
     expect(missing.map((e) => e.seq)).toEqual([ruling.seq]);

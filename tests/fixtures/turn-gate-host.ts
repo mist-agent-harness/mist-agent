@@ -24,7 +24,10 @@ import {
 } from "../../src/session/turn-gate.ts";
 import { type FactKind, FactLedger, type GapProbe } from "../../src/store/fact-ledger.ts";
 
-const ledger = new FactLedger();
+const dataDir = process.env.MIST_TURN_GATE_DATADIR;
+// 给了 dataDir 就是「落盘宿主」形态：ResidentStore 与 FactLedger 同目录共存
+// （各自认领各自的后缀），供父进程 SIGKILL 后原目录拉起，验猝死不续接。
+const ledger = dataDir === undefined ? new FactLedger() : new FactLedger({ dataDir });
 const events: TurnGateEvent[] = [];
 const logger: TurnEventLogger = {
   log: (event) => {
@@ -35,6 +38,7 @@ const logger: TurnEventLogger = {
 // --- A 窗通道：生产 MistDriver，say 的注入文本经捕获型 reply 留给父进程断言 ---
 let lastDriverPrompt: string | null = null;
 const driver = createDriver({
+  ...(dataDir === undefined ? {} : { dataDir }),
   factLedger: ledger,
   turnEventLogger: logger,
   reply: (_residentId, message) => {
@@ -90,6 +94,10 @@ type HostCommand = {
   requestId: string;
   op:
     | "createResident"
+    | "remember"
+    | "commit"
+    | "recall"
+    | "killSession"
     | "appendRuling"
     | "supersede"
     | "entries"
@@ -114,6 +122,9 @@ type HostCommand = {
   targetSeq?: number;
   reason?: string;
   message?: string;
+  content?: string;
+  commitment?: string;
+  query?: string;
   on?: boolean;
 };
 
@@ -136,6 +147,25 @@ async function execute(command: HostCommand): Promise<unknown> {
       storeB.createRoom(residentId);
       return { residentId };
     }
+    case "remember":
+      return driver.remember(
+        requireString(command.residentId, "residentId"),
+        requireString(command.content, "content"),
+      );
+    case "commit":
+      await driver.commit(
+        requireString(command.residentId, "residentId"),
+        requireString(command.commitment, "commitment"),
+      );
+      return null;
+    case "recall":
+      return driver.recall(
+        requireString(command.residentId, "residentId"),
+        requireString(command.query, "query"),
+      );
+    case "killSession":
+      await driver.killSession(requireString(command.residentId, "residentId"));
+      return null;
     case "appendRuling":
       return ledger.append(requireString(command.residentId, "residentId"), {
         author: requireString(command.author, "author"),

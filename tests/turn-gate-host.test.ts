@@ -1,7 +1,10 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import type { BootPack, HistoryNode } from "../acceptance/driver.ts";
+import type { BootPack, HistoryNode, MemoryEntry } from "../acceptance/driver.ts";
 import type { TurnGateEvent } from "../src/session/turn-gate.ts";
 import type { GapProbe, LedgerEntry } from "../src/store/fact-ledger.ts";
 
@@ -26,11 +29,15 @@ type HostReply = {
 type SayResult = { node: HistoryNode; prompt: string | null };
 
 const children: ChildProcess[] = [];
+const directories: string[] = [];
 const fixture = fileURLToPath(new URL("./fixtures/turn-gate-host.ts", import.meta.url));
 
-function startHost(): ChildProcess {
+function startHost(dataDir?: string): ChildProcess {
   const child = spawn(process.execPath, ["--import", "tsx", fixture], {
-    env: { ...process.env },
+    env: {
+      ...process.env,
+      ...(dataDir === undefined ? {} : { MIST_TURN_GATE_DATADIR: dataDir }),
+    },
     stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
   children.push(child);
@@ -115,6 +122,9 @@ afterEach(async () => {
       }
     }),
   );
+  for (const directory of directories.splice(0)) {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 /** 从闸事件日志里取 driver 窗的 windowId——driver 窗由生产懒开窗路径开出，日志三元组是它的出生证。 */
@@ -179,15 +189,16 @@ describe("turn-gate real host subprocess", () => {
     );
   });
 
-  it("MV-C01/C02 横向可见：主线程落账后，B 窗下一轮经拉取看到裁定并追平（无推送通道可丢）", async () => {
+  it("MV-C01/C02 横向可见：主线程落账后，B 窗下一轮经拉取看到裁定并追平（拉是唯一正确性来源）", async () => {
     const child = startHost();
     await waitForReady(child);
     const { residentId } = await callHost<{ residentId: string }>(child, {
       op: "createResident",
       name: "placeholder-c01",
     });
-    // A 窗先开工（driver 懒开窗路径）；推送通道在本实现里根本不存在——
-    // 拉是唯一通道，「推送全灭」就是默认形态（MV-C02）。
+    // A 窗先开工（driver 懒开窗路径）。MV-C02 的正确性来源只有拉：
+    // 本实现不存在推送通道（无可模拟、无可丢弃），B 窗能看到的每一条裁定
+    // 都只能是开工闸拉来的。
     await callHost(child, { op: "sayOn", residentId, message: "placeholder A turn" });
     const { windowId: windowB, baseline } = await callHost<{ windowId: string; baseline: number }>(
       child,
@@ -241,7 +252,9 @@ describe("turn-gate real host subprocess", () => {
     // say 被拒一次 + history 报到一次，两条都得记「缺口未知」。
     expect(unknownEvents.length).toBeGreaterThanOrEqual(2);
     expect(unknownEvents.every((e) => e.detail.includes("缺口未知"))).toBe(true);
-    expect(unknownEvents.every((e) => e.generation !== undefined)).toBe(true);
+    // generation 预期是 number 且为 1：两条事件都落在 driver 自己注册的那扇
+    // 一代窗上（不是 registry 查不到的窗——那种才该落 null）。
+    expect(unknownEvents.every((e) => e.generation === 1)).toBe(true);
 
     // 注入撤销后闸恢复放行——fail-closed 不是永久熔断。
     await callHost(child, { op: "failProbe", on: false });
@@ -357,5 +370,113 @@ describe("turn-gate real host subprocess", () => {
     // 现行有效集不再含旧条目（直接查账侧推导视图；此窗初始对齐已交付，
     // 启动包只对未对齐的窗生成——MV-A05 已钉包通道）。
     expect(await callHost<LedgerEntry[]>(child, { op: "currentSet", residentId })).toEqual([]);
+  });
+
+  it("宿主猝死不续接旧窗（PR #98 拍板）：同 dataDir 拉起新宿主，人与账原样恢复，新窗重新初始对齐", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mist-gate-crash-"));
+    directories.push(dir);
+
+    // 宿主 A：落盘形态（ResidentStore 与 FactLedger 同目录）。R1 首窗前落账
+    // （首轮初始对齐交付并 ack）、R2 第二轮缺口交付并 ack、R1 随后被解除。
+    const hostA = startHost(dir);
+    await waitForReady(hostA);
+    const { residentId } = await callHost<{ residentId: string }>(hostA, {
+      op: "createResident",
+      name: "placeholder-crash",
+    });
+    await callHost(hostA, { op: "remember", residentId, content: "placeholder memory" });
+    await callHost(hostA, { op: "commit", residentId, commitment: "placeholder commitment" });
+    await callHost(hostA, {
+      op: "appendRuling",
+      residentId,
+      author: "main-thread",
+      kind: "ruling",
+      body: "placeholder ruling one",
+    });
+    await callHost(hostA, { op: "sayOn", residentId, message: "placeholder A first turn" });
+    await callHost(hostA, {
+      op: "appendRuling",
+      residentId,
+      author: "main-thread",
+      kind: "ruling",
+      body: "placeholder ruling two",
+    });
+    await callHost(hostA, { op: "sayOn", residentId, message: "placeholder A second turn" });
+    await callHost(hostA, {
+      op: "supersede",
+      residentId,
+      targetSeq: 1,
+      author: "main-thread",
+      reason: "placeholder crash supersede",
+    });
+    const oldWindowId = await driverWindowId(hostA);
+    const entriesBefore = await callHost<LedgerEntry[]>(hostA, { op: "entries", residentId });
+    const ackedBefore = await callHost<number>(hostA, {
+      op: "ackedSeq",
+      residentId,
+      windowId: oldWindowId,
+    });
+
+    // 猝死：SIGKILL，不给优雅退出——上面每条 IPC 应答都对应一次同步落盘，
+    // 最后一个应答回来时盘就是新的。
+    hostA.kill("SIGKILL");
+    await new Promise<void>((resolve) => hostA.once("exit", () => resolve()));
+
+    const hostB = startHost(dir);
+    await waitForReady(hostB);
+
+    // 1. 住户侧原样恢复：记忆与承诺在案（commitments 经 killSession 后的
+    //    启动包断言，见下）；history 可用——消息树不随 dataDir 恢复是既有
+    //    M0 裁定（tests/acceptance-driver-options.test.ts 钉着「不伪装恢复」），
+    //    猝死收窄的是窗，不是这条裁定。
+    const recalled = await callHost<MemoryEntry[]>(hostB, {
+      op: "recall",
+      residentId,
+      query: "placeholder",
+    });
+    expect(recalled.map((entry) => entry.content)).toContain("placeholder memory");
+    expect(await callHost<HistoryNode[]>(hostB, { op: "history", residentId })).toEqual([]);
+
+    // 2. 账原样恢复：全史、旧窗确认位、现行集逐项一致。
+    expect(await callHost<LedgerEntry[]>(hostB, { op: "entries", residentId })).toEqual(
+      entriesBefore,
+    );
+    expect(
+      await callHost<number>(hostB, { op: "ackedSeq", residentId, windowId: oldWindowId }),
+    ).toBe(ackedBefore);
+    expect(
+      (await callHost<LedgerEntry[]>(hostB, { op: "currentSet", residentId })).map((e) => e.body),
+    ).toEqual(["placeholder ruling two"]);
+
+    // 3+4. B 首次 say 开出新 windowId（旧窗不续接：B 的 registry 是纯内存，
+    // 旧窗从来不是它的活窗；恢复出的旧窗确认位是历史轨迹，无 pending）。
+    // 新窗的快照在 B 开窗截面新冻：只含 B 启动时的现行集（R2），A 死前被
+    // 解除的 R1 与那条 supersede 都不在注入里（它们在 baseline 之前）。
+    const first = await callHost<SayResult>(hostB, {
+      op: "sayOn",
+      residentId,
+      message: "placeholder B first turn",
+    });
+    const newWindowId = await driverWindowId(hostB);
+    expect(newWindowId).not.toBe(oldWindowId);
+    expect(first.prompt).toContain(
+      "[权威事实账·现行有效集（初始对齐）| kind=ruling | seq=2 | author=main-thread] placeholder ruling two",
+    );
+    expect(first.prompt).not.toContain("placeholder ruling one");
+    expect(first.prompt).not.toContain("[权威事实账缺口");
+
+    // 恰好一次：第二轮零注入。
+    const second = await callHost<SayResult>(hostB, {
+      op: "sayOn",
+      residentId,
+      message: "placeholder B second turn",
+    });
+    expect(second.prompt).toBe("placeholder B second turn");
+
+    // 承诺在案 + 包通道在新窗上可用：killSession 后新窗重新冻结快照出包。
+    await callHost(hostB, { op: "killSession", residentId });
+    const pack = await callHost<BootPack>(hostB, { op: "bootpack", residentId });
+    expect(pack.commitments).toEqual(["placeholder commitment"]);
+    expect(pack.currentFacts?.map((entry) => entry.body)).toEqual(["placeholder ruling two"]);
   });
 });
