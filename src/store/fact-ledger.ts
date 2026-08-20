@@ -11,8 +11,9 @@
  *
  * 两条铁律：
  *
- * 1. 现行有效集是从日志推导的视图，不是账上的字段。每条 kind 的最新未被
- *    supersede 的条目即现行有效；全史留作追溯，按需查询（entries()）。
+ * 1. 现行有效集是从日志推导的视图，不是账上的字段。所有未被 supersede
+ *    指名的事实条目即现行有效——同一种 kind 多条并行生效是常态；
+ *    全史留作追溯，按需查询（entries()）。
  * 2. 新鲜度判据只有序号差值。禁止 last_synced_at 式时间戳判断——它分不清
  *    「没有新东西」和「同步失败」。ts 只为追溯与展示存在，绝不参与缺口判断；
  *    测试里专门喂了一份 ts 倒序的快照来钉死这一点（MV-C06）。
@@ -290,20 +291,20 @@ export class FactLedger {
   }
 
   /**
-   * 现行有效集：每条 kind 的最新未被 supersede 的条目。这是从日志现推的
-   * 视图，账上没有对应的字段——它永远不可能和日志脱节，因为它就是日志。
+   * 现行有效集：所有未被任何 supersede 条目指名的事实条目（kind 为
+   * ruling / active_rule / confirmed_preference 且 seq 不在解除名单里）。
+   * 同一种 kind 多条并行生效是常态——supersede 精确指向单条 seq，不存在
+   * 「最新一条盖掉旧条」的隐含语义（2026-08-20 主笔拍板，改掉图纸上
+   * 「每条 kind 的最新」那句错措辞）。supersede 条目自身不是事实，不进集。
+   *
+   * 这是从日志现推的视图，账上没有对应的字段——它永远不可能和日志脱节，
+   * 因为它就是日志。
    */
   currentSet(residentId: string): LedgerEntry[] {
     const ledger = this.#ledger(residentId);
-    const current = new Map<FactKind, LedgerEntry>();
-    for (let i = ledger.entries.length - 1; i >= 0; i -= 1) {
-      const entry = ledger.entries[i];
-      if (entry === undefined) continue;
-      if (entry.kind === "supersede") continue;
-      if (ledger.supersededSeqs.has(entry.seq)) continue;
-      if (!current.has(entry.kind)) current.set(entry.kind, { ...entry });
-    }
-    return [...current.values()].sort((a, b) => a.seq - b.seq);
+    return ledger.entries
+      .filter((entry) => entry.kind !== "supersede" && !ledger.supersededSeqs.has(entry.seq))
+      .map((entry) => ({ ...entry }));
   }
 
   // --- 窗级确认位（viewport 一词从 glossary，图纸上说的「窗」）---
@@ -481,6 +482,7 @@ export class FactLedger {
 
   /** 条目校验：seq 必须从 1 起连续——账侧发号的不变量，断档就是档坏了。 */
   #restoreEntries(record: LedgerRecord): void {
+    const restoredSupersededSeqs = new Set<number>();
     for (let i = 0; i < record.entries.length; i += 1) {
       const entry = record.entries[i];
       if (entry === undefined) {
@@ -498,15 +500,29 @@ export class FactLedger {
         );
       }
       if (entry.kind === "supersede") {
+        const targetSeq = entry.supersedesSeq;
         if (
-          entry.supersedesSeq === null ||
-          entry.supersedesSeq < 1 ||
-          entry.supersedesSeq >= entry.seq
+          !Number.isInteger(targetSeq) ||
+          targetSeq === null ||
+          targetSeq < 1 ||
+          targetSeq >= entry.seq
         ) {
           throw new Error(
-            `快照 ${record.residentId} 的 seq=${entry.seq} 是 supersede 但 supersedesSeq=${entry.supersedesSeq} 不指向前面的条目`,
+            `快照 ${record.residentId} 的 seq=${entry.seq} 是 supersede 但 supersedesSeq=${String(entry.supersedesSeq)} 不指向前面的条目`,
           );
         }
+        const target = record.entries[targetSeq - 1];
+        if (target === undefined || target.kind === "supersede") {
+          throw new Error(
+            `快照 ${record.residentId} 的 seq=${entry.seq} 试图解除 seq=${targetSeq}，但目标不是事实条目`,
+          );
+        }
+        if (restoredSupersededSeqs.has(targetSeq)) {
+          throw new Error(
+            `快照 ${record.residentId} 重复解除 seq=${targetSeq}——恢复路径必须与 append 路径保持同一不变量`,
+          );
+        }
+        restoredSupersededSeqs.add(targetSeq);
       } else if (entry.supersedesSeq !== null) {
         throw new Error(
           `快照 ${record.residentId} 的 seq=${entry.seq} 是 ${entry.kind} 却带着 supersedesSeq——字段形状对不上`,
@@ -524,7 +540,13 @@ export class FactLedger {
         throw new Error(`快照 ${record.residentId} 里 viewport ${row.viewportId} 有两行确认位`);
       }
       seen.add(row.viewportId);
-      if (row.baselineSeq < 0 || row.ackedSeq < row.baselineSeq || row.ackedSeq > latestSeq) {
+      if (
+        !Number.isInteger(row.baselineSeq) ||
+        !Number.isInteger(row.ackedSeq) ||
+        row.baselineSeq < 0 ||
+        row.ackedSeq < row.baselineSeq ||
+        row.ackedSeq > latestSeq
+      ) {
         throw new Error(
           `快照 ${record.residentId} 里 viewport ${row.viewportId} 的确认位越界：baseline=${row.baselineSeq} acked=${row.ackedSeq} latest=${latestSeq}`,
         );

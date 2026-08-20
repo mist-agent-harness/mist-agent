@@ -196,34 +196,47 @@ describe("supersede 是追加不是涂改（MV-C07 账侧）", () => {
 });
 
 describe("现行有效集是推导视图", () => {
-  it("每种 kind 的最新未解除条目即现行", () => {
+  it("同一种 kind 多条并行生效是常态（2026-08-20 主笔拍板的新语义）", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
     ledger.append("r", { author: "main", kind: "ruling", body: "裁定一" });
     ledger.append("r", { author: "main", kind: "ruling", body: "裁定二" });
     ledger.append("r", { author: "main", kind: "active_rule", body: "规矩一" });
+    // 不是「每条 kind 的最新一条」——未被指名的全部现行，按 seq 升序。
     const current = ledger.currentSet("r");
-    expect(current.map((e) => e.body)).toEqual(["裁定二", "规矩一"]);
+    expect(current.map((e) => e.body)).toEqual(["裁定一", "裁定二", "规矩一"]);
   });
 
-  it("解除最新后回退到更早的未解除条目，全解除了就没有现行", () => {
+  it("supersede 精确指向单条：解除两条并行 ruling 中的一条，另一条仍在", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
     ledger.append("r", { author: "main", kind: "ruling", body: "裁定一" });
     ledger.append("r", { author: "main", kind: "ruling", body: "裁定二" });
-    ledger.supersede("r", 2, { author: "main", reason: "解除裁定二" });
+    ledger.supersede("r", 2, { author: "main", reason: "只解除裁定二" });
     expect(ledger.currentSet("r").map((e) => e.body)).toEqual(["裁定一"]);
+    // 不存在「回退」——裁定一自始至终都在集里，不是被解除后重新浮上来的。
     ledger.supersede("r", 1, { author: "main", reason: "解除裁定一" });
     expect(ledger.currentSet("r")).toEqual([]);
   });
 
-  it("解除中间一条不影响更新的同 kind 条目", () => {
+  it("解除一条不影响其他 kind 的并行条目", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
     ledger.append("r", { author: "main", kind: "ruling", body: "裁定一" });
-    ledger.append("r", { author: "main", kind: "ruling", body: "裁定二" });
+    ledger.append("r", { author: "main", kind: "active_rule", body: "规矩一" });
+    ledger.append("r", { author: "main", kind: "confirmed_preference", body: "偏好一" });
     ledger.supersede("r", 1, { author: "main", reason: "只解除裁定一" });
-    expect(ledger.currentSet("r").map((e) => e.body)).toEqual(["裁定二"]);
+    expect(ledger.currentSet("r").map((e) => e.body)).toEqual(["规矩一", "偏好一"]);
+  });
+
+  it("supersede 条目自身不是事实，不进现行有效集", () => {
+    const ledger = new FactLedger();
+    ledger.createLedger("r");
+    ledger.append("r", { author: "main", kind: "ruling", body: "裁定一" });
+    ledger.supersede("r", 1, { author: "main", reason: "解除" });
+    // 集是空的——解除记录留在全史里查（entries），不冒充一条现行事实。
+    expect(ledger.currentSet("r")).toEqual([]);
+    expect(ledger.entries("r")).toHaveLength(2);
   });
 
   it("视图拿到的是副本，改它毒化不了账", () => {
@@ -580,6 +593,118 @@ describe("持久化", () => {
     });
   });
 
+  it("supersede 指向另一条 supersede 的坏档显式失败", () => {
+    withTempDir((dataDir) => {
+      writeFileSync(
+        join(dataDir, "r.facts.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          residentId: "r",
+          entries: [
+            {
+              seq: 1,
+              ts: "2026-08-20T00:00:00.000Z",
+              author: "m",
+              kind: "ruling",
+              body: "一",
+              supersedesSeq: null,
+            },
+            {
+              seq: 2,
+              ts: "2026-08-20T00:00:01.000Z",
+              author: "m",
+              kind: "supersede",
+              body: "解除一",
+              supersedesSeq: 1,
+            },
+            {
+              seq: 3,
+              ts: "2026-08-20T00:00:02.000Z",
+              author: "m",
+              kind: "supersede",
+              body: "解除解除",
+              supersedesSeq: 2,
+            },
+          ],
+          viewports: [],
+        }),
+      );
+      expect(() => new FactLedger({ dataDir })).toThrow(/目标不是事实条目/);
+    });
+  });
+
+  it("重复 supersede 同一条的坏档显式失败", () => {
+    withTempDir((dataDir) => {
+      writeFileSync(
+        join(dataDir, "r.facts.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          residentId: "r",
+          entries: [
+            {
+              seq: 1,
+              ts: "2026-08-20T00:00:00.000Z",
+              author: "m",
+              kind: "ruling",
+              body: "一",
+              supersedesSeq: null,
+            },
+            {
+              seq: 2,
+              ts: "2026-08-20T00:00:01.000Z",
+              author: "m",
+              kind: "supersede",
+              body: "第一次解除",
+              supersedesSeq: 1,
+            },
+            {
+              seq: 3,
+              ts: "2026-08-20T00:00:02.000Z",
+              author: "m",
+              kind: "supersede",
+              body: "第二次解除",
+              supersedesSeq: 1,
+            },
+          ],
+          viewports: [],
+        }),
+      );
+      expect(() => new FactLedger({ dataDir })).toThrow(/重复解除/);
+    });
+  });
+
+  it("supersedesSeq 不是整数的坏档显式失败", () => {
+    withTempDir((dataDir) => {
+      writeFileSync(
+        join(dataDir, "r.facts.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          residentId: "r",
+          entries: [
+            {
+              seq: 1,
+              ts: "2026-08-20T00:00:00.000Z",
+              author: "m",
+              kind: "ruling",
+              body: "一",
+              supersedesSeq: null,
+            },
+            {
+              seq: 2,
+              ts: "2026-08-20T00:00:01.000Z",
+              author: "m",
+              kind: "supersede",
+              body: "解除一",
+              supersedesSeq: "1",
+            },
+          ],
+          viewports: [],
+        }),
+      );
+      expect(() => new FactLedger({ dataDir })).toThrow(/supersedesSeq=1/);
+    });
+  });
+
   it("确认位越界的坏档显式失败", () => {
     withTempDir((dataDir) => {
       writeFileSync(
@@ -589,6 +714,21 @@ describe("持久化", () => {
           residentId: "r",
           entries: [],
           viewports: [{ viewportId: "w-a", baselineSeq: 0, ackedSeq: 5 }],
+        }),
+      );
+      expect(() => new FactLedger({ dataDir })).toThrow(/确认位越界/);
+    });
+  });
+
+  it("确认位不是整数的坏档显式失败", () => {
+    withTempDir((dataDir) => {
+      writeFileSync(
+        join(dataDir, "r.facts.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          residentId: "r",
+          entries: [],
+          viewports: [{ viewportId: "w-a", baselineSeq: "0", ackedSeq: "0" }],
         }),
       );
       expect(() => new FactLedger({ dataDir })).toThrow(/确认位越界/);
