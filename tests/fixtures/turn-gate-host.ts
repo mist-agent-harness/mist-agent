@@ -154,23 +154,12 @@ async function execute(command: HostCommand): Promise<unknown> {
       return ledger.entries(requireString(command.residentId, "residentId"));
     case "openWindowB": {
       const residentId = requireString(command.residentId, "residentId");
-      // 两个注册表各自发号，windowId 可能撞车（账的 ack 行按 windowId 索引，
-      // 撞上就是两扇窗共用一行确认位）。撞了就把这扇窗归档、重新开，
-      // 直到拿到账上没占过的 id——ack 行才是窗身份的真源。
-      for (;;) {
-        const opened = sessionsB.open(residentId, { context: null });
-        try {
-          const baseline = ledger.openViewport(residentId, opened.windowId);
-          windowsB.set(residentId, opened.windowId);
-          return { windowId: opened.windowId, baseline };
-        } catch (error) {
-          sessionsB.kill(opened.windowId);
-          if (error instanceof Error && error.message.includes("ack row already exists")) {
-            continue;
-          }
-          throw error;
-        }
-      }
+      // 两个注册表各发各的号也不撞：生产发号是 w_ + ULID（进程间不可撞），
+      // 撞号重试的拐杖已随 F5 拆除。
+      const opened = sessionsB.open(residentId, { context: null });
+      const baseline = ledger.openViewport(residentId, opened.windowId);
+      windowsB.set(residentId, opened.windowId);
+      return { windowId: opened.windowId, baseline };
     }
     case "sayOn": {
       const node = await driver.say(

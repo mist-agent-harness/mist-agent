@@ -41,11 +41,11 @@ export class GateUnavailableError extends Error {
  * 用在 registry 之外的窗上）为 null，不伪报。
  */
 export interface TurnGateEvent {
-  event: "gate_clear" | "gate_gap_pulled" | "gate_ack" | "gate_unknown";
+  event: "gate_clear" | "gate_gap_pulled" | "gate_ack" | "ack_failed" | "gate_unknown";
   residentId: string;
   windowId: string;
   generation: number | null;
-  /** 人读摘要，如 "pulled 3 entries (seq 5..7)" / "缺口未知"。 */
+  /** 人读摘要，如 "pulled 3 entries (seq 5..7)" / "缺口未知" / "回执未达"。 */
   detail: string;
 }
 
@@ -67,10 +67,12 @@ const noopLogger: TurnEventLogger = {
 /**
  * 缺口条目的注入格式：来源档位（kind）、序号、作者一字不缺——模型要知道
  * 这段话是「权威事实账的缺口」，不是住户刚说的话；缺了标注，裁定会被当成
- * 闲聊，闸就白拉了。
+ * 闲聊，闸就白拉了。supersede 条目额外带 supersedes=seq 指针：解除的是
+ * 哪一条必须机器可读地写进注入，否则模型看得见解除、认不出对象。
  */
 function formatGapEntry(entry: LedgerEntry): string {
-  return `[权威事实账缺口 | kind=${entry.kind} | seq=${entry.seq} | author=${entry.author}] ${entry.body}`;
+  const supersedes = entry.supersedesSeq === null ? "" : ` | supersedes=seq ${entry.supersedesSeq}`;
+  return `[权威事实账缺口 | kind=${entry.kind} | seq=${entry.seq}${supersedes} | author=${entry.author}] ${entry.body}`;
 }
 
 export class ViewportTurnGate implements TurnGate {
@@ -122,7 +124,20 @@ export class ViewportTurnGate implements TurnGate {
       commit: () => {
         // ack 到开工那一刻的 latestSeq：开工期间新落的账不属于这一轮，
         // 下一轮开工时经缺口通道再拉——ack 只追认本轮真正注入过的内容。
-        this.#ledger.ack(residentId, windowId, probe.latestSeq);
+        try {
+          this.#ledger.ack(residentId, windowId, probe.latestSeq);
+        } catch (error) {
+          // 回执未达不能否认本轮已交付（MV-C05）：树与 head 都已提交，
+          // 向外抛错会让调用方以为这轮没发生而重试——同一句话落树两次。
+          // 记 ack_failed，ackedSeq 不前进，下轮开工自然重拉同一份缺口。
+          this.#log(
+            "ack_failed",
+            residentId,
+            windowId,
+            `回执未达：${error instanceof Error ? error.message : String(error)}`,
+          );
+          return;
+        }
         this.#log("gate_ack", residentId, windowId, `acked seq=${probe.latestSeq}`);
       },
     };

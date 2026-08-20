@@ -316,6 +316,14 @@ export class ResidentStore {
     return this.#rooms.has(residentId);
   }
 
+  /**
+   * 全部住户 id 的副本（只读枚举）。给总装方做「每户一本账」式的对齐遍历——
+   * 返回副本，调用方改返回值动不了这张表。
+   */
+  residentIds(): string[] {
+    return [...this.#rooms.keys()];
+  }
+
   destroyResident(residentId: string): void {
     this.#rooms.delete(residentId);
     if (this.#dataDir !== null) {

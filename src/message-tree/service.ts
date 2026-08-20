@@ -29,7 +29,12 @@ export type AssistantReply = (residentId: string, message: string) => string | P
 export interface TurnPass {
   /** 注入本轮上下文的缺口条目（已标注来源档位），无缺口为空数组。 */
   readonly contextPrefix: string[];
-  /** 落树成功后回执 ack；assistantReply 失败则不调用，下轮重拉。 */
+  /**
+   * 落树成功后回执 ack；assistantReply 失败则不调用，下轮重拉。
+   * 回执自身失败（如账落盘错误）不向外传播：本轮交付已被树与 head 证明，
+   * 反报失败只会诱导调用方重试、同一句话落树两次——实现方应记 ack_failed
+   * 事件、ackedSeq 不前进，让下轮开工自然重拉（MV-C05）。
+   */
   commit(): void;
 }
 

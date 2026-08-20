@@ -1,4 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { chmodSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import type { HistoryNode } from "../acceptance/driver.ts";
 import type { AssistantReply } from "../src/message-tree/index.ts";
 import { MessageTreeService, MessageTreeStore } from "../src/message-tree/index.ts";
 import { SessionRegistry } from "../src/session/session-registry.ts";
@@ -263,5 +267,77 @@ describe("不接闸的 MessageTreeService", () => {
 
     expect(prompts).toEqual(["没有闸的日子"]);
     expect(await service.history(RESIDENT)).toHaveLength(2);
+  });
+});
+
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+describe("ack 落盘失败（MV-C05：回执未达不能否认本轮已交付）", () => {
+  it("真实落盘失败：say 照常返回、记 ack_failed、ackedSeq 不前进、恢复后重拉并 ack 成功", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mist-gate-ack-"));
+    tempDirs.push(dir);
+    let next = 0;
+    const store = new MessageTreeStore({
+      now: () => "2026-08-20T00:00:00.000Z",
+      newId: () => `node-${++next}`,
+    });
+    store.createRoom(RESIDENT);
+    const sessions = new SessionRegistry<null>();
+    // 真 FactLedger + 真 dataDir：注入的是磁盘写失败，不是 mocked 的账。
+    const ledger = new FactLedger({ dataDir: dir });
+    ledger.createLedger(RESIDENT);
+    const logger = new CollectingLogger();
+    const gate = new ViewportTurnGate(ledger, {
+      logger,
+      generationOf: (windowId) => sessions.get(windowId)?.generation ?? null,
+    });
+    const prompts: string[] = [];
+    const service = new MessageTreeService(
+      store,
+      {
+        getHead: (windowId) => sessions.getHead(windowId),
+        setHead: (windowId, headId) => sessions.setHead(windowId, headId),
+      },
+      {
+        assistantReply: (_residentId, message) => {
+          prompts.push(message);
+          return "占位回应";
+        },
+        turnGate: gate,
+      },
+    );
+    const window = sessions.open(RESIDENT, { context: null });
+    ledger.openViewport(RESIDENT, window.windowId);
+    ledger.append(RESIDENT, { author: "main-thread", kind: "ruling", body: "裁定甲" });
+
+    // chmod 0555 让 ack 的落盘必败（同 tests/fact-ledger.test.ts 的装置）。
+    let reply: HistoryNode | undefined;
+    chmodSync(dir, 0o555);
+    try {
+      reply = await service.say(RESIDENT, "第一句", window.windowId);
+    } finally {
+      chmodSync(dir, 0o755);
+    }
+
+    // say 不得制造可重试假失败：本轮交付已被树与 head 证明，必须照常返回。
+    expect(reply?.role).toBe("assistant");
+    expect(store.history(RESIDENT)).toHaveLength(2);
+    expect(ledger.ackedSeq(RESIDENT, window.windowId)).toBe(0);
+    const failed = logger.events.filter((event) => event.event === "ack_failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0]?.detail).toContain("回执未达");
+    expect(logger.events.some((event) => event.event === "gate_ack")).toBe(false);
+
+    // 恢复可写：下轮开工重拉同一份缺口，这次回执到账。
+    await service.say(RESIDENT, "第二句", window.windowId);
+    expect(prompts[1]).toContain("裁定甲");
+    expect(ledger.ackedSeq(RESIDENT, window.windowId)).toBe(1);
+    expect(logger.events.filter((event) => event.event === "gate_ack")).toHaveLength(1);
   });
 });

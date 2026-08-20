@@ -31,7 +31,7 @@ import {
 import { createResidentMigrationService } from "./migration/resident-store-migration.ts";
 import { SessionRegistry } from "./session/session-registry.ts";
 import { type TurnEventLogger, ViewportTurnGate } from "./session/turn-gate.ts";
-import type { FactLedger } from "./store/fact-ledger.ts";
+import { type FactLedger, LedgerNotFoundError } from "./store/fact-ledger.ts";
 import { ResidentStore } from "./store/resident-store.ts";
 
 export interface CreateDriverOptions {
@@ -105,6 +105,17 @@ class MistDriver implements HarnessDriver {
       },
     );
     this.#migration = createResidentMigrationService(this.#store, this.#messageTreeStore);
+    // dataDir 恢复补账：账接线之前落盘的老住户没有 facts.json——为每个缺账
+    // 住户补一本空账（baseline=0 的空 book，不开窗；主笔口径：旧消息树与记忆
+    // 不迁成事实账）。FactLedger 构造时已从 facts.json 恢复出的真账绝不重置、
+    // 绝不重建（has 守卫）。
+    if (this.#factLedger !== null) {
+      for (const residentId of this.#store.residentIds()) {
+        if (!this.#factLedger.has(residentId)) {
+          this.#factLedger.createLedger(residentId);
+        }
+      }
+    }
   }
 
   #session(residentId: string) {
@@ -116,7 +127,14 @@ class MistDriver implements HarnessDriver {
     const opened = this.#sessions.open(residentId, { headId: null, context: null });
     // 开窗的唯一汇合点：账侧在这里记 baseline，新窗的 ackedSeq 从开窗那一刻
     // 的 latestSeq 起算，不背全史（MV-A05）。
-    this.#factLedger?.openViewport(residentId, opened.windowId);
+    try {
+      this.#factLedger?.openViewport(residentId, opened.windowId);
+    } catch (error) {
+      // 记 baseline 失败的窗不能半活着：没有 ack 行的窗过闸必炸 fail-closed，
+      // 留着它等于把一次落账错误固化成这扇窗的永久残废。
+      this.#sessions.kill(opened.windowId);
+      throw error;
+    }
     this.#driverWindows.set(residentId, opened.windowId);
     return opened;
   }
@@ -149,7 +167,15 @@ class MistDriver implements HarnessDriver {
     this.#createMessageRoom(residentId);
     // 人户与账本同时开立：有账的 driver 里「这个住户没有账」只许是响亮的错误，
     // 不许在首次 say 时被静默建账吞掉（与 FactLedger 显式开户同一口径）。
-    this.#factLedger?.createLedger(residentId);
+    try {
+      this.#factLedger?.createLedger(residentId);
+    } catch (error) {
+      // 开户失败必须回滚：留下「有住户没账」的半成品，以后每次开工都炸在半路。
+      this.#messageRooms.delete(residentId);
+      this.#messageTreeStore.destroyRoom(residentId);
+      this.#store.destroyResident(residentId);
+      throw error;
+    }
     return residentId;
   }
 
@@ -179,6 +205,8 @@ class MistDriver implements HarnessDriver {
       this.#killDriverWindows(residentId);
       this.#messageRooms.delete(residentId);
       this.#messageTreeStore.destroyRoom(residentId);
+      // 账与档案同步销：留着 facts.json，重启后账会诈尸回来。
+      this.#factLedger?.destroyLedger(residentId);
       this.#store.destroyResident(residentId);
       return;
     }
@@ -186,6 +214,7 @@ class MistDriver implements HarnessDriver {
     if (this.#messageRooms.delete(residentId)) {
       this.#messageTreeStore.destroyRoom(residentId);
     }
+    this.#factLedger?.destroyLedger(residentId);
     this.#store.destroyResident(residentId);
   }
 
@@ -218,14 +247,24 @@ class MistDriver implements HarnessDriver {
   // --- P3：启动包 ---
 
   async buildBootPack(residentId: string): Promise<BootPack> {
-    // 现行有效集随启动包注入（MV-A05）。没接账时不带这个分区——「没接账」
-    // 与「账是空的」在包上是两个形状，不许编码成同一个值（同 MV-C03 口径）。
-    // 接了账而住户没有账时 currentSet 会响亮地抛，不静默降级成缺分区。
-    return this.#factLedger === null
-      ? assembleBootPack(this.#store, residentId)
-      : assembleBootPack(this.#store, residentId, {
-          currentFacts: this.#factLedger.currentSet(residentId),
-        });
+    const ledger = this.#factLedger;
+    // 没接账时不带 currentFacts 分区——「没接账」与「账是空的」在包上是两个
+    // 形状，不许编码成同一个值（同 MV-C03 口径）。
+    if (ledger === null) return assembleBootPack(this.#store, residentId);
+    this.#store.room(residentId); // 住户不存在先亮这个错，与未接账路径同语义。
+    // 缺账 = 响亮抛，任何路径都不懒建账（拼错 residentId 同罪）。
+    if (!ledger.has(residentId)) throw new LedgerNotFoundError(residentId);
+    // 包生成与首窗 baseline 必须在同一同步调用栈：「包之前落的裁定」已进
+    // currentSet，「包之后落的」走缺口通道——一条裁定在包与缺口里各出现
+    // 恰好一次，不永久漏、不两边重复。
+    const bound = this.#driverWindows.get(residentId);
+    const live = bound === undefined ? undefined : this.#sessions.get(bound);
+    if (live === undefined) {
+      this.#session(residentId);
+    }
+    return assembleBootPack(this.#store, residentId, {
+      currentFacts: ledger.currentSet(residentId),
+    });
   }
 
   // --- P4：会话生杀（TODO(P4) 认领者替换）---
@@ -249,6 +288,17 @@ class MistDriver implements HarnessDriver {
   async importResident(pack: Uint8Array): Promise<string> {
     const residentId = await this.#migration.importResident(pack);
     this.#messageRooms.add(residentId);
+    try {
+      // 迁入住户补一本空账（baseline=0 的空 book，不开窗）：旧消息树与记忆
+      // 不迁成事实账（主笔拍定的口径），账从迁入这一刻起记；已有真账绝不重建。
+      if (this.#factLedger !== null && !this.#factLedger.has(residentId)) {
+        this.#factLedger.createLedger(residentId);
+      }
+    } catch (error) {
+      // 补账失败回滚导入件：同 createResident，不留「有住户没账」的半成品。
+      await this.destroyResident(residentId);
+      throw error;
+    }
     return residentId;
   }
 }

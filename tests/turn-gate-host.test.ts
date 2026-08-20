@@ -327,14 +327,15 @@ describe("turn-gate real host subprocess", () => {
     expect(afterEntries).toHaveLength(2);
     expect(afterEntries.find((entry) => entry.seq === 1)).toEqual(original);
 
-    // 已 ack 旧条目的窗，下一轮经缺口通道看到这条 supersede。
+    // 已 ack 旧条目的窗，下一轮经缺口通道看到这条 supersede——注入里必须
+    // 带被解除条目的 seq 指针，模型才知道解除的是哪一条（F2）。
     const said = await callHost<SayResult>(child, {
       op: "sayOn",
       residentId,
       message: "placeholder post-supersede turn",
     });
     expect(said.prompt).toContain(
-      "[权威事实账缺口 | kind=supersede | seq=2 | author=main-thread] placeholder supersede reason",
+      "[权威事实账缺口 | kind=supersede | seq=2 | supersedes=seq 1 | author=main-thread] placeholder supersede reason",
     );
     expect(await callHost<number>(child, { op: "ackedSeq", residentId, windowId })).toBe(2);
 

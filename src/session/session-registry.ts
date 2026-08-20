@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -16,6 +17,12 @@ import { dirname } from "node:path";
 
 /** 缺省 scope 是私聊，任何路径都不得默认「全局」。 */
 export const PRIVATE_SCOPE = "private" as const;
+
+/**
+ * Crockford base32（ULID 字母表）：去掉 I/L/O/U，目检不歧义。
+ * windowId 发号形状 w_ + ULID，图纸 docs/design/multi-viewport.md §1.1。
+ */
+const ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 export const WINDOW_ARCHIVED = "WINDOW_ARCHIVED" as const;
 export const WINDOW_REOPEN_INVALID = "WINDOW_REOPEN_INVALID" as const;
@@ -168,8 +175,10 @@ export class SessionRegistry<TContext> {
   /** 代际归窗：windowId -> 上一次用过的代际号。 */
   readonly #lastGeneration = new Map<string, number>();
   readonly #archivePath: string | undefined;
-  #windowSeq = 0;
   #dispatchSeq = 0;
+  /** 上一枚 ULID 的时间戳与随机段——同毫秒连开多窗时自增随机段保单调。 */
+  #ulidTimestamp = 0;
+  #ulidRandom: number[] = [];
 
   constructor(options: SessionRegistryOptions = {}) {
     this.#archivePath = options.archivePath;
@@ -241,15 +250,50 @@ export class SessionRegistry<TContext> {
 
   #mintWindowId(): string {
     let candidate: string;
+    // 碰撞检查留给「显式 windowId 与随机发号撞名」这种理论事故；随机段
+    // 80bit，正常路径一轮就出去。
     do {
-      this.#windowSeq += 1;
-      candidate = `window-${this.#windowSeq.toString(36).padStart(6, "0")}`;
+      candidate = `w_${this.#nextUlid()}`;
     } while (
       this.#active.has(candidate) ||
       this.#archived.has(candidate) ||
       this.#lastGeneration.has(candidate)
     );
     return candidate;
+  }
+
+  /**
+   * w_ 后面的 ULID：48bit 毫秒时间 + 80bit crypto 随机，Crockford base32
+   * 共 26 字符。随机段来自 node:crypto——顺序发号（window-000001）在两个
+   * 注册表共用一本账时会撞号（共享 ack 行事故），随机发号进程间不可撞，
+   * 也满足图纸「外部不可猜」。同毫秒连开时随机段按 base32 自增
+   * （monotonic ULID 变体）：进程内字典序即开窗序，且同毫秒不重号。
+   */
+  #nextUlid(): string {
+    const now = Date.now();
+    if (now <= this.#ulidTimestamp) {
+      // 同毫秒连开、或时钟回拨：随机段按 base32 自增（monotonic ULID 变体），
+      // 时间戳钳在上一枚的值——字典序即开窗序，时钟倒走也撞不出重号。
+      // 自增从最低位（末尾）起，向前进位；全程 31（约 32^16 分之一的同毫秒
+      // 开窗量）才会溢出成全 0——那个量级到不了，不为其造错误类型。
+      for (let i = this.#ulidRandom.length - 1; i >= 0; i -= 1) {
+        const digit = this.#ulidRandom[i] ?? 0;
+        if (digit < 31) {
+          this.#ulidRandom[i] = digit + 1;
+          break;
+        }
+        this.#ulidRandom[i] = 0;
+      }
+    } else {
+      this.#ulidTimestamp = now;
+      // 取每个字节的低 5bit：256 = 8 × 32，低 5bit 在 0..31 上均匀，无偏。
+      this.#ulidRandom = [...randomBytes(16)].map((byte) => byte & 31);
+    }
+    let time = "";
+    for (let shift = 45; shift >= 0; shift -= 5) {
+      time += ULID_ALPHABET.charAt(Math.floor(this.#ulidTimestamp / 2 ** shift) % 32);
+    }
+    return time + this.#ulidRandom.map((digit) => ULID_ALPHABET.charAt(digit)).join("");
   }
 
   #requireArchivedForReopen(residentId: string, scopeId: string, windowId: string): ArchivedWindow {
