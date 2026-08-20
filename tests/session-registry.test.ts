@@ -1,3 +1,6 @@
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   PRIVATE_SCOPE,
@@ -118,6 +121,61 @@ describe("SessionRegistry：多窗语义", () => {
       sessions.open("resident-a", { windowId: archived.windowId, context: null }),
     ).toThrow(/scope mismatch/);
     expect(sessions.isArchived(archived.windowId)).toBe(true);
+  });
+
+  it("MV-A03 归档 append 到 JSONL，重启后仍可查询并按下一代重开", () => {
+    const directory = mkdtempSync(join(tmpdir(), "mist-window-archive-"));
+    const archivePath = join(directory, "windows.jsonl");
+    try {
+      const first = new SessionRegistry<null>({ archivePath });
+      const window = first.open("resident-a", {
+        scopeId: "room-1",
+        headId: "node-1",
+        context: null,
+      });
+      first.kill(window.windowId);
+
+      const lines = readFileSync(archivePath, "utf8").trim().split("\n");
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(lines[0] ?? "null")).toMatchObject({
+        schemaVersion: 1,
+        type: "window_archived",
+        window: { windowId: window.windowId, generation: 1, headId: "node-1" },
+      });
+
+      const second = new SessionRegistry<null>({ archivePath });
+      expect(second.getArchived(window.windowId)).toMatchObject({
+        residentId: "resident-a",
+        scopeId: "room-1",
+        generation: 1,
+        headId: "node-1",
+      });
+      const reopened = second.open("resident-a", {
+        windowId: window.windowId,
+        scopeId: "room-1",
+        context: null,
+      });
+      expect(reopened.generation).toBe(2);
+      second.kill(reopened.windowId);
+
+      const third = new SessionRegistry<null>({ archivePath });
+      expect(third.getArchived(window.windowId)?.generation).toBe(2);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("损坏的归档 JSONL 在启动时 fail loud", () => {
+    const directory = mkdtempSync(join(tmpdir(), "mist-window-archive-corrupt-"));
+    const archivePath = join(directory, "windows.jsonl");
+    try {
+      writeFileSync(archivePath, "not-json\n");
+      expect(() => new SessionRegistry<null>({ archivePath })).toThrow(
+        /invalid window archive JSONL at line 1/,
+      );
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("会话态归零不动住户留下的东西", () => {

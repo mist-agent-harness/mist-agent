@@ -1,3 +1,6 @@
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { dirname } from "node:path";
+
 /**
  * 活窗（viewport）的临时状态。
  *
@@ -72,13 +75,99 @@ export interface OpenOptions<TContext> {
   windowId?: string;
 }
 
+export interface SessionRegistryOptions {
+  /**
+   * 窗归档的 append-only JSONL。只保存已归档窗，不保存或复活活窗。
+   * 不给路径时保持纯内存，供无持久化需求的嵌入方与单测使用。
+   */
+  archivePath?: string;
+}
+
+interface ArchivedWindowRecord {
+  schemaVersion: 1;
+  type: "window_archived";
+  window: ArchivedWindow;
+}
+
+function parseArchivedWindowRecord(line: string, lineNumber: number): ArchivedWindow {
+  let value: unknown;
+  try {
+    value = JSON.parse(line);
+  } catch {
+    throw new Error(`invalid window archive JSONL at line ${lineNumber}`);
+  }
+  if (typeof value !== "object" || value === null) {
+    throw new Error(`invalid window archive record at line ${lineNumber}`);
+  }
+  const record = value as Partial<ArchivedWindowRecord>;
+  if (record.schemaVersion !== 1 || record.type !== "window_archived") {
+    throw new Error(`unsupported window archive record at line ${lineNumber}`);
+  }
+  const window = record.window;
+  if (
+    typeof window !== "object" ||
+    window === null ||
+    typeof window.residentId !== "string" ||
+    window.residentId.length === 0 ||
+    typeof window.windowId !== "string" ||
+    window.windowId.length === 0 ||
+    typeof window.scopeId !== "string" ||
+    window.scopeId.length === 0 ||
+    !Number.isInteger(window.generation) ||
+    window.generation < 1 ||
+    (window.headId !== null && typeof window.headId !== "string") ||
+    window.archived !== true
+  ) {
+    throw new Error(`invalid window archive payload at line ${lineNumber}`);
+  }
+  return {
+    residentId: window.residentId,
+    windowId: window.windowId,
+    scopeId: window.scopeId,
+    generation: window.generation,
+    headId: window.headId,
+    archived: true,
+  };
+}
+
 export class SessionRegistry<TContext> {
   readonly #active = new Map<string, ActiveWindow<TContext>>();
   readonly #archived = new Map<string, ArchivedWindow>();
   /** 代际归窗：windowId -> 上一次用过的代际号。 */
   readonly #lastGeneration = new Map<string, number>();
+  readonly #archivePath: string | undefined;
   #windowSeq = 0;
   #dispatchSeq = 0;
+
+  constructor(options: SessionRegistryOptions = {}) {
+    this.#archivePath = options.archivePath;
+    if (this.#archivePath === undefined) return;
+    mkdirSync(dirname(this.#archivePath), { recursive: true });
+    if (!existsSync(this.#archivePath)) return;
+    const lines = readFileSync(this.#archivePath, "utf8").split("\n");
+    for (const [index, line] of lines.entries()) {
+      if (line.trim().length === 0) continue;
+      const archived = parseArchivedWindowRecord(line, index + 1);
+      const previousGeneration = this.#lastGeneration.get(archived.windowId) ?? 0;
+      if (archived.generation <= previousGeneration) {
+        throw new Error(
+          `window archive generation is not increasing at line ${index + 1}: ${archived.windowId}`,
+        );
+      }
+      this.#archived.set(archived.windowId, archived);
+      this.#lastGeneration.set(archived.windowId, archived.generation);
+    }
+  }
+
+  #appendArchive(archived: ArchivedWindow): void {
+    if (this.#archivePath === undefined) return;
+    const record: ArchivedWindowRecord = {
+      schemaVersion: 1,
+      type: "window_archived",
+      window: archived,
+    };
+    appendFileSync(this.#archivePath, `${JSON.stringify(record)}\n`, "utf8");
+  }
 
   #mintWindowId(): string {
     let candidate: string;
@@ -143,6 +232,10 @@ export class SessionRegistry<TContext> {
     return this.#archived.get(windowId);
   }
 
+  getHead(windowId: string): string | null {
+    return this.#requireLive(windowId).headId;
+  }
+
   isActive(windowId: string): boolean {
     return this.#active.has(windowId);
   }
@@ -199,7 +292,6 @@ export class SessionRegistry<TContext> {
   kill(windowId: string): ArchivedWindow | undefined {
     const window = this.#active.get(windowId);
     if (window === undefined) return this.#archived.get(windowId);
-    this.#active.delete(windowId);
     const archived: ArchivedWindow = {
       residentId: window.residentId,
       windowId: window.windowId,
@@ -208,6 +300,9 @@ export class SessionRegistry<TContext> {
       headId: window.headId,
       archived: true,
     };
+    // 先落耐久证据再改内存；追加失败时窗仍保持活态，不伪报已归档。
+    this.#appendArchive(archived);
+    this.#active.delete(windowId);
     this.#archived.set(windowId, archived);
     return archived;
   }
