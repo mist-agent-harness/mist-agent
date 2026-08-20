@@ -31,6 +31,11 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 - [ ] **[PV0-A09](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s2) env 绑定形状不可混用**：逐一测试 secret×value、secret×secretRef、
   plain×value、plain×secretRef；只有中间两种匹配组合中的 secret×secretRef 与
   plain×value 通过，错配返回 `CONFIG_INVALID`，明文 secret 不进入配置快照。
+- [ ] **[PV0-A10](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s2) env 只经 context 交付**：manifest 声明 plain `A`、secret `B`、可选未绑定
+  `C`；插件 prepare 时记录 `context.env` 的键集合，并另设 `process.env.D` 探针。断言
+  `context.env` 恰为 `{A, B}`（`B` 为已解析值）、不含 `C`/`D`；配置快照、日志与事件中
+  `B` 的值不出现（`SECRET_SHOULD_NEVER_APPEAR`）；宿主向插件交付未声明名字或漏交
+  `required` 项时本条变红，后者返回 `REQUIREMENT_MISSING`。
 
 ## B. 权限、secret 与工具翻译
 
@@ -68,6 +73,10 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 - [ ] **[PV0-B13](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s3) 注入随停用与卸载撤下**：active 插件分别装入 resident/session 注入后，将
   `enabled` 切为 false 并完成 dispose；住户上下文快照、启动包及下一次会话重建输入均不含
   该 plugin id 的注入段。工具与资源已消失但守则仍留在 wakepack 时本条变红。
+- [ ] **[PV0-B14](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s2) secret 不落 settings 通道**：把同一唯一标记分别作为 `secretRef` 解析值和
+  凭证值下发，插件 active 后转储宿主写盘的 instance config 与全部配置快照；`settings` 及
+  快照中均不出现该标记。宿主把解析后的 secret 或凭证值回写进 `settings`／配置快照时本条
+  变红，键名叫 `token` 还是 `theme` 不改变判定。
 
 ## C. 事务注册、隔离与注销
 
@@ -92,13 +101,29 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
   失败后的调度周期并排空队列。整个确定性观察窗内 prepare、activate、call 三类计数均不增加；不得使用
   真实 sleep，也不得为此定义生产 TTL。
 - [ ] **[PV0-C10](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s3) 生命周期中断可恢复**：分别在 ① activate 已创建资源但 active 终态写盘前、
-  ② dispose 已撤销部分资源时杀死宿主进程。重启后先执行操作日志协调且插件入口始终不可达：
-  前者按持久化注册日志回滚后停在 `blocked + ACTIVATE_FAILED`，保留 plugin id、operationId、
-  `enabled: true` 的启用意图、配置与绑定，等待显式重试或停用；后者从撤销回执继续逆序清理，
-  失败则 quarantined。剩余资源 id 与 quarantined 记录跨重启仍可枚举，协调期间返回
-  `LIFECYCLE_RECOVERY_PENDING`，不得把任一孤儿中间态恢复成 ready 或假装从未安装。此处协调
-  是启动时未完成 activate/dispose 日志的恢复，不是用户重试；协调后 blocked 只能显式修复/重试
-  重新走生命周期，或显式停用清理。
+  ② active 终态已写盘但 `PreparedPlugin.activate()` 尚未返回时、
+  ③ dispose 已撤销部分资源时杀死宿主进程。重启后先执行操作日志协调且插件入口始终不可达：
+  fixture 的三个资源必须是宿主子进程退出后仍存活、可由父进程独立枚举的外部副作用（例如
+  fixture 目录内的锁文件/端口代理登记）；不能用随子进程一起消失的内存计数器冒充回收。
+  宿主 `operationId`、装载模块的 `moduleRef` 与每个资源的稳定 recovery key 都要在首个
+  副作用前落盘。重启协调只能调用
+  `PluginModuleV0.recover(context)` 重建专用撤销器，不得重跑普通 prepare/activate：
+  ① 按持久化注册日志回滚后停在 `blocked + ACTIVATE_FAILED`，保留 plugin id、operationId、
+  `enabled: true` 的启用意图、配置与绑定，等待显式重试或停用；
+  ② 已写盘的 active 记录改回 `blocked + ACTIVATE_FAILED`，与 ① 同终态、同样保留启用意图——
+  协调**不得**调用 `PreparedPlugin.activate()` 补跑发布，也不得把该记录投影为 active/ready；
+  发布步骤无幂等要求，补跑等于替住户按下重试。**同时断言资源真被回收**：三个资源均已
+  activate 过，协调必须按注册逆序 `revoke` 全部资源并 `rollback`，撤销回执逐笔落盘，
+  全部成功后记录才改写为 `blocked`；父进程探针在协调后为零，且 prepare/两个 activate 的
+  调用计数在重启协调期间均不增加。跳过 revoke 直接改写状态位、
+  或以「终态已写盘」为由把资源留在已提交状态，本条变红；
+  ③ 从撤销回执继续逆序清理，失败则 quarantined。另加缺失/重复/漂移 recovery key、
+  模块内容摘要与 `moduleRef` 不符、与 `recover(context)` 抛错五个分支：均返回
+  `RECOVERY_HANDLE_UNAVAILABLE` 并 quarantined，
+  外部残留和人工处理清单继续可枚举，不得写成 blocked/disposed。剩余资源 id 与 quarantined 记录跨重启仍可
+  枚举，协调期间返回 `LIFECYCLE_RECOVERY_PENDING`，不得把任一孤儿中间态恢复成 ready 或假装
+  从未安装。此处协调是启动时未完成 activate/dispose 日志的恢复，不是用户重试；协调后 blocked
+  只能显式修复/重试重新走生命周期，或显式停用清理。
 - [ ] **[PV0-C11](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s3) 权威状态先于公开索引**：在 active 四元组原子提交前、提交后但公开前、公开后
   三个时点分别杀死宿主；每次重启后，可枚举入口、路由索引与工具目录都必须是已持久化
   `{active, config, bindings, verifiedScope}` 的子集。先持久化路由索引再写 active 记录时本条变红。
@@ -111,6 +136,23 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
   独立的显式清理重试（例如 `retryCleanup(pluginId)`）才能继续撤销。重试且全部剩余资源
   撤销成功时进入 `disposed`；重试再次失败时仍为 `quarantined`，剩余资源 id、reason code、
   操作记录和人工处理清单均保留，不得伪装成 `disposed` 或恢复为 `ready`。
+- [ ] **[PV0-C13](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s3) 两个 activate 顺序固定**：prepare 注册三个资源，每个 `ResourceDeclaration.activate()`
+  记录调用序号并保持不可达探针为零。**两侧断言分主语**——宿主的持久化对插件不可观测，
+  插件只能断言自己记得的提交集合：
+  - 插件侧（`PreparedPlugin.activate()` 内部）：断言自己声明的三个资源均已收到宿主提交，
+    否则拒绝发布；三个资源 activate 全部先于唯一一次 `PreparedPlugin.activate()`；
+    发布前所有可达性探针为零，发布后探针为正。
+  - 宿主侧（测试夹具，非插件）：断言 active 四元组写盘先于调用 `PreparedPlugin.activate()`。
+
+  宿主先调 `PreparedPlugin.activate()` 再逐资源提交、或在任一资源 activate 失败后仍发布，
+  本条变红，返回 `ACTIVATE_FAILED` 且全量 rollback。
+- [ ] **[PV0-C14](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s3) 恢复凭据防模块漂移**：fixture 插件在 activate 已创建资源、active 终态
+  写盘前被杀（同 C10 ①时点）；保持 plugin id 与声明版本字符串不变，原地改写模块内容后重启
+  宿主。协调必须在调用 `recover` 之前重算模块内容摘要并与操作日志 `moduleRef` 比对：不符即
+  返回 `RECOVERY_HANDLE_UNAVAILABLE` 并进入 `quarantined`，`recover`/`prepare`/两个 activate
+  的调用计数在协调期间均为零，人工处理清单含期望与实际摘要且跨重启可枚举。仅凭声明版本
+  字符串判定「同版本」并调用 `recover`，或摘要不符仍继续协调，本条变红。显式重装或升级
+  路径不受本条限制，但不得由启动协调自动触发。
 
 ## D. 绑定、角色与凭证类型
 
@@ -211,6 +253,7 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 | A07 | enabled=false 只隐藏 UI、不 dispose | A07 |
 | A08 | 允许非法/冲突 plugin id 覆盖现役 | A08 |
 | A09 | 允许 secret env 使用明文 value | A09 |
+| A10 | 把未声明的 env 交给插件，或让插件从 process.env 取声明项 | A10 |
 | B01 | 把 `/new` 字面量约束改成任意文本 | B01 |
 | B02 | 把空 operations/literals 解释为通配 | B02 |
 | B03 | 以插件的 read 覆盖宿主 irreversible | B03 |
@@ -224,6 +267,7 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 | B11 | 静默采用 server 漂移后的 instructions | B11 |
 | B12 | 允许工具返回值把已知 secret 带入模型上下文 | B12 |
 | B13 | 停用或卸载后仍把该插件守则留在 wakepack | B13 |
+| B14 | 宿主把已解析 secret 或凭证值写入 settings / 配置快照 | B14 |
 | C01 | prepare 阶段提前公开首个资源 | C01 |
 | C02 | 第三个 register 失败后保留前两个 handle | C02 |
 | C03 | activate 失败后跳过 rollback | C03 |
@@ -234,8 +278,14 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 | C08 | 把插件运行时异常抛到宿主顶层 | C08 |
 | C09 | 一次返回 `PLUGIN_RUNTIME_FAILED` 的失败 call 后，让 scheduler 在可控 tick/队列排空观察窗内自动循环重试 | C09 |
 | C10 | 把启动时 activate/dispose 日志协调当用户重试、协调后自动 ready/active，或清除失败记录并假装未安装 | C10 |
+| C10 | 把写盘后未发布的 active 记录当作已发布：协调阶段补跑 `PreparedPlugin.activate()`，或直接投影为 active/ready | C10 |
+| C10 | 写盘后未发布的记录只改状态位不回滚资源：跳过 `revoke`/`rollback` 直接写 `blocked`，把已 activate 的资源留在已提交状态 | C10 |
+| C10 | 只把内存 `DisposableHandle` 当恢复能力，操作日志不写 recovery key；或重启协调重跑普通 `prepare`/`activate` 来重新拿句柄 | C10 |
+| C10 | recovery key 缺失、重复、漂移或 `recover(context)` 失败后仍写 `blocked`/`disposed`，不进 `quarantined + RECOVERY_HANDLE_UNAVAILABLE` | C10 |
 | C11 | 先持久化公开路由索引，再写 active 四元组 | C11 |
 | C12 | quarantined 进入后自动重试、把重复 dispose 当作宿主 `retryCleanup` 显式清理重试、把重试失败当 disposed，或清掉剩余资源/人工处理记录 | C12 |
+| C13 | 先调 `PreparedPlugin.activate()` 发布，再逐资源提交 | C13 |
+| C14 | 仅凭声明版本字符串当恢复凭据：不比对模块内容摘要就调用 `recover`，或摘要不符仍写 `blocked` 继续协调 | C14 |
 | D01 | 仅以 lane 为键，忽略 residentId | D01 |
 | D02 | 给 subagent 挂载住户记忆 | D02 |
 | D03 | 显式换道时沿用原车道权限结果 | D03 |

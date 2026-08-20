@@ -120,12 +120,21 @@ viewport 共享同一份可见事实，隔离边界只按 scope 划（论证见 
 「窗／活窗」，因容易被读成隔离边界而弃用；图纸上说「窗」时一律指 viewport。
 
 **DisposableHandle.revoke**
-宿主注册日志持有的**单个资源**撤销句柄。它幂等；宿主先撤销可达性再清理资源，失败留下
-资源级隔离记录，不能留下无人认领的活线。
+当前宿主进程持有的**单个资源**撤销句柄。它幂等；注册日志只持久化恢复描述符，不会把函数
+对象变成跨进程能力。宿主先撤销可达性再清理资源，失败留下资源级隔离记录；进程重启后改由
+`RecoveredPlugin.revoke` 执行，不能留下无人认领的活线。
+
+**恢复描述符（recovery descriptor）**
+宿主生成的稳定 `operationId`、宿主装载模块时自算的内容摘要 `moduleRef`，与插件为每个资源
+声明的稳定 `recoveryKey`。宿主必须在对应副作用发生前把它们写入操作日志；进程重启后，宿主
+先重算模块摘要与 `moduleRef` 比对，一致才允许通过 `PluginModuleV0.recover` 读取这些描述符
+并重建专用撤销器，不得重跑普通 `prepare` 或 `activate`。它不保存函数对象、secret 值或任意运行时闭包。
+描述符缺失、重复、漂移、模块摘要不符或无法重建时，资源进入 `quarantined`，不能只改状态位假装已回滚。
 
 **PreparedPlugin.rollback**
 一次 prepare 的**整次逆操作**。它幂等，用于 activate 失败或中断前撤销本次 prepare 的资源；
-它不是单资源 `revoke`，也不是整插件 `dispose`。
+它不是单资源 `revoke`，也不是整插件 `dispose`。当前进程死亡后必须重建
+`RecoveredPlugin.rollback`，不得假设旧闭包仍在。
 
 **ActivePlugin.dispose**
 active 插件的**整插件卸载**操作。它幂等；撤销不完整时进入 `quarantined`，而非把失败当作

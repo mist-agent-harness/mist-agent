@@ -130,9 +130,25 @@ trim、套别名或模糊纠错，也不得从 adapter、credential 或 role 推
 事件正文。凭证比普通 secret env 更严格：manifest 只声明槽位与可接受类型，实际绑定只
 传 `credentialRef`，插件永远看不到凭证库的枚举能力。
 
+env 值只经 `PluginPrepareContext.env` 交付：宿主在 `prepare` 前解析
+`PluginInstanceConfig.environment`（`value` 直接采用，`secretRef` 在执行边界解析为值），
+以只读映射交给插件，键集合必须恰好是 manifest `env` 已声明的 `name`——未声明的名字不得
+出现，声明了但未绑定的可选项不出现，`required: true` 缺失在 validate 阶段即
+`REQUIREMENT_MISSING`。插件不得从 `process.env` 读取声明项：同进程多插件共享进程环境，
+按名字读会串值，也绕过了宿主的 secret 追踪。manifest 声明了 env 却不从 `context.env`
+读取属于声明失实，但这是**文档层要求，由 review 把关**：宿主交出去的是一个只读映射，
+看不见插件读没读它，运行时没有观测通道，因此不设 readiness 灯、不产生 reason code、
+不构成任何 runtime 判定。宿主实现这条时不得声称能检出声明失实。
+
 `value` 与 `secretRef` 必须二选一并与 manifest 的 `secret` 标志一致。`enabled: false`
 保留设置但不进入 prepare；从 true 切到 false 必须走完整卸载，从 false 切到 true 必须
 重新校验并走完整注册事务，不能靠隐藏 UI 冒充停用。
+
+secret 只有两条交付通道：`environment` 的 `secretRef` 与 `credentialRefs`。`settings` 是
+不透明的普通设置载体，协议不对它做 secret 追踪或脱敏，因此 token、API key 与任何已解析的
+secret 都不得经 `settings` 交付。宿主不得把解析后的 secret 或凭证值回写进 `settings`、
+instance config 或配置快照——保护由通道决定，不由字段名决定：键叫 `token` 不会让它被追踪，
+叫 `theme` 也不会让塞进去的凭证变安全。需要 token 的插件必须声明 secret env 或凭证槽位。
 
 代价：字面量权限会让动态命令类插件需要更细的宿主能力或显式人工授权，不能用一个
 “terminal=true”偷懒换取万能键盘。
@@ -147,11 +163,14 @@ trim、套别名或模糊纠错，也不得从 adapter、credential 或 role 推
 interface PluginModuleV0 {
   migrate?(request: MigrationRequest): Promise<unknown>;
   prepare(context: PluginPrepareContext): Promise<PreparedPlugin>;
+  recover?(context: PluginRecoveryContext): Promise<RecoveredPlugin>; // 经 context 注册过资源的插件必须导出；见 §3 恢复段
 }
 
 interface PluginPrepareContext {
   readonly pluginId: string;
+  readonly operationId: string; // 宿主先写盘再传入；也是整次 prepare 的稳定恢复键
   readonly config: unknown;
+  readonly env: Readonly<Record<string, string>>; // 只含 manifest 已声明且已绑定的 name，见第 2 节
   register(resource: ResourceDeclaration): DisposableHandle;
 }
 
@@ -161,6 +180,7 @@ interface ResourceDeclaration {
   readonly id: string;
   readonly kind: ResourceKind;
   readonly capabilityId?: string;
+  readonly recoveryKey: string; // 稳定、非 secret；必须先写盘，后执行首个副作用
   activate(): Promise<void>; // 由宿主在原子提交阶段调用；prepare 时不得已对外可达
   dispose(): Promise<void>;
 }
@@ -173,6 +193,29 @@ interface DisposableHandle {
 interface PreparedPlugin {
   activate(): Promise<ActivePlugin>;
   rollback(): Promise<void>; // prepare 的反向操作，幂等
+}
+
+interface RecoveryResourceRecord {
+  readonly id: string;
+  readonly kind: ResourceKind;
+  readonly capabilityId?: string;
+  readonly recoveryKey: string;
+  readonly phase: "registered" | "ready" | "revoked";
+}
+
+interface PluginRecoveryContext {
+  readonly pluginId: string;
+  readonly operationId: string;
+  readonly operation: "activate" | "dispose";
+  readonly config: unknown;
+  readonly env: Readonly<Record<string, string>>;
+  readonly resources: readonly RecoveryResourceRecord[];
+}
+
+interface RecoveredPlugin {
+  revoke(resource: RecoveryResourceRecord): Promise<void>; // 单资源恢复撤销，幂等
+  rollback(): Promise<void>; // 整次 prepare 的恢复逆操作，幂等
+  dispose(): Promise<DisposeReport>; // 中断 dispose 的恢复清理，幂等
 }
 
 interface ActivePlugin {
@@ -207,24 +250,74 @@ blocked ─显式停用并清理→ disposing → disposed / quarantined
 重新从 `discovered` 走完整生命周期，或由显式停用进入清理。`dispose` 不完整进入
 `quarantined`，其唯一出边仍是宿主显式清理重试。
 
-`prepare` 期间的每次 `register` 都先写入宿主拥有的注册日志，并返回宿主同样持有的
-`DisposableHandle`。协议合规插件应当只经 context 创建对外资源；v0 对宿主管理资源提供
-事务保证，不声称能拦截受信任同进程代码直接调用 Node 原生 API。`activate` 成功后，宿主
+`prepare` 期间的每次 `register` 都先把资源 id、kind、capability id 与稳定 `recoveryKey` 写入
+宿主拥有的注册日志，并返回宿主同样持有的 `DisposableHandle`；宿主生成的 `operationId` 在
+调用 `prepare` 前已经写盘并经 context 交付。`recoveryKey` 在同一 operation 内唯一且不可漂移，只能定位
+恢复清理，不能携带 secret 值、函数序列化结果或任意闭包。协议合规插件应当只经 context 创建
+对外资源；v0 对宿主管理资源提供事务保证，不声称能拦截受信任同进程代码直接调用 Node 原生
+API。`activate` 成功后，宿主
 以一次原子提交公开整批资源；中途失败则按注册逆序撤销全部句柄并调用 `rollback`。部分
 成功不得泄漏为半个 active 插件。
 
-生命周期事务必须跨宿主进程边界可恢复。宿主在执行第一个生命周期副作用前，先持久化带
-`operationId` 的操作日志；日志至少记录 plugin id、操作种类（activate/dispose）、当前阶段、
-已登记资源 id 与已完成撤销回执。active 终态必须先与配置、绑定和 verified scope 原子写盘，
+activate 阶段有两个 `activate()`，顺序固定、不得颠倒：宿主先按注册顺序逐个调用
+`ResourceDeclaration.activate()`，它只把该资源置为「已提交、就绪」，此时仍不得对外可达；
+全部资源就绪并完成 active 终态写盘后，宿主调用一次 `PreparedPlugin.activate()`，这是
+唯一的对外发布步骤（例如绑定监听器、把路由挂进索引），返回的 `ActivePlugin` 出现即表示
+已可达。任一 `ResourceDeclaration.activate()` 失败，或 `PreparedPlugin.activate()` 失败，
+都按注册逆序 `revoke` 已就绪资源并调用 `rollback`，终态 `blocked + ACTIVATE_FAILED`；
+已写盘的 active 记录按操作日志改回 `blocked`。插件可以在 `PreparedPlugin.activate()` 中
+拒绝「尚有资源未经宿主提交」的调用并返回 `ACTIVATE_FAILED`，宿主不得把这种拒绝当作
+插件缺陷绕过。
+
+生命周期事务必须跨宿主进程边界可恢复。内存里的 `DisposableHandle` 与 `PreparedPlugin`
+不能算恢复证据：宿主进程死亡后这些函数对象已经不存在。宿主在执行第一个生命周期副作用前，
+先持久化带 `operationId` 的操作日志；日志至少记录 plugin id、操作种类（activate/dispose）、
+当前阶段、装载模块的 `moduleRef`、每个资源的恢复记录与已完成撤销回执。`moduleRef` 是宿主
+装载插件模块时对模块内容自算的摘要（例如对解析后的模块入口产物做 sha-256）：声明式版本
+字符串可漂移、可撞名，不得充当恢复凭据。activate 成功后 `moduleRef` 随 active 权威记录
+持久保留，后续 dispose 操作日志沿用该值；模块内容变更只能走显式升级或重装路径，不属于
+启动协调可恢复范畴。active 终态必须先与
+配置、绑定和 verified scope 原子写盘，
 再公开路由与能力；因此不存在“已经公开但没有权威 active 记录”的合法顺序。任何可枚举的
 插件入口、路由索引与工具目录都必须是已持久化 active 四元组的子集，不得把公开索引作为一笔
 更早、更独立的提交。
 
 宿主启动时必须先协调未完成操作，再发布任何插件入口：中断在 activate 提交前的操作保持
-不可达，并按持久化注册日志逆序回滚；协调完成后停在 `blocked + ACTIVATE_FAILED`，保留
-plugin id、`operationId`、`enabled: true` 的启用意图、配置与绑定，直到显式重试，或住户把
-`enabled` 改为 false 后进入 disposed。不能把一次失败启用擦成“从没安装过”。中断在 dispose
-中途的操作保持不可达，从最后一笔撤销回执继续清理；失败则进入 quarantined。
+不可达。协调器重新解析插件模块并重算内容摘要，与操作日志中的 `moduleRef` 比对一致——
+「同一模块」以此为凭，不以声明版本字符串为凭——才能调用一次 `PluginModuleV0.recover(context)`，用
+持久恢复描述符取得 `RecoveredPlugin`，再按日志逆序调用其 `revoke(record)` 和 `rollback()`；
+中断在 dispose 的事务则按撤销回执继续 `revoke(record)`，最后调用恢复 `dispose()`。不得重跑
+普通 `prepare`、`ResourceDeclaration.activate` 或 `PreparedPlugin.activate` 来制造新
+句柄。协调完成后停在 `blocked + ACTIVATE_FAILED`，保留 plugin id、`operationId`、
+`enabled: true` 的启用意图、配置与绑定，直到显式重试，或住户把 `enabled` 改为 false 后进入
+disposed。不能把一次失败启用擦成“从没安装过”。
+
+操作日志中尚有资源记录而模块未导出 `recover`、模块内容摘要与 `moduleRef` 不符、
+恢复键缺失/重复/漂移、恢复器构造失败，或恢复器不能覆盖日志中的全部剩余资源时，宿主返回
+`RECOVERY_HANDLE_UNAVAILABLE` 并进入 `quarantined`：入口继续关闭，持久保留未撤销资源 id、
+恢复键摘要、reason code 与人工处理清单（摘要不符时含期望与实际 `moduleRef`）。
+`recover` 因此在签名上是可选成员：从未经 context 注册资源的插件可以不导出它。这类插件的
+操作日志里没有资源记录，协调无需恢复器——activate 中断照上文落 `blocked + ACTIVATE_FAILED`，
+dispose 中断按撤销回执（全空即无事可撤）落 disposed；不得仅因未导出 `recover` 进入
+`quarantined`，也不得反过来强迫零资源插件实现一个永远不会被调用的方法。只有真正取得恢复器并收到
+全部撤销回执，才允许落到 `blocked + ACTIVATE_FAILED`；不能把“无法证明已回收”降格为普通
+activate 失败。
+
+active 终态写盘与 `PreparedPlugin.activate()` 之间存在一个崩溃窗口：磁盘上已有 active
+终态，但唯一的发布步骤从未发生或未返回。**协调不得按日志补跑发布**，一律把这条已写盘的
+active 记录按操作日志改回 `blocked + ACTIVATE_FAILED`，保留启用意图等显式重试，与上一段
+中断在提交前的处置同终态。**回滚不因写盘已完成而省略**：协调必须经上述
+`recover(context)` 重建专用撤销器，按注册逆序撤销操作日志里全部已就绪资源并调用恢复
+`rollback`，撤销回执逐笔落盘，全部撤销成功后才把记录
+改写为 `blocked`；任一资源撤销失败按既有路径进入 `quarantined`，不得因为「终态已经写盘」
+就把资源留在已提交状态。这个窗口的残留恰恰比中断在提交前更多——写盘发生在全部资源就绪
+之后，崩溃时每一个资源都已经 activate 过。两个理由：发布步骤在本协议里没有幂等要求，补跑等于给
+`PreparedPlugin.activate()` 追加一条实现方从未被告知的隐含契约；且启动协调按 C10 的口径
+只做恢复、不代替用户重试，自动补跑发布正是在替住户按下重试。宿主重启后把这类记录直接
+投影为 active 或 ready、或在协调阶段调用 `PreparedPlugin.activate()` 补发布，均为违规。
+恢复期间该记录与其他未完成操作一样以 `LIFECYCLE_RECOVERY_PENDING` 显式 blocked。
+
+中断在 dispose 中途的操作保持不可达，从最后一笔撤销回执继续清理；失败则进入 quarantined。
 `quarantined`、剩余资源 id、reason code 与操作日志都必须跨重启保留；不得因重启清空内存态
 而把孤儿中间态投影为 ready。协调结束前，该插件以 `LIFECYCLE_RECOVERY_PENDING` 显式
 blocked，不允许自动执行普通 prepare/activate/call 路径。这是 C10 的**启动时日志协调**，
@@ -441,6 +534,7 @@ scope 的 ready。
 | `PERMISSION_DENIED` | 操作、参数或字面量未授权 | 当前调用失败，无副作用 |
 | `PREPARE_FAILED` | prepare 抛错、超时或返回无效 | 全量 rollback，未公开 |
 | `ACTIVATE_FAILED` | activate 失败或其中断恢复完成 | 全量 rollback，blocked 且未公开；保留启用意图，等待显式重试或停用 |
+| `RECOVERY_HANDLE_UNAVAILABLE` | 未完成生命周期操作缺少稳定恢复描述符，或重启后无法重建覆盖全部残留的撤销器 | quarantined，入口关闭；保留残留资源与人工处理清单，不得伪装成 blocked/disposed |
 | `MIGRATION_FAILED` | 迁移或目标 schema 校验失败 | 旧版本保持 ready |
 | `UPGRADE_PERMISSION_CONFIRMATION_REQUIRED` | v2 有相对 v1 的 `PermissionGrant` 或 canonical context injection 扩权，且本次升级未获显式人工确认 | 升级事务 blocked；v1 保持 ready，v2 未激活、未公开新注入 |
 | `DISPOSE_INCOMPLETE` | 任一资源撤销失败 | quarantined，对外入口关闭；只能由显式清理重试进入 disposed，重试失败继续隔离并保留案底 |
@@ -479,3 +573,13 @@ scope 的 ready。
   协议只保留不透明 ref，不落 secret。没有 active issuer 时不得展示对应入口、不得新建或导入
   无法回指现役 issuer 的 ref，也不得制造悬空 ref；现役 ref 的删除语义由产品另行决定；
 - 不允许插件协议改写已决的通道政策、住户连续性或权限审批点。
+
+## 11. v0 已登记、留待 v0.1 的缺口
+
+由首个真实消费者（#61，webui 整包 `frontend` 插件）暴露、本稿明确不在 v0 设计的空白：
+
+- `frontend` 插件的宿主服务通道：v0 的 `PluginPrepareContext` 不向 `frontend` 插件交付
+  宿主已 active 的服务实现（例如会话编排层背后的 `/api` handler），插件只能自带实现或
+  桩。在 v0.1 定义交付形状（候选：`context.services.get(capabilityId)` 返回随 dispose
+  一起撤销的只读句柄）之前，`frontend` 插件的 manifest 与文档必须明示其后端为何物，
+  不得让「已按协议装载」被读成「已接上宿主真身」。
