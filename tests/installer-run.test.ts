@@ -210,6 +210,36 @@ it("keeps Grok OAuth out of the v0 installer acquisition catalog", () => {
   expect(grok?.methods).toEqual(["api-key"]);
 });
 
+it("replaces a credential when the user enters the same name twice", async () => {
+  const directory = freshDirectory();
+  const store = new InstallerStateStore(directory);
+  const memoryPath = join(directory, "memory");
+  mkdirSync(memoryPath);
+  const prompt = new ScriptedPrompt({
+    selects: ["codex", "api-key", "codex", "api-key", "codex-key", "external", "existing"],
+    inputs: ["codex-key", "codex-key", memoryPath],
+    secrets: ["first-secret", "replacement-secret"],
+    confirms: [true, false, false, true],
+  });
+
+  const result = await runInstaller({
+    residentId: "resident-1",
+    dataDir: directory,
+    controller: new InstallerController(store),
+    store,
+    prompt,
+    oauth: noOAuth,
+    memoryLibraries: new FileMemoryLibrary(),
+  });
+
+  expect(result.status).toBe("committed");
+  if (result.status !== "committed") throw new Error("expected committed setup");
+  expect(result.receipt.config.credentialRefs).toEqual([apiKeyRef("codex-key")]);
+  expect(store.readCredentialSecret("codex-key")).toBe("replacement-secret");
+  expect(prompt.infoMessages).toContain("已替换同名凭证 codex-key");
+  prompt.expectExhausted();
+});
+
 it("resumes from the persisted next step instead of asking for credentials again", async () => {
   const directory = freshDirectory();
   const store = new InstallerStateStore(directory);
@@ -629,7 +659,7 @@ it("saveCredentials rejects a duplicate id instead of leaving it for commit", ()
   const directory = freshDirectory();
   const store = new InstallerStateStore(directory);
   const controller = new InstallerController(store);
-  controller.start("resident-1");
+  const draft = controller.start("resident-1");
 
   expect(() =>
     controller.saveCredentials([
@@ -655,7 +685,7 @@ it("saveCredentials rejects a duplicate id instead of leaving it for commit", ()
   ).toThrow(/duplicate credential id: codex-key/);
 
   // Rejected before staging: no orphan secret, and the draft stays on step 1.
-  expect(existsSync(join(directory, "drafts", "secrets"))).toBe(false);
+  expect(store.hasStagedSecret(draft.draftId, "codex-key.credential")).toBe(false);
   expect(store.loadDraft()?.progress.currentStep).toBe("credentials");
 });
 

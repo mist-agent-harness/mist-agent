@@ -93,6 +93,11 @@ async function collectCredentials(
     } else {
       secret = await options.prompt.secret({ message: `${provider.label} API key` });
     }
+    const existingIndex = entries.findIndex((entry) => entry.credential.ref.id === id);
+    if (existingIndex !== -1) {
+      entries.splice(existingIndex, 1);
+      options.prompt.info(`已替换同名凭证 ${id}`);
+    }
     entries.push({
       credential: {
         ref: {
