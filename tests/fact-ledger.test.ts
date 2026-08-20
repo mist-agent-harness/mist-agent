@@ -9,7 +9,7 @@
  * 「查不到」会不会被编码成 0、倒走的钟会不会骗过缺口判断。
  */
 
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -28,6 +28,16 @@ function withTempDir(run: (dataDir: string) => void): void {
     run(dataDir);
   } finally {
     rmSync(dataDir, { recursive: true, force: true });
+  }
+}
+
+/** 让 dataDir 暂时不可写（模拟磁盘写失败），无论断言成败都恢复权限。 */
+function whileReadonly(dataDir: string, run: () => void): void {
+  chmodSync(dataDir, 0o555);
+  try {
+    run();
+  } finally {
+    chmodSync(dataDir, 0o755);
   }
 }
 
@@ -750,7 +760,7 @@ describe("持久化", () => {
           viewports: [],
         }),
       );
-      expect(() => new FactLedger({ dataDir })).toThrow(/supersedesSeq=1/);
+      expect(() => new FactLedger({ dataDir })).toThrow(/supersedesSeq 既不是 null 也不是整数/);
     });
   });
 
@@ -780,7 +790,7 @@ describe("持久化", () => {
           viewports: [{ viewportId: "w-a", baselineSeq: "0", ackedSeq: "0" }],
         }),
       );
-      expect(() => new FactLedger({ dataDir })).toThrow(/确认位越界/);
+      expect(() => new FactLedger({ dataDir })).toThrow(/baselineSeq\/ackedSeq 不是整数/);
     });
   });
 
@@ -807,6 +817,181 @@ describe("持久化", () => {
       const copy = restored.entries("r");
       (copy[0] as { body: string }).body = "涂改";
       expect(restored.entries("r")[0]?.body).toBe("正文");
+    });
+  });
+});
+
+describe("落盘失败不改内存（写路径先落盘后发布）", () => {
+  it("createLedger 落盘失败：内存里不留半本账", () => {
+    withTempDir((dataDir) => {
+      const ledger = new FactLedger({ dataDir });
+      whileReadonly(dataDir, () => {
+        expect(() => ledger.createLedger("r")).toThrow();
+        expect(ledger.has("r")).toBe(false);
+      });
+      // 恢复可写后同一个 id 能正常开——失败没有留下半个占位。
+      ledger.createLedger("r");
+      expect(ledger.has("r")).toBe(true);
+    });
+  });
+
+  it("append 落盘失败：条目不多、seq 不动、盘与内存一致", () => {
+    withTempDir((dataDir) => {
+      const ledger = new FactLedger({ dataDir });
+      ledger.createLedger("r");
+      ledger.append("r", { author: "main", kind: "ruling", body: "一" });
+      whileReadonly(dataDir, () => {
+        expect(() => ledger.append("r", { author: "main", kind: "ruling", body: "二" })).toThrow();
+        expect(ledger.latestSeq("r")).toBe(1);
+        expect(ledger.entries("r").map((e) => e.body)).toEqual(["一"]);
+      });
+      // 盘上也没多：新实例读到的和内存一致。
+      expect(new FactLedger({ dataDir }).entries("r")).toHaveLength(1);
+      // 恢复可写后追加成功，seq 连续——失败没有吃掉序号。
+      const entry = ledger.append("r", { author: "main", kind: "ruling", body: "二" });
+      expect(entry.seq).toBe(2);
+    });
+  });
+
+  it("supersede 落盘失败：不留「条目进了全史、解除标记没进」的半改", () => {
+    withTempDir((dataDir) => {
+      const ledger = new FactLedger({ dataDir });
+      ledger.createLedger("r");
+      ledger.append("r", { author: "main", kind: "ruling", body: "裁定" });
+      whileReadonly(dataDir, () => {
+        expect(() => ledger.supersede("r", 1, { author: "main", reason: "解除" })).toThrow();
+        // 这是故障注入打过的洞：旧实现先 push 再落盘，失败后全史多一条
+        // supersede 而 supersededSeqs 没更新，currentSet 与全史自相矛盾。
+        // 现在必须是干净的「什么都没发生」。
+        expect(ledger.entries("r")).toHaveLength(1);
+        expect(ledger.currentSet("r").map((e) => e.body)).toEqual(["裁定"]);
+      });
+      // 恢复可写后同一次解除能正常完成。
+      ledger.supersede("r", 1, { author: "main", reason: "解除" });
+      expect(ledger.currentSet("r")).toEqual([]);
+    });
+  });
+
+  it("openViewport 落盘失败：不留确认位", () => {
+    withTempDir((dataDir) => {
+      const ledger = new FactLedger({ dataDir });
+      ledger.createLedger("r");
+      ledger.append("r", { author: "main", kind: "ruling", body: "裁定" });
+      whileReadonly(dataDir, () => {
+        expect(() => ledger.openViewport("r", "w-a")).toThrow();
+        expect(() => ledger.gap("r", "w-a")).toThrow(ViewportNotFoundError);
+      });
+      expect(ledger.openViewport("r", "w-a")).toBe(1);
+    });
+  });
+
+  it("ack 落盘失败：确认位不动", () => {
+    withTempDir((dataDir) => {
+      const ledger = new FactLedger({ dataDir });
+      ledger.createLedger("r");
+      ledger.openViewport("r", "w-a");
+      ledger.append("r", { author: "main", kind: "ruling", body: "裁定" });
+      whileReadonly(dataDir, () => {
+        expect(() => ledger.ack("r", "w-a", 1)).toThrow();
+        expect(ledger.ackedSeq("r", "w-a")).toBe(0);
+        expect(ledger.gap("r", "w-a")).toEqual({ latestSeq: 1, ackedSeq: 0 });
+      });
+      ledger.ack("r", "w-a", 1);
+      expect(ledger.ackedSeq("r", "w-a")).toBe(1);
+    });
+  });
+});
+
+describe("恢复的运行时校验（不可信 JSON 不许直接断言成 LedgerRecord）", () => {
+  it("根不是对象 / residentId 不是字符串：显式失败，不猜", () => {
+    withTempDir((dataDir) => {
+      writeFileSync(join(dataDir, "r.facts.json"), "[]");
+      expect(() => new FactLedger({ dataDir })).toThrow(/根不是对象/);
+    });
+    withTempDir((dataDir) => {
+      // 故障注入实测案例：residentId=123 会混过 `as LedgerRecord`，
+      // Map 以数字为键、字符串查不到，一本账无声消失。
+      writeFileSync(
+        join(dataDir, "123.facts.json"),
+        JSON.stringify({ schemaVersion: 1, residentId: 123, entries: [], viewports: [] }),
+      );
+      expect(() => new FactLedger({ dataDir })).toThrow(/residentId 不是字符串/);
+    });
+  });
+
+  it("entries 与条目字段类型不对：显式失败", () => {
+    withTempDir((dataDir) => {
+      writeFileSync(
+        join(dataDir, "r.facts.json"),
+        JSON.stringify({ schemaVersion: 1, residentId: "r", entries: {}, viewports: [] }),
+      );
+      expect(() => new FactLedger({ dataDir })).toThrow(/entries 不是数组/);
+
+      writeFileSync(
+        join(dataDir, "r.facts.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          residentId: "r",
+          entries: [
+            {
+              seq: 1,
+              ts: "2026-08-20T00:00:00.000Z",
+              author: "m",
+              kind: "ruling",
+              body: 42,
+              supersedesSeq: null,
+            },
+          ],
+          viewports: [],
+        }),
+      );
+      expect(() => new FactLedger({ dataDir })).toThrow(/body 不是字符串/);
+
+      writeFileSync(
+        join(dataDir, "r.facts.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          residentId: "r",
+          entries: [
+            {
+              seq: "1",
+              ts: "2026-08-20T00:00:00.000Z",
+              author: "m",
+              kind: "ruling",
+              body: "x",
+              supersedesSeq: null,
+            },
+          ],
+          viewports: [],
+        }),
+      );
+      expect(() => new FactLedger({ dataDir })).toThrow(/seq 不是整数/);
+    });
+  });
+
+  it("确认位字段类型不对：显式失败", () => {
+    withTempDir((dataDir) => {
+      writeFileSync(
+        join(dataDir, "r.facts.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          residentId: "r",
+          entries: [],
+          viewports: [{ viewportId: 123, baselineSeq: 0, ackedSeq: 0 }],
+        }),
+      );
+      expect(() => new FactLedger({ dataDir })).toThrow(/viewportId 不是字符串/);
+
+      writeFileSync(
+        join(dataDir, "r.facts.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          residentId: "r",
+          entries: [],
+          viewports: [{ viewportId: "w-a", baselineSeq: "0", ackedSeq: 0 }],
+        }),
+      );
+      expect(() => new FactLedger({ dataDir })).toThrow(/baselineSeq\/ackedSeq 不是整数/);
     });
   });
 });

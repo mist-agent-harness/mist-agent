@@ -177,14 +177,14 @@ export class FactLedger {
     if (this.#ledgers.has(residentId)) {
       throw new Error(`ledger already exists: ${residentId}`);
     }
-    const ledger: ResidentLedger = {
+    // 先落盘后发布：落盘失败时内存里不留半本账。
+    this.#persistSnapshot(this.#snapshotOf(residentId, [], new Map()));
+    this.#ledgers.set(residentId, {
       residentId,
       entries: [],
       supersededSeqs: new Set(),
       viewports: new Map(),
-    };
-    this.#ledgers.set(residentId, ledger);
-    this.#persist(ledger);
+    });
   }
 
   has(residentId: string): boolean {
@@ -260,18 +260,24 @@ export class FactLedger {
     body: string,
     supersedesSeq: number | null,
   ): LedgerEntry {
-    const entry: LedgerEntry = {
+    const entry: LedgerEntry = Object.freeze({
       seq: ledger.entries.length + 1,
       ts: this.#nextStamp(),
       author,
       kind,
       body,
       supersedesSeq,
-    };
+    });
+    // 候选快照先落盘，成功才发布进内存：落盘失败时调用方收到错误，
+    // 而账一个字节没变——不存在「内存改了、盘上没改」的中间态。
+    // （故障注入打过的洞：先 push 再落盘，supersede 失败会留下
+    // 「条目进了全史、解除标记没进」的自相矛盾。）
+    this.#persistSnapshot(
+      this.#snapshotOf(ledger.residentId, [...ledger.entries, entry], ledger.viewports),
+    );
     // 冻结石彻 append-only 的最后一步：即使有人拿到账内引用（持久化恢复
     // 之外的路径都返回副本），运行时也拒绝任何涂改。
-    ledger.entries.push(Object.freeze(entry));
-    this.#persist(ledger);
+    ledger.entries.push(entry);
     return { ...entry };
   }
 
@@ -326,8 +332,12 @@ export class FactLedger {
       throw new Error(`ack row already exists for viewport ${viewportId} in ${residentId}`);
     }
     const baselineSeq = ledger.entries.length;
-    ledger.viewports.set(viewportId, { baselineSeq, ackedSeq: baselineSeq });
-    this.#persist(ledger);
+    const row: ViewportAckRow = { baselineSeq, ackedSeq: baselineSeq };
+    const candidate = new Map(ledger.viewports);
+    candidate.set(viewportId, row);
+    // 先落盘后发布，同 append。
+    this.#persistSnapshot(this.#snapshotOf(residentId, ledger.entries, candidate));
+    ledger.viewports.set(viewportId, row);
     return baselineSeq;
   }
 
@@ -386,8 +396,11 @@ export class FactLedger {
       );
     }
     if (seq === row.ackedSeq) return; // 重复回执，幂等
+    const candidate = new Map(ledger.viewports);
+    candidate.set(viewportId, { ...row, ackedSeq: seq });
+    // 先落盘后发布，同 append。
+    this.#persistSnapshot(this.#snapshotOf(residentId, ledger.entries, candidate));
     row.ackedSeq = seq;
-    this.#persist(ledger);
   }
 
   /** 窗的确认位只读视图。 */
@@ -397,24 +410,36 @@ export class FactLedger {
 
   // --- 持久化（dataDir 未设时整段短路，判卷路径零文件 IO）---
 
-  /** 把一本账写进它自己的快照文件。同步写：返回即已落盘。 */
-  #persist(ledger: ResidentLedger): void {
-    if (this.#dataDir === null) return;
-    const residentId = ledger.residentId;
-    // 这条断言防的是「将来某个改动让外部输入流进文件名」。
-    if (!/^[a-z0-9-]+$/.test(residentId)) {
-      throw new Error(`resident id 不可作为文件名: ${residentId}`);
-    }
-    const record: LedgerRecord = {
+  /** 从候选件拼一份落盘快照。写路径都先拼「改完之后」的快照再落盘。 */
+  #snapshotOf(
+    residentId: string,
+    entries: readonly LedgerEntry[],
+    viewports: ReadonlyMap<string, ViewportAckRow>,
+  ): LedgerRecord {
+    return {
       schemaVersion: SCHEMA_VERSION,
       residentId,
-      entries: ledger.entries,
-      viewports: [...ledger.viewports.entries()].map(([viewportId, row]) => ({
+      entries: entries.map((entry) => ({ ...entry })),
+      viewports: [...viewports.entries()].map(([viewportId, row]) => ({
         viewportId,
         baselineSeq: row.baselineSeq,
         ackedSeq: row.ackedSeq,
       })),
     };
+  }
+
+  /**
+   * 把一份候选快照写进它自己的文件。同步写：返回即已落盘。
+   * 只写不读内存状态——调用方保证快照是「改完之后」的完整形状，
+   * 落盘成功才把变更发布进内存，失败时内存一个字节不变。
+   */
+  #persistSnapshot(record: LedgerRecord): void {
+    if (this.#dataDir === null) return;
+    const residentId = record.residentId;
+    // 这条断言防的是「将来某个改动让外部输入流进文件名」。
+    if (!/^[a-z0-9-]+$/.test(residentId)) {
+      throw new Error(`resident id 不可作为文件名: ${residentId}`);
+    }
     const finalPath = join(this.#dataDir, `${residentId}${FILE_SUFFIX}`);
     const tmpPath = `${finalPath}.tmp`;
     let fd: number | null = null;
@@ -451,7 +476,8 @@ export class FactLedger {
     for (const file of readdirSync(dataDir).sort()) {
       // .tmp 是没写完的一次写入，旧 .json 才是权威——跳过即可，下次写会覆盖。
       if (!file.endsWith(FILE_SUFFIX)) continue;
-      const record = JSON.parse(readFileSync(join(dataDir, file), "utf8")) as LedgerRecord;
+      const parsed: unknown = JSON.parse(readFileSync(join(dataDir, file), "utf8"));
+      const record = this.#validateSnapshot(parsed, file);
       if (record.schemaVersion !== SCHEMA_VERSION) {
         throw new Error(
           `快照 ${file} 的 schema_version=${record.schemaVersion}，本进程只认 ${SCHEMA_VERSION}——显式失败等人来迁移，不静默跳过`,
@@ -482,6 +508,53 @@ export class FactLedger {
         if (Number.isFinite(t) && t > this.#lastStamp) this.#lastStamp = t;
       }
     }
+  }
+
+  /**
+   * 快照的运行时 schema 校验：JSON.parse 出来的是不可信输入，`as LedgerRecord`
+   * 只是把类型系统的嘴捂上——`residentId: 123` 会顺利通过断言，然后 Map 以
+   * 数字为键、字符串查不到，一本账无声消失（故障注入实测）。所有坏档必须
+   * 在写入 Map 之前抛错，这里只查形状与类型，语义校验在 #restoreEntries /
+   * #restoreViewports。
+   */
+  #validateSnapshot(value: unknown, file: string): LedgerRecord {
+    const bad = (what: string): Error =>
+      new Error(`快照 ${file} 的 ${what}——坏档显式失败，不猜、不静默跳过`);
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw bad("根不是对象");
+    }
+    const record = value as Record<string, unknown>;
+    if (typeof record.schemaVersion !== "number") throw bad("schemaVersion 不是数字");
+    if (typeof record.residentId !== "string") throw bad("residentId 不是字符串");
+    if (!Array.isArray(record.entries)) throw bad("entries 不是数组");
+    for (let i = 0; i < record.entries.length; i += 1) {
+      const entry: unknown = record.entries[i];
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+        throw bad(`第 ${i + 1} 条不是对象`);
+      }
+      const e = entry as Record<string, unknown>;
+      if (!Number.isInteger(e.seq)) throw bad(`第 ${i + 1} 条的 seq 不是整数`);
+      if (typeof e.ts !== "string") throw bad(`第 ${i + 1} 条的 ts 不是字符串`);
+      if (typeof e.author !== "string") throw bad(`第 ${i + 1} 条的 author 不是字符串`);
+      if (typeof e.kind !== "string") throw bad(`第 ${i + 1} 条的 kind 不是字符串`);
+      if (typeof e.body !== "string") throw bad(`第 ${i + 1} 条的 body 不是字符串`);
+      if (e.supersedesSeq !== null && !Number.isInteger(e.supersedesSeq)) {
+        throw bad(`第 ${i + 1} 条的 supersedesSeq 既不是 null 也不是整数`);
+      }
+    }
+    if (!Array.isArray(record.viewports)) throw bad("viewports 不是数组");
+    for (const row of record.viewports) {
+      if (typeof row !== "object" || row === null || Array.isArray(row)) {
+        throw bad("确认位行不是对象");
+      }
+      const r = row as Record<string, unknown>;
+      if (typeof r.viewportId !== "string") throw bad("确认位的 viewportId 不是字符串");
+      if (!Number.isInteger(r.baselineSeq) || !Number.isInteger(r.ackedSeq)) {
+        throw bad("确认位的 baselineSeq/ackedSeq 不是整数");
+      }
+    }
+    // 形状与类型都钉过了，这个断言才不是捂嘴。
+    return value as LedgerRecord;
   }
 
   /** 条目校验：seq 必须从 1 起连续——账侧发号的不变量，断档就是档坏了。 */
