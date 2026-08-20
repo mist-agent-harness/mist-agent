@@ -8,7 +8,8 @@ one belief: an agent that wakes up inside it should remain *someone* — session
 the person may not. Memory lives outside sessions; every session can be killed and the next
 one grows back from memory and keeps being the same one. This repository currently holds the
 project's foundation documents: design principles, glossary, module research, design docs
-folded in from community issues, and a decision ledger. Code comes when the wish pool closes.
+folded in from community issues, and a decision ledger. The first milestone loop is green
+(see `acceptance/`); the multi-viewport foundation is under construction.
 
 ---
 
@@ -30,6 +31,10 @@ mist 是一个个人 agent harness（还在图纸阶段）。它的设计从一�
 可执行版都在 [acceptance/](acceptance/)，`npm run acceptance` 随时打红绿灯。
 六盏全绿即里程碑达成。
 
+2026-08 在施：多 viewport 地基（一位住户多扇活窗，图纸
+[docs/design/multi-viewport.md](docs/design/multi-viewport.md)，验收 25 条逐条判卷）；
+一窗流已升格为产品不变量（[docs/decisions.md](docs/decisions.md) D9）。
+
 ## 仓库地图
 
 想干什么，就进哪个门：
@@ -42,6 +47,7 @@ mist 是一个个人 agent harness（还在图纸阶段）。它的设计从一�
 | 看拍过什么板、还挂着什么 | [docs/decisions.md](docs/decisions.md)，全项目唯一看板 |
 | 读调研和设计稿 | [docs/research/](docs/research/) 和 [docs/design/](docs/design/) |
 | 知道里程碑完成没有 | [acceptance/](acceptance/)，`npm run acceptance` 打红绿灯 |
+| 查环境变量和运行时配置 | [docs/runtime-config.md](docs/runtime-config.md)，全项目唯一登记处 |
 | 读或写产品代码 | `src/`（建造中），单元测试在 `tests/` |
 | 参与进来 | [CONTRIBUTING.md](CONTRIBUTING.md) |
 
