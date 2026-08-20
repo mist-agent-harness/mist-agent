@@ -107,7 +107,10 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
   `enabled: true` 的启用意图、配置与绑定，等待显式重试或停用；
   ② 已写盘的 active 记录改回 `blocked + ACTIVATE_FAILED`，与 ① 同终态、同样保留启用意图——
   协调**不得**调用 `PreparedPlugin.activate()` 补跑发布，也不得把该记录投影为 active/ready；
-  发布步骤无幂等要求，补跑等于替住户按下重试；
+  发布步骤无幂等要求，补跑等于替住户按下重试。**同时断言资源真被回收**：三个资源均已
+  activate 过，协调必须按注册逆序 `revoke` 全部资源并 `rollback`，撤销回执逐笔落盘，
+  全部成功后记录才改写为 `blocked`；探针在协调后为零。跳过 revoke 直接改写状态位、
+  或以「终态已写盘」为由把资源留在已提交状态，本条变红；
   ③ 从撤销回执继续逆序清理，失败则 quarantined。剩余资源 id 与 quarantined 记录跨重启仍可
   枚举，协调期间返回 `LIFECYCLE_RECOVERY_PENDING`，不得把任一孤儿中间态恢复成 ready 或假装
   从未安装。此处协调是启动时未完成 activate/dispose 日志的恢复，不是用户重试；协调后 blocked
@@ -260,6 +263,7 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 | C09 | 一次返回 `PLUGIN_RUNTIME_FAILED` 的失败 call 后，让 scheduler 在可控 tick/队列排空观察窗内自动循环重试 | C09 |
 | C10 | 把启动时 activate/dispose 日志协调当用户重试、协调后自动 ready/active，或清除失败记录并假装未安装 | C10 |
 | C10 | 把写盘后未发布的 active 记录当作已发布：协调阶段补跑 `PreparedPlugin.activate()`，或直接投影为 active/ready | C10 |
+| C10 | 写盘后未发布的记录只改状态位不回滚资源：跳过 `revoke`/`rollback` 直接写 `blocked`，把已 activate 的资源留在已提交状态 | C10 |
 | C11 | 先持久化公开路由索引，再写 active 四元组 | C11 |
 | C12 | quarantined 进入后自动重试、把重复 dispose 当作宿主 `retryCleanup` 显式清理重试、把重试失败当 disposed，或清掉剩余资源/人工处理记录 | C12 |
 | C13 | 先调 `PreparedPlugin.activate()` 发布，再逐资源提交 | C13 |
