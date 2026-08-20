@@ -385,6 +385,24 @@ describe("查账失败按缺处理（MV-C03 账侧）", () => {
     expect("ackedSeq" in missingViewport).toBe(false);
   });
 
+  it("类型层看门狗：unknown 分支取 latestSeq 必须编译不过", () => {
+    const ledger = new FactLedger();
+    const probe = ledger.probeGap("nobody", "w-x");
+    if (probe.status === "unknown") {
+      // 类型级的承诺用编译器来验：哪天 GapProbe 被改成 unknown 也带数字
+      // （比如塞个 latestSeq: 0），这行就会编译通过，@ts-expect-error 反过来
+      // 报「unused directive」——tsc 是这条承诺的永久看门狗，不靠谁手动撞。
+      // @ts-expect-error unknown 分支不携带数字
+      void probe.latestSeq;
+    }
+    if (probe.status === "ok") {
+      // 对照：ok 分支的数字必须真的存在且是 number。
+      const latest: number = probe.latestSeq;
+      expect(latest).toBeGreaterThanOrEqual(0);
+    }
+    expect(probe.status).toBe("unknown");
+  });
+
   it("probeGap 永不抛：任何失败都归一成 unknown", () => {
     const ledger = new FactLedger();
     // 连账都没开的住户。
