@@ -236,7 +236,7 @@ it("replaces a credential when the user enters the same name twice", async () =>
   if (result.status !== "committed") throw new Error("expected committed setup");
   expect(result.receipt.config.credentialRefs).toEqual([apiKeyRef("codex-key")]);
   expect(store.readCredentialSecret("codex-key")).toBe("replacement-secret");
-  expect(prompt.infoMessages).toContain("已替换同名凭证 codex-key");
+  expect(prompt.infoMessages).toContain('Replaced existing credential "codex-key".');
   prompt.expectExhausted();
 });
 

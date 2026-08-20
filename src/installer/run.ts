@@ -96,7 +96,7 @@ async function collectCredentials(
     const existingIndex = entries.findIndex((entry) => entry.credential.ref.id === id);
     if (existingIndex !== -1) {
       entries.splice(existingIndex, 1);
-      options.prompt.info(`已替换同名凭证 ${id}`);
+      options.prompt.info(`Replaced existing credential "${id}".`);
     }
     entries.push({
       credential: {
