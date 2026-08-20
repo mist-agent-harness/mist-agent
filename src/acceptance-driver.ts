@@ -70,7 +70,7 @@ class MistDriver implements HarnessDriver {
     this.#messageTree = new MessageTreeService(
       this.#messageTreeStore,
       {
-        getHead: (windowId) => this.#sessions.get(windowId)?.headId ?? null,
+        getHead: (windowId) => this.#sessions.getHead(windowId),
         setHead: (windowId, headId) => this.#sessions.setHead(windowId, headId),
       } satisfies SessionHeadPort,
       { assistantReply: options.reply ?? ((_residentId, message) => `收到：${message}`) },

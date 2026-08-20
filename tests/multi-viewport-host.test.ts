@@ -1,4 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -27,10 +30,15 @@ type Receipt = {
 };
 
 const children: ChildProcess[] = [];
+const directories: string[] = [];
 const fixture = fileURLToPath(new URL("./fixtures/session-registry-host.ts", import.meta.url));
 
-function startHost(): ChildProcess {
+function startHost(archivePath?: string): ChildProcess {
   const child = spawn(process.execPath, ["--import", "tsx", fixture], {
+    env: {
+      ...process.env,
+      ...(archivePath === undefined ? {} : { MIST_WINDOW_ARCHIVE_PATH: archivePath }),
+    },
     stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
   children.push(child);
@@ -117,11 +125,17 @@ afterEach(async () => {
       }
     }),
   );
+  for (const directory of directories.splice(0)) {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 describe("multi-viewport real host subprocess", () => {
   it("opens two windows, kills and reopens one generation, and keeps the other live", async () => {
-    const child = startHost();
+    const directory = mkdtempSync(join(tmpdir(), "mist-viewport-host-"));
+    directories.push(directory);
+    const archivePath = join(directory, "windows.jsonl");
+    const child = startHost(archivePath);
     const pid = await waitForReady(child);
     expect(pid).toBe(child.pid);
 
@@ -155,22 +169,50 @@ describe("multi-viewport real host subprocess", () => {
       },
     );
 
-    const reopened = await callHost<WindowRecord>(child, {
+    const killed = await callHost<WindowRecord[]>(child, {
+      op: "killResident",
+      residentId: "resident-a",
+    });
+    expect(killed.map((window) => window.windowId)).toEqual([w2.windowId]);
+    await stopHost(child);
+
+    const restarted = startHost(archivePath);
+    await waitForReady(restarted);
+    expect(
+      await callHost<WindowRecord>(restarted, { op: "getArchived", windowId: w1.windowId }),
+    ).toMatchObject({ generation: 1, headId: "node-w1" });
+    expect(
+      await callHost<WindowRecord>(restarted, { op: "getArchived", windowId: w2.windowId }),
+    ).toMatchObject({ generation: 1, headId: "node-w2" });
+
+    const reopened = await callHost<WindowRecord>(restarted, {
       op: "open",
       residentId: "resident-a",
       scopeId: "room-1",
       windowId: w1.windowId,
     });
     expect(reopened.generation).toBe(2);
-    expect(await callHost(child, { op: "belongs", receipt: r1 })).toBe(false);
-
-    const killed = await callHost<WindowRecord[]>(child, {
-      op: "killResident",
-      residentId: "resident-a",
+    expect(await callHost(restarted, { op: "belongs", receipt: r1 })).toBe(false);
+    const generation2Receipt = await callHost<Receipt>(restarted, {
+      op: "issueDispatch",
+      windowId: w1.windowId,
     });
-    expect(killed.map((window) => window.windowId).sort()).toEqual(
-      [w1.windowId, w2.windowId].sort(),
+    await stopHost(restarted);
+
+    // 活窗在未归档时正常停机；第三个进程必须从发号水位继续到 generation 3，
+    // 不能重复发 generation 2，让上一化身的迟到回执复活。
+    const restartedAgain = startHost(archivePath);
+    await waitForReady(restartedAgain);
+    const reopenedAgain = await callHost<WindowRecord>(restartedAgain, {
+      op: "open",
+      residentId: "resident-a",
+      scopeId: "room-1",
+      windowId: w1.windowId,
+    });
+    expect(reopenedAgain.generation).toBe(3);
+    expect(await callHost(restartedAgain, { op: "belongs", receipt: generation2Receipt })).toBe(
+      false,
     );
-    await stopHost(child);
+    await stopHost(restartedAgain);
   });
 });
