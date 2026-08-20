@@ -494,6 +494,37 @@ describe("持久化", () => {
     });
   });
 
+  it("在线推导与恢复重建的视图必须完全一致：两条路径不许口径分叉", () => {
+    withTempDir((dataDir) => {
+      // 这颗钉子钉的是一类洞，不是一个洞：restore 的 supersede 校验曾比
+      // 在线 append 松（同型事故），视图推导也可能在两条路径上悄悄分叉。
+      const ledger = new FactLedger({ dataDir });
+      ledger.createLedger("r");
+      ledger.append("r", { author: "main", kind: "ruling", body: "裁定一" });
+      ledger.append("r", { author: "main", kind: "ruling", body: "裁定二" });
+      ledger.append("r", { author: "main", kind: "active_rule", body: "规矩一" });
+      ledger.append("r", { author: "main", kind: "confirmed_preference", body: "偏好一" });
+      ledger.openViewport("r", "w-1"); // baseline=4
+      ledger.ack("r", "w-1", 4);
+      ledger.supersede("r", 2, { author: "main", reason: "只解除裁定二" });
+      ledger.supersede("r", 4, { author: "main", reason: "偏好一作废——这个 kind 全解除" });
+      ledger.openViewport("r", "w-2"); // baseline=6
+      ledger.append("r", { author: "main", kind: "active_rule", body: "规矩二" });
+
+      // 在线取一次，落盘后新实例再取一次，深比较相等。
+      const restored = new FactLedger({ dataDir });
+      expect(restored.currentSet("r")).toEqual(ledger.currentSet("r"));
+      // 前提不是空转：集里确实有内容，且有 kind 被全解除。
+      expect(ledger.currentSet("r").map((e) => e.body)).toEqual(["裁定一", "规矩一", "规矩二"]);
+      // 顺带：seq 水位与各窗确认位也要一致。
+      expect(restored.latestSeq("r")).toBe(ledger.latestSeq("r"));
+      expect(restored.ackedSeq("r", "w-1")).toBe(ledger.ackedSeq("r", "w-1"));
+      expect(restored.ackedSeq("r", "w-2")).toBe(ledger.ackedSeq("r", "w-2"));
+      expect(restored.gapEntries("r", "w-1")).toEqual(ledger.gapEntries("r", "w-1"));
+      expect(restored.gapEntries("r", "w-2")).toEqual(ledger.gapEntries("r", "w-2"));
+    });
+  });
+
   it("多住户共用一个目录，文件名与 ResidentStore 不撞", () => {
     withTempDir((dataDir) => {
       const ledger = new FactLedger({ dataDir });
