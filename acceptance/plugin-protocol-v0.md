@@ -101,13 +101,17 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
   失败后的调度周期并排空队列。整个确定性观察窗内 prepare、activate、call 三类计数均不增加；不得使用
   真实 sleep，也不得为此定义生产 TTL。
 - [ ] **[PV0-C10](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s3) 生命周期中断可恢复**：分别在 ① activate 已创建资源但 active 终态写盘前、
-  ② dispose 已撤销部分资源时杀死宿主进程。重启后先执行操作日志协调且插件入口始终不可达：
-  前者按持久化注册日志回滚后停在 `blocked + ACTIVATE_FAILED`，保留 plugin id、operationId、
-  `enabled: true` 的启用意图、配置与绑定，等待显式重试或停用；后者从撤销回执继续逆序清理，
-  失败则 quarantined。剩余资源 id 与 quarantined 记录跨重启仍可枚举，协调期间返回
-  `LIFECYCLE_RECOVERY_PENDING`，不得把任一孤儿中间态恢复成 ready 或假装从未安装。此处协调
-  是启动时未完成 activate/dispose 日志的恢复，不是用户重试；协调后 blocked 只能显式修复/重试
-  重新走生命周期，或显式停用清理。
+  ② active 终态已写盘但 `PreparedPlugin.activate()` 尚未返回时、
+  ③ dispose 已撤销部分资源时杀死宿主进程。重启后先执行操作日志协调且插件入口始终不可达：
+  ① 按持久化注册日志回滚后停在 `blocked + ACTIVATE_FAILED`，保留 plugin id、operationId、
+  `enabled: true` 的启用意图、配置与绑定，等待显式重试或停用；
+  ② 已写盘的 active 记录改回 `blocked + ACTIVATE_FAILED`，与 ① 同终态、同样保留启用意图——
+  协调**不得**调用 `PreparedPlugin.activate()` 补跑发布，也不得把该记录投影为 active/ready；
+  发布步骤无幂等要求，补跑等于替住户按下重试；
+  ③ 从撤销回执继续逆序清理，失败则 quarantined。剩余资源 id 与 quarantined 记录跨重启仍可
+  枚举，协调期间返回 `LIFECYCLE_RECOVERY_PENDING`，不得把任一孤儿中间态恢复成 ready 或假装
+  从未安装。此处协调是启动时未完成 activate/dispose 日志的恢复，不是用户重试；协调后 blocked
+  只能显式修复/重试重新走生命周期，或显式停用清理。
 - [ ] **[PV0-C11](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s3) 权威状态先于公开索引**：在 active 四元组原子提交前、提交后但公开前、公开后
   三个时点分别杀死宿主；每次重启后，可枚举入口、路由索引与工具目录都必须是已持久化
   `{active, config, bindings, verifiedScope}` 的子集。先持久化路由索引再写 active 记录时本条变红。
@@ -255,6 +259,7 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 | C08 | 把插件运行时异常抛到宿主顶层 | C08 |
 | C09 | 一次返回 `PLUGIN_RUNTIME_FAILED` 的失败 call 后，让 scheduler 在可控 tick/队列排空观察窗内自动循环重试 | C09 |
 | C10 | 把启动时 activate/dispose 日志协调当用户重试、协调后自动 ready/active，或清除失败记录并假装未安装 | C10 |
+| C10 | 把写盘后未发布的 active 记录当作已发布：协调阶段补跑 `PreparedPlugin.activate()`，或直接投影为 active/ready | C10 |
 | C11 | 先持久化公开路由索引，再写 active 四元组 | C11 |
 | C12 | quarantined 进入后自动重试、把重复 dispose 当作宿主 `retryCleanup` 显式清理重试、把重试失败当 disposed，或清掉剩余资源/人工处理记录 | C12 |
 | C13 | 先调 `PreparedPlugin.activate()` 发布，再逐资源提交 | C13 |

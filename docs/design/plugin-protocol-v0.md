@@ -136,7 +136,9 @@ env 值只经 `PluginPrepareContext.env` 交付：宿主在 `prepare` 前解析
 出现，声明了但未绑定的可选项不出现，`required: true` 缺失在 validate 阶段即
 `REQUIREMENT_MISSING`。插件不得从 `process.env` 读取声明项：同进程多插件共享进程环境，
 按名字读会串值，也绕过了宿主的 secret 追踪。manifest 声明了 env 却不从 `context.env`
-读取的插件视为声明失实，宿主可以在 readiness 里标出。
+读取属于声明失实，但这是**文档层要求，由 review 把关**：宿主交出去的是一个只读映射，
+看不见插件读没读它，运行时没有观测通道，因此不设 readiness 灯、不产生 reason code、
+不构成任何 runtime 判定。宿主实现这条时不得声称能检出声明失实。
 
 `value` 与 `secretRef` 必须二选一并与 manifest 的 `secret` 标志一致。`enabled: false`
 保留设置但不进入 prepare；从 true 切到 false 必须走完整卸载，从 false 切到 true 必须
@@ -248,8 +250,18 @@ activate 阶段有两个 `activate()`，顺序固定、不得颠倒：宿主先�
 宿主启动时必须先协调未完成操作，再发布任何插件入口：中断在 activate 提交前的操作保持
 不可达，并按持久化注册日志逆序回滚；协调完成后停在 `blocked + ACTIVATE_FAILED`，保留
 plugin id、`operationId`、`enabled: true` 的启用意图、配置与绑定，直到显式重试，或住户把
-`enabled` 改为 false 后进入 disposed。不能把一次失败启用擦成“从没安装过”。中断在 dispose
-中途的操作保持不可达，从最后一笔撤销回执继续清理；失败则进入 quarantined。
+`enabled` 改为 false 后进入 disposed。不能把一次失败启用擦成“从没安装过”。
+
+active 终态写盘与 `PreparedPlugin.activate()` 之间存在一个崩溃窗口：磁盘上已有 active
+终态，但唯一的发布步骤从未发生或未返回。**协调不得按日志补跑发布**，一律把这条已写盘的
+active 记录按操作日志改回 `blocked + ACTIVATE_FAILED`，保留启用意图等显式重试，与上一段
+中断在提交前的处置同终态。两个理由：发布步骤在本协议里没有幂等要求，补跑等于给
+`PreparedPlugin.activate()` 追加一条实现方从未被告知的隐含契约；且启动协调按 C10 的口径
+只做恢复、不代替用户重试，自动补跑发布正是在替住户按下重试。宿主重启后把这类记录直接
+投影为 active 或 ready、或在协调阶段调用 `PreparedPlugin.activate()` 补发布，均为违规。
+恢复期间该记录与其他未完成操作一样以 `LIFECYCLE_RECOVERY_PENDING` 显式 blocked。
+
+中断在 dispose 中途的操作保持不可达，从最后一笔撤销回执继续清理；失败则进入 quarantined。
 `quarantined`、剩余资源 id、reason code 与操作日志都必须跨重启保留；不得因重启清空内存态
 而把孤儿中间态投影为 ready。协调结束前，该插件以 `LIFECYCLE_RECOVERY_PENDING` 显式
 blocked，不允许自动执行普通 prepare/activate/call 路径。这是 C10 的**启动时日志协调**，
