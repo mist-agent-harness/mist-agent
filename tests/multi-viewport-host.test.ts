@@ -193,6 +193,26 @@ describe("multi-viewport real host subprocess", () => {
     });
     expect(reopened.generation).toBe(2);
     expect(await callHost(restarted, { op: "belongs", receipt: r1 })).toBe(false);
+    const generation2Receipt = await callHost<Receipt>(restarted, {
+      op: "issueDispatch",
+      windowId: w1.windowId,
+    });
     await stopHost(restarted);
+
+    // 活窗在未归档时正常停机；第三个进程必须从发号水位继续到 generation 3，
+    // 不能重复发 generation 2，让上一化身的迟到回执复活。
+    const restartedAgain = startHost(archivePath);
+    await waitForReady(restartedAgain);
+    const reopenedAgain = await callHost<WindowRecord>(restartedAgain, {
+      op: "open",
+      residentId: "resident-a",
+      scopeId: "room-1",
+      windowId: w1.windowId,
+    });
+    expect(reopenedAgain.generation).toBe(3);
+    expect(await callHost(restartedAgain, { op: "belongs", receipt: generation2Receipt })).toBe(
+      false,
+    );
+    await stopHost(restartedAgain);
   });
 });

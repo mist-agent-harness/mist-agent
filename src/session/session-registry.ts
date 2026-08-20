@@ -77,7 +77,8 @@ export interface OpenOptions<TContext> {
 
 export interface SessionRegistryOptions {
   /**
-   * 窗归档的 append-only JSONL。只保存已归档窗，不保存或复活活窗。
+   * 窗生命周期的 append-only JSONL。保存已发出的代际水位与归档证据，
+   * 不保存或复活活窗。
    * 不给路径时保持纯内存，供无持久化需求的嵌入方与单测使用。
    */
   archivePath?: string;
@@ -89,7 +90,15 @@ interface ArchivedWindowRecord {
   window: ArchivedWindow;
 }
 
-function parseArchivedWindowRecord(line: string, lineNumber: number): ArchivedWindow {
+interface WindowOpenedRecord {
+  schemaVersion: 1;
+  type: "window_opened";
+  window: Pick<ActiveWindow<unknown>, "residentId" | "windowId" | "scopeId" | "generation">;
+}
+
+type WindowJournalRecord = ArchivedWindowRecord | WindowOpenedRecord;
+
+function parseWindowJournalRecord(line: string, lineNumber: number): WindowJournalRecord {
   let value: unknown;
   try {
     value = JSON.parse(line);
@@ -99,8 +108,15 @@ function parseArchivedWindowRecord(line: string, lineNumber: number): ArchivedWi
   if (typeof value !== "object" || value === null) {
     throw new Error(`invalid window archive record at line ${lineNumber}`);
   }
-  const record = value as Partial<ArchivedWindowRecord>;
-  if (record.schemaVersion !== 1 || record.type !== "window_archived") {
+  const record = value as {
+    schemaVersion?: unknown;
+    type?: unknown;
+    window?: Partial<ArchivedWindow>;
+  };
+  if (
+    record.schemaVersion !== 1 ||
+    (record.type !== "window_archived" && record.type !== "window_opened")
+  ) {
     throw new Error(`unsupported window archive record at line ${lineNumber}`);
   }
   const window = record.window;
@@ -113,26 +129,42 @@ function parseArchivedWindowRecord(line: string, lineNumber: number): ArchivedWi
     window.windowId.length === 0 ||
     typeof window.scopeId !== "string" ||
     window.scopeId.length === 0 ||
+    typeof window.generation !== "number" ||
     !Number.isInteger(window.generation) ||
     window.generation < 1 ||
-    (window.headId !== null && typeof window.headId !== "string") ||
-    window.archived !== true
+    (record.type === "window_archived" &&
+      ((window.headId !== null && typeof window.headId !== "string") || window.archived !== true))
   ) {
     throw new Error(`invalid window archive payload at line ${lineNumber}`);
   }
+  const common = {
+    residentId: window.residentId as string,
+    windowId: window.windowId as string,
+    scopeId: window.scopeId as string,
+    generation: window.generation as number,
+  };
+  if (record.type === "window_opened") {
+    return {
+      schemaVersion: 1,
+      type: "window_opened",
+      window: common,
+    };
+  }
   return {
-    residentId: window.residentId,
-    windowId: window.windowId,
-    scopeId: window.scopeId,
-    generation: window.generation,
-    headId: window.headId,
-    archived: true,
+    schemaVersion: 1,
+    type: "window_archived",
+    window: {
+      ...common,
+      headId: window.headId as string | null,
+      archived: true,
+    },
   };
 }
 
 export class SessionRegistry<TContext> {
   readonly #active = new Map<string, ActiveWindow<TContext>>();
   readonly #archived = new Map<string, ArchivedWindow>();
+  readonly #windowIdentity = new Map<string, { residentId: string; scopeId: string }>();
   /** 代际归窗：windowId -> 上一次用过的代际号。 */
   readonly #lastGeneration = new Map<string, number>();
   readonly #archivePath: string | undefined;
@@ -147,16 +179,54 @@ export class SessionRegistry<TContext> {
     const lines = readFileSync(this.#archivePath, "utf8").split("\n");
     for (const [index, line] of lines.entries()) {
       if (line.trim().length === 0) continue;
-      const archived = parseArchivedWindowRecord(line, index + 1);
-      const previousGeneration = this.#lastGeneration.get(archived.windowId) ?? 0;
-      if (archived.generation <= previousGeneration) {
+      const record = parseWindowJournalRecord(line, index + 1);
+      const window = record.window;
+      const identity = this.#windowIdentity.get(window.windowId);
+      if (
+        identity !== undefined &&
+        (identity.residentId !== window.residentId || identity.scopeId !== window.scopeId)
+      ) {
+        throw new Error(`window identity changed at line ${index + 1}: ${window.windowId}`);
+      }
+      this.#windowIdentity.set(window.windowId, {
+        residentId: window.residentId,
+        scopeId: window.scopeId,
+      });
+      const previousGeneration = this.#lastGeneration.get(window.windowId) ?? 0;
+      if (record.type === "window_opened" && window.generation <= previousGeneration) {
         throw new Error(
-          `window archive generation is not increasing at line ${index + 1}: ${archived.windowId}`,
+          `window generation is not increasing at line ${index + 1}: ${window.windowId}`,
         );
       }
-      this.#archived.set(archived.windowId, archived);
-      this.#lastGeneration.set(archived.windowId, archived.generation);
+      if (record.type === "window_archived") {
+        const previousArchiveGeneration = this.#archived.get(window.windowId)?.generation ?? 0;
+        if (
+          window.generation < previousGeneration ||
+          window.generation <= previousArchiveGeneration
+        ) {
+          throw new Error(
+            `window archive generation is not increasing at line ${index + 1}: ${window.windowId}`,
+          );
+        }
+        this.#archived.set(window.windowId, record.window);
+      }
+      this.#lastGeneration.set(window.windowId, Math.max(previousGeneration, window.generation));
     }
+  }
+
+  #appendOpened(window: ActiveWindow<TContext>): void {
+    if (this.#archivePath === undefined) return;
+    const record: WindowOpenedRecord = {
+      schemaVersion: 1,
+      type: "window_opened",
+      window: {
+        residentId: window.residentId,
+        windowId: window.windowId,
+        scopeId: window.scopeId,
+        generation: window.generation,
+      },
+    };
+    appendFileSync(this.#archivePath, `${JSON.stringify(record)}\n`, "utf8");
   }
 
   #appendArchive(archived: ArchivedWindow): void {
@@ -174,7 +244,11 @@ export class SessionRegistry<TContext> {
     do {
       this.#windowSeq += 1;
       candidate = `window-${this.#windowSeq.toString(36).padStart(6, "0")}`;
-    } while (this.#active.has(candidate) || this.#archived.has(candidate));
+    } while (
+      this.#active.has(candidate) ||
+      this.#archived.has(candidate) ||
+      this.#lastGeneration.has(candidate)
+    );
     return candidate;
   }
 
@@ -210,8 +284,6 @@ export class SessionRegistry<TContext> {
       this.#requireArchivedForReopen(residentId, scopeId, windowId);
     }
     const generation = (this.#lastGeneration.get(windowId) ?? 0) + 1;
-    this.#lastGeneration.set(windowId, generation);
-    this.#archived.delete(windowId);
     const window: ActiveWindow<TContext> = {
       residentId,
       windowId,
@@ -220,6 +292,11 @@ export class SessionRegistry<TContext> {
       headId: options.headId ?? null,
       context: options.context,
     };
+    // 代际一经发出就先落盘；否则活窗在未归档时停机，重启后会重复发出同一代际。
+    this.#appendOpened(window);
+    this.#lastGeneration.set(windowId, generation);
+    this.#windowIdentity.set(windowId, { residentId, scopeId });
+    this.#archived.delete(windowId);
     this.#active.set(windowId, window);
     return window;
   }

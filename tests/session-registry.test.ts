@@ -136,8 +136,13 @@ describe("SessionRegistry：多窗语义", () => {
       first.kill(window.windowId);
 
       const lines = readFileSync(archivePath, "utf8").trim().split("\n");
-      expect(lines).toHaveLength(1);
+      expect(lines).toHaveLength(2);
       expect(JSON.parse(lines[0] ?? "null")).toMatchObject({
+        schemaVersion: 1,
+        type: "window_opened",
+        window: { windowId: window.windowId, generation: 1 },
+      });
+      expect(JSON.parse(lines[1] ?? "null")).toMatchObject({
         schemaVersion: 1,
         type: "window_archived",
         window: { windowId: window.windowId, generation: 1, headId: "node-1" },
