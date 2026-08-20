@@ -75,6 +75,12 @@ class MistDriver implements HarnessDriver {
   readonly #factLedger: FactLedger | null;
   /** 开工闸实例；与 #factLedger 同生同灭（有账才有闸）。 */
   readonly #turnGate: ViewportTurnGate | null;
+  /**
+   * 初始对齐已交付的窗（windowId 集合）。「初始 currentSet 交付一次且仅一次」
+   * 的状态面：交付通道只有启动包与首轮开工注入两条，开窗记 baseline 不算
+   * 交付。内存态即可——进程重启重交是安全的幂等，窗死即清（新窗重交）。
+   */
+  readonly #alignedWindows = new Set<string>();
 
   constructor(options: CreateDriverOptions = {}) {
     this.#store = new ResidentStore(
@@ -90,6 +96,12 @@ class MistDriver implements HarnessDriver {
             // 事件三元组的 generation 向窗注册表现查；查不到（账上有而注册表
             // 没有的窗）落 null，不伪报代际。
             generationOf: (windowId) => this.#sessions.get(windowId)?.generation ?? null,
+            initialAlignment: {
+              isDelivered: (windowId) => this.#alignedWindows.has(windowId),
+              markDelivered: (windowId) => {
+                this.#alignedWindows.add(windowId);
+              },
+            },
           });
     const turnGate: TurnGate | null = this.#turnGate;
     this.#messageTree = new MessageTreeService(
@@ -196,26 +208,50 @@ class MistDriver implements HarnessDriver {
   }
 
   #killDriverWindows(residentId: string): void {
+    // 新窗要重新对齐：死窗的「初始对齐已交付」标记一并清掉。
+    for (const window of this.#sessions.windowsOf(residentId)) {
+      this.#alignedWindows.delete(window.windowId);
+    }
     this.#sessions.killResident(residentId);
     this.#driverWindows.delete(residentId);
   }
 
   async destroyResident(residentId: string): Promise<void> {
-    if (!this.#store.has(residentId)) {
-      this.#killDriverWindows(residentId);
+    const hadResident = this.#store.has(residentId);
+    const ledger = this.#factLedger;
+    // 事务化销毁：文件先删、内存后删。任何一步抛错都必须「全在且仍可正常
+    // 使用」，成功必须「全无」——半删 = 重启后账或人诈尸。
+    // 第一步：账的落盘文件。抛 → 内存账、住户、消息房全都还没动，直接抛。
+    ledger?.prepareDestroy(residentId);
+    // 第二步：住户存储（其内部同样是文件先删、内存后删）。抛 → 尽力把账的
+    // 文件写回去再抛；abort 再失败就把双重失败写进错误信息，不静默。
+    try {
+      this.#store.destroyResident(residentId);
+    } catch (error) {
+      if (ledger !== null) {
+        try {
+          ledger.restoreDestroy(residentId);
+        } catch (restoreError) {
+          throw new Error(
+            `destroyResident 失败且账本文件恢复也失败：destroy=${error instanceof Error ? error.message : String(error)}；restore=${restoreError instanceof Error ? restoreError.message : String(restoreError)}`,
+          );
+        }
+      }
+      throw error;
+    }
+    // 第三步起全是内存操作。finalizeDestroy / killDriverWindows / Map.delete
+    // 不可失败；messageTreeStore.destroyRoom 对「有住户没房间」的幽灵输入
+    // 会抛——那是既有语义（未知住户亮 MessageTreeError），刻意保留。
+    ledger?.finalizeDestroy(residentId);
+    this.#killDriverWindows(residentId);
+    if (hadResident) {
+      if (this.#messageRooms.delete(residentId)) {
+        this.#messageTreeStore.destroyRoom(residentId);
+      }
+    } else {
       this.#messageRooms.delete(residentId);
       this.#messageTreeStore.destroyRoom(residentId);
-      // 账与档案同步销：留着 facts.json，重启后账会诈尸回来。
-      this.#factLedger?.destroyLedger(residentId);
-      this.#store.destroyResident(residentId);
-      return;
     }
-    this.#killDriverWindows(residentId);
-    if (this.#messageRooms.delete(residentId)) {
-      this.#messageTreeStore.destroyRoom(residentId);
-    }
-    this.#factLedger?.destroyLedger(residentId);
-    this.#store.destroyResident(residentId);
   }
 
   // --- P2：消息树 ---
@@ -228,14 +264,26 @@ class MistDriver implements HarnessDriver {
   async history(residentId: string): Promise<HistoryNode[]> {
     this.#ensureMessageRoom(residentId, "tree");
     // 普通动作半格（MV-C03）：读历史不拦，但查账失败要在日志留下「缺口未知」。
-    // #windowIdOf 可能懒开窗——只在接了账的路径上引入这个副作用，未接账时
-    // history 保持纯读。
-    this.#turnGate?.noteOrdinaryAction(residentId, this.#windowIdOf(residentId));
+    // 普通读不创建任何状态：有绑定的活窗才报到，没有就跳过——为记一条日志
+    // 懒开窗会记下一个早 baseline，把「初始集只交付一次」撕成包与缺口各一次。
+    const gate = this.#turnGate;
+    if (gate !== null) {
+      const bound = this.#driverWindows.get(residentId);
+      const live = bound === undefined ? undefined : this.#sessions.get(bound);
+      if (live !== undefined) {
+        gate.noteOrdinaryAction(residentId, live.windowId);
+      }
+    }
     return this.#messageTree.history(residentId);
   }
 
   async reviseNode(residentId: string, nodeId: string, newContent: string): Promise<HistoryNode> {
     this.#ensureMessageRoom(residentId);
+    // reviseNode 必须移动 head，离不开窗（#windowIdOf 可能懒开窗）。懒开窗记的
+    // baseline 会不会让初始 currentSet 被永久跳过？不会：开窗不算交付，后续
+    // 首次 say 的开工闸发现这扇窗「初始对齐未交付」，仍会把现行有效集注入
+    // （InitialAlignmentPort）。代价只是那次注入里初始集与缺口可能各标一遍
+    // 同一条新事实——标注不同、语义不冲突。
     return this.#messageTree.reviseNode(
       residentId,
       nodeId,
@@ -259,12 +307,14 @@ class MistDriver implements HarnessDriver {
     // 恰好一次，不永久漏、不两边重复。
     const bound = this.#driverWindows.get(residentId);
     const live = bound === undefined ? undefined : this.#sessions.get(bound);
-    if (live === undefined) {
-      this.#session(residentId);
-    }
-    return assembleBootPack(this.#store, residentId, {
+    const window = live ?? this.#session(residentId);
+    const pack = assembleBootPack(this.#store, residentId, {
       currentFacts: ledger.currentSet(residentId),
     });
+    // 包即交付：currentFacts 进了包，这扇窗的初始对齐就算交付过——
+    // 首轮开工不再重复注入初始集，只拉包后新落的缺口。
+    this.#alignedWindows.add(window.windowId);
+    return pack;
   }
 
   // --- P4：会话生杀（TODO(P4) 认领者替换）---

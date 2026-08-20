@@ -197,13 +197,22 @@ export class FactLedger {
   }
 
   /**
-   * 拆一本账：内存删除 + 落盘文件删除。幂等——没账时 no-op 不炸，
+   * 拆一本账 = prepare + finalize。幂等——没账时 no-op 不炸，
    * 与 ResidentStore.destroyResident 对未知住户的容忍口径一致：
    * 销毁路径只管「结束后什么都不剩」，不管「之前有没有」。
    * 留着 facts.json 不删，重启后账会诈尸回来（同 .json 档案的道理）。
    */
   destroyLedger(residentId: string): void {
-    this.#ledgers.delete(residentId);
+    this.prepareDestroy(residentId);
+    this.finalizeDestroy(residentId);
+  }
+
+  /**
+   * 销毁第一阶段：只删落盘文件，内存不动。没文件也是 no-op 成功。
+   * 文件先删、内存后删——两阶段之间任何失败，内存账都完整在案，
+   * 调用方可用 restoreDestroy 把文件写回去（失败必须「全在且可用」）。
+   */
+  prepareDestroy(residentId: string): void {
     if (this.#dataDir === null) return;
     // 同 #persistSnapshot 的文件名闸：能走到这说明 id 曾通过开户校验，
     // 这条断言防的是「将来某个改动让外部输入流进文件名」。
@@ -211,6 +220,21 @@ export class FactLedger {
       throw new Error(`resident id 不可作为文件名: ${residentId}`);
     }
     rmSync(join(this.#dataDir, `${residentId}${FILE_SUFFIX}`), { force: true });
+  }
+
+  /** 销毁第二阶段：只删内存账。过了这一步，事务就越过了不可回退点。 */
+  finalizeDestroy(residentId: string): void {
+    this.#ledgers.delete(residentId);
+  }
+
+  /**
+   * 销毁 abort：内存账还在就把快照写回盘上；内存已经没了（finalize 已跑，
+   * 事务越过了不可回退点）就无事可恢复，静默返回。
+   */
+  restoreDestroy(residentId: string): void {
+    const ledger = this.#ledgers.get(residentId);
+    if (ledger === undefined) return;
+    this.#persistSnapshot(this.#snapshotOf(residentId, ledger.entries, ledger.viewports));
   }
 
   /** 拿账。拿不到就抛——这是跨住户隔离的唯一入口。 */

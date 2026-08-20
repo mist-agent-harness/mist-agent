@@ -7,6 +7,9 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { chmodSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ResidentNotFoundError, ResidentStore } from "../src/store/resident-store.ts";
 
@@ -306,5 +309,36 @@ describe("会话态不进住户快照（#16 问 2 裁定）", () => {
     expect(Object.keys(store.exportRoom(r)).sort()).toEqual(
       ["commitments", "createdAt", "memories", "name", "nodes"].sort(),
     );
+  });
+});
+
+describe("销毁的两阶段（文件先删、内存后删）", () => {
+  it("档案删不掉时 destroy 抛错，房间与文件都还在（不半删）", () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "mist-resident-destroy-"));
+    try {
+      const store = new ResidentStore({ dataDir });
+      const r = store.createResident("placeholder-destroy");
+      store.remember(r, "占位记忆");
+      expect(readdirSync(dataDir)).toEqual([`${r}.json`]);
+
+      // 目录不可写 → rmSync 必败。房间必须在、文件必须在，全在可重试。
+      chmodSync(dataDir, 0o555);
+      try {
+        expect(() => store.destroyResident(r)).toThrow();
+      } finally {
+        chmodSync(dataDir, 0o755);
+      }
+      expect(store.has(r)).toBe(true);
+      expect(store.recall(r, "占位")).toHaveLength(1);
+      expect(readdirSync(dataDir)).toEqual([`${r}.json`]);
+
+      // 权限恢复后销得干净：全无，不诈尸。
+      store.destroyResident(r);
+      expect(store.has(r)).toBe(false);
+      expect(readdirSync(dataDir)).toEqual([]);
+      expect(new ResidentStore({ dataDir }).has(r)).toBe(false);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 });

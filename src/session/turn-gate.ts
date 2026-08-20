@@ -53,11 +53,27 @@ export interface TurnEventLogger {
   log(event: TurnGateEvent): void;
 }
 
+/**
+ * 初始对齐的交付状态口。规则（主笔口径）：初始 currentSet 必须被显式交付
+ * 一次且仅一次——交付通道只有启动包（buildBootPack 的 currentFacts）与
+ * 首轮开工注入两条，开窗记 baseline 本身不算交付。窗死标记清，新窗重交；
+ * 进程重启重交是安全的幂等（注入只是上下文，不是账）。
+ */
+export interface InitialAlignmentPort {
+  isDelivered(windowId: string): boolean;
+  markDelivered(windowId: string): void;
+}
+
 export interface ViewportTurnGateOptions {
   /** 默认 no-op：不接日志的嵌入方不该被迫造一个哑 logger。 */
   logger?: TurnEventLogger;
   /** 窗代际查询口，一般由宿主的 SessionRegistry 适配；不给则事件里 generation 恒为 null。 */
   generationOf?: (windowId: string) => number | null;
+  /**
+   * 初始对齐状态口；不给则闸不做首轮注入——现行有效集只能经启动包交付
+   * （接账前的旧行为，Standalone 用闸的默认形态）。
+   */
+  initialAlignment?: InitialAlignmentPort;
 }
 
 const noopLogger: TurnEventLogger = {
@@ -75,15 +91,27 @@ function formatGapEntry(entry: LedgerEntry): string {
   return `[权威事实账缺口 | kind=${entry.kind} | seq=${entry.seq}${supersedes} | author=${entry.author}] ${entry.body}`;
 }
 
+/**
+ * 初始对齐注入的格式：与缺口标注刻意不同——同一批条目经「现行有效集
+ * （初始对齐）」进来是「你醒来时这些裁定已在生效」，经「缺口」进来是
+ * 「你上一轮之后新落的」，模型要分得清这两种时态。supersede 条目不涉及：
+ * 它不进现行有效集，初始对齐里根本不会出现。
+ */
+function formatInitialEntry(entry: LedgerEntry): string {
+  return `[权威事实账·现行有效集（初始对齐）| kind=${entry.kind} | seq=${entry.seq} | author=${entry.author}] ${entry.body}`;
+}
+
 export class ViewportTurnGate implements TurnGate {
   readonly #ledger: FactLedger;
   readonly #logger: TurnEventLogger;
   readonly #generationOf: ((windowId: string) => number | null) | undefined;
+  readonly #initialAlignment: InitialAlignmentPort | undefined;
 
   constructor(ledger: FactLedger, options: ViewportTurnGateOptions = {}) {
     this.#ledger = ledger;
     this.#logger = options.logger ?? noopLogger;
     this.#generationOf = options.generationOf;
+    this.#initialAlignment = options.initialAlignment;
   }
 
   #log(event: TurnGateEvent["event"], residentId: string, windowId: string, detail: string): void {
@@ -102,9 +130,27 @@ export class ViewportTurnGate implements TurnGate {
       this.#log("gate_unknown", residentId, windowId, `缺口未知：${probe.cause}`);
       throw new GateUnavailableError(residentId, windowId, probe.cause);
     }
+    // 初始对齐未交付的窗：现行有效集随本轮注入（排在缺口之前）。开窗记
+    // baseline 不算交付——否则 say-first 的窗会把开窗前已生效的裁定永久
+    // 跳过（baseline 只吃缺口，不吃存量）。
+    const alignment = this.#initialAlignment;
+    const needsAlignment = alignment !== undefined && !alignment.isDelivered(windowId);
+    const initialLines = needsAlignment
+      ? this.#ledger.currentSet(residentId).map(formatInitialEntry)
+      : [];
     if (probe.latestSeq === probe.ackedSeq) {
-      this.#log("gate_clear", residentId, windowId, `无缺口（latestSeq=${probe.latestSeq}）`);
-      return { contextPrefix: [], commit: () => {} };
+      const detail = needsAlignment
+        ? `无缺口（latestSeq=${probe.latestSeq}）；初始对齐交付 ${initialLines.length} 条现行有效集`
+        : `无缺口（latestSeq=${probe.latestSeq}）`;
+      this.#log("gate_clear", residentId, windowId, detail);
+      // ackedSeq 已平 latestSeq，无需 ack；commit 只负责标交付——
+      // assistantReply 失败时 commit 不被调用，下轮原样重交。
+      return {
+        contextPrefix: initialLines,
+        commit: () => {
+          alignment?.markDelivered(windowId);
+        },
+      };
     }
     const entries = this.#ledger.gapEntries(residentId, windowId);
     const first = entries[0];
@@ -117,10 +163,12 @@ export class ViewportTurnGate implements TurnGate {
       "gate_gap_pulled",
       residentId,
       windowId,
-      `pulled ${entries.length} entries (${seqRange})`,
+      needsAlignment
+        ? `pulled ${entries.length} entries (${seqRange})；初始对齐交付 ${initialLines.length} 条现行有效集`
+        : `pulled ${entries.length} entries (${seqRange})`,
     );
     return {
-      contextPrefix: entries.map(formatGapEntry),
+      contextPrefix: [...initialLines, ...entries.map(formatGapEntry)],
       commit: () => {
         // ack 到开工那一刻的 latestSeq：开工期间新落的账不属于这一轮，
         // 下一轮开工时经缺口通道再拉——ack 只追认本轮真正注入过的内容。
@@ -129,7 +177,8 @@ export class ViewportTurnGate implements TurnGate {
         } catch (error) {
           // 回执未达不能否认本轮已交付（MV-C05）：树与 head 都已提交，
           // 向外抛错会让调用方以为这轮没发生而重试——同一句话落树两次。
-          // 记 ack_failed，ackedSeq 不前进，下轮开工自然重拉同一份缺口。
+          // 记 ack_failed，ackedSeq 不前进、不标交付，下轮开工连缺口
+          // 带初始集一起重拉。
           this.#log(
             "ack_failed",
             residentId,
@@ -138,6 +187,8 @@ export class ViewportTurnGate implements TurnGate {
           );
           return;
         }
+        // 先 ack 再标交付：回执到了才认「这轮交付完成」。
+        alignment?.markDelivered(windowId);
         this.#log("gate_ack", residentId, windowId, `acked seq=${probe.latestSeq}`);
       },
     };

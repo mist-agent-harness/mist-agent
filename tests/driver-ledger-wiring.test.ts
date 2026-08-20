@@ -6,7 +6,7 @@ import { createDriver } from "../src/acceptance-driver.ts";
 import { MessageTreeError } from "../src/message-tree/index.ts";
 import type { TurnGateEvent } from "../src/session/turn-gate.ts";
 import { FactLedger } from "../src/store/fact-ledger.ts";
-import { ResidentNotFoundError } from "../src/store/resident-store.ts";
+import { ResidentNotFoundError, ResidentStore } from "../src/store/resident-store.ts";
 
 /**
  * driver 级接线测试：启动包与首窗 baseline 的时序（F1）、住户与账本的生命周期
@@ -87,6 +87,75 @@ describe("F1 启动包与首窗 baseline 时序", () => {
 
     // 这条裁定已在包里：say 的注入里不得再出现它。
     await revived.say(residentId, "占位首句");
+    expect(prompts[0]).toBe("占位首句");
+  });
+
+  it("(3) 账上有 ruling 时直接 say-first：首轮注入初始对齐的现行集，第二轮不重复", async () => {
+    const ledger = new FactLedger();
+    const prompts: string[] = [];
+    const driver = createDriver({
+      factLedger: ledger,
+      reply: (_residentId, message) => {
+        prompts.push(message);
+        return "占位回应";
+      },
+    });
+    const residentId = await driver.createResident("placeholder-f1c");
+    ledger.append(residentId, {
+      author: "main-thread",
+      kind: "ruling",
+      body: "占位裁定-say-first",
+    });
+
+    // 没开过包、没开过窗：say 懒开窗记 baseline=1 把缺口清零，但开窗不算
+    // 交付——首轮开工注入必须把现行有效集交给模型，否则这条裁定永久失踪。
+    await driver.say(residentId, "占位首句");
+    expect(prompts[0]).toContain(
+      "[权威事实账·现行有效集（初始对齐）| kind=ruling | seq=1 | author=main-thread] 占位裁定-say-first",
+    );
+
+    // 已交付：第二轮只有用户原话，不重复注入。
+    await driver.say(residentId, "占位第二句");
+    expect(prompts[1]).toBe("占位第二句");
+  });
+
+  it("(4) history 不开窗：ruling 进包不进缺口，只出现一次", async () => {
+    const ledger = new FactLedger();
+    const events: TurnGateEvent[] = [];
+    const prompts: string[] = [];
+    const driver = createDriver({
+      factLedger: ledger,
+      turnEventLogger: {
+        log: (event) => {
+          events.push(event);
+        },
+      },
+      reply: (_residentId, message) => {
+        prompts.push(message);
+        return "占位回应";
+      },
+    });
+    const residentId = await driver.createResident("placeholder-f1d");
+
+    // history 不得开窗的证据：让 probeGap 必返 unknown——若 history 碰了任何
+    // 窗（哪怕是它自己懒开的），普通动作半格就会记下 gate_unknown。
+    const realProbe = ledger.probeGap.bind(ledger);
+    ledger.probeGap = () => ({ status: "unknown", cause: "占位探测" });
+    await driver.history(residentId);
+    ledger.probeGap = realProbe;
+    expect(events).toEqual([]);
+
+    ledger.append(residentId, {
+      author: "main-thread",
+      kind: "ruling",
+      body: "占位裁定-history-first",
+    });
+    const pack = await driver.buildBootPack(residentId);
+    expect(pack.currentFacts?.map((entry) => entry.body)).toEqual(["占位裁定-history-first"]);
+
+    // 包即交付：say 的注入里不得再出现这条 ruling（早 baseline 时代的
+    // 「包一份、缺口一份」重复已消灭）。
+    await driver.say(residentId, "占位首句");
     expect(prompts[0]).toBe("占位首句");
   });
 });
@@ -182,6 +251,77 @@ describe("F4 住户与账本生命周期原子性", () => {
     expect(restored.has(residentId)).toBe(false);
     // 幂等：销一本不存在的账是 no-op，不炸。
     expect(() => ledger.destroyLedger(residentId)).not.toThrow();
+  });
+
+  it("destroy 第一步失败（facts 目录不可写）：全在且可用，恢复后销得干净", async () => {
+    const residentsDir = freshDir();
+    const factsDir = freshDir();
+    const ledger = new FactLedger({ dataDir: factsDir });
+    const driver = createDriver({ dataDir: residentsDir, factLedger: ledger });
+    const residentId = await driver.createResident("placeholder-destroy-fail");
+    await driver.remember(residentId, "占位记忆");
+    await driver.say(residentId, "占位一句");
+
+    chmodSync(factsDir, 0o555);
+    try {
+      await expect(driver.destroyResident(residentId)).rejects.toThrow();
+    } finally {
+      chmodSync(factsDir, 0o755);
+    }
+
+    // 失败必须「全在」：账内存在、两份档案在、住户与对话照常可用。
+    expect(ledger.has(residentId)).toBe(true);
+    expect(readdirSync(factsDir)).toEqual([`${residentId}.facts.json`]);
+    expect(readdirSync(residentsDir)).toEqual([`${residentId}.json`]);
+    expect((await driver.recall(residentId, "占位")).map((entry) => entry.content)).toEqual([
+      "占位记忆",
+    ]);
+    expect(await driver.history(residentId)).toHaveLength(2);
+    await driver.say(residentId, "占位仍能开工");
+
+    // 权限恢复：再销一次，成功必须「全无」，重建存储恢复不诈尸。
+    await driver.destroyResident(residentId);
+    expect(readdirSync(factsDir)).toEqual([]);
+    expect(readdirSync(residentsDir)).toEqual([]);
+    expect(new FactLedger({ dataDir: factsDir }).has(residentId)).toBe(false);
+    expect(new ResidentStore({ dataDir: residentsDir }).has(residentId)).toBe(false);
+  });
+
+  it("destroy 第二步失败（住户档案删不掉）：账本文件被恢复，全在", async () => {
+    const residentsDir = freshDir();
+    const factsDir = freshDir();
+    const ledger = new FactLedger({ dataDir: factsDir });
+    const driver = createDriver({ dataDir: residentsDir, factLedger: ledger });
+    const residentId = await driver.createResident("placeholder-destroy-abort");
+    ledger.append(residentId, { author: "main-thread", kind: "ruling", body: "占位真账" });
+
+    // facts.json 已删（prepare 成功）、住户快照删不动（第二步抛）→
+    // abort 必须把账的文件写回去，两边都不许半删。
+    chmodSync(residentsDir, 0o555);
+    try {
+      await expect(driver.destroyResident(residentId)).rejects.toThrow();
+    } finally {
+      chmodSync(residentsDir, 0o755);
+    }
+
+    expect(ledger.has(residentId)).toBe(true);
+    expect(readdirSync(factsDir)).toEqual([`${residentId}.facts.json`]);
+    expect(readdirSync(residentsDir)).toEqual([`${residentId}.json`]);
+    // 恢复出的账内容原样（不是空账冒充）。
+    const restored = new FactLedger({ dataDir: factsDir });
+    expect(restored.entries(residentId).map((entry) => entry.body)).toEqual(["占位真账"]);
+  });
+
+  it("缺账住户的 destroy 不回归：prepare/finalize 都是 no-op，住户照销", async () => {
+    const ledger = new FactLedger();
+    const driver = createDriver({ factLedger: ledger });
+    const residentId = await driver.createResident("placeholder-no-ledger");
+    // 手工把账拆掉，造出「有住户没账」的缺账住户。
+    ledger.destroyLedger(residentId);
+
+    await driver.destroyResident(residentId);
+
+    await expect(driver.recall(residentId, "占位")).rejects.toThrow(ResidentNotFoundError);
   });
 });
 

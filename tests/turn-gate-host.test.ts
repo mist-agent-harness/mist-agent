@@ -148,8 +148,13 @@ describe("turn-gate real host subprocess", () => {
       residentId,
       message: "placeholder first turn",
     });
-    // 首次 say 懒开窗记 baseline：无全史拉取，模型拿到的就是原话。
-    expect(said.prompt).toBe("placeholder first turn");
+    // 首次 say 懒开窗记 baseline=50：无全史拉取（缺口为零）。但开窗不算交付——
+    // 现行有效集以「初始对齐」标注随首轮注入交付一次，不是缺口条目。
+    expect(said.prompt).toContain(
+      "[权威事实账·现行有效集（初始对齐）| kind=ruling | seq=1 | author=main-thread] placeholder ruling 1",
+    );
+    expect(said.prompt).toContain("placeholder ruling 50");
+    expect(said.prompt).not.toContain("[权威事实账缺口");
 
     const windowId = await driverWindowId(child);
     expect(await callHost<number>(child, { op: "ackedSeq", residentId, windowId })).toBe(50);
@@ -158,6 +163,14 @@ describe("turn-gate real host subprocess", () => {
       latestSeq: 50,
       ackedSeq: 50,
     });
+
+    // 初始对齐只交付一次：第二轮 say 只剩用户原话。
+    const secondSay = await callHost<SayResult>(child, {
+      op: "sayOn",
+      residentId,
+      message: "placeholder second turn",
+    });
+    expect(secondSay.prompt).toBe("placeholder second turn");
 
     const pack = await callHost<BootPack>(child, { op: "bootpack", residentId });
     expect(pack.currentFacts).toHaveLength(50);

@@ -325,11 +325,12 @@ export class ResidentStore {
   }
 
   destroyResident(residentId: string): void {
-    this.#rooms.delete(residentId);
     if (this.#dataDir !== null) {
       // 拆房连档案一起销：留着文件，重启后人会诈尸回来。
+      // 文件先删、内存后删：rm 抛错时房间在、文件在（全在可重试），不半删。
       rmSync(join(this.#dataDir, `${residentId}.json`), { force: true });
     }
+    this.#rooms.delete(residentId);
   }
 
   // --- 记忆库 ---
