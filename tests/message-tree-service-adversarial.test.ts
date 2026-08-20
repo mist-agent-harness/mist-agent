@@ -16,20 +16,20 @@ class Heads implements SessionHeadPort {
   readonly #map = new Map<string, string>();
   failNextSet = false;
 
-  getHead(windowId: string): string | null {
-    return this.#map.get(windowId) ?? null;
+  getHead(residentId: string): string | null {
+    return this.#map.get(residentId) ?? null;
   }
 
-  setHead(windowId: string, headId: string): void {
+  setHead(residentId: string, headId: string): void {
     if (this.failNextSet) {
       this.failNextSet = false;
       throw new Error("session registry unavailable");
     }
-    this.#map.set(windowId, headId);
+    this.#map.set(residentId, headId);
   }
 
-  force(windowId: string, headId: string): void {
-    this.#map.set(windowId, headId);
+  force(residentId: string, headId: string): void {
+    this.#map.set(residentId, headId);
   }
 }
 
@@ -52,10 +52,10 @@ describe("多住户交错", () => {
     store.createRoom("a");
     store.createRoom("b");
 
-    const a1 = await service.say("a", "A 一", "a");
-    const b1 = await service.say("b", "B 一", "b");
-    const a2 = await service.say("a", "A 二", "a");
-    const b2 = await service.say("b", "B 二", "b");
+    const a1 = await service.say("a", "A 一");
+    const b1 = await service.say("b", "B 一");
+    const a2 = await service.say("a", "A 二");
+    const b2 = await service.say("b", "B 二");
 
     const treeA = await service.history("a");
     const treeB = await service.history("b");
@@ -87,7 +87,7 @@ describe("异步 responder", () => {
       },
     });
 
-    const reply = await slowService.say("a", "慢一点", "a");
+    const reply = await slowService.say("a", "慢一点");
     expect(calls).toStrictEqual([{ rid: "a", msg: "慢一点" }]);
     expect(reply.content).toBe("异步回：慢一点");
     expect((await slowService.history("a")).map((n) => n.content)).toStrictEqual([
@@ -101,17 +101,17 @@ describe("setHead 失败的落点", () => {
   it("双节点已落树后 setHead 抛错：错误上抛，树保持 append-only 不回滚，head 停在原地", async () => {
     const { store, heads, service } = setup();
     store.createRoom("a");
-    const first = await service.say("a", "第一轮", "a");
+    const first = await service.say("a", "第一轮");
 
     heads.failNextSet = true;
-    await expect(service.say("a", "第二轮", "a")).rejects.toThrow("session registry unavailable");
+    await expect(service.say("a", "第二轮")).rejects.toThrow("session registry unavailable");
 
     // append-only：已落的节点不因 head 失败而消失——树永不回滚
     const tree = await service.history("a");
     expect(tree).toHaveLength(4);
     // head 仍指第一轮 assistant，下一轮从旧 head 分叉而不是断链
     expect(heads.getHead("a")).toBe(first.id);
-    const third = await service.say("a", "第三轮", "a");
+    const third = await service.say("a", "第三轮");
     const thirdUser = (await service.history("a")).find(
       (n) => n.role === "user" && n.content === "第三轮",
     );
@@ -125,17 +125,17 @@ describe("service 出口的不透明性", () => {
     const { store, service } = setup();
     store.createRoom("a");
     store.createRoom("b");
-    const reply = await service.say("a", "A 的话", "a");
+    const reply = await service.say("a", "A 的话");
 
     let crossMessage = "";
     let missingMessage = "";
     try {
-      await service.reviseNode("b", reply.id, "越权", "b");
+      await service.reviseNode("b", reply.id, "越权");
     } catch (err) {
       crossMessage = (err as Error).message;
     }
     try {
-      await service.reviseNode("b", "never-existed", "改", "b");
+      await service.reviseNode("b", "never-existed", "改");
     } catch (err) {
       missingMessage = (err as Error).message;
     }
@@ -146,7 +146,7 @@ describe("service 出口的不透明性", () => {
   it("未知住户走 history / reviseNode 也被拒绝（say 之外的口同样不开门）", async () => {
     const { service } = setup();
     await expect(service.history("ghost")).rejects.toThrow();
-    await expect(service.reviseNode("ghost", "n1", "改", "ghost")).rejects.toThrow();
+    await expect(service.reviseNode("ghost", "n1", "改")).rejects.toThrow();
   });
 });
 
@@ -165,7 +165,7 @@ describe("失效 head 在 responder 前 fail-close", () => {
       },
     });
 
-    await expect(guardedService.say("a", "不会付模型成本", "a")).rejects.toThrow(NODE_UNAVAILABLE);
+    await expect(guardedService.say("a", "不会付模型成本")).rejects.toThrow(NODE_UNAVAILABLE);
     expect(responderCalls).toBe(0);
     expect(JSON.stringify(store.history("a"))).toBe(beforeTree);
     expect(heads.getHead("a")).toBe(beforeHead);
@@ -175,7 +175,7 @@ describe("失效 head 在 responder 前 fail-close", () => {
     const { store, heads, service } = setup();
     store.createRoom("a");
     store.createRoom("b");
-    const aReply = await service.say("a", "只属于 A", "a");
+    const aReply = await service.say("a", "只属于 A");
     heads.force("b", aReply.id);
     const beforeTreeA = JSON.stringify(store.history("a"));
     const beforeTreeB = JSON.stringify(store.history("b"));
@@ -189,7 +189,7 @@ describe("失效 head 在 responder 前 fail-close", () => {
       },
     });
 
-    await expect(guardedService.say("b", "不能跨房续写", "b")).rejects.toThrow(NODE_UNAVAILABLE);
+    await expect(guardedService.say("b", "不能跨房续写")).rejects.toThrow(NODE_UNAVAILABLE);
     expect(responderCalls).toBe(0);
     expect(JSON.stringify(store.history("a"))).toBe(beforeTreeA);
     expect(JSON.stringify(store.history("b"))).toBe(beforeTreeB);
@@ -202,12 +202,12 @@ describe("改口的角落", () => {
   it("对 user 节点改口：继承 user 角色，同父成兄弟", async () => {
     const { store, service } = setup();
     store.createRoom("a");
-    await service.say("a", "原问法", "a");
+    await service.say("a", "原问法");
     const userNode = (await service.history("a")).find((n) => n.role === "user");
     expect(userNode).toBeDefined();
     if (userNode === undefined) throw new Error("unreachable");
 
-    const revised = await service.reviseNode("a", userNode.id, "换个问法", "a");
+    const revised = await service.reviseNode("a", userNode.id, "换个问法");
     expect(revised.role).toBe("user");
     expect(revised.parentId).toBe(userNode.parentId);
     expect(revised.id).not.toBe(userNode.id);
@@ -216,11 +216,11 @@ describe("改口的角落", () => {
   it("同一节点二次改口：两个兄弟并存同父，旧节点始终不动", async () => {
     const { service, store } = setup();
     store.createRoom("a");
-    const reply = await service.say("a", "初稿", "a");
+    const reply = await service.say("a", "初稿");
     const snapshot = JSON.stringify((await service.history("a")).find((n) => n.id === reply.id));
 
-    const r1 = await service.reviseNode("a", reply.id, "第二版", "a");
-    const r2 = await service.reviseNode("a", reply.id, "第三版", "a");
+    const r1 = await service.reviseNode("a", reply.id, "第二版");
+    const r2 = await service.reviseNode("a", reply.id, "第三版");
     const tree = await service.history("a");
 
     expect(tree).toHaveLength(4);
@@ -233,15 +233,15 @@ describe("改口的角落", () => {
   it("user 改口也切 head：未重新生成便继续 say 时，有意形成 user 挂 user", async () => {
     const { service, store, heads } = setup();
     store.createRoom("a");
-    await service.say("a", "原问法", "a");
+    await service.say("a", "原问法");
     const originalUser = (await service.history("a")).find(
       (node) => node.role === "user" && node.content === "原问法",
     );
     expect(originalUser).toBeDefined();
     if (originalUser === undefined) throw new Error("unreachable");
 
-    const revisedUser = await service.reviseNode("a", originalUser.id, "修订后的问法", "a");
-    const nextReply = await service.say("a", "不经重新生成，直接续话", "a");
+    const revisedUser = await service.reviseNode("a", originalUser.id, "修订后的问法");
+    const nextReply = await service.say("a", "不经重新生成，直接续话");
     const nextUser = (await service.history("a")).find(
       (node) => node.role === "user" && node.content === "不经重新生成，直接续话",
     );

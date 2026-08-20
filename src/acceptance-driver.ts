@@ -53,14 +53,6 @@ class MistDriver implements HarnessDriver {
    * 合龙时由 P4 的 SessionRegistry 接管这张表。
    */
   readonly #sessions = new SessionRegistry<null>();
-  /**
-   * 驱动器自己持有的「本驱动这一扇窗」绑定。
-   *
-   * 多窗合法之后，注册表不再回答「这个住户的当前会话是哪一个」——那正是
-   * MV-A02 要拔掉的隐式单键。所以由调用方显式声明自己用哪一扇窗，
-   * 而不是反过来让注册表替调用方猜。
-   */
-  readonly #driverWindows = new Map<string, string>();
 
   constructor(options: CreateDriverOptions = {}) {
     this.#store = new ResidentStore(
@@ -70,8 +62,8 @@ class MistDriver implements HarnessDriver {
     this.#messageTree = new MessageTreeService(
       this.#messageTreeStore,
       {
-        getHead: (windowId) => this.#sessions.get(windowId)?.headId ?? null,
-        setHead: (windowId, headId) => this.#sessions.setHead(windowId, headId),
+        getHead: (residentId) => this.#session(residentId).headId,
+        setHead: (residentId, headId) => this.#sessions.setHead(residentId, headId),
       } satisfies SessionHeadPort,
       { assistantReply: options.reply ?? ((_residentId, message) => `收到：${message}`) },
     );
@@ -79,18 +71,7 @@ class MistDriver implements HarnessDriver {
   }
 
   #session(residentId: string) {
-    const bound = this.#driverWindows.get(residentId);
-    if (bound !== undefined) {
-      const live = this.#sessions.get(bound);
-      if (live !== undefined) return live;
-    }
-    const opened = this.#sessions.open(residentId, { headId: null, context: null });
-    this.#driverWindows.set(residentId, opened.windowId);
-    return opened;
-  }
-
-  #windowIdOf(residentId: string): string {
-    return this.#session(residentId).windowId;
+    return this.#sessions.get(residentId) ?? this.#sessions.open(residentId, null, null);
   }
 
   #createMessageRoom(residentId: string): void {
@@ -134,20 +115,15 @@ class MistDriver implements HarnessDriver {
     this.#store.commit(residentId, commitment);
   }
 
-  #killDriverWindows(residentId: string): void {
-    this.#sessions.killResident(residentId);
-    this.#driverWindows.delete(residentId);
-  }
-
   async destroyResident(residentId: string): Promise<void> {
     if (!this.#store.has(residentId)) {
-      this.#killDriverWindows(residentId);
+      this.#sessions.kill(residentId);
       this.#messageRooms.delete(residentId);
       this.#messageTreeStore.destroyRoom(residentId);
       this.#store.destroyResident(residentId);
       return;
     }
-    this.#killDriverWindows(residentId);
+    this.#sessions.kill(residentId);
     if (this.#messageRooms.delete(residentId)) {
       this.#messageTreeStore.destroyRoom(residentId);
     }
@@ -158,7 +134,7 @@ class MistDriver implements HarnessDriver {
 
   async say(residentId: string, message: string): Promise<HistoryNode> {
     this.#ensureMessageRoom(residentId);
-    return this.#messageTree.say(residentId, message, this.#windowIdOf(residentId));
+    return this.#messageTree.say(residentId, message);
   }
 
   async history(residentId: string): Promise<HistoryNode[]> {
@@ -168,12 +144,7 @@ class MistDriver implements HarnessDriver {
 
   async reviseNode(residentId: string, nodeId: string, newContent: string): Promise<HistoryNode> {
     this.#ensureMessageRoom(residentId);
-    return this.#messageTree.reviseNode(
-      residentId,
-      nodeId,
-      newContent,
-      this.#windowIdOf(residentId),
-    );
+    return this.#messageTree.reviseNode(residentId, nodeId, newContent);
   }
 
   // --- P3：启动包 ---
@@ -190,7 +161,7 @@ class MistDriver implements HarnessDriver {
     // 会话死，人不能死（C1 验 kill 前后整棵树的 hash 不变）。
     // 删除活会话 —— 下一句 say 会开新 generation、新根；旧 generation 的迟到
     // effect receipt 也不能再被视为当前会话，H1 的 Effect Journal 会接这条线。
-    this.#killDriverWindows(residentId);
+    this.#sessions.kill(residentId);
   }
 
   // --- P5：迁移 ---
