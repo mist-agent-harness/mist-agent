@@ -142,6 +142,12 @@ env 值只经 `PluginPrepareContext.env` 交付：宿主在 `prepare` 前解析
 保留设置但不进入 prepare；从 true 切到 false 必须走完整卸载，从 false 切到 true 必须
 重新校验并走完整注册事务，不能靠隐藏 UI 冒充停用。
 
+secret 只有两条交付通道：`environment` 的 `secretRef` 与 `credentialRefs`。`settings` 是
+不透明的普通设置载体，协议不对它做 secret 追踪或脱敏，因此 token、API key 与任何已解析的
+secret 都不得经 `settings` 交付。宿主不得把解析后的 secret 或凭证值回写进 `settings`、
+instance config 或配置快照——保护由通道决定，不由字段名决定：键叫 `token` 不会让它被追踪，
+叫 `theme` 也不会让塞进去的凭证变安全。需要 token 的插件必须声明 secret env 或凭证槽位。
+
 代价：字面量权限会让动态命令类插件需要更细的宿主能力或显式人工授权，不能用一个
 “terminal=true”偷懒换取万能键盘。
 

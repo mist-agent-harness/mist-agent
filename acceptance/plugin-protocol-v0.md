@@ -31,7 +31,7 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 - [ ] **[PV0-A09](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s2) env 绑定形状不可混用**：逐一测试 secret×value、secret×secretRef、
   plain×value、plain×secretRef；只有中间两种匹配组合中的 secret×secretRef 与
   plain×value 通过，错配返回 `CONFIG_INVALID`，明文 secret 不进入配置快照。
-- [ ] **PV0-A10 env 只经 context 交付**：manifest 声明 plain `A`、secret `B`、可选未绑定
+- [ ] **[PV0-A10](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s2) env 只经 context 交付**：manifest 声明 plain `A`、secret `B`、可选未绑定
   `C`；插件 prepare 时记录 `context.env` 的键集合，并另设 `process.env.D` 探针。断言
   `context.env` 恰为 `{A, B}`（`B` 为已解析值）、不含 `C`/`D`；配置快照、日志与事件中
   `B` 的值不出现（`SECRET_SHOULD_NEVER_APPEAR`）；宿主向插件交付未声明名字或漏交
@@ -73,6 +73,10 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 - [ ] **[PV0-B13](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s3) 注入随停用与卸载撤下**：active 插件分别装入 resident/session 注入后，将
   `enabled` 切为 false 并完成 dispose；住户上下文快照、启动包及下一次会话重建输入均不含
   该 plugin id 的注入段。工具与资源已消失但守则仍留在 wakepack 时本条变红。
+- [ ] **[PV0-B14](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s2) secret 不落 settings 通道**：把同一唯一标记分别作为 `secretRef` 解析值和
+  凭证值下发，插件 active 后转储宿主写盘的 instance config 与全部配置快照；`settings` 及
+  快照中均不出现该标记。宿主把解析后的 secret 或凭证值回写进 `settings`／配置快照时本条
+  变红，键名叫 `token` 还是 `theme` 不改变判定。
 
 ## C. 事务注册、隔离与注销
 
@@ -240,6 +244,7 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 | B11 | 静默采用 server 漂移后的 instructions | B11 |
 | B12 | 允许工具返回值把已知 secret 带入模型上下文 | B12 |
 | B13 | 停用或卸载后仍把该插件守则留在 wakepack | B13 |
+| B14 | 宿主把已解析 secret 或凭证值写入 settings / 配置快照 | B14 |
 | C01 | prepare 阶段提前公开首个资源 | C01 |
 | C02 | 第三个 register 失败后保留前两个 handle | C02 |
 | C03 | activate 失败后跳过 rollback | C03 |
