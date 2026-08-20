@@ -6,10 +6,11 @@ import type {
   InstallCommitReceipt,
   InstallerCredential,
   InstallerDraft,
+  InstallerStep,
   LaneBinding,
   MemoryChoice,
 } from "./contracts.ts";
-import { installerAdapterAcceptsCredentialType } from "./contracts.ts";
+import { InstallerValidationError, installerAdapterAcceptsCredentialType } from "./contracts.ts";
 import type { InstallerController } from "./controller.ts";
 import type { MemoryLibraryPort } from "./memory-library.ts";
 import type { OAuthLoginPort } from "./pi-login.ts";
@@ -91,6 +92,11 @@ async function collectCredentials(
       secret = (await options.oauth.login(provider)).locator;
     } else {
       secret = await options.prompt.secret({ message: `${provider.label} API key` });
+    }
+    const existingIndex = entries.findIndex((entry) => entry.credential.ref.id === id);
+    if (existingIndex !== -1) {
+      entries.splice(existingIndex, 1);
+      options.prompt.info(`Replaced existing credential "${id}".`);
     }
     entries.push({
       credential: {
@@ -254,8 +260,44 @@ async function collectMemory(options: RunInstallerOptions): Promise<void> {
   // Record the intended side effect before creating it. If the process dies between these
   // operations, resume can safely recreate it; discard still knows exactly what may be removed.
   const draft = options.controller.saveMemory({ kind, path });
-  options.memoryLibraries.createEmpty(path, draft.draftId);
+  try {
+    options.memoryLibraries.createEmpty(path, draft.draftId);
+  } catch (error) {
+    // Same failure the review step guards against, caught at the moment the user
+    // typed the path: the loop comes straight back to this step for another path.
+    options.prompt.info(
+      `The memory library at ${path} cannot be created: ${
+        error instanceof Error ? error.message : String(error)
+      }. Choose another path.`,
+    );
+    options.controller.revisitMemory();
+  }
 }
+
+/**
+ * What review can offer when commit rejects the draft, keyed by the step that owns the
+ * rejected data. Credentials are reset only when the credential set itself was rejected.
+ */
+const REVIEW_REPAIRS: Partial<
+  Record<InstallerStep, { label: string; apply: (controller: InstallerController) => void }>
+> = {
+  credentials: {
+    label: "Go back to credentials and fix it",
+    apply: (controller) => controller.revisitCredentials({ reset: true }),
+  },
+  bindings: {
+    label: "Go back to lane bindings and fix it",
+    apply: (controller) => controller.revisitBindings(),
+  },
+  frontend: {
+    label: "Go back to the frontend choice and fix it",
+    apply: (controller) => controller.revisitFrontend(),
+  },
+  memory: {
+    label: "Go back to the memory library and fix it",
+    apply: (controller) => controller.revisitMemory(),
+  },
+};
 
 export async function runInstaller(options: RunInstallerOptions): Promise<RunInstallerResult> {
   const existing = options.store.loadDraft();
@@ -321,7 +363,20 @@ export async function runInstaller(options: RunInstallerOptions): Promise<RunIns
       case "review": {
         if (draft.memory?.kind === "create") {
           // Idempotently finish a creation interrupted after the draft was persisted.
-          options.memoryLibraries.createEmpty(draft.memory.path, draft.draftId);
+          try {
+            options.memoryLibraries.createEmpty(draft.memory.path, draft.draftId);
+          } catch (error) {
+            // The path is taken by a directory mist did not create, so createEmpty
+            // refuses. Letting this escape strands the draft for good: every later
+            // resume lands on review again and re-runs this same call.
+            options.prompt.info(
+              `The memory library at ${draft.memory.path} cannot be created: ${
+                error instanceof Error ? error.message : String(error)
+              }. Your draft is kept — choose another path.`,
+            );
+            options.controller.revisitMemory();
+            break;
+          }
         }
         options.prompt.info(formatReview(draft));
         if (draft.frontend?.kind === "official-skin") {
@@ -347,7 +402,37 @@ export async function runInstaller(options: RunInstallerOptions): Promise<RunIns
           default: true,
         });
         if (!shouldCommit) return { status: "paused", draft };
-        return { status: "committed", receipt: options.controller.commit() };
+        try {
+          return { status: "committed", receipt: options.controller.commit() };
+        } catch (error) {
+          // Validation that only commit can see (duplicate ids being the known case)
+          // must not be a dead end: review had no way back to step 1, so the only
+          // exit was discarding the whole draft.
+          if (!(error instanceof InstallerValidationError)) throw error;
+          options.prompt.info(
+            `This setup cannot be saved: ${error.message}. Your draft is kept and no active config changed.`,
+          );
+          // Route by the step that owns the rejected data. Only a rejected credential
+          // set clears credentials; a binding, frontend, or memory rejection must not
+          // throw away credentials that were never the problem. A rejection with no
+          // step (draft envelope) has no step to go back to.
+          const repair = REVIEW_REPAIRS[error.step ?? "review"];
+          if (repair === undefined) {
+            return { status: "paused", draft: options.controller.current() };
+          }
+          const fixChoice = await options.prompt.select({
+            message: "How do you want to continue?",
+            choices: [
+              { value: "fix", name: repair.label },
+              { value: "keep", name: "Keep this draft and exit" },
+            ],
+            default: "fix",
+          });
+          if (fixChoice === "keep")
+            return { status: "paused", draft: options.controller.current() };
+          repair.apply(options.controller);
+          break;
+        }
       }
     }
     draft = options.controller.current();
