@@ -15,12 +15,21 @@
 export const PRIVATE_SCOPE = "private" as const;
 
 export const WINDOW_ARCHIVED = "WINDOW_ARCHIVED" as const;
+export const WINDOW_REOPEN_INVALID = "WINDOW_REOPEN_INVALID" as const;
 
 export class WindowArchivedError extends Error {
   readonly code = WINDOW_ARCHIVED;
   constructor(windowId: string) {
     super(`${WINDOW_ARCHIVED}: ${windowId}`);
     this.name = "WindowArchivedError";
+  }
+}
+
+export class WindowReopenError extends Error {
+  readonly code = WINDOW_REOPEN_INVALID;
+  constructor(windowId: string, reason: string) {
+    super(`${WINDOW_REOPEN_INVALID}: ${windowId}: ${reason}`);
+    this.name = "WindowReopenError";
   }
 }
 
@@ -72,8 +81,32 @@ export class SessionRegistry<TContext> {
   #dispatchSeq = 0;
 
   #mintWindowId(): string {
-    this.#windowSeq += 1;
-    return `window-${this.#windowSeq.toString(36).padStart(6, "0")}`;
+    let candidate: string;
+    do {
+      this.#windowSeq += 1;
+      candidate = `window-${this.#windowSeq.toString(36).padStart(6, "0")}`;
+    } while (this.#active.has(candidate) || this.#archived.has(candidate));
+    return candidate;
+  }
+
+  #requireArchivedForReopen(residentId: string, scopeId: string, windowId: string): ArchivedWindow {
+    const archived = this.#archived.get(windowId);
+    if (archived === undefined) {
+      throw new WindowReopenError(windowId, "target is not an archived window");
+    }
+    if (archived.residentId !== residentId) {
+      throw new WindowReopenError(
+        windowId,
+        `resident mismatch: archived=${archived.residentId}, requested=${residentId}`,
+      );
+    }
+    if (archived.scopeId !== scopeId) {
+      throw new WindowReopenError(
+        windowId,
+        `scope mismatch: archived=${archived.scopeId}, requested=${scopeId}`,
+      );
+    }
+    return archived;
   }
 
   /**
@@ -82,11 +115,11 @@ export class SessionRegistry<TContext> {
    * 给 windowId 时是按同一身份重开一扇已归档的窗，起新一代（#66 B5）。
    */
   open(residentId: string, options: OpenOptions<TContext>): ActiveWindow<TContext> {
-    const windowId = options.windowId ?? this.#mintWindowId();
-    if (this.#active.has(windowId)) {
-      throw new Error(`window ${windowId} is already active`);
-    }
     const scopeId = options.scopeId ?? PRIVATE_SCOPE;
+    const windowId = options.windowId ?? this.#mintWindowId();
+    if (options.windowId !== undefined) {
+      this.#requireArchivedForReopen(residentId, scopeId, windowId);
+    }
     const generation = (this.#lastGeneration.get(windowId) ?? 0) + 1;
     this.#lastGeneration.set(windowId, generation);
     this.#archived.delete(windowId);

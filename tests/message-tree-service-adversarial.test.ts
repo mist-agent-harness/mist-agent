@@ -16,20 +16,20 @@ class Heads implements SessionHeadPort {
   readonly #map = new Map<string, string>();
   failNextSet = false;
 
-  getHead(residentId: string): string | null {
-    return this.#map.get(residentId) ?? null;
+  getHead(windowId: string): string | null {
+    return this.#map.get(windowId) ?? null;
   }
 
-  setHead(residentId: string, headId: string): void {
+  setHead(windowId: string, headId: string): void {
     if (this.failNextSet) {
       this.failNextSet = false;
       throw new Error("session registry unavailable");
     }
-    this.#map.set(residentId, headId);
+    this.#map.set(windowId, headId);
   }
 
-  force(residentId: string, headId: string): void {
-    this.#map.set(residentId, headId);
+  force(windowId: string, headId: string): void {
+    this.#map.set(windowId, headId);
   }
 }
 

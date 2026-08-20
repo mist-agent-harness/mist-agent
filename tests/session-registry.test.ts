@@ -3,6 +3,7 @@ import {
   PRIVATE_SCOPE,
   SessionRegistry,
   WINDOW_ARCHIVED,
+  WINDOW_REOPEN_INVALID,
 } from "../src/session/session-registry.ts";
 
 describe("SessionRegistry：多窗语义", () => {
@@ -72,6 +73,51 @@ describe("SessionRegistry：多窗语义", () => {
         .map((w) => w.generation)
         .sort(),
     ).toEqual([1, 2]);
+  });
+
+  it("显式 windowId 只能重开已归档窗，未知 id fail loud 且不污染内部发号", () => {
+    const sessions = new SessionRegistry<null>();
+
+    expect(() => sessions.open("resident-a", { windowId: "window-000001", context: null })).toThrow(
+      WINDOW_REOPEN_INVALID,
+    );
+
+    const fresh = sessions.open("resident-a", { context: null });
+    expect(fresh.windowId).toBe("window-000001");
+    expect(fresh.generation).toBe(1);
+  });
+
+  it("归档窗不能被另一住户抢注，拒绝后原住户仍可按原 scope 重开", () => {
+    const sessions = new SessionRegistry<null>();
+    const archived = sessions.open("resident-a", { scopeId: "room-1", context: null });
+    sessions.kill(archived.windowId);
+
+    expect(() =>
+      sessions.open("resident-b", {
+        windowId: archived.windowId,
+        scopeId: "room-1",
+        context: null,
+      }),
+    ).toThrow(/resident mismatch/);
+    expect(sessions.isArchived(archived.windowId)).toBe(true);
+
+    const reopened = sessions.open("resident-a", {
+      windowId: archived.windowId,
+      scopeId: "room-1",
+      context: null,
+    });
+    expect(reopened.generation).toBe(2);
+  });
+
+  it("归档窗只能按原 scope 重开，scope 不一致显式拒绝", () => {
+    const sessions = new SessionRegistry<null>();
+    const archived = sessions.open("resident-a", { scopeId: "room-1", context: null });
+    sessions.kill(archived.windowId);
+
+    expect(() =>
+      sessions.open("resident-a", { windowId: archived.windowId, context: null }),
+    ).toThrow(/scope mismatch/);
+    expect(sessions.isArchived(archived.windowId)).toBe(true);
   });
 
   it("会话态归零不动住户留下的东西", () => {

@@ -4,25 +4,25 @@ import type { SessionHeadPort } from "../src/message-tree/index.ts";
 
 class TestSessionHeads implements SessionHeadPort {
   readonly #heads = new Map<string, string>();
-  readonly writes: Array<{ residentId: string; headId: string }> = [];
-  beforeSet?: (residentId: string, headId: string) => void;
+  readonly writes: Array<{ windowId: string; headId: string }> = [];
+  beforeSet?: (windowId: string, headId: string) => void;
 
-  getHead(residentId: string): string | null {
-    return this.#heads.get(residentId) ?? null;
+  getHead(windowId: string): string | null {
+    return this.#heads.get(windowId) ?? null;
   }
 
-  setHead(residentId: string, headId: string): void {
-    this.beforeSet?.(residentId, headId);
-    this.#heads.set(residentId, headId);
-    this.writes.push({ residentId, headId });
+  setHead(windowId: string, headId: string): void {
+    this.beforeSet?.(windowId, headId);
+    this.#heads.set(windowId, headId);
+    this.writes.push({ windowId, headId });
   }
 
-  kill(residentId: string): void {
-    this.#heads.delete(residentId);
+  kill(windowId: string): void {
+    this.#heads.delete(windowId);
   }
 
-  force(residentId: string, headId: string): void {
-    this.#heads.set(residentId, headId);
+  force(windowId: string, headId: string): void {
+    this.#heads.set(windowId, headId);
   }
 }
 
@@ -47,7 +47,7 @@ function setup() {
 describe("MessageTreeService.say", () => {
   it("首轮原子落双节点，全部落完后才把 head 指向 assistant", async () => {
     const { store, heads, service } = setup();
-    heads.beforeSet = (_residentId, headId) => {
+    heads.beforeSet = (_windowId, headId) => {
       const tree = store.history("resident-a");
       expect(tree).toHaveLength(2);
       expect(tree.some((node) => node.id === headId && node.role === "assistant")).toBe(true);
@@ -74,7 +74,7 @@ describe("MessageTreeService.say", () => {
     ]);
     expect(reply).toEqual(tree[1]);
     expect(heads.getHead("resident-a")).toBe(reply.id);
-    expect(heads.writes).toEqual([{ residentId: "resident-a", headId: reply.id }]);
+    expect(heads.writes).toEqual([{ windowId: "resident-a", headId: reply.id }]);
   });
 
   it("同一会话第二轮 user 挂在上一轮 assistant 下", async () => {
