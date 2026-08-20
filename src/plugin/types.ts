@@ -7,7 +7,9 @@
  * wording verbatim; the consumer-side copies in webui/mist-plugin.ts (#61) predate
  * #62 and re-point here in a follow-up PR.
  *
- * Scope note (#76 单B PR①): type surface only — no runtime semantics in this commit.
+ * Scope note (#76 单B): canonical type surface shared by the runtime landed in this PR
+ * series — §2 manifest/discovery/env delivery, §3 transactions/recovery, §8 failure
+ * semantics all implement against these shapes.
  */
 
 /** Resource categories a plugin may register through its prepare context. RFC §3. */

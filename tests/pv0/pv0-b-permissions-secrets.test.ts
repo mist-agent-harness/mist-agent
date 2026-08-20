@@ -52,6 +52,10 @@ describe("PV0 series B — 权限、secret 与工具翻译 (RFC §2/§6/§8)", (
   it.todo(
     "[PV0-B13] 注入随停用与卸载撤下 — STUBBED-PENDING(permission-narrowing / secret-gate / tool-translation subsystems — 单B 范围外)",
   );
+  // ⚠️ 接线警示（PR#97 评审「不挡」项）：STUBBED ≠ 没有落盘面。权威记录今天就原样
+  // 持久化 `config: unknown`（settings 全文随之落盘）；env 通道单B已闭（A09/A10），
+  // settings 通道尚无闸。后续实现本条时，把「已存在的写盘面」当取证对象，
+  // 不要当成「范围外所以未发生」。
   it.todo(
     "[PV0-B14] secret 不落 settings 通道 — STUBBED-PENDING(permission-narrowing / secret-gate / tool-translation subsystems — 单B 范围外)",
   );

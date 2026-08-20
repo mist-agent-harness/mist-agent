@@ -10,8 +10,10 @@
  * (main@acdfcab2); titles copied verbatim.
  *
  * A01–A04/A06–A10 run REAL：真实包目录 fixture、顶层抛错的探针 entrypoint、零 import
- * 取证；A07 经 applyEnabledChange 生产入口（含 blocked 停用与崩溃窗回归）、A10 经
- * resolveEnvironment 执行边界交付。A05 仍为 honest todo——等 readiness scope 投影面。
+ * 取证；A07 与 A10 经 applyEnabledChange 生产入口交付（A07 含 blocked 停用与崩溃窗
+ * 回归；A10 为半绿——context 交付/快照扫描真绿，日志/事件 sink 未建+同进程隔离不可证
+ * 按阻塞申报，见 PR 正文）。A08 的写盘门半场取证于 pv0-a08-write-gate.test.ts。
+ * A05 仍为 honest todo——等 readiness scope 投影面。
  */
 
 import { readFileSync } from "node:fs";
@@ -346,6 +348,8 @@ describe("PV0 series A — Manifest 与兼容性 (RFC §2)", () => {
       const r = await discoverPlugin(await pkg(manifestOf({ id: bad })), HOST);
       expect(r).toMatchObject({ ok: false, reasonCode: "MANIFEST_INVALID" });
     }
+    // 冲突半场之一（discovery 预检）：现役集合由调用方自报，这只是 import 前的早退。
+    // 权威闸在事务写盘入口（PR#97 评审①），取证于 tests/pv0/pv0-a08-write-gate.test.ts。
     const conflicted = await discoverPlugin(await pkg(manifestOf({ id: "already.active" })), {
       hostVersion: HOST.hostVersion,
       activeIds: new Set(["already.active"]),
@@ -432,10 +436,14 @@ describe("PV0 series A — Manifest 与兼容性 (RFC §2)", () => {
     const host = new PluginTransactionHost({ store, newOperationId: () => `op-${seq++}` });
     let seenKeys: string[] = [];
     let seenB = "";
+    let seenProcessD = "";
     const module: PluginModuleV0 = {
       async prepare(context) {
         seenKeys = Object.keys(context.env).sort();
         seenB = context.env.B ?? "";
+        // 插件自录探针（PR#97 评审②）：同进程下 process.env 对插件天然可见——本条
+        // 主张的是「宿主不经 context 交付 D」，不是「插件取不到 D」；隔离不在单B范围。
+        seenProcessD = process.env.D ?? "";
         return {
           async activate() {
             return {
@@ -448,24 +456,28 @@ describe("PV0 series A — Manifest 与兼容性 (RFC §2)", () => {
         };
       },
     };
-    const outcome = await host.activate({
+    // 真实交付（PR#97 评审②）：走 applyEnabledChange 生产入口 + 生产 instance config
+    // 形状，不再手拼 config 直捅 host.activate；权威快照因此携带真实 secretRef 绑定。
+    const outcome = await applyEnabledChange(host, store, {
       pluginId: "demo.envonly",
-      moduleRef: moduleRefFromSource("demo-envonly-v1"),
+      manifest,
       module,
-      config: { settingsOnly: true },
-      env: assembled.env,
-      bindings: { environment: goodConfig.environment },
-      verifiedScope: {},
+      moduleRef: moduleRefFromSource("demo-envonly-v1"),
+      config: goodConfig,
+      resolveSecret: () => "SECRET_SHOULD_NEVER_APPEAR",
     });
     expect(outcome.state).toBe("active");
     // context.env 恰为 {A, B}（B 为已解析值）不含 C/D
     expect(seenKeys).toEqual(["A", "B"]);
     expect(seenB).toBe("SECRET_SHOULD_NEVER_APPEAR");
+    expect(seenProcessD).toBe("process-env-probe"); // 同进程可见＝隔离不被本条冒领
     expect(assembled.env).not.toHaveProperty("C");
     expect(assembled.env).not.toHaveProperty("D");
-    // 配置快照（磁盘权威文件）中 B 的解析值不出现
+    // 配置快照（磁盘权威文件）中 B 的解析值不出现；题面「日志与事件」两个 sink 本仓
+    // 尚不存在、无从扫描——那一半按阻塞申报（PR 正文 61 题表 A10 行），不冒充绿。
     const snapshot = readFileSync(store.pathFor("demo.envonly"), "utf8");
     expect(snapshot).not.toContain("SECRET_SHOULD_NEVER_APPEAR");
+    expect(snapshot).toContain("vault:b"); // 生产 config 形状真的落了盘（secretRef 而非解析值）
     // 漏交 required：REQUIREMENT_MISSING
     const missingRequired = resolveEnvironment(
       manifest,

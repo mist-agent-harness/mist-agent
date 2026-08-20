@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { type PluginActivateRefusal, refuseActiveIdOverwrite } from "./install-gate.ts";
 import { isSelfDescribingModuleRef } from "./module-ref.ts";
 import type {
   PluginAuthorityRecord,
@@ -25,6 +26,7 @@ export type {
   RecoveryModule,
   RecoveryModuleLoader,
 } from "./recovery-coordinator.ts";
+export type { PluginActivateRefusal } from "./install-gate.ts";
 
 export type PluginCheckpointName =
   | "operation-persisted"
@@ -90,10 +92,16 @@ export class PluginTransactionHost {
     this.#recovery = new PluginRecoveryCoordinator(options.store);
   }
 
-  async activate(request: ActivatePluginRequest): Promise<PluginOperationOutcome> {
+  async activate(
+    request: ActivatePluginRequest,
+  ): Promise<PluginOperationOutcome | PluginActivateRefusal> {
     if (!isSelfDescribingModuleRef(request.moduleRef)) {
       throw new Error(`moduleRef must self-describe its digest algorithm: ${request.moduleRef}`);
     }
+    // 写盘门（PR#97 评审①）：普通安装复用现役 id，在落第一笔权威记录之前拒掉，
+    // 现役账与 runtime 一概不动；blocked 重试 / disposed 重装不经此门（旧账非 active）。
+    const refused = refuseActiveIdOverwrite(request.pluginId, this.#active, this.#store);
+    if (refused !== null) return refused;
     const operationId = this.#newOperationId();
     const record: PluginAuthorityRecord = {
       schemaVersion: 1,

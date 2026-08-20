@@ -283,6 +283,10 @@ describe("PV0 series C — 跨进程生命周期恢复与权威投影 (RFC §3)"
   }, 30_000);
 
   it("[PV0-C11] 权威状态先于公开索引", async () => {
+    // 取证边界（PR#97 评审「不挡」项）：#published 纯内存，SIGKILL 后跨进程恒为空集。
+    // 三个切点在重启面证明的是「公开索引 ⊆ 权威 active」以空集成立 + 权威账完好，
+    // 空集不是「完整投影」的证据——提交前不可见性由进程内 C04/C13 取证；重启后重建
+    // 公开索引属热加载，单B 范围外，接线时别把本条误读成已覆盖。
     const checkpoints = [
       "before-active-authority-commit",
       "active-authority-committed-before-publish",
