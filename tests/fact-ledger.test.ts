@@ -994,4 +994,46 @@ describe("恢复的运行时校验（不可信 JSON 不许直接断言成 Ledger
       expect(() => new FactLedger({ dataDir })).toThrow(/baselineSeq\/ackedSeq 不是整数/);
     });
   });
+
+  it("多带的额外字段：拒绝，不静默剥离（根/条目/确认位三层）", () => {
+    withTempDir((dataDir) => {
+      // 带 extra 的条目若恢复成功，会经 entries() 外泄、后续落盘继续保留——
+      // 所以字段集合必须恰好，多一个都当场拒（同 migration assertExactKeys 口径）。
+      const valid = {
+        schemaVersion: 1,
+        residentId: "r",
+        entries: [
+          {
+            seq: 1,
+            ts: "2026-08-20T00:00:00.000Z",
+            author: "m",
+            kind: "ruling",
+            body: "一",
+            supersedesSeq: null,
+          },
+        ],
+        viewports: [{ viewportId: "w-a", baselineSeq: 0, ackedSeq: 0 }],
+      };
+      const file = join(dataDir, "r.facts.json");
+
+      writeFileSync(file, JSON.stringify({ ...valid, extra: "leak" }));
+      expect(() => new FactLedger({ dataDir })).toThrow(/根.*字段集合对不上/);
+
+      writeFileSync(
+        file,
+        JSON.stringify({ ...valid, entries: [{ ...valid.entries[0], extra: "leak" }] }),
+      );
+      expect(() => new FactLedger({ dataDir })).toThrow(/第 1 条.*字段集合对不上/);
+
+      writeFileSync(
+        file,
+        JSON.stringify({ ...valid, viewports: [{ ...valid.viewports[0], extra: "leak" }] }),
+      );
+      expect(() => new FactLedger({ dataDir })).toThrow(/确认位行.*字段集合对不上/);
+
+      // 对照：原样不多不少的快照能正常恢复——校验层不误伤好档。
+      writeFileSync(file, JSON.stringify(valid));
+      expect(new FactLedger({ dataDir }).latestSeq("r")).toBe(1);
+    });
+  });
 });

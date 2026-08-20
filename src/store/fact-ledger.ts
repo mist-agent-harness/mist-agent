@@ -520,10 +520,20 @@ export class FactLedger {
   #validateSnapshot(value: unknown, file: string): LedgerRecord {
     const bad = (what: string): Error =>
       new Error(`快照 ${file} 的 ${what}——坏档显式失败，不猜、不静默跳过`);
+    // 字段集合必须恰好：多带的字段（如混进条目的额外数据）不许静默剥离——
+    // 剥离等于替坏档做手术，它该亮出来给人看（同 migration 的 assertExactKeys 口径）。
+    const exactKeys = (obj: Record<string, unknown>, expected: string[], what: string): void => {
+      const actual = Object.keys(obj).sort();
+      const wanted = [...expected].sort();
+      if (actual.length !== wanted.length || actual.some((key, index) => key !== wanted[index])) {
+        throw bad(`${what}字段集合对不上（期望恰好 ${wanted.length} 个字段），不静默剥离`);
+      }
+    };
     if (typeof value !== "object" || value === null || Array.isArray(value)) {
       throw bad("根不是对象");
     }
     const record = value as Record<string, unknown>;
+    exactKeys(record, ["schemaVersion", "residentId", "entries", "viewports"], "根");
     if (typeof record.schemaVersion !== "number") throw bad("schemaVersion 不是数字");
     if (typeof record.residentId !== "string") throw bad("residentId 不是字符串");
     if (!Array.isArray(record.entries)) throw bad("entries 不是数组");
@@ -533,6 +543,7 @@ export class FactLedger {
         throw bad(`第 ${i + 1} 条不是对象`);
       }
       const e = entry as Record<string, unknown>;
+      exactKeys(e, ["seq", "ts", "author", "kind", "body", "supersedesSeq"], `第 ${i + 1} 条`);
       if (!Number.isInteger(e.seq)) throw bad(`第 ${i + 1} 条的 seq 不是整数`);
       if (typeof e.ts !== "string") throw bad(`第 ${i + 1} 条的 ts 不是字符串`);
       if (typeof e.author !== "string") throw bad(`第 ${i + 1} 条的 author 不是字符串`);
@@ -548,6 +559,7 @@ export class FactLedger {
         throw bad("确认位行不是对象");
       }
       const r = row as Record<string, unknown>;
+      exactKeys(r, ["viewportId", "baselineSeq", "ackedSeq"], "确认位行");
       if (typeof r.viewportId !== "string") throw bad("确认位的 viewportId 不是字符串");
       if (!Number.isInteger(r.baselineSeq) || !Number.isInteger(r.ackedSeq)) {
         throw bad("确认位的 baselineSeq/ackedSeq 不是整数");
