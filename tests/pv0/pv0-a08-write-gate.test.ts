@@ -9,13 +9,19 @@
  * 变异锚：把 activate 里的 install-gate 调用摘掉，「同 id 二次 activate 覆盖现役」
  * 与「重启窗直捅写盘」两腿全红——这正是评审①指出原 A08 无法变红的路径。
  * 直捅 host.activate 在本文件是合法取证姿势：被考的就是写盘入口本身。
+ *
+ * 153/51F 渡审补钉（fail-open 修正回归）：坏账不可读、quarantined、中断态（disposing）
+ * 三腿——普通安装一律拒装，原账逐字节不变，入侵 prepare=0；ENOENT 之外的读错误
+ * 不得被吞成「无账」。
  */
 
-import { mkdtemp, rm } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { moduleRefFromSource } from "../../src/plugin/module-ref.ts";
+import type { PluginAuthorityRecord } from "../../src/plugin/operation-store.ts";
 import { PluginOperationStore } from "../../src/plugin/operation-store.ts";
 import { PluginTransactionHost } from "../../src/plugin/transaction-host.ts";
 import type { PluginModuleV0 } from "../../src/plugin/types.ts";
@@ -162,5 +168,121 @@ describe("PV0-A08 写盘门 — 普通安装不得覆盖现役 (RFC §2/§8)", (
       throw new Error("full transactions must carry operation ids");
     }
     expect(again.operationId).not.toBe(on.operationId);
+  });
+
+  it("坏账 fail-closed（51F 阻塞①）：可读性/schema 错误拒装，原字节一动不动", async () => {
+    const store = new PluginOperationStore(join(root, `store-${seq++}`));
+    const host = new PluginTransactionHost({ store, newOperationId: () => `op-${seq++}` });
+    const cases = [
+      { id: "demo.garbage", bytes: "{ not json ][" },
+      {
+        id: "demo.badschema",
+        bytes: JSON.stringify({
+          schemaVersion: 1,
+          pluginId: "demo.badschema",
+          lifecycleState: "actiive",
+        }),
+      },
+    ];
+    for (const bad of cases) {
+      await writeFile(store.pathFor(bad.id), bad.bytes);
+      const intruder = counters();
+      const refused = await host.activate(request(bad.id, moduleWith(intruder), `${bad.id}-v1`));
+      expect(refused).toMatchObject({
+        state: "blocked",
+        reasonCode: "LIFECYCLE_RECOVERY_PENDING",
+        detail: expect.stringContaining("unreadable"),
+      });
+      expect("operationId" in refused).toBe(false);
+      expect(intruder.prepared).toBe(0);
+      // 坏账原字节不动：不许被普通安装「修复」或覆盖——裁决权在 recovery/巡检。
+      expect(readFileSync(store.pathFor(bad.id), "utf8")).toBe(bad.bytes);
+    }
+  });
+
+  it("quarantined 不得被普通安装洗白（51F 阻塞②）：拒装、隔离账逐字节不变", async () => {
+    const store = new PluginOperationStore(join(root, `store-${seq++}`));
+    const host = new PluginTransactionHost({ store, newOperationId: () => `op-${seq++}` });
+    // 真实回滚失败造隔离：资源 dispose 抛错 → host.dispose → DISPOSE_INCOMPLETE → quarantined。
+    const life = counters();
+    const failing: PluginModuleV0 = {
+      async prepare(context) {
+        life.prepared += 1;
+        context.register({
+          id: "res-1",
+          kind: "tool",
+          recoveryKey: "rk-1",
+          async activate() {},
+          async dispose() {
+            throw new Error("resource dispose fails on purpose");
+          },
+        });
+        return {
+          async activate() {
+            return {
+              async dispose() {
+                return { revoked: [], failed: [] };
+              },
+            };
+          },
+          async rollback() {},
+        };
+      },
+    };
+    const on = await host.activate(request("demo.washout", failing, "washout-v1"));
+    expect(on.state).toBe("active");
+    const off = await host.dispose("demo.washout");
+    expect(off).toMatchObject({ state: "quarantined", reasonCode: "DISPOSE_INCOMPLETE" });
+    const bytesBefore = readFileSync(store.pathFor("demo.washout"), "utf8");
+
+    const intruder = counters();
+    const refused = await host.activate(
+      request("demo.washout", moduleWith(intruder), "washout-v2"),
+    );
+    expect(refused).toMatchObject({ state: "blocked", reasonCode: "LIFECYCLE_RECOVERY_PENDING" });
+    expect(intruder.prepared).toBe(0);
+    // 隔离账逐字节不变：remainingResourceIds/manualActions 一个都不许丢。
+    expect(readFileSync(store.pathFor("demo.washout"), "utf8")).toBe(bytesBefore);
+    expect(store.read("demo.washout").lifecycleState).toBe("quarantined");
+  });
+
+  it("中断态不得被普通安装覆盖（51F）：disposing 在飞账拒装、字节不变", async () => {
+    const store = new PluginOperationStore(join(root, `store-${seq++}`));
+    const host = new PluginTransactionHost({ store, newOperationId: () => `op-${seq++}` });
+    const ref = moduleRefFromSource("midflight-v1");
+    const parked: PluginAuthorityRecord = {
+      schemaVersion: 1,
+      pluginId: "demo.midflight",
+      lifecycleState: "disposing",
+      enabled: false,
+      moduleRef: ref,
+      config: { enabled: false, settings: {} },
+      bindings: {},
+      verifiedScope: {},
+      operation: {
+        operationId: "op-midflight",
+        operation: "dispose",
+        phase: "disposing",
+        moduleRef: ref,
+        resources: [],
+        rollbackCompleted: false,
+        disposeCompleted: false,
+        cleanupAttempts: [],
+      },
+    };
+    store.save(parked);
+    const bytesBefore = readFileSync(store.pathFor("demo.midflight"), "utf8");
+
+    const intruder = counters();
+    const refused = await host.activate(
+      request("demo.midflight", moduleWith(intruder), "midflight-v2"),
+    );
+    expect(refused).toMatchObject({
+      state: "blocked",
+      reasonCode: "LIFECYCLE_RECOVERY_PENDING",
+      detail: expect.stringContaining("disposing"),
+    });
+    expect(intruder.prepared).toBe(0);
+    expect(readFileSync(store.pathFor("demo.midflight"), "utf8")).toBe(bytesBefore);
   });
 });

@@ -98,8 +98,9 @@ export class PluginTransactionHost {
     if (!isSelfDescribingModuleRef(request.moduleRef)) {
       throw new Error(`moduleRef must self-describe its digest algorithm: ${request.moduleRef}`);
     }
-    // 写盘门（PR#97 评审①）：普通安装复用现役 id，在落第一笔权威记录之前拒掉，
-    // 现役账与 runtime 一概不动；blocked 重试 / disposed 重装不经此门（旧账非 active）。
+    // 写盘门（PR#97 评审① + 153/51F 渡审）：落第一笔权威记录之前按真账状态裁决——
+    // active → PLUGIN_ID_CONFLICT；坏账/在飞/quarantined → LIFECYCLE_RECOVERY_PENDING
+    // （fail-closed，原字节不动）；仅 ENOENT、blocked 显式重试、disposed 重装放行。
     const refused = refuseActiveIdOverwrite(request.pluginId, this.#active, this.#store);
     if (refused !== null) return refused;
     const operationId = this.#newOperationId();
