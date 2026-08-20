@@ -103,15 +103,22 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 - [ ] **[PV0-C10](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s3) 生命周期中断可恢复**：分别在 ① activate 已创建资源但 active 终态写盘前、
   ② active 终态已写盘但 `PreparedPlugin.activate()` 尚未返回时、
   ③ dispose 已撤销部分资源时杀死宿主进程。重启后先执行操作日志协调且插件入口始终不可达：
+  fixture 的三个资源必须是宿主子进程退出后仍存活、可由父进程独立枚举的外部副作用（例如
+  fixture 目录内的锁文件/端口代理登记）；不能用随子进程一起消失的内存计数器冒充回收。
+  宿主 `operationId` 与每个资源的稳定 recovery key 都要在首个副作用前落盘。重启协调只能调用
+  `PluginModuleV0.recover(context)` 重建专用撤销器，不得重跑普通 prepare/activate：
   ① 按持久化注册日志回滚后停在 `blocked + ACTIVATE_FAILED`，保留 plugin id、operationId、
   `enabled: true` 的启用意图、配置与绑定，等待显式重试或停用；
   ② 已写盘的 active 记录改回 `blocked + ACTIVATE_FAILED`，与 ① 同终态、同样保留启用意图——
   协调**不得**调用 `PreparedPlugin.activate()` 补跑发布，也不得把该记录投影为 active/ready；
   发布步骤无幂等要求，补跑等于替住户按下重试。**同时断言资源真被回收**：三个资源均已
   activate 过，协调必须按注册逆序 `revoke` 全部资源并 `rollback`，撤销回执逐笔落盘，
-  全部成功后记录才改写为 `blocked`；探针在协调后为零。跳过 revoke 直接改写状态位、
+  全部成功后记录才改写为 `blocked`；父进程探针在协调后为零，且 prepare/两个 activate 的
+  调用计数在重启协调期间均不增加。跳过 revoke 直接改写状态位、
   或以「终态已写盘」为由把资源留在已提交状态，本条变红；
-  ③ 从撤销回执继续逆序清理，失败则 quarantined。剩余资源 id 与 quarantined 记录跨重启仍可
+  ③ 从撤销回执继续逆序清理，失败则 quarantined。另加缺失/重复/漂移 recovery key 与
+  `recover(context)` 抛错四个分支：均返回 `RECOVERY_HANDLE_UNAVAILABLE` 并 quarantined，
+  外部残留和人工处理清单继续可枚举，不得写成 blocked/disposed。剩余资源 id 与 quarantined 记录跨重启仍可
   枚举，协调期间返回 `LIFECYCLE_RECOVERY_PENDING`，不得把任一孤儿中间态恢复成 ready 或假装
   从未安装。此处协调是启动时未完成 activate/dispose 日志的恢复，不是用户重试；协调后 blocked
   只能显式修复/重试重新走生命周期，或显式停用清理。
@@ -264,6 +271,8 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 | C10 | 把启动时 activate/dispose 日志协调当用户重试、协调后自动 ready/active，或清除失败记录并假装未安装 | C10 |
 | C10 | 把写盘后未发布的 active 记录当作已发布：协调阶段补跑 `PreparedPlugin.activate()`，或直接投影为 active/ready | C10 |
 | C10 | 写盘后未发布的记录只改状态位不回滚资源：跳过 `revoke`/`rollback` 直接写 `blocked`，把已 activate 的资源留在已提交状态 | C10 |
+| C10 | 只把内存 `DisposableHandle` 当恢复能力，操作日志不写 recovery key；或重启协调重跑普通 `prepare`/`activate` 来重新拿句柄 | C10 |
+| C10 | recovery key 缺失、重复、漂移或 `recover(context)` 失败后仍写 `blocked`/`disposed`，不进 `quarantined + RECOVERY_HANDLE_UNAVAILABLE` | C10 |
 | C11 | 先持久化公开路由索引，再写 active 四元组 | C11 |
 | C12 | quarantined 进入后自动重试、把重复 dispose 当作宿主 `retryCleanup` 显式清理重试、把重试失败当 disposed，或清掉剩余资源/人工处理记录 | C12 |
 | C13 | 先调 `PreparedPlugin.activate()` 发布，再逐资源提交 | C13 |
