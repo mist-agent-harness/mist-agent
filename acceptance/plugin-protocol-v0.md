@@ -105,7 +105,8 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
   ③ dispose 已撤销部分资源时杀死宿主进程。重启后先执行操作日志协调且插件入口始终不可达：
   fixture 的三个资源必须是宿主子进程退出后仍存活、可由父进程独立枚举的外部副作用（例如
   fixture 目录内的锁文件/端口代理登记）；不能用随子进程一起消失的内存计数器冒充回收。
-  宿主 `operationId` 与每个资源的稳定 recovery key 都要在首个副作用前落盘。重启协调只能调用
+  宿主 `operationId`、装载模块的 `moduleRef` 与每个资源的稳定 recovery key 都要在首个
+  副作用前落盘。重启协调只能调用
   `PluginModuleV0.recover(context)` 重建专用撤销器，不得重跑普通 prepare/activate：
   ① 按持久化注册日志回滚后停在 `blocked + ACTIVATE_FAILED`，保留 plugin id、operationId、
   `enabled: true` 的启用意图、配置与绑定，等待显式重试或停用；
@@ -116,8 +117,9 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
   全部成功后记录才改写为 `blocked`；父进程探针在协调后为零，且 prepare/两个 activate 的
   调用计数在重启协调期间均不增加。跳过 revoke 直接改写状态位、
   或以「终态已写盘」为由把资源留在已提交状态，本条变红；
-  ③ 从撤销回执继续逆序清理，失败则 quarantined。另加缺失/重复/漂移 recovery key 与
-  `recover(context)` 抛错四个分支：均返回 `RECOVERY_HANDLE_UNAVAILABLE` 并 quarantined，
+  ③ 从撤销回执继续逆序清理，失败则 quarantined。另加缺失/重复/漂移 recovery key、
+  模块内容摘要与 `moduleRef` 不符、与 `recover(context)` 抛错五个分支：均返回
+  `RECOVERY_HANDLE_UNAVAILABLE` 并 quarantined，
   外部残留和人工处理清单继续可枚举，不得写成 blocked/disposed。剩余资源 id 与 quarantined 记录跨重启仍可
   枚举，协调期间返回 `LIFECYCLE_RECOVERY_PENDING`，不得把任一孤儿中间态恢复成 ready 或假装
   从未安装。此处协调是启动时未完成 activate/dispose 日志的恢复，不是用户重试；协调后 blocked
@@ -144,6 +146,13 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 
   宿主先调 `PreparedPlugin.activate()` 再逐资源提交、或在任一资源 activate 失败后仍发布，
   本条变红，返回 `ACTIVATE_FAILED` 且全量 rollback。
+- [ ] **[PV0-C14](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s3) 恢复凭据防模块漂移**：fixture 插件在 activate 已创建资源、active 终态
+  写盘前被杀（同 C10 ①时点）；保持 plugin id 与声明版本字符串不变，原地改写模块内容后重启
+  宿主。协调必须在调用 `recover` 之前重算模块内容摘要并与操作日志 `moduleRef` 比对：不符即
+  返回 `RECOVERY_HANDLE_UNAVAILABLE` 并进入 `quarantined`，`recover`/`prepare`/两个 activate
+  的调用计数在协调期间均为零，人工处理清单含期望与实际摘要且跨重启可枚举。仅凭声明版本
+  字符串判定「同版本」并调用 `recover`，或摘要不符仍继续协调，本条变红。显式重装或升级
+  路径不受本条限制，但不得由启动协调自动触发。
 
 ## D. 绑定、角色与凭证类型
 
@@ -276,6 +285,7 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 | C11 | 先持久化公开路由索引，再写 active 四元组 | C11 |
 | C12 | quarantined 进入后自动重试、把重复 dispose 当作宿主 `retryCleanup` 显式清理重试、把重试失败当 disposed，或清掉剩余资源/人工处理记录 | C12 |
 | C13 | 先调 `PreparedPlugin.activate()` 发布，再逐资源提交 | C13 |
+| C14 | 仅凭声明版本字符串当恢复凭据：不比对模块内容摘要就调用 `recover`，或摘要不符仍写 `blocked` 继续协调 | C14 |
 | D01 | 仅以 lane 为键，忽略 residentId | D01 |
 | D02 | 给 subagent 挂载住户记忆 | D02 |
 | D03 | 显式换道时沿用原车道权限结果 | D03 |

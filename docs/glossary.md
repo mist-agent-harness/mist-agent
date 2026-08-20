@@ -119,10 +119,11 @@ reason code 跨重启保留；重启不能把它洗成 ready。显式清理重�
 `RecoveredPlugin.revoke` 执行，不能留下无人认领的活线。
 
 **恢复描述符（recovery descriptor）**
-宿主生成的稳定 `operationId` 与插件为每个资源声明的稳定 `recoveryKey`。宿主必须在对应副作用
-发生前把它们写入操作日志；进程重启后，插件只能通过 `PluginModuleV0.recover` 读取这些描述符
+宿主生成的稳定 `operationId`、宿主装载模块时自算的内容摘要 `moduleRef`，与插件为每个资源
+声明的稳定 `recoveryKey`。宿主必须在对应副作用发生前把它们写入操作日志；进程重启后，宿主
+先重算模块摘要与 `moduleRef` 比对，一致才允许通过 `PluginModuleV0.recover` 读取这些描述符
 并重建专用撤销器，不得重跑普通 `prepare` 或 `activate`。它不保存函数对象、secret 值或任意运行时闭包。
-描述符缺失、重复、漂移或无法重建时，资源进入 `quarantined`，不能只改状态位假装已回滚。
+描述符缺失、重复、漂移、模块摘要不符或无法重建时，资源进入 `quarantined`，不能只改状态位假装已回滚。
 
 **PreparedPlugin.rollback**
 一次 prepare 的**整次逆操作**。它幂等，用于 activate 失败或中断前撤销本次 prepare 的资源；

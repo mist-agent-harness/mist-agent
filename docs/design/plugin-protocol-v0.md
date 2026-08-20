@@ -272,14 +272,19 @@ activate 阶段有两个 `activate()`，顺序固定、不得颠倒：宿主先�
 生命周期事务必须跨宿主进程边界可恢复。内存里的 `DisposableHandle` 与 `PreparedPlugin`
 不能算恢复证据：宿主进程死亡后这些函数对象已经不存在。宿主在执行第一个生命周期副作用前，
 先持久化带 `operationId` 的操作日志；日志至少记录 plugin id、操作种类（activate/dispose）、
-当前阶段、每个资源的恢复记录与已完成撤销回执。active 终态必须先与
+当前阶段、装载模块的 `moduleRef`、每个资源的恢复记录与已完成撤销回执。`moduleRef` 是宿主
+装载插件模块时对模块内容自算的摘要（例如对解析后的模块入口产物做 sha-256）：声明式版本
+字符串可漂移、可撞名，不得充当恢复凭据。activate 成功后 `moduleRef` 随 active 权威记录
+持久保留，后续 dispose 操作日志沿用该值；模块内容变更只能走显式升级或重装路径，不属于
+启动协调可恢复范畴。active 终态必须先与
 配置、绑定和 verified scope 原子写盘，
 再公开路由与能力；因此不存在“已经公开但没有权威 active 记录”的合法顺序。任何可枚举的
 插件入口、路由索引与工具目录都必须是已持久化 active 四元组的子集，不得把公开索引作为一笔
 更早、更独立的提交。
 
 宿主启动时必须先协调未完成操作，再发布任何插件入口：中断在 activate 提交前的操作保持
-不可达。协调器重新加载同版本插件模块，只能调用一次 `PluginModuleV0.recover(context)`，用
+不可达。协调器重新解析插件模块并重算内容摘要，与操作日志中的 `moduleRef` 比对一致——
+「同一模块」以此为凭，不以声明版本字符串为凭——才能调用一次 `PluginModuleV0.recover(context)`，用
 持久恢复描述符取得 `RecoveredPlugin`，再按日志逆序调用其 `revoke(record)` 和 `rollback()`；
 中断在 dispose 的事务则按撤销回执继续 `revoke(record)`，最后调用恢复 `dispose()`。不得重跑
 普通 `prepare`、`ResourceDeclaration.activate` 或 `PreparedPlugin.activate` 来制造新
@@ -287,9 +292,10 @@ activate 阶段有两个 `activate()`，顺序固定、不得颠倒：宿主先�
 `enabled: true` 的启用意图、配置与绑定，直到显式重试，或住户把 `enabled` 改为 false 后进入
 disposed。不能把一次失败启用擦成“从没安装过”。
 
-模块缺少 `recover`、恢复键缺失/重复/漂移、恢复器构造失败，或恢复器不能覆盖日志中的全部
-剩余资源时，宿主返回 `RECOVERY_HANDLE_UNAVAILABLE` 并进入 `quarantined`：入口继续关闭，
-持久保留未撤销资源 id、恢复键摘要、reason code 与人工处理清单。只有真正取得恢复器并收到
+模块缺少 `recover`、模块内容摘要与 `moduleRef` 不符、恢复键缺失/重复/漂移、恢复器构造失败，
+或恢复器不能覆盖日志中的全部剩余资源时，宿主返回 `RECOVERY_HANDLE_UNAVAILABLE` 并进入
+`quarantined`：入口继续关闭，持久保留未撤销资源 id、恢复键摘要、reason code 与人工处理清单
+（摘要不符时含期望与实际 `moduleRef`）。只有真正取得恢复器并收到
 全部撤销回执，才允许落到 `blocked + ACTIVATE_FAILED`；不能把“无法证明已回收”降格为普通
 activate 失败。
 
