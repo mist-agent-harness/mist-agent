@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { MessageTreeService, MessageTreeStore } from "../src/message-tree/index.ts";
 import type { SessionHeadPort } from "../src/message-tree/index.ts";
+import { SessionRegistry, WINDOW_ARCHIVED } from "../src/session/session-registry.ts";
 
 class TestSessionHeads implements SessionHeadPort {
   readonly #heads = new Map<string, string>();
@@ -146,6 +147,28 @@ describe("MessageTreeService.say", () => {
     expect(store.history("resident-a")).toEqual([]);
     expect(heads.getHead("resident-a")).toBe("missing-parent");
     expect(heads.writes).toEqual([]);
+  });
+
+  it("归档窗在读 head 时先 fail-closed，say/revise 都不会留下孤儿节点", async () => {
+    const store = deterministicStore();
+    store.createRoom("resident-a");
+    const sessions = new SessionRegistry<null>();
+    const window = sessions.open("resident-a", { context: null });
+    const service = new MessageTreeService(store, {
+      getHead: (windowId) => sessions.getHead(windowId),
+      setHead: (windowId, headId) => sessions.setHead(windowId, headId),
+    });
+    const reply = await service.say("resident-a", "归档前", window.windowId);
+    const before = store.history("resident-a");
+    sessions.kill(window.windowId);
+
+    await expect(service.say("resident-a", "不应落树", window.windowId)).rejects.toThrow(
+      WINDOW_ARCHIVED,
+    );
+    await expect(
+      service.reviseNode("resident-a", reply.id, "也不应落树", window.windowId),
+    ).rejects.toThrow(WINDOW_ARCHIVED);
+    expect(store.history("resident-a")).toEqual(before);
   });
 
   it("相同正文的两轮仍各自落完整节点，不按内容去重", async () => {

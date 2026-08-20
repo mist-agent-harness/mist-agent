@@ -1,6 +1,7 @@
 import { SessionRegistry } from "../../src/session/session-registry.ts";
 
-const sessions = new SessionRegistry<null>();
+const archivePath = process.env.MIST_WINDOW_ARCHIVE_PATH;
+const sessions = new SessionRegistry<null>(archivePath === undefined ? {} : { archivePath });
 
 type HostCommand = {
   requestId: string;

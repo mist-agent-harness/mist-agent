@@ -71,6 +71,8 @@ export class MessageTreeService {
     newContent: string,
     windowId: string,
   ): Promise<HistoryNode> {
+    // 读侧先验证窗仍可写；归档窗不能先落一条 sibling 再在 setHead 时才失败。
+    this.#sessionHeads.getHead(windowId);
     const revised = this.#store.appendSibling(residentId, nodeId, newContent);
     // #14 二轮 + 认领人延伸裁定：改口即换枝，assistant/user 一视同仁，
     // active head 都切到新兄弟。若改的是 user 且未重新生成便继续 say，下一棵
