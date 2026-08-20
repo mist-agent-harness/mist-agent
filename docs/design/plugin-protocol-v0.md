@@ -163,7 +163,7 @@ instance config 或配置快照——保护由通道决定，不由字段名决�
 interface PluginModuleV0 {
   migrate?(request: MigrationRequest): Promise<unknown>;
   prepare(context: PluginPrepareContext): Promise<PreparedPlugin>;
-  recover(context: PluginRecoveryContext): Promise<RecoveredPlugin>;
+  recover?(context: PluginRecoveryContext): Promise<RecoveredPlugin>; // 经 context 注册过资源的插件必须导出；见 §3 恢复段
 }
 
 interface PluginPrepareContext {
@@ -292,10 +292,14 @@ activate 阶段有两个 `activate()`，顺序固定、不得颠倒：宿主先�
 `enabled: true` 的启用意图、配置与绑定，直到显式重试，或住户把 `enabled` 改为 false 后进入
 disposed。不能把一次失败启用擦成“从没安装过”。
 
-模块缺少 `recover`、模块内容摘要与 `moduleRef` 不符、恢复键缺失/重复/漂移、恢复器构造失败，
-或恢复器不能覆盖日志中的全部剩余资源时，宿主返回 `RECOVERY_HANDLE_UNAVAILABLE` 并进入
-`quarantined`：入口继续关闭，持久保留未撤销资源 id、恢复键摘要、reason code 与人工处理清单
-（摘要不符时含期望与实际 `moduleRef`）。只有真正取得恢复器并收到
+操作日志中尚有资源记录而模块未导出 `recover`、模块内容摘要与 `moduleRef` 不符、
+恢复键缺失/重复/漂移、恢复器构造失败，或恢复器不能覆盖日志中的全部剩余资源时，宿主返回
+`RECOVERY_HANDLE_UNAVAILABLE` 并进入 `quarantined`：入口继续关闭，持久保留未撤销资源 id、
+恢复键摘要、reason code 与人工处理清单（摘要不符时含期望与实际 `moduleRef`）。
+`recover` 因此在签名上是可选成员：从未经 context 注册资源的插件可以不导出它。这类插件的
+操作日志里没有资源记录，协调无需恢复器——activate 中断照上文落 `blocked + ACTIVATE_FAILED`，
+dispose 中断按撤销回执（全空即无事可撤）落 disposed；不得仅因未导出 `recover` 进入
+`quarantined`，也不得反过来强迫零资源插件实现一个永远不会被调用的方法。只有真正取得恢复器并收到
 全部撤销回执，才允许落到 `blocked + ACTIVATE_FAILED`；不能把“无法证明已回收”降格为普通
 activate 失败。
 
