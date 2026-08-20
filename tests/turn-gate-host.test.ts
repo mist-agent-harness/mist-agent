@@ -143,18 +143,19 @@ describe("turn-gate real host subprocess", () => {
       });
     }
 
+    // 启动包先走：开首窗（baseline=50 + 冻结快照），currentFacts 携带开窗
+    // 截面的现行有效集——包即交付，不是全史拉取。
+    const pack = await callHost<BootPack>(child, { op: "bootpack", residentId });
+    expect(pack.currentFacts).toHaveLength(50);
+    expect(pack.currentFacts?.every((entry) => entry.kind === "ruling")).toBe(true);
+
+    // 快照已被包消费：首轮 say 零注入（不背全史），模型拿到的就是原话。
     const said = await callHost<SayResult>(child, {
       op: "sayOn",
       residentId,
       message: "placeholder first turn",
     });
-    // 首次 say 懒开窗记 baseline=50：无全史拉取（缺口为零）。但开窗不算交付——
-    // 现行有效集以「初始对齐」标注随首轮注入交付一次，不是缺口条目。
-    expect(said.prompt).toContain(
-      "[权威事实账·现行有效集（初始对齐）| kind=ruling | seq=1 | author=main-thread] placeholder ruling 1",
-    );
-    expect(said.prompt).toContain("placeholder ruling 50");
-    expect(said.prompt).not.toContain("[权威事实账缺口");
+    expect(said.prompt).toBe("placeholder first turn");
 
     const windowId = await driverWindowId(child);
     expect(await callHost<number>(child, { op: "ackedSeq", residentId, windowId })).toBe(50);
@@ -164,7 +165,7 @@ describe("turn-gate real host subprocess", () => {
       ackedSeq: 50,
     });
 
-    // 初始对齐只交付一次：第二轮 say 只剩用户原话。
+    // 第二轮 say 同样只有原话——初始对齐只交付一次。
     const secondSay = await callHost<SayResult>(child, {
       op: "sayOn",
       residentId,
@@ -172,9 +173,10 @@ describe("turn-gate real host subprocess", () => {
     });
     expect(secondSay.prompt).toBe("placeholder second turn");
 
-    const pack = await callHost<BootPack>(child, { op: "bootpack", residentId });
-    expect(pack.currentFacts).toHaveLength(50);
-    expect(pack.currentFacts?.every((entry) => entry.kind === "ruling")).toBe(true);
+    // 已交付的窗再要启动包：显式拒绝（要重建请先 killSession）。
+    await expect(callHost(child, { op: "bootpack", residentId })).rejects.toThrow(
+      /BootPackAlignmentError/,
+    );
   });
 
   it("MV-C01/C02 横向可见：主线程落账后，B 窗下一轮经拉取看到裁定并追平（无推送通道可丢）", async () => {
@@ -352,8 +354,8 @@ describe("turn-gate real host subprocess", () => {
     );
     expect(await callHost<number>(child, { op: "ackedSeq", residentId, windowId })).toBe(2);
 
-    // 现行有效集不再含旧条目。
-    const pack = await callHost<BootPack>(child, { op: "bootpack", residentId });
-    expect(pack.currentFacts).toEqual([]);
+    // 现行有效集不再含旧条目（直接查账侧推导视图；此窗初始对齐已交付，
+    // 启动包只对未对齐的窗生成——MV-A05 已钉包通道）。
+    expect(await callHost<LedgerEntry[]>(child, { op: "currentSet", residentId })).toEqual([]);
   });
 });

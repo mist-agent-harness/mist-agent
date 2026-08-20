@@ -2,7 +2,7 @@ import { chmodSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createDriver } from "../src/acceptance-driver.ts";
+import { BootPackAlignmentError, createDriver } from "../src/acceptance-driver.ts";
 import { MessageTreeError } from "../src/message-tree/index.ts";
 import type { TurnGateEvent } from "../src/session/turn-gate.ts";
 import { FactLedger } from "../src/store/fact-ledger.ts";
@@ -374,5 +374,138 @@ describe("F5 两个真实 MistDriver 共用 dataDir 与 FactLedger", () => {
     await driverB.say(residentId, "占位 B 窗第二句");
     expect(ledger.ackedSeq(residentId, windowB)).toBe(1);
     expect(ledger.ackedSeq(residentId, windowA)).toBe(1);
+  });
+});
+
+describe("初始对齐 exactly-once（冻结快照语义，四轮复核反例）", () => {
+  it("revise-first：开窗后落的 ruling 只经缺口出现一次，不标初始对齐", async () => {
+    const ledger = new FactLedger();
+    const prompts: string[] = [];
+    const driver = createDriver({
+      factLedger: ledger,
+      reply: (_residentId, message) => {
+        prompts.push(message);
+        return "占位回应";
+      },
+    });
+    const residentId = await driver.createResident("placeholder-revise-first");
+    await driver.say(residentId, "占位旧节点");
+    const assistant = (await driver.history(residentId)).find((node) => node.role === "assistant");
+    if (assistant === undefined) throw new Error("第一轮没造出旧节点");
+    await driver.killSession(residentId);
+
+    // reviseNode 懒开新窗：baseline 记在此刻，初始快照也冻结在此刻（空）。
+    await driver.reviseNode(residentId, assistant.id, "占位改口");
+    ledger.append(residentId, {
+      author: "main-thread",
+      kind: "ruling",
+      body: "占位裁定-revise-first",
+    });
+    await driver.say(residentId, "占位新窗首句");
+
+    const prompt = prompts[prompts.length - 1];
+    if (prompt === undefined) throw new Error("新窗首轮没有 prompt");
+    // 快照冻在开窗截面，不含这条 ruling——它只经缺口通道出现，恰好一次。
+    expect(prompt).toContain(
+      "[权威事实账缺口 | kind=ruling | seq=1 | author=main-thread] 占位裁定-revise-first",
+    );
+    expect(prompt).not.toContain("初始对齐");
+    expect(prompt.split("占位裁定-revise-first")).toHaveLength(2);
+  });
+
+  it("开窗已有 ruling、首轮交付前被 supersede：快照保住原 ruling，按序看到事实→解除", async () => {
+    const ledger = new FactLedger();
+    const prompts: string[] = [];
+    const driver = createDriver({
+      factLedger: ledger,
+      reply: (_residentId, message) => {
+        prompts.push(message);
+        return "占位回应";
+      },
+    });
+    const residentId = await driver.createResident("placeholder-supersede-timing");
+    ledger.append(residentId, {
+      author: "main-thread",
+      kind: "ruling",
+      body: "占位裁定-将被解除",
+    });
+    // 第一扇窗先把 ruling 交付掉（初始对齐注入），拿到一个旧节点。
+    await driver.say(residentId, "占位旧节点");
+    const assistant = (await driver.history(residentId)).find((node) => node.role === "assistant");
+    if (assistant === undefined) throw new Error("第一轮没造出旧节点");
+    await driver.killSession(residentId);
+
+    // 新窗在 ruling 还活着时冻结快照；随后 ruling 被解除——现取 currentSet
+    // 已经空了，但冻结快照里它还是原来的样子。
+    await driver.reviseNode(residentId, assistant.id, "占位改口");
+    ledger.supersede(residentId, 1, { author: "main-thread", reason: "占位解除理由" });
+    expect(ledger.currentSet(residentId)).toEqual([]);
+    await driver.say(residentId, "占位新窗首句");
+
+    const prompt = prompts[prompts.length - 1];
+    if (prompt === undefined) throw new Error("新窗首轮没有 prompt");
+    const initialMark =
+      "[权威事实账·现行有效集（初始对齐）| kind=ruling | seq=1 | author=main-thread] 占位裁定-将被解除";
+    const supersedeMark =
+      "[权威事实账缺口 | kind=supersede | seq=2 | supersedes=seq 1 | author=main-thread] 占位解除理由";
+    expect(prompt).toContain(initialMark);
+    expect(prompt).toContain(supersedeMark);
+    // 按序：先看到事实本体，再看到指向它的解除——模型看得懂时序。
+    expect(prompt.indexOf(initialMark)).toBeLessThan(prompt.indexOf(supersedeMark));
+  });
+
+  it("say-first 交付后再 buildBootPack：显式抛 BootPackAlignmentError", async () => {
+    const ledger = new FactLedger();
+    const driver = createDriver({ factLedger: ledger });
+    const residentId = await driver.createResident("placeholder-bootpack-after-say");
+    ledger.append(residentId, { author: "main-thread", kind: "ruling", body: "占位裁定" });
+    await driver.say(residentId, "占位首句"); // 首轮注入即交付
+
+    await expect(driver.buildBootPack(residentId)).rejects.toThrow(BootPackAlignmentError);
+
+    // killSession 后新窗重新冻结快照、重新对齐，包通道恢复。
+    await driver.killSession(residentId);
+    const pack = await driver.buildBootPack(residentId);
+    expect(pack.currentFacts?.map((entry) => entry.body)).toEqual(["占位裁定"]);
+  });
+
+  it("bootpack-first（正常交付）后再 buildBootPack：同样显式抛", async () => {
+    const ledger = new FactLedger();
+    const driver = createDriver({ factLedger: ledger });
+    const residentId = await driver.createResident("placeholder-bootpack-twice");
+    ledger.append(residentId, { author: "main-thread", kind: "ruling", body: "占位裁定" });
+
+    const pack = await driver.buildBootPack(residentId);
+    expect(pack.currentFacts).toHaveLength(1);
+
+    await expect(driver.buildBootPack(residentId)).rejects.toThrow(BootPackAlignmentError);
+  });
+});
+
+describe("ResidentStore 与 FactLedger 同目录共存（阻塞二）", () => {
+  it("联合往返：两边各自认领各自的后缀，互不吞档", () => {
+    const dir = freshDir();
+    const store1 = new ResidentStore({ dataDir: dir });
+    const ledger1 = new FactLedger({ dataDir: dir });
+    const residentId = store1.createResident("placeholder-shared-dir");
+    store1.remember(residentId, "占位记忆");
+    store1.commit(residentId, "占位承诺");
+    ledger1.createLedger(residentId);
+    // 窗开在落账之前：ack 后 ackedSeq > baselineSeq，重启才认得出「已交付」。
+    ledger1.openViewport(residentId, "w_probe");
+    ledger1.append(residentId, { author: "main-thread", kind: "ruling", body: "占位裁定" });
+    ledger1.ack(residentId, "w_probe", 1);
+
+    // 重启形态：两个存储从同一目录各自恢复——修复前 ResidentStore 会把
+    // .facts.json 当房间快照读，报「文件名与身份对不上」。
+    const store2 = new ResidentStore({ dataDir: dir });
+    const ledger2 = new FactLedger({ dataDir: dir });
+    expect(store2.recall(residentId, "占位").map((entry) => entry.content)).toEqual(["占位记忆"]);
+    expect(store2.commitments(residentId)).toEqual(["占位承诺"]);
+    expect(ledger2.entries(residentId).map((entry) => entry.body)).toEqual(["占位裁定"]);
+    expect(ledger2.currentSet(residentId)).toHaveLength(1);
+    expect(ledger2.ackedSeq(residentId, "w_probe")).toBe(1);
+    // ack 前进过的窗按重启退化语义视为已交付，无 pending。
+    expect(ledger2.pendingInitial(residentId, "w_probe")).toBeNull();
   });
 });

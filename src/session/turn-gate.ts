@@ -53,27 +53,11 @@ export interface TurnEventLogger {
   log(event: TurnGateEvent): void;
 }
 
-/**
- * 初始对齐的交付状态口。规则（主笔口径）：初始 currentSet 必须被显式交付
- * 一次且仅一次——交付通道只有启动包（buildBootPack 的 currentFacts）与
- * 首轮开工注入两条，开窗记 baseline 本身不算交付。窗死标记清，新窗重交；
- * 进程重启重交是安全的幂等（注入只是上下文，不是账）。
- */
-export interface InitialAlignmentPort {
-  isDelivered(windowId: string): boolean;
-  markDelivered(windowId: string): void;
-}
-
 export interface ViewportTurnGateOptions {
   /** 默认 no-op：不接日志的嵌入方不该被迫造一个哑 logger。 */
   logger?: TurnEventLogger;
   /** 窗代际查询口，一般由宿主的 SessionRegistry 适配；不给则事件里 generation 恒为 null。 */
   generationOf?: (windowId: string) => number | null;
-  /**
-   * 初始对齐状态口；不给则闸不做首轮注入——现行有效集只能经启动包交付
-   * （接账前的旧行为，Standalone 用闸的默认形态）。
-   */
-  initialAlignment?: InitialAlignmentPort;
 }
 
 const noopLogger: TurnEventLogger = {
@@ -105,13 +89,11 @@ export class ViewportTurnGate implements TurnGate {
   readonly #ledger: FactLedger;
   readonly #logger: TurnEventLogger;
   readonly #generationOf: ((windowId: string) => number | null) | undefined;
-  readonly #initialAlignment: InitialAlignmentPort | undefined;
 
   constructor(ledger: FactLedger, options: ViewportTurnGateOptions = {}) {
     this.#ledger = ledger;
     this.#logger = options.logger ?? noopLogger;
     this.#generationOf = options.generationOf;
-    this.#initialAlignment = options.initialAlignment;
   }
 
   #log(event: TurnGateEvent["event"], residentId: string, windowId: string, detail: string): void {
@@ -130,25 +112,27 @@ export class ViewportTurnGate implements TurnGate {
       this.#log("gate_unknown", residentId, windowId, `缺口未知：${probe.cause}`);
       throw new GateUnavailableError(residentId, windowId, probe.cause);
     }
-    // 初始对齐未交付的窗：现行有效集随本轮注入（排在缺口之前）。开窗记
-    // baseline 不算交付——否则 say-first 的窗会把开窗前已生效的裁定永久
-    // 跳过（baseline 只吃缺口，不吃存量）。
-    const alignment = this.#initialAlignment;
-    const needsAlignment = alignment !== undefined && !alignment.isDelivered(windowId);
-    const initialLines = needsAlignment
-      ? this.#ledger.currentSet(residentId).map(formatInitialEntry)
-      : [];
+    // 初始对齐未交付的窗（pendingInitial 非 null）：把开窗截面冻结的现行
+    // 有效集快照随本轮注入，排在缺口之前。开窗记 baseline 不算交付——
+    // 否则 say-first 的窗会把开窗前已生效的裁定永久跳过；快照必须是冻结
+    // 的——现取 currentSet 会在「首轮交付前被 supersede」时让原裁定无声
+    // 消失（模型只收到一条指向陌生 seq 的解除）。缺口条目永远只含
+    // baseline 之后的事件，与快照不重叠。
+    const pending = this.#ledger.pendingInitial(residentId, windowId);
+    const initialLines = pending === null ? [] : pending.map(formatInitialEntry);
+    // 空快照（开窗时现行集为空）与已交付在日志上同形：交付零条不值得占一行摘要。
+    const aligning = initialLines.length > 0;
     if (probe.latestSeq === probe.ackedSeq) {
-      const detail = needsAlignment
+      const detail = aligning
         ? `无缺口（latestSeq=${probe.latestSeq}）；初始对齐交付 ${initialLines.length} 条现行有效集`
         : `无缺口（latestSeq=${probe.latestSeq}）`;
       this.#log("gate_clear", residentId, windowId, detail);
-      // ackedSeq 已平 latestSeq，无需 ack；commit 只负责标交付——
-      // assistantReply 失败时 commit 不被调用，下轮原样重交。
+      // ackedSeq 已平 latestSeq，无需 ack；commit 只负责确认交付（幂等）——
+      // assistantReply 失败时 commit 不被调用，快照保留，下轮原样重交。
       return {
         contextPrefix: initialLines,
         commit: () => {
-          alignment?.markDelivered(windowId);
+          this.#ledger.clearPendingInitial(residentId, windowId);
         },
       };
     }
@@ -163,9 +147,9 @@ export class ViewportTurnGate implements TurnGate {
       "gate_gap_pulled",
       residentId,
       windowId,
-      needsAlignment
-        ? `pulled ${entries.length} entries (${seqRange})；初始对齐交付 ${initialLines.length} 条现行有效集`
-        : `pulled ${entries.length} entries (${seqRange})`,
+      pending === null || !aligning
+        ? `pulled ${entries.length} entries (${seqRange})`
+        : `pulled ${entries.length} entries (${seqRange})；初始对齐交付 ${initialLines.length} 条现行有效集`,
     );
     return {
       contextPrefix: [...initialLines, ...entries.map(formatGapEntry)],
@@ -177,8 +161,8 @@ export class ViewportTurnGate implements TurnGate {
         } catch (error) {
           // 回执未达不能否认本轮已交付（MV-C05）：树与 head 都已提交，
           // 向外抛错会让调用方以为这轮没发生而重试——同一句话落树两次。
-          // 记 ack_failed，ackedSeq 不前进、不标交付，下轮开工连缺口
-          // 带初始集一起重拉。
+          // 记 ack_failed，ackedSeq 不前进、快照保留，下轮开工连缺口
+          // 带快照一起重交。
           this.#log(
             "ack_failed",
             residentId,
@@ -187,8 +171,8 @@ export class ViewportTurnGate implements TurnGate {
           );
           return;
         }
-        // 先 ack 再标交付：回执到了才认「这轮交付完成」。
-        alignment?.markDelivered(windowId);
+        // 先 ack 再确认交付：回执到了才认「这轮交付完成」。
+        this.#ledger.clearPendingInitial(residentId, windowId);
         this.#log("gate_ack", residentId, windowId, `acked seq=${probe.latestSeq}`);
       },
     };

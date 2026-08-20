@@ -114,6 +114,13 @@ interface ViewportAckRow {
   /** 开窗那一刻的 latestSeq；新窗 ackedSeq 从 baseline 起算，不背全史（MV-A05）。 */
   baselineSeq: number;
   ackedSeq: number;
+  /**
+   * 开窗同一同步截面冻结的初始现行有效集快照（内存态，不落盘）；
+   * null = 已交付或已清理。冻结的意义：初始事实必须按「开窗那一刻的样子」
+   * 交付一次且仅一次——现取 currentSet 会在「首轮交付前被 supersede」时
+   * 让原裁定无声消失（模型只收到一条指向陌生 seq 的解除）。
+   */
+  pendingInitial: LedgerEntry[] | null;
 }
 
 interface ResidentLedger {
@@ -370,6 +377,11 @@ export class FactLedger {
    * 从 baseline 起算——append-only 的账配 ackedSeq=0 会让新窗的缺口等于全史
    * （MV-A05）。开窗前已落账的事实如需追溯，走 entries() 归档查询，不走缺口通道。
    *
+   * 记 baseline 的同一同步截面，把当时的现行有效集冻结成这扇窗的初始快照
+   * （pendingInitial）：初始事实按「开窗那一刻的样子」交付一次且仅一次——
+   * 交付通道只有启动包与首轮开工注入，开窗本身不算交付。快照纯内存态，
+   * 不落盘（重启退化语义见 #restore）。
+   *
    * viewportId 对账是不透明字符串；它的发号（w_ + ULID）是宿主的事，不在这里校验。
    */
   openViewport(residentId: string, viewportId: string): number {
@@ -378,13 +390,41 @@ export class FactLedger {
       throw new Error(`ack row already exists for viewport ${viewportId} in ${residentId}`);
     }
     const baselineSeq = ledger.entries.length;
-    const row: ViewportAckRow = { baselineSeq, ackedSeq: baselineSeq };
+    // 冻结副本：之后的 supersede 改推导视图，改不了这份快照（append-only
+    // 的账上旧条目本就不动，冻的是「哪些条目当时算现行」这个判断）。
+    const pendingInitial = ledger.entries
+      .filter((entry) => entry.kind !== "supersede" && !ledger.supersededSeqs.has(entry.seq))
+      .map((entry) => Object.freeze({ ...entry }));
+    const row: ViewportAckRow = { baselineSeq, ackedSeq: baselineSeq, pendingInitial };
     const candidate = new Map(ledger.viewports);
     candidate.set(viewportId, row);
     // 先落盘后发布，同 append。
     this.#persistSnapshot(this.#snapshotOf(residentId, ledger.entries, candidate));
     ledger.viewports.set(viewportId, row);
     return baselineSeq;
+  }
+
+  /**
+   * 这扇窗未交付的初始快照（开窗截面冻结的现行有效集）；已交付/已清理
+   * 返回 null——「已交付」与「从来没有过」对调用方都是「不要注入」。
+   * 返回副本：改返回值涂改不了快照。
+   */
+  pendingInitial(residentId: string, viewportId: string): LedgerEntry[] | null {
+    const row = this.#viewportRow(this.#ledger(residentId), viewportId);
+    const pending = row.pendingInitial;
+    return pending === null ? null : pending.map((entry) => ({ ...entry }));
+  }
+
+  /**
+   * 初始快照的交付确认/清理。幂等且容忍缺账缺窗：清理路径（交付成功、
+   * 窗死、销毁回卷）只管「结束后没有 pending」，不管「之前有没有」——
+   * 与 destroy 系 API 同一容忍口径。
+   */
+  clearPendingInitial(residentId: string, viewportId: string): void {
+    const ledger = this.#ledgers.get(residentId);
+    const row = ledger?.viewports.get(viewportId);
+    if (row === undefined) return;
+    row.pendingInitial = null;
   }
 
   /**
@@ -545,7 +585,27 @@ export class FactLedger {
         viewports: new Map(
           record.viewports.map((row) => [
             row.viewportId,
-            { baselineSeq: row.baselineSeq, ackedSeq: row.ackedSeq },
+            {
+              baselineSeq: row.baselineSeq,
+              ackedSeq: row.ackedSeq,
+              // 初始快照不落盘，重启退化语义：ackedSeq 还停在 baseline 的窗
+              // 视为「初始对齐从未交付」，按此刻的 live currentSet 重冻一份
+              // pending（幂等重交的近似——原始快照可能已被随后的 supersede
+              // 改变，重交的是「此刻的现行集」而不是「开窗那一刻的现行集」，
+              // 这是已认可的近似）；ackedSeq 前进过的窗视为已交付，无 pending。
+              pendingInitial:
+                row.ackedSeq === row.baselineSeq
+                  ? record.entries
+                      .filter(
+                        (entry) =>
+                          entry.kind !== "supersede" &&
+                          !record.entries.some(
+                            (s) => s.kind === "supersede" && s.supersedesSeq === entry.seq,
+                          ),
+                      )
+                      .map((entry) => Object.freeze({ ...entry }))
+                  : null,
+            },
           ]),
         ),
       });

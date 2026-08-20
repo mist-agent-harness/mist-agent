@@ -46,6 +46,21 @@ export interface CreateDriverOptions {
   turnEventLogger?: TurnEventLogger;
 }
 
+/**
+ * 启动包只对「初始对齐未交付」的窗生成：窗已经经首轮开工注入或上一份
+ * 启动包交付过初始现行有效集后，再包一次等于把「交付一次且仅一次」
+ * 撕成两次。显式报错而不是静默重包——要重建启动包请先 killSession
+ * （新窗重新冻结快照、重新对齐）。
+ */
+export class BootPackAlignmentError extends Error {
+  constructor(residentId: string, windowId: string) {
+    super(
+      `buildBootPack refused: window ${windowId} of ${residentId} 的初始对齐已交付——启动包只对未对齐的窗生成，要重建请先 killSession`,
+    );
+    this.name = "BootPackAlignmentError";
+  }
+}
+
 class MistDriver implements HarnessDriver {
   readonly #store: ResidentStore;
   readonly #messageTreeStore: MessageTreeStore;
@@ -75,12 +90,6 @@ class MistDriver implements HarnessDriver {
   readonly #factLedger: FactLedger | null;
   /** 开工闸实例；与 #factLedger 同生同灭（有账才有闸）。 */
   readonly #turnGate: ViewportTurnGate | null;
-  /**
-   * 初始对齐已交付的窗（windowId 集合）。「初始 currentSet 交付一次且仅一次」
-   * 的状态面：交付通道只有启动包与首轮开工注入两条，开窗记 baseline 不算
-   * 交付。内存态即可——进程重启重交是安全的幂等，窗死即清（新窗重交）。
-   */
-  readonly #alignedWindows = new Set<string>();
 
   constructor(options: CreateDriverOptions = {}) {
     this.#store = new ResidentStore(
@@ -96,12 +105,6 @@ class MistDriver implements HarnessDriver {
             // 事件三元组的 generation 向窗注册表现查；查不到（账上有而注册表
             // 没有的窗）落 null，不伪报代际。
             generationOf: (windowId) => this.#sessions.get(windowId)?.generation ?? null,
-            initialAlignment: {
-              isDelivered: (windowId) => this.#alignedWindows.has(windowId),
-              markDelivered: (windowId) => {
-                this.#alignedWindows.add(windowId);
-              },
-            },
           });
     const turnGate: TurnGate | null = this.#turnGate;
     this.#messageTree = new MessageTreeService(
@@ -208,9 +211,10 @@ class MistDriver implements HarnessDriver {
   }
 
   #killDriverWindows(residentId: string): void {
-    // 新窗要重新对齐：死窗的「初始对齐已交付」标记一并清掉。
+    // 新窗要重新对齐：死窗的未交付初始快照一并清掉（幂等；账已先销的
+    // 销毁路径上它是 no-op）。
     for (const window of this.#sessions.windowsOf(residentId)) {
-      this.#alignedWindows.delete(window.windowId);
+      this.#factLedger?.clearPendingInitial(residentId, window.windowId);
     }
     this.#sessions.killResident(residentId);
     this.#driverWindows.delete(residentId);
@@ -280,10 +284,10 @@ class MistDriver implements HarnessDriver {
   async reviseNode(residentId: string, nodeId: string, newContent: string): Promise<HistoryNode> {
     this.#ensureMessageRoom(residentId);
     // reviseNode 必须移动 head，离不开窗（#windowIdOf 可能懒开窗）。懒开窗记的
-    // baseline 会不会让初始 currentSet 被永久跳过？不会：开窗不算交付，后续
-    // 首次 say 的开工闸发现这扇窗「初始对齐未交付」，仍会把现行有效集注入
-    // （InitialAlignmentPort）。代价只是那次注入里初始集与缺口可能各标一遍
-    // 同一条新事实——标注不同、语义不冲突。
+    // baseline 会不会让初始 currentSet 被永久跳过？不会：开窗不算交付，这扇窗
+    // 的冻结快照（pendingInitial）还在账上，后续首次 say 的开工闸仍会把它注入。
+    // 反过来也不会重复：快照冻在开窗截面，开窗后落的 ruling 不在快照里，
+    // 只经缺口通道出现一次（revise-first 形状）。
     return this.#messageTree.reviseNode(
       residentId,
       nodeId,
@@ -302,18 +306,22 @@ class MistDriver implements HarnessDriver {
     this.#store.room(residentId); // 住户不存在先亮这个错，与未接账路径同语义。
     // 缺账 = 响亮抛，任何路径都不懒建账（拼错 residentId 同罪）。
     if (!ledger.has(residentId)) throw new LedgerNotFoundError(residentId);
-    // 包生成与首窗 baseline 必须在同一同步调用栈：「包之前落的裁定」已进
-    // currentSet，「包之后落的」走缺口通道——一条裁定在包与缺口里各出现
-    // 恰好一次，不永久漏、不两边重复。
     const bound = this.#driverWindows.get(residentId);
     const live = bound === undefined ? undefined : this.#sessions.get(bound);
     const window = live ?? this.#session(residentId);
-    const pack = assembleBootPack(this.#store, residentId, {
-      currentFacts: ledger.currentSet(residentId),
-    });
-    // 包即交付：currentFacts 进了包，这扇窗的初始对齐就算交付过——
+    // 包消费的是开窗截面冻结的同一份快照（不是现取的 currentSet）——
+    // 「开窗后、交付前被 supersede 的裁定」在包里仍是它原来的样子，
+    // 解除事件随后经缺口通道按序到达（事实→解除，模型看得懂时序）。
+    const pending = ledger.pendingInitial(residentId, window.windowId);
+    if (pending === null) {
+      // 初始对齐已交付过的窗：启动包只对未对齐的窗生成——再包一次等于把
+      // 「交付一次且仅一次」撕成两次。要重建包请先 killSession。
+      throw new BootPackAlignmentError(residentId, window.windowId);
+    }
+    const pack = assembleBootPack(this.#store, residentId, { currentFacts: pending });
+    // 包即交付：快照进了包，这扇窗的初始对齐就算交付过——
     // 首轮开工不再重复注入初始集，只拉包后新落的缺口。
-    this.#alignedWindows.add(window.windowId);
+    ledger.clearPendingInitial(residentId, window.windowId);
     return pack;
   }
 

@@ -93,6 +93,7 @@ type HostCommand = {
     | "appendRuling"
     | "supersede"
     | "entries"
+    | "currentSet"
     | "openWindowB"
     | "sayOn"
     | "sayOnB"
@@ -152,6 +153,8 @@ async function execute(command: HostCommand): Promise<unknown> {
       );
     case "entries":
       return ledger.entries(requireString(command.residentId, "residentId"));
+    case "currentSet":
+      return ledger.currentSet(requireString(command.residentId, "residentId"));
     case "openWindowB": {
       const residentId = requireString(command.residentId, "residentId");
       // 两个注册表各发各的号也不撞：生产发号是 w_ + ULID（进程间不可撞），

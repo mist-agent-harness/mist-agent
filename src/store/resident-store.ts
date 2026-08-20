@@ -231,6 +231,9 @@ export class ResidentStore {
     for (const file of readdirSync(dataDir).sort()) {
       // .tmp 是没写完的一次写入，旧 .json 才是权威——跳过即可，下次写会覆盖。
       if (!file.endsWith(".json")) continue;
+      // 同目录允许共存 FactLedger 快照（<id>.facts.json）：两边各自认领各自的
+      // 后缀，互不吞档。residentId 字符集 [a-z0-9-]+ 不含点，后缀划分无歧义。
+      if (file.endsWith(".facts.json")) continue;
       const record = JSON.parse(readFileSync(join(dataDir, file), "utf8")) as RoomRecord;
       if (record.schemaVersion !== SCHEMA_VERSION) {
         throw new Error(
