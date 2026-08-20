@@ -53,7 +53,7 @@ describe("MessageTreeService.say", () => {
       expect(tree.some((node) => node.id === headId && node.role === "assistant")).toBe(true);
     };
 
-    const reply = await service.say("resident-a", "第一句");
+    const reply = await service.say("resident-a", "第一句", "resident-a");
     const tree = await service.history("resident-a");
 
     expect(tree).toEqual([
@@ -79,8 +79,8 @@ describe("MessageTreeService.say", () => {
 
   it("同一会话第二轮 user 挂在上一轮 assistant 下", async () => {
     const { heads, service } = setup();
-    const firstReply = await service.say("resident-a", "第一句");
-    const secondReply = await service.say("resident-a", "第二句");
+    const firstReply = await service.say("resident-a", "第一句", "resident-a");
+    const secondReply = await service.say("resident-a", "第二句", "resident-a");
     const tree = await service.history("resident-a");
     const secondUser = tree.find((node) => node.content === "第二句" && node.role === "user");
 
@@ -92,11 +92,11 @@ describe("MessageTreeService.say", () => {
 
   it("会话 head 被杀后，下一轮从新根开始且旧树不动", async () => {
     const { heads, service } = setup();
-    await service.say("resident-a", "旧会话");
+    await service.say("resident-a", "旧会话", "resident-a");
     const beforeKill = await service.history("resident-a");
 
     heads.kill("resident-a");
-    const newReply = await service.say("resident-a", "新会话");
+    const newReply = await service.say("resident-a", "新会话", "resident-a");
     const afterKill = await service.history("resident-a");
     const newUser = afterKill.find((node) => node.content === "新会话" && node.role === "user");
 
@@ -115,7 +115,7 @@ describe("MessageTreeService.say", () => {
       },
     });
 
-    await expect(service.say("resident-a", "不会落库")).rejects.toThrow("model unavailable");
+    await expect(service.say("resident-a", "不会落库", "resident-a")).rejects.toThrow("model unavailable");
     expect(store.history("resident-a")).toEqual([]);
     expect(heads.writes).toEqual([]);
   });
@@ -131,7 +131,7 @@ describe("MessageTreeService.say", () => {
       },
     });
 
-    await expect(service.say("ghost", "不会进 responder")).rejects.toThrow();
+    await expect(service.say("ghost", "不会进 responder", "ghost")).rejects.toThrow();
     expect(responderCalls).toBe(0);
     expect(heads.writes).toEqual([]);
   });
@@ -140,7 +140,7 @@ describe("MessageTreeService.say", () => {
     const { store, heads, service } = setup();
     heads.force("resident-a", "missing-parent");
 
-    await expect(service.say("resident-a", "不能悬空")).rejects.toThrow();
+    await expect(service.say("resident-a", "不能悬空", "resident-a")).rejects.toThrow();
     expect(store.history("resident-a")).toEqual([]);
     expect(heads.getHead("resident-a")).toBe("missing-parent");
     expect(heads.writes).toEqual([]);
@@ -148,8 +148,8 @@ describe("MessageTreeService.say", () => {
 
   it("相同正文的两轮仍各自落完整节点，不按内容去重", async () => {
     const { service } = setup();
-    await service.say("resident-a", "重复");
-    await service.say("resident-a", "重复");
+    await service.say("resident-a", "重复", "resident-a");
+    await service.say("resident-a", "重复", "resident-a");
 
     const tree = await service.history("resident-a");
     expect(tree).toHaveLength(4);
@@ -159,7 +159,7 @@ describe("MessageTreeService.say", () => {
 
   it("修改 say/history 返回对象不能篡改 Store 原件", async () => {
     const { service } = setup();
-    const reply = await service.say("resident-a", "原文");
+    const reply = await service.say("resident-a", "原文", "resident-a");
     const before = await service.history("resident-a");
     const first = before[0];
     if (first === undefined) {
@@ -180,7 +180,7 @@ describe("MessageTreeService.say", () => {
 describe("MessageTreeService.reviseNode", () => {
   it("只新增同父同角色兄弟，旧节点完整不变", async () => {
     const { service } = setup();
-    const reply = await service.say("resident-a", "初稿");
+    const reply = await service.say("resident-a", "初稿", "resident-a");
     const before = await service.history("resident-a");
     const old = before.find((node) => node.id === reply.id);
     if (old === undefined) {
@@ -188,7 +188,7 @@ describe("MessageTreeService.reviseNode", () => {
     }
     const oldBefore = structuredClone(old);
 
-    const revised = await service.reviseNode("resident-a", reply.id, "改口");
+    const revised = await service.reviseNode("resident-a", reply.id, "改口", "resident-a");
     const after = await service.history("resident-a");
 
     expect(after).toHaveLength(before.length + 1);
@@ -204,20 +204,20 @@ describe("MessageTreeService.reviseNode", () => {
   it("跨房节点拒绝且两房零写入", async () => {
     const { store, service } = setup();
     store.createRoom("resident-b");
-    const reply = await service.say("resident-a", "只属于 A");
+    const reply = await service.say("resident-a", "只属于 A", "resident-a");
     const beforeA = store.history("resident-a");
     const beforeB = store.history("resident-b");
 
-    await expect(service.reviseNode("resident-b", reply.id, "越权")).rejects.toThrow();
+    await expect(service.reviseNode("resident-b", reply.id, "越权", "resident-b")).rejects.toThrow();
     expect(store.history("resident-a")).toEqual(beforeA);
     expect(store.history("resident-b")).toEqual(beforeB);
   });
 
   it("assistant 改口即换枝：下一轮 user 挂在新兄弟下", async () => {
     const { heads, service } = setup();
-    const reply = await service.say("resident-a", "初稿");
-    const revised = await service.reviseNode("resident-a", reply.id, "改口");
-    const nextReply = await service.say("resident-a", "沿新枝继续");
+    const reply = await service.say("resident-a", "初稿", "resident-a");
+    const revised = await service.reviseNode("resident-a", reply.id, "改口", "resident-a");
+    const nextReply = await service.say("resident-a", "沿新枝继续", "resident-a");
     const nextUser = (await service.history("resident-a")).find(
       (node) => node.role === "user" && node.content === "沿新枝继续",
     );
