@@ -115,7 +115,9 @@ describe("MessageTreeService.say", () => {
       },
     });
 
-    await expect(service.say("resident-a", "不会落库", "resident-a")).rejects.toThrow("model unavailable");
+    await expect(service.say("resident-a", "不会落库", "resident-a")).rejects.toThrow(
+      "model unavailable",
+    );
     expect(store.history("resident-a")).toEqual([]);
     expect(heads.writes).toEqual([]);
   });
@@ -208,7 +210,9 @@ describe("MessageTreeService.reviseNode", () => {
     const beforeA = store.history("resident-a");
     const beforeB = store.history("resident-b");
 
-    await expect(service.reviseNode("resident-b", reply.id, "越权", "resident-b")).rejects.toThrow();
+    await expect(
+      service.reviseNode("resident-b", reply.id, "越权", "resident-b"),
+    ).rejects.toThrow();
     expect(store.history("resident-a")).toEqual(beforeA);
     expect(store.history("resident-b")).toEqual(beforeB);
   });

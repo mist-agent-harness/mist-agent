@@ -24,7 +24,9 @@ describe("SessionRegistry：多窗语义", () => {
     const sessions = new SessionRegistry<null>();
 
     expect(sessions.open("resident-a", { context: null }).scopeId).toBe(PRIVATE_SCOPE);
-    expect(sessions.open("resident-a", { scopeId: "room-1", context: null }).scopeId).toBe("room-1");
+    expect(sessions.open("resident-a", { scopeId: "room-1", context: null }).scopeId).toBe(
+      "room-1",
+    );
   });
 
   it("MV-A03 kill 幂等，归档后只读，写入返 WINDOW_ARCHIVED", () => {
@@ -64,7 +66,12 @@ describe("SessionRegistry：多窗语义", () => {
     expect(reopened.generation).toBe(2);
     expect(fresh.generation).toBe(1);
     expect(sessions).not.toHaveProperty("currentGeneration");
-    expect(sessions.windowsOf("resident-a").map((w) => w.generation).sort()).toEqual([1, 2]);
+    expect(
+      sessions
+        .windowsOf("resident-a")
+        .map((w) => w.generation)
+        .sort(),
+    ).toEqual([1, 2]);
   });
 
   it("会话态归零不动住户留下的东西", () => {
@@ -76,7 +83,10 @@ describe("SessionRegistry：多窗语义", () => {
     const before = structuredClone(residentState);
     const sessions = new SessionRegistry<{ pending: string[] }>();
 
-    const w1 = sessions.open("resident-a", { headId: "node-2", context: { pending: ["还没落库的话"] } });
+    const w1 = sessions.open("resident-a", {
+      headId: "node-2",
+      context: { pending: ["还没落库的话"] },
+    });
     sessions.kill(w1.windowId);
 
     expect(sessions.get(w1.windowId)).toBeUndefined();
