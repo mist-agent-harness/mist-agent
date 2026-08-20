@@ -8,5 +8,7 @@ export type {
   AssistantReply,
   MessageTreeServiceOptions,
   SessionHeadPort,
+  TurnGate,
+  TurnPass,
 } from "./service.ts";
 export { MessageTreeStore } from "./store.ts";

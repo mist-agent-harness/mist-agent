@@ -17,9 +17,23 @@
  * Promise 即可；本模块不触碰 src/acceptance-driver.ts——那是 P4 的地盘。
  */
 import type { BootPack, MemoryEntry } from "../acceptance/driver.ts";
+import type { LedgerEntry } from "./store/fact-ledger.ts";
 import type { ResidentStore } from "./store/resident-store.ts";
 
-export function buildBootPack(store: ResidentStore, residentId: string): BootPack {
+export interface BuildBootPackOptions {
+  /**
+   * 现行有效集（MV-A05：随启动包注入）。由接了权威事实账的总装方透传
+   * ledger.currentSet() 的结果；不传则包里没有这个分区——
+   * 「没接账」与「账是空的」不许编码成同一个值（同 MV-C03 的口径）。
+   */
+  currentFacts?: LedgerEntry[];
+}
+
+export function buildBootPack(
+  store: ResidentStore,
+  residentId: string,
+  options: BuildBootPackOptions = {},
+): BootPack {
   const room = store.room(residentId);
   const memories = [...room.memories.values()].map(cloneEntry).sort(byCreatedAtThenId);
   return {
@@ -27,6 +41,9 @@ export function buildBootPack(store: ResidentStore, residentId: string): BootPac
     identity: room.name,
     commitments: [...room.commitments],
     memories,
+    // 直接引用透传：currentSet() 返回的已是全新数组与条目副本（条目本身
+    // 冻结），纯函数确定性不被破坏——同一存储状态仍产出逐字节相同的包。
+    ...(options.currentFacts === undefined ? {} : { currentFacts: options.currentFacts }),
   };
 }
 

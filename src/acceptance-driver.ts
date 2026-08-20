@@ -26,14 +26,24 @@ import {
   MessageTreeService,
   MessageTreeStore,
   type SessionHeadPort,
+  type TurnGate,
 } from "./message-tree/index.ts";
 import { createResidentMigrationService } from "./migration/resident-store-migration.ts";
 import { SessionRegistry } from "./session/session-registry.ts";
+import { type TurnEventLogger, ViewportTurnGate } from "./session/turn-gate.ts";
+import type { FactLedger } from "./store/fact-ledger.ts";
 import { ResidentStore } from "./store/resident-store.ts";
 
 export interface CreateDriverOptions {
   dataDir?: string;
   reply?: AssistantReply;
+  /**
+   * 权威事实账（泳道 2 接线）。给了就装开工闸：say 过闸、开窗记 baseline、
+   * 启动包带现行有效集；不给则整台 driver 行为与接账前完全一致。
+   */
+  factLedger?: FactLedger;
+  /** 闸事件日志口；不给则事件落 no-op（ViewportTurnGate 的默认）。 */
+  turnEventLogger?: TurnEventLogger;
 }
 
 class MistDriver implements HarnessDriver {
@@ -61,19 +71,38 @@ class MistDriver implements HarnessDriver {
    * 而不是反过来让注册表替调用方猜。
    */
   readonly #driverWindows = new Map<string, string>();
+  /** 权威事实账；null = 未接账，整台 driver 保持接账前行为。 */
+  readonly #factLedger: FactLedger | null;
+  /** 开工闸实例；与 #factLedger 同生同灭（有账才有闸）。 */
+  readonly #turnGate: ViewportTurnGate | null;
 
   constructor(options: CreateDriverOptions = {}) {
     this.#store = new ResidentStore(
       options.dataDir === undefined ? undefined : { dataDir: options.dataDir },
     );
     this.#messageTreeStore = new MessageTreeStore();
+    this.#factLedger = options.factLedger ?? null;
+    this.#turnGate =
+      this.#factLedger === null
+        ? null
+        : new ViewportTurnGate(this.#factLedger, {
+            ...(options.turnEventLogger === undefined ? {} : { logger: options.turnEventLogger }),
+            // 事件三元组的 generation 向窗注册表现查；查不到（账上有而注册表
+            // 没有的窗）落 null，不伪报代际。
+            generationOf: (windowId) => this.#sessions.get(windowId)?.generation ?? null,
+          });
+    const turnGate: TurnGate | null = this.#turnGate;
     this.#messageTree = new MessageTreeService(
       this.#messageTreeStore,
       {
         getHead: (windowId) => this.#sessions.getHead(windowId),
         setHead: (windowId, headId) => this.#sessions.setHead(windowId, headId),
       } satisfies SessionHeadPort,
-      { assistantReply: options.reply ?? ((_residentId, message) => `收到：${message}`) },
+      {
+        assistantReply: options.reply ?? ((_residentId, message) => `收到：${message}`),
+        // exactOptionalPropertyTypes 下不能显式塞 undefined：有闸才带这个键。
+        ...(turnGate === null ? {} : { turnGate }),
+      },
     );
     this.#migration = createResidentMigrationService(this.#store, this.#messageTreeStore);
   }
@@ -85,6 +114,9 @@ class MistDriver implements HarnessDriver {
       if (live !== undefined) return live;
     }
     const opened = this.#sessions.open(residentId, { headId: null, context: null });
+    // 开窗的唯一汇合点：账侧在这里记 baseline，新窗的 ackedSeq 从开窗那一刻
+    // 的 latestSeq 起算，不背全史（MV-A05）。
+    this.#factLedger?.openViewport(residentId, opened.windowId);
     this.#driverWindows.set(residentId, opened.windowId);
     return opened;
   }
@@ -115,6 +147,9 @@ class MistDriver implements HarnessDriver {
   async createResident(name: string): Promise<string> {
     const residentId = this.#store.createResident(name);
     this.#createMessageRoom(residentId);
+    // 人户与账本同时开立：有账的 driver 里「这个住户没有账」只许是响亮的错误，
+    // 不许在首次 say 时被静默建账吞掉（与 FactLedger 显式开户同一口径）。
+    this.#factLedger?.createLedger(residentId);
     return residentId;
   }
 
@@ -163,6 +198,10 @@ class MistDriver implements HarnessDriver {
 
   async history(residentId: string): Promise<HistoryNode[]> {
     this.#ensureMessageRoom(residentId, "tree");
+    // 普通动作半格（MV-C03）：读历史不拦，但查账失败要在日志留下「缺口未知」。
+    // #windowIdOf 可能懒开窗——只在接了账的路径上引入这个副作用，未接账时
+    // history 保持纯读。
+    this.#turnGate?.noteOrdinaryAction(residentId, this.#windowIdOf(residentId));
     return this.#messageTree.history(residentId);
   }
 
@@ -179,7 +218,14 @@ class MistDriver implements HarnessDriver {
   // --- P3：启动包 ---
 
   async buildBootPack(residentId: string): Promise<BootPack> {
-    return assembleBootPack(this.#store, residentId);
+    // 现行有效集随启动包注入（MV-A05）。没接账时不带这个分区——「没接账」
+    // 与「账是空的」在包上是两个形状，不许编码成同一个值（同 MV-C03 口径）。
+    // 接了账而住户没有账时 currentSet 会响亮地抛，不静默降级成缺分区。
+    return this.#factLedger === null
+      ? assembleBootPack(this.#store, residentId)
+      : assembleBootPack(this.#store, residentId, {
+          currentFacts: this.#factLedger.currentSet(residentId),
+        });
   }
 
   // --- P4：会话生杀（TODO(P4) 认领者替换）---
