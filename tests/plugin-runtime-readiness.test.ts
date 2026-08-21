@@ -402,6 +402,29 @@ describe("runtime readiness / readback contract", () => {
           readiness: receipt,
         }),
       ).rejects.toThrow("ready runtime readiness requires an authority verifiedScope");
+
+      const mismatchedCapabilityReceipt = {
+        ...receipt,
+        definition: { ...receipt.definition, capabilityId: "fixture.other" },
+        binding:
+          receipt.binding === null ? null : { ...receipt.binding, capabilityId: "fixture.other" },
+      };
+      const mismatchedCapabilityOutcome = await host.activate({
+        pluginId: definition.pluginId,
+        moduleRef,
+        module,
+        config: { enabled: true },
+        env: {},
+        bindings: {},
+        verifiedScope: mismatchedCapabilityReceipt.verifiedScope,
+        readiness: mismatchedCapabilityReceipt,
+      });
+      expect(mismatchedCapabilityOutcome).toMatchObject({
+        state: "blocked",
+        reasonCode: "ACTIVATE_FAILED",
+      });
+      expect(store.read(definition.pluginId).readiness).toBeUndefined();
+
       await host.activate({
         pluginId: definition.pluginId,
         moduleRef,

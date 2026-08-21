@@ -193,6 +193,17 @@ export class PluginTransactionHost {
       return this.#rollbackCurrent(record, resources, undefined, "PREPARE_FAILED");
     }
 
+    // Resource capability declarations are only authoritative after prepare(). Re-check a
+    // caller-supplied receipt before any resource activation or public projection; a receipt
+    // that passed the pre-write identity check must not outrun the plugin's actual inventory.
+    if (
+      request.readiness !== undefined &&
+      (!isReadinessReceipt(request.readiness) ||
+        !readinessMatchesAuthority(record, request.readiness))
+    ) {
+      return this.#rollbackCurrent(record, resources, prepared, "ACTIVATE_FAILED");
+    }
+
     record.lifecycleState = "prepared";
     record.operation.phase = "prepared";
     this.#store.save(record);
