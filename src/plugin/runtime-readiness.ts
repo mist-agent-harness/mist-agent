@@ -120,6 +120,12 @@ export interface RuntimeReadbackProbe {
   readonly readback: (scope: ReadinessScope) => Promise<RuntimeEvidence>;
 }
 
+/** Input and an observer owned by the current host invocation; callers do not supply a receipt. */
+export interface RuntimeReadinessRequest {
+  readonly input: ReadinessEvaluationInput;
+  readonly probe: RuntimeReadbackProbe;
+}
+
 /**
  * Run an independent existence/running/readback probe and evaluate its receipt.
  * A probe that cannot answer is represented by missing evidence and therefore `unknown`;
@@ -453,12 +459,19 @@ export function isReadinessReceipt(value: unknown): value is ReadinessReceipt {
 }
 
 /** A projection used by the host: an active plugin without a receipt is explicitly unknown. */
-export interface ReadinessProjection {
-  readonly status: ReadinessStatus;
-  readonly reasonCode: ReasonCode;
-  readonly detail: string;
-  readonly receipt?: ReadinessReceipt;
-}
+export type ReadinessProjection =
+  | {
+      readonly status: "ready";
+      readonly detail: string;
+      readonly receipt: ReadinessReceipt;
+      readonly reasonCode?: never;
+    }
+  | {
+      readonly status: Exclude<ReadinessStatus, "ready">;
+      readonly reasonCode: ReasonCode;
+      readonly detail: string;
+      readonly receipt?: ReadinessReceipt;
+    };
 
 export function projectReadiness(
   lifecycleState:
@@ -479,6 +492,13 @@ export function projectReadiness(
         status: "unknown",
         reasonCode: "CAPABILITY_UNVERIFIED",
         detail: "runtime readiness receipt is expired or has no persisted verification window",
+      };
+    }
+    if (receipt.status === "ready") {
+      return {
+        status: "ready",
+        detail: receipt.detail,
+        receipt,
       };
     }
     return {

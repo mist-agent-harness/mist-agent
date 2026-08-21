@@ -6,7 +6,8 @@
  * external-evidence fixtures; unrelated F04/F05 and mutation accounting remain todo.
  *
  * Item source of truth: acceptance/plugin-protocol-v0.md at the #62 freeze point
- * (main@acdfcab2); titles copied verbatim.
+ * (main@acdfcab2); these tests intentionally name only the implemented narrow slice, not a
+ * completed F01/F02/F06 checklist item.
  * Awaits: readiness lamps + reason-code wiring (spans PR①-③).
  */
 import { describe, expect, it } from "vitest";
@@ -73,13 +74,13 @@ function request(overrides: Partial<ReadinessEvaluationInput> = {}): ReadinessEv
 }
 
 describe("PV0 series F — readiness 与稳定失败语义 (RFC §4/§8)", () => {
-  it("[PV0-F01] readiness 有 scope", () => {
+  it("readiness narrow slice preserves scope (not the full PV0-F01 checklist)", () => {
     const receipt = evaluateRuntimeReadiness(request());
     expect(receipt.status).toBe("ready");
     expect(receipt.verifiedScope).toEqual(scope);
     expect(receipt.lastVerifiedAt).toBe("2026-08-21T00:00:00.000Z");
   });
-  it("[PV0-F02] 原因码稳定可判", () => {
+  it("narrow slice keeps CAPABILITY_UNVERIFIED stable (not the full PV0-F02 A–E matrix)", () => {
     const receipt = evaluateRuntimeReadiness(request({ evidence: [probe("existence")] }));
     expect(receipt.status).toBe("unknown");
     expect(receipt.reasonCode).toBe("CAPABILITY_UNVERIFIED");
@@ -91,7 +92,7 @@ describe("PV0 series F — readiness 与稳定失败语义 (RFC §4/§8)", () =>
   it.todo(
     "[PV0-F05] 壳共享魂私有 — STUBBED-PENDING(readiness lamps + capability receipts — 单B 范围外)",
   );
-  it("[PV0-F06] ready 必须有当前 scope 的可用性收据", () => {
+  it("narrow slice requires a current readback receipt (not the full PV0-F06 provider matrix)", () => {
     const missingReadback = evaluateRuntimeReadiness(
       request({ evidence: [probe("existence"), probe("running")] }),
     );

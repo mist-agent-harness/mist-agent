@@ -244,7 +244,8 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 本次 #101 只落地了确定性 evaluator/readback contract 与窄 fixture（缺运行证据、真实路径失败、
 scope/version/条件漂移和过期收据）；上述 F01/F02/F06 仍需完整的四状态、A–E 失败矩阵和三类
 provider-like readback fixture 后再勾选。`npm run acceptance` 的 C1–C6 六盏灯不替代 PV0 F
-系列验收，故此处保持未勾选。
+系列验收，故此处保持未勾选。`publishedResources` 仍是生命周期 projection，本切片不声称
+它受 readiness gate 控制；active 无收据时可能仍有已发布资源，但 readiness 必须为 unknown。
 
 ## 逐项 mutation 台账
 

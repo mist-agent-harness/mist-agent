@@ -2,6 +2,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { applyEnabledChange } from "../src/plugin/enable.ts";
+import type { PluginManifestV0 } from "../src/plugin/manifest.ts";
 import { moduleRefFromSource } from "../src/plugin/module-ref.ts";
 import { PluginOperationStore } from "../src/plugin/operation-store.ts";
 import {
@@ -10,6 +12,7 @@ import {
   type ReadinessEvaluationInput,
   type ReadinessScope,
   type RuntimeEvidence,
+  type RuntimeReadinessRequest,
   evaluateRuntimeReadiness,
   isReadinessReceipt,
   projectReadiness,
@@ -75,6 +78,24 @@ function input(overrides: Partial<ReadinessEvaluationInput> = {}): ReadinessEval
     maxAgeMs: 60_000,
     evidence: [evidence("existence"), evidence("running"), evidence("readback")],
     ...overrides,
+  };
+}
+
+function probeRequest(overrides: Partial<ReadinessEvaluationInput> = {}): RuntimeReadinessRequest {
+  const readinessInput = input(overrides);
+  const probeEvidence = (kind: RuntimeEvidence["kind"]): RuntimeEvidence => ({
+    ...evidence(kind),
+    scope: readinessInput.scope,
+    version: readinessInput.definition.version,
+    moduleRef: readinessInput.definition.moduleRef,
+  });
+  return {
+    input: readinessInput,
+    probe: {
+      existence: async () => probeEvidence("existence"),
+      running: async () => probeEvidence("running"),
+      readback: async () => probeEvidence("readback"),
+    },
   };
 }
 
@@ -310,7 +331,15 @@ describe("runtime readiness / readback contract", () => {
       const store = new PluginOperationStore(directory);
       const host = new PluginTransactionHost({ store });
       const module: PluginModuleV0 = {
-        async prepare() {
+        async prepare(context) {
+          context.register({
+            id: "fixture-unverified-call",
+            kind: "tool",
+            capabilityId: "fixture.call",
+            recoveryKey: "fixture-unverified-call",
+            async activate() {},
+            async dispose() {},
+          });
           return {
             async activate() {
               return {
@@ -336,12 +365,131 @@ describe("runtime readiness / readback contract", () => {
         status: "unknown",
         reasonCode: "CAPABILITY_UNVERIFIED",
       });
+      expect(host.publishedResources("fixture.unverified")).toEqual([
+        { id: "fixture-unverified-call", kind: "tool", capabilityId: "fixture.call" },
+      ]);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
   });
 
-  it("projects only the receipt that was produced by the external readback contract", async () => {
+  it("runs all three probes through applyEnabledChange and fails closed on probe failure", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mist-runtime-readiness-enable-"));
+    try {
+      const store = new PluginOperationStore(directory);
+      const host = new PluginTransactionHost({ store });
+      const manifest: PluginManifestV0 = {
+        manifestSchemaVersion: 0,
+        id: "fixture.enable",
+        version: "1.2.3",
+        requiresMist: ">=0.1.0",
+        entrypoint: "dist/index.js",
+        kinds: ["tool_capability"],
+        configSchemaVersion: 1,
+        capabilities: [
+          {
+            id: "fixture.call",
+            description: "fixture call",
+            effect: "read",
+            operations: ["call"],
+            injectionMode: "eager",
+          },
+        ],
+        contextInjections: [],
+        env: [],
+        credentials: [],
+        permissions: [],
+      };
+      const moduleRef = moduleRefFromSource("fixture-enable");
+      const module: PluginModuleV0 = {
+        async prepare(context) {
+          context.register({
+            id: "fixture-enable-call",
+            kind: "tool",
+            capabilityId: "fixture.call",
+            recoveryKey: "fixture-enable-call",
+            async activate() {},
+            async dispose() {},
+          });
+          return {
+            async activate() {
+              return {
+                async dispose() {
+                  return { revoked: [], failed: [] };
+                },
+              };
+            },
+            async rollback() {},
+          };
+        },
+      };
+      const baseProbeRequest = probeRequest({
+        definition: { ...definition, pluginId: manifest.id, moduleRef },
+        binding: { ...binding, pluginId: manifest.id, moduleRef },
+      });
+      const probeCalls = { existence: 0, running: 0, readback: 0 };
+      const readinessRequest: RuntimeReadinessRequest = {
+        input: baseProbeRequest.input,
+        probe: {
+          existence: async (probeScope) => {
+            probeCalls.existence += 1;
+            return baseProbeRequest.probe.existence(probeScope);
+          },
+          running: async (probeScope) => {
+            probeCalls.running += 1;
+            return baseProbeRequest.probe.running(probeScope);
+          },
+          readback: async (probeScope) => {
+            probeCalls.readback += 1;
+            return baseProbeRequest.probe.readback(probeScope);
+          },
+        },
+      };
+      const request = {
+        pluginId: manifest.id,
+        manifest,
+        module,
+        moduleRef,
+        config: { enabled: true, settings: {}, environment: [], credentialRefs: {} },
+        resolveSecret: () => "unused",
+        readinessRequest,
+      };
+      const directReadyReceipt = await readRuntimeReadiness(
+        readinessRequest.input,
+        readinessRequest.probe,
+      );
+      const legacyRequest = { ...request };
+      Reflect.deleteProperty(legacyRequest, "readinessRequest");
+      await expect(
+        applyEnabledChange(host, store, { ...legacyRequest, readiness: directReadyReceipt }),
+      ).rejects.toThrow("must be produced by a current-process readback probe");
+      expect(() => store.read(manifest.id)).toThrow();
+      expect((await applyEnabledChange(host, store, request)).state).toBe("active");
+      expect((await applyEnabledChange(host, store, request)).state).toBe("active");
+      expect(probeCalls).toEqual({ existence: 3, running: 3, readback: 3 });
+      expect(host.readiness(manifest.id, "2026-08-21T00:00:30.000Z").status).toBe("ready");
+
+      const failingRequest: typeof request = {
+        ...request,
+        readinessRequest: {
+          ...readinessRequest,
+          probe: {
+            ...readinessRequest.probe,
+            readback: async () => {
+              throw new Error("readback unavailable");
+            },
+          },
+        },
+      };
+      expect((await applyEnabledChange(host, store, failingRequest)).state).toBe("active");
+      expect(probeCalls).toEqual({ existence: 4, running: 4, readback: 3 });
+      expect(host.readiness(manifest.id).status).toBe("unknown");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("projects only a receipt produced by the current-process readback probe", async () => {
     const directory = mkdtempSync(join(tmpdir(), "mist-runtime-readiness-"));
     try {
       const store = new PluginOperationStore(directory);
@@ -371,11 +519,13 @@ describe("runtime readiness / readback contract", () => {
       const moduleRef = moduleRefFromSource("fixture-ready");
       const readyDefinition = { ...definition, moduleRef };
       const readyBinding = { ...binding, moduleRef };
-      const readyEvidence = [evidence("existence"), evidence("running"), evidence("readback")].map(
-        (item) => ({ ...item, moduleRef }),
-      );
-      const receipt = evaluateRuntimeReadiness(
-        input({ definition: readyDefinition, binding: readyBinding, evidence: readyEvidence }),
+      const readyProbeRequest = probeRequest({
+        definition: readyDefinition,
+        binding: readyBinding,
+      });
+      const callerReceipt = await readRuntimeReadiness(
+        readyProbeRequest.input,
+        readyProbeRequest.probe,
       );
       await expect(
         host.activate({
@@ -386,29 +536,10 @@ describe("runtime readiness / readback contract", () => {
           env: {},
           bindings: {},
           verifiedScope: null,
-          readiness: receipt,
+          readiness: callerReceipt,
         }),
-      ).rejects.toThrow("ready runtime readiness requires an authority verifiedScope");
+      ).rejects.toThrow("must be produced by a current-process readback probe");
       expect(() => store.read(definition.pluginId)).toThrow();
-      await expect(
-        host.activate({
-          pluginId: definition.pluginId,
-          moduleRef,
-          module,
-          config: { enabled: true },
-          env: {},
-          bindings: {},
-          verifiedScope: { ...receipt.verifiedScope, residentId: "resident-b" },
-          readiness: receipt,
-        }),
-      ).rejects.toThrow("ready runtime readiness requires an authority verifiedScope");
-
-      const mismatchedCapabilityReceipt = {
-        ...receipt,
-        definition: { ...receipt.definition, capabilityId: "fixture.other" },
-        binding:
-          receipt.binding === null ? null : { ...receipt.binding, capabilityId: "fixture.other" },
-      };
       const mismatchedCapabilityOutcome = await host.activate({
         pluginId: definition.pluginId,
         moduleRef,
@@ -416,8 +547,11 @@ describe("runtime readiness / readback contract", () => {
         config: { enabled: true },
         env: {},
         bindings: {},
-        verifiedScope: mismatchedCapabilityReceipt.verifiedScope,
-        readiness: mismatchedCapabilityReceipt,
+        verifiedScope: null,
+        readinessRequest: probeRequest({
+          definition: { ...readyDefinition, capabilityId: "fixture.other" },
+          binding: { ...readyBinding, capabilityId: "fixture.other" },
+        }),
       });
       expect(mismatchedCapabilityOutcome).toMatchObject({
         state: "blocked",
@@ -432,10 +566,15 @@ describe("runtime readiness / readback contract", () => {
         config: { enabled: true },
         env: {},
         bindings: {},
-        verifiedScope: receipt.verifiedScope,
-        readiness: receipt,
+        verifiedScope: null,
+        readinessRequest: readyProbeRequest,
       });
-      expect(host.readiness(definition.pluginId, "2026-08-21T00:00:30.000Z").status).toBe("ready");
+      const readyProjection = host.readiness(definition.pluginId, "2026-08-21T00:00:30.000Z");
+      expect(readyProjection.status).toBe("ready");
+      expect("reasonCode" in readyProjection).toBe(false);
+      const persisted = store.read(definition.pluginId).readiness;
+      if (persisted === undefined) throw new Error("probe result was not persisted");
+      expect(persisted.status).toBe("ready");
       const restartedHost = new PluginTransactionHost({
         store: new PluginOperationStore(directory),
       });
@@ -445,45 +584,25 @@ describe("runtime readiness / readback contract", () => {
         status: "unknown",
         reasonCode: "CAPABILITY_UNVERIFIED",
       });
-      expect(
-        host.recordReadiness(definition.pluginId, receipt, "2026-08-21T00:00:30.000Z").status,
-      ).toBe("ready");
-
-      const mismatchedCapability = {
-        ...receipt,
-        definition: { ...receipt.definition, capabilityId: "fixture.other" },
-        binding:
-          receipt.binding === null ? null : { ...receipt.binding, capabilityId: "fixture.other" },
-      };
-      expect(isReadinessReceipt(mismatchedCapability)).toBe(true);
-      expect(() => host.recordReadiness(definition.pluginId, mismatchedCapability)).toThrow(
-        "runtime readiness receipt does not match the current plugin authority",
+      expect(() => host.recordReadiness(definition.pluginId, persisted)).toThrow(
+        "must be produced by a current-process readback probe",
       );
-
-      const mismatchedVersion = {
-        ...receipt,
-        definition: { ...receipt.definition, version: "1.2.4" },
-      };
-      expect(() => host.recordReadiness(definition.pluginId, mismatchedVersion)).toThrow(
-        "runtime readiness receipt does not match the current plugin authority",
-      );
-
-      const mismatchedBinding = {
-        ...receipt,
-        verifiedScope: { ...receipt.verifiedScope, networkPath: "loopback:19002/call" },
-        binding:
-          receipt.binding === null
-            ? null
-            : { ...receipt.binding, networkPath: "loopback:19002/call" },
-        evidence: receipt.evidence.map((item) => ({
-          ...item,
-          scope: { ...item.scope, networkPath: "loopback:19002/call" },
-        })),
-      };
-      expect(isReadinessReceipt(mismatchedBinding)).toBe(true);
-      expect(() => host.recordReadiness(definition.pluginId, mismatchedBinding)).toThrow(
-        "runtime readiness receipt does not match the current plugin authority",
-      );
+      await expect(
+        host.recordReadinessFromProbe(
+          definition.pluginId,
+          readyProbeRequest,
+          "2026-08-21T00:00:30.000Z",
+        ),
+      ).resolves.toMatchObject({ status: "ready" });
+      await expect(
+        host.recordReadinessFromProbe(
+          definition.pluginId,
+          probeRequest({
+            definition: { ...readyDefinition, capabilityId: "fixture.other" },
+            binding: { ...readyBinding, capabilityId: "fixture.other" },
+          }),
+        ),
+      ).rejects.toThrow("does not match the current plugin authority");
 
       const authority = store.read(definition.pluginId);
       store.save({ ...authority, verifiedScope: null });

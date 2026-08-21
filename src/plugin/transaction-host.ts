@@ -16,9 +16,11 @@ import {
   type ReadinessProjection,
   type ReadinessReceipt,
   type ReadinessScope,
+  type RuntimeReadinessRequest,
   isReadinessReceipt,
   isReadinessScope,
   projectReadiness,
+  readRuntimeReadiness,
 } from "./runtime-readiness.ts";
 import type {
   ActivePlugin,
@@ -59,7 +61,10 @@ export interface ActivatePluginRequest {
   readonly env: Readonly<Record<string, string>>;
   readonly bindings: unknown;
   readonly verifiedScope: unknown;
+  /** Legacy compatibility input: ready receipts are rejected unless produced by a probe. */
   readonly readiness?: ReadinessReceipt;
+  /** Current-process probe request; its result is the only new ready receipt source. */
+  readonly readinessRequest?: RuntimeReadinessRequest;
 }
 
 export interface PublishedPluginResource {
@@ -112,14 +117,9 @@ export class PluginTransactionHost {
     // （fail-closed，原字节不动）；仅 ENOENT、blocked 显式重试、disposed 重装放行。
     const refused = refuseActiveIdOverwrite(request.pluginId, this.#active, this.#store);
     if (refused !== null) return refused;
-    if (
-      request.readiness?.status === "ready" &&
-      (!isReadinessReceipt(request.readiness) ||
-        !isReadinessScope(request.verifiedScope) ||
-        !sameReadinessScope(request.verifiedScope, request.readiness.verifiedScope))
-    ) {
+    if (request.readiness?.status === "ready") {
       throw new Error(
-        "ready runtime readiness requires an authority verifiedScope matching the receipt",
+        "ready runtime readiness must be produced by a current-process readback probe",
       );
     }
     const operationId = this.#newOperationId();
@@ -132,7 +132,11 @@ export class PluginTransactionHost {
       config: request.config,
       bindings: request.bindings,
       verifiedScope: request.verifiedScope,
-      ...(request.readiness === undefined ? {} : { readiness: request.readiness }),
+      ...(request.readinessRequest !== undefined
+        ? {}
+        : request.readiness === undefined
+          ? {}
+          : { readiness: request.readiness }),
       operation: {
         operationId,
         operation: "activate",
@@ -193,10 +197,36 @@ export class PluginTransactionHost {
       return this.#rollbackCurrent(record, resources, undefined, "PREPARE_FAILED");
     }
 
-    // Resource capability declarations are only authoritative after prepare(). Re-check a
-    // caller-supplied receipt before any resource activation or public projection; a receipt
-    // that passed the pre-write identity check must not outrun the plugin's actual inventory.
-    if (
+    // Resource capability declarations are only authoritative after prepare(). A readiness
+    // request is executed by this host at this point; callers never hand the host a ready
+    // receipt to persist. The temporary record binds the generated scope before activation.
+    if (request.readinessRequest !== undefined) {
+      let generated: ReadinessReceipt;
+      try {
+        generated = await readRuntimeReadiness(
+          request.readinessRequest.input,
+          request.readinessRequest.probe,
+        );
+      } catch {
+        return this.#rollbackCurrent(record, resources, prepared, "ACTIVATE_FAILED");
+      }
+      const generatedRecord: PluginAuthorityRecord = {
+        ...record,
+        verifiedScope: generated.verifiedScope,
+        readiness: generated,
+      };
+      if (
+        !isReadinessReceipt(generated) ||
+        !readinessMatchesAuthority(generatedRecord, generated)
+      ) {
+        return this.#rollbackCurrent(record, resources, prepared, "ACTIVATE_FAILED");
+      }
+      Object.assign(record, {
+        verifiedScope: generated.verifiedScope,
+        readiness: generated,
+      });
+      this.#store.save(record);
+    } else if (
       request.readiness !== undefined &&
       (!isReadinessReceipt(request.readiness) ||
         !readinessMatchesAuthority(record, request.readiness))
@@ -438,6 +468,11 @@ export class PluginTransactionHost {
     if (record.lifecycleState !== "active") {
       throw new Error(`plugin ${pluginId} is not active; runtime readiness cannot be recorded`);
     }
+    if (receipt.status === "ready") {
+      throw new Error(
+        "ready runtime readiness must be produced by a current-process readback probe",
+      );
+    }
     if (!isReadinessReceipt(receipt) || !readinessMatchesAuthority(record, receipt)) {
       throw new Error("runtime readiness receipt does not match the current plugin authority");
     }
@@ -446,6 +481,34 @@ export class PluginTransactionHost {
       verifiedScope: receipt.verifiedScope,
       readiness: receipt,
     };
+    this.#store.save(updated);
+    return projectReadiness(updated.lifecycleState, updated.readiness, now);
+  }
+
+  /** Execute the current-process probe before persisting a fresh readiness receipt. */
+  async recordReadinessFromProbe(
+    pluginId: string,
+    request: RuntimeReadinessRequest,
+    now: string | number = Date.now(),
+  ): Promise<ReadinessProjection> {
+    const record = this.#store.read(pluginId);
+    if (record.lifecycleState !== "active") {
+      throw new Error(`plugin ${pluginId} is not active; runtime readiness cannot be recorded`);
+    }
+    let receipt: ReadinessReceipt;
+    try {
+      receipt = await readRuntimeReadiness(request.input, request.probe);
+    } catch {
+      throw new Error("current-process runtime readiness probe could not produce a receipt");
+    }
+    const updated: PluginAuthorityRecord = {
+      ...record,
+      verifiedScope: receipt.verifiedScope,
+      readiness: receipt,
+    };
+    if (!isReadinessReceipt(receipt) || !readinessMatchesAuthority(updated, receipt)) {
+      throw new Error("runtime readiness probe result does not match the current plugin authority");
+    }
     this.#store.save(updated);
     return projectReadiness(updated.lifecycleState, updated.readiness, now);
   }

@@ -12,7 +12,7 @@ import { type SecretResolver, resolveEnvironment } from "./environment.ts";
 import { type PluginManifestV0, validateBindings } from "./manifest.ts";
 import type { PluginOperationStore } from "./operation-store.ts";
 import { type PluginOperationOutcome, operationOutcome } from "./recovery-coordinator.ts";
-import type { ReadinessReceipt } from "./runtime-readiness.ts";
+import type { ReadinessReceipt, RuntimeReadinessRequest } from "./runtime-readiness.ts";
 import type { PluginTransactionHost } from "./transaction-host.ts";
 import type { PluginModuleV0, ReasonCode } from "./types.ts";
 
@@ -24,8 +24,10 @@ export interface EnabledChangeRequest {
   /** instance config 全量（含 enabled 目标值）；运行时形状由就绪门定型。 */
   readonly config: unknown;
   readonly resolveSecret: SecretResolver;
-  /** Optional external runtime receipt. Omission deliberately remains unknown. */
+  /** Legacy compatibility input; a ready receipt is rejected by the host. */
   readonly readiness?: ReadinessReceipt;
+  /** Current-process probe request; its generated receipt is the only new ready authority. */
+  readonly readinessRequest?: RuntimeReadinessRequest;
 }
 
 export type EnabledChangeResult =
@@ -68,6 +70,10 @@ export async function applyEnabledChange(
 
   const existing = readIfPresent(store, request.pluginId);
   if (existing?.enabled && existing.lifecycleState === "active") {
+    if (request.readinessRequest !== undefined) {
+      await host.recordReadinessFromProbe(request.pluginId, request.readinessRequest);
+      return operationOutcome(store.read(request.pluginId));
+    }
     if (request.readiness !== undefined) {
       host.recordReadiness(request.pluginId, request.readiness);
       return operationOutcome(store.read(request.pluginId));
@@ -92,8 +98,12 @@ export async function applyEnabledChange(
     bindings: { environment: (request.config as { environment: unknown }).environment },
     // Activation and runtime readiness are separate facts. Without an external receipt,
     // the durable authority carries no verified scope and host projection remains unknown.
-    verifiedScope: request.readiness?.verifiedScope ?? null,
+    verifiedScope:
+      request.readinessRequest === undefined ? (request.readiness?.verifiedScope ?? null) : null,
     ...(request.readiness === undefined ? {} : { readiness: request.readiness }),
+    ...(request.readinessRequest === undefined
+      ? {}
+      : { readinessRequest: request.readinessRequest }),
   });
 }
 

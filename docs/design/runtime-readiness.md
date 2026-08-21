@@ -25,10 +25,11 @@
 `ReadinessScope` 至少绑定：
 
 ```text
-residentId, lane, operations, host, networkPath, version, lastVerifiedAt, verificationWindowMs
+residentId, lane, operations, host, networkPath, version
 ```
 
 `ReadinessReceipt` 还保存 definition、binding、authorization、证据清单和稳定 reason code。
+receipt 另保存 `lastVerifiedAt` 与 `verificationWindowMs`；它们不是 scope 字段。
 `verifiedScope` 与 `lastVerifiedAt` 始终成对出现；没有成功验证时 timestamp 为 null，状态明确为
 `unknown`，不能把空对象当作空 scope。ready 收据还必须持久化一个正的
 `verificationWindowMs`；宿主重启后按当前时间重新检查窗口，过期或没有窗口的旧收据都投影为
@@ -60,6 +61,12 @@ measurements 只能跟在同一证据行，不得脱离条件单独投影。本�
 
 任何非 `ready` 结果都不得进入 ready 工具集。`quarantined` 仍由 #97 资源撤销语义负责，投影时
 保持 fail-closed；readiness receipt 不会让它重新变绿。
+
+生产入口接收 `RuntimeReadinessRequest`（本次调用的 evaluator input 与三腿 probe），由当前宿主
+现场调用 `readRuntimeReadiness` 后才可持久化结果。旧的直接 receipt 输入只保留解析/诊断兼容，
+不能把手写 `ready` receipt 升格为权威 ready。`publishedResources` 是既有生命周期 projection，
+本切片不把 readiness 当作其 gate；active 且无收据时仍可能有已发布资源，但 readiness projection
+必须是 `unknown`，因此 F06 继续未勾选。
 
 ## 与 #97 的接线
 
