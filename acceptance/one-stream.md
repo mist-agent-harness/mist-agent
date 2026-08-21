@@ -31,7 +31,10 @@
   B 并发产生两个合法事件；桌面与手机最终得到相同的 canonical `eventId` 集合和相同
   顺序。第三个客户端在两事件发生期间离线，重连后得到同一集合与顺序且无重复。
   测试交换 A、B 的到达次序重复运行；不要求某一 viewport 固定先赢，只要求主流 writer
-  给出的顺序在所有投影一致。任一 viewport 的局部 transcript 都不得成为第二个权威源。
+  给出的顺序在所有投影一致。判卷驱动还须把主流中每个事件的不可变 payload 规范化为
+  字节串或内容 hash，并让各投影带回其引用的同一份摘要；同一 `eventId` 的正文、来源与
+  效果语义必须逐项等价，只有明确声明的投影层展示元数据可排除。保留相同 id/顺序却改了
+  payload 仍判红。任一 viewport 的局部 transcript 都不得成为第二个权威源。
 
 - [ ] **OS-02 猝死重放至多入流一次，回执不冒充生效** [集成]：对同一投递分别在
   “生成后、主流写入前”和“主流写入后、回执前”杀死宿主，再恢复并重试。最终 canonical
@@ -41,10 +44,13 @@
 
 - [ ] **OS-03 归档流水只进证据面，不长成第二条聊天史** [协议/客户端]：活工作区可从
   first-party workspace navigator 进入；关闭后其活动入口消失，canonical stream 留下
-  typed closure/result card 与权威产物指针。普通用户能力面拿不到把归档 `session.history`
-  复原为永久聊天条目的数据形状；带明确 evidence/control 授权的调用仍能沿权威指针读取
-  只读流水，用于审计、恢复和取证。`session.create` 的成功回执是工作区已存在，不是
-  “创建了一条新聊天”。
+  typed closure/result card 与权威产物指针。测试夹具声明两种调用主体：默认 P1 用户主体
+  （无 evidence/control 授权）和显式获授权的证据主体，不锁最终权限名。viewport 关闭后，
+  对默认主体同时断言：first-party navigator 的活动项消失；用户面投影不出现可 resume、
+  可追加或可导航到逐条 transcript 的永久聊天入口；直接请求归档流水被拒绝或该能力根本
+  不暴露。对证据主体断言：只能沿 closure/result 的权威指针读到与该归档 viewport 绑定的
+  只读流水，不能续聊或写回。`session.create` 的成功回执是工作区已存在，不是“创建了一条
+  新聊天”。这四项由协议响应和 first-party read model 的结构化结果判定，不靠肉眼看 UI。
 
 - [ ] **OS-04 有界投递不夹带局部 transcript** [集成]：progress、blocked、result 三类
   合法 envelope 各投一次，来源 viewport、发生时刻、工作把手、权威产物指针与效果状态
