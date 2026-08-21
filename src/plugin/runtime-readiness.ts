@@ -312,25 +312,30 @@ export function evaluateRuntimeReadiness(input: ReadinessEvaluationInput): Readi
     return invalid("evidence-missing", "runtime readback does not cover every requested operation");
   }
 
-  const failed = evidence.filter((item) => item.outcome === "fail");
-  if (failed.length > 0) {
-    const first = failed[0];
-    if (first?.kind === "existence") {
-      return failedReceipt(
-        base,
-        "existence-failed",
-        "PLUGIN_RUNTIME_FAILED",
-        "independent existence probe failed",
-      );
-    }
-    if (first?.kind === "running") {
-      return failedReceipt(
-        base,
-        "running-failed",
-        "PLUGIN_RUNTIME_FAILED",
-        "independent running probe failed",
-      );
-    }
+  const failedExistence = evidence.find(
+    (item) => item.kind === "existence" && item.outcome === "fail",
+  );
+  const failedRunning = evidence.find((item) => item.kind === "running" && item.outcome === "fail");
+  const failedReadback = evidence.find(
+    (item) => item.kind === "readback" && item.outcome === "fail",
+  );
+  if (failedExistence !== undefined) {
+    return failedReceipt(
+      base,
+      "existence-failed",
+      "PLUGIN_RUNTIME_FAILED",
+      "independent existence probe failed",
+    );
+  }
+  if (failedRunning !== undefined) {
+    return failedReceipt(
+      base,
+      "running-failed",
+      "PLUGIN_RUNTIME_FAILED",
+      "independent running probe failed",
+    );
+  }
+  if (failedReadback !== undefined) {
     const passedReadbackOperations = new Set(
       evidence
         .filter((item) => item.kind === "readback" && item.outcome === "pass")
@@ -485,6 +490,7 @@ export function projectReadiness(
     | "discovered",
   receipt: ReadinessReceipt | undefined,
   now: string | number = Date.now(),
+  lifecycleReasonCode?: ReasonCode,
 ): ReadinessProjection {
   if (lifecycleState === "active" && receipt !== undefined && isReadinessReceipt(receipt)) {
     if (receipt.status === "ready" && !isReceiptCurrent(receipt, now)) {
@@ -518,7 +524,7 @@ export function projectReadiness(
   if (lifecycleState === "blocked") {
     return {
       status: "blocked",
-      reasonCode: "CAPABILITY_UNVERIFIED",
+      reasonCode: lifecycleReasonCode ?? "CAPABILITY_UNVERIFIED",
       detail: "plugin is blocked; no readiness projection is exposed",
     };
   }

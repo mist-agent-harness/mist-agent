@@ -114,6 +114,30 @@ describe("runtime readiness / readback contract", () => {
     expect(receipt.reasonCode).toBe("CAPABILITY_UNVERIFIED");
   });
 
+  it("classifies simultaneous failures by probe kind, not evidence array order", () => {
+    const existenceFirst = evaluateRuntimeReadiness(
+      input({
+        evidence: [
+          evidence("readback", "fail"),
+          evidence("running", "fail"),
+          evidence("existence", "fail"),
+        ],
+      }),
+    );
+    expect(existenceFirst.reason).toBe("existence-failed");
+
+    const runningFirst = evaluateRuntimeReadiness(
+      input({
+        evidence: [
+          evidence("readback", "fail"),
+          evidence("running", "fail"),
+          evidence("existence"),
+        ],
+      }),
+    );
+    expect(runningFirst.reason).toBe("running-failed");
+  });
+
   it("does not trust a green health response when the real operation path is unreachable", () => {
     const receipt = evaluateRuntimeReadiness(
       input({
@@ -260,6 +284,15 @@ describe("runtime readiness / readback contract", () => {
     expect(projectReadiness("active", legacyReceipt, "2026-08-21T00:00:30.000Z")).toMatchObject({
       status: "unknown",
       reasonCode: "CAPABILITY_UNVERIFIED",
+    });
+  });
+
+  it("preserves a lifecycle failure reason when projecting blocked readiness", () => {
+    expect(
+      projectReadiness("blocked", undefined, "2026-08-21T00:00:30.000Z", "ACTIVATE_FAILED"),
+    ).toMatchObject({
+      status: "blocked",
+      reasonCode: "ACTIVATE_FAILED",
     });
   });
 
@@ -458,6 +491,33 @@ describe("runtime readiness / readback contract", () => {
         resolveSecret: () => "unused",
         readinessRequest,
       };
+      const malformedProbeRequest: RuntimeReadinessRequest = {
+        input: readinessRequest.input,
+        probe: {
+          existence: async () => null as unknown as RuntimeEvidence,
+          running: async () => null as unknown as RuntimeEvidence,
+          readback: async () => null as unknown as RuntimeEvidence,
+        },
+      };
+      const malformedOutcome = await host.activate({
+        pluginId: "fixture.malformed-probe",
+        moduleRef,
+        module,
+        runtimeVersion: manifest.version,
+        config: { enabled: true },
+        env: {},
+        bindings: {},
+        verifiedScope: null,
+        readinessRequest: malformedProbeRequest,
+      });
+      expect(malformedOutcome).toMatchObject({
+        state: "blocked",
+        reasonCode: "ACTIVATE_FAILED",
+      });
+      expect(store.read("fixture.malformed-probe")).toMatchObject({
+        lifecycleState: "blocked",
+        operation: { phase: "completed", rollbackCompleted: true },
+      });
       const directReadyReceipt = await readRuntimeReadiness(
         readinessRequest.input,
         readinessRequest.probe,
@@ -470,6 +530,12 @@ describe("runtime readiness / readback contract", () => {
       expect(() => store.read(manifest.id)).toThrow();
       expect((await applyEnabledChange(host, store, request)).state).toBe("active");
       expect((await applyEnabledChange(host, store, request)).state).toBe("active");
+      await expect(
+        applyEnabledChange(host, store, { ...legacyRequest, readiness: directReadyReceipt }),
+      ).resolves.toMatchObject({
+        state: "active",
+        reasonCode: "CAPABILITY_UNVERIFIED",
+      });
       expect(store.read(manifest.id).runtimeVersion).toBe(manifest.version);
       expect(new PluginOperationStore(directory).read(manifest.id).runtimeVersion).toBe(
         manifest.version,
@@ -639,6 +705,19 @@ describe("runtime readiness / readback contract", () => {
           "2026-08-21T00:00:30.000Z",
         ),
       ).resolves.toMatchObject({ status: "ready" });
+      const shiftedScope = { ...scope, residentId: "resident-b" };
+      await expect(
+        host.recordReadinessFromProbe(
+          definition.pluginId,
+          probeRequest({
+            definition: readyDefinition,
+            binding: readyBinding,
+            authorization: { ...authorization, residentId: shiftedScope.residentId },
+            scope: shiftedScope,
+          }),
+        ),
+      ).rejects.toThrow("does not match the current plugin authority");
+      expect(store.read(definition.pluginId).readiness?.verifiedScope).toEqual(scope);
       await expect(
         host.recordReadinessFromProbe(
           definition.pluginId,
@@ -652,6 +731,18 @@ describe("runtime readiness / readback contract", () => {
       const authority = store.read(definition.pluginId);
       store.save({ ...authority, verifiedScope: null });
       expect(host.readiness(definition.pluginId, "2026-08-21T00:00:30.000Z")).toMatchObject({
+        status: "unknown",
+        reasonCode: "CAPABILITY_UNVERIFIED",
+      });
+      const authorityWithoutScope = { ...authority };
+      Reflect.deleteProperty(authorityWithoutScope, "verifiedScope");
+      store.save(authorityWithoutScope);
+      const restartedWithoutScope = new PluginTransactionHost({
+        store: new PluginOperationStore(directory),
+      });
+      expect(
+        restartedWithoutScope.readiness(definition.pluginId, "2026-08-21T00:00:30.000Z"),
+      ).toMatchObject({
         status: "unknown",
         reasonCode: "CAPABILITY_UNVERIFIED",
       });

@@ -154,7 +154,7 @@ export class PluginTransactionHost {
     if (
       request.readiness !== undefined &&
       (!isReadinessReceipt(request.readiness) ||
-        !readinessMatchesAuthority(record, request.readiness))
+        !readinessMatchesAuthority(record, request.readiness, null))
     ) {
       throw new Error("runtime readiness receipt does not match the current plugin authority");
     }
@@ -211,21 +211,24 @@ export class PluginTransactionHost {
           request.readinessRequest.probe,
         );
       } catch {
+        // Normal probe failures become an explicit non-ready receipt. Malformed probe output
+        // can still fail during evaluation and must roll back the in-flight transaction.
         return this.#rollbackCurrent(record, resources, prepared, "ACTIVATE_FAILED");
       }
-      const generatedRecord: PluginAuthorityRecord = {
-        ...record,
-        verifiedScope: generated.verifiedScope,
-        readiness: generated,
-      };
       if (!isReadinessReceipt(generated)) {
         return this.#rollbackCurrent(record, resources, prepared, "ACTIVATE_FAILED");
       }
-      if (!readinessMatchesAuthority(generatedRecord, generated)) {
+      if (
+        !readinessMatchesAuthority(
+          record,
+          generated,
+          record.verifiedScope === null ? undefined : record.verifiedScope,
+        )
+      ) {
         // A probe can report a valid receipt for a different deployed version. Keep the
         // lifecycle activation usable, but never persist that receipt as this authority's
         // readiness. Other identity/scope mismatches remain activation failures.
-        if (!isAuthorityVersionMismatch(generatedRecord, generated)) {
+        if (!isAuthorityVersionMismatch(record, generated, record.verifiedScope)) {
           return this.#rollbackCurrent(record, resources, prepared, "ACTIVATE_FAILED");
         }
         Reflect.deleteProperty(record, "readiness");
@@ -241,7 +244,7 @@ export class PluginTransactionHost {
     } else if (
       request.readiness !== undefined &&
       (!isReadinessReceipt(request.readiness) ||
-        !readinessMatchesAuthority(record, request.readiness))
+        !readinessMatchesAuthority(record, request.readiness, null))
     ) {
       return this.#rollbackCurrent(record, resources, prepared, "ACTIVATE_FAILED");
     }
@@ -459,15 +462,15 @@ export class PluginTransactionHost {
     if (
       record.readiness !== undefined &&
       (!isReadinessReceipt(record.readiness) ||
-        !readinessMatchesAuthority(record, record.readiness))
+        !readinessMatchesAuthority(record, record.readiness, record.verifiedScope ?? null))
     ) {
       return {
         status: "unknown",
-        reasonCode: "CAPABILITY_UNVERIFIED",
+        reasonCode: record.reasonCode ?? "CAPABILITY_UNVERIFIED",
         detail: "runtime readiness receipt does not describe the current plugin authority",
       };
     }
-    return projectReadiness(record.lifecycleState, record.readiness, now);
+    return projectReadiness(record.lifecycleState, record.readiness, now, record.reasonCode);
   }
 
   /**
@@ -483,7 +486,7 @@ export class PluginTransactionHost {
     const updated: PluginAuthorityRecord = { ...record, verifiedScope: null };
     Reflect.deleteProperty(updated, "readiness");
     this.#store.save(updated);
-    return projectReadiness(updated.lifecycleState, undefined, now);
+    return projectReadiness(updated.lifecycleState, undefined, now, updated.reasonCode);
   }
 
   /** Persist a fresh external receipt without changing lifecycle or capability definitions. */
@@ -501,7 +504,10 @@ export class PluginTransactionHost {
         "ready runtime readiness must be produced by a current-process readback probe",
       );
     }
-    if (!isReadinessReceipt(receipt) || !readinessMatchesAuthority(record, receipt)) {
+    if (
+      !isReadinessReceipt(receipt) ||
+      !readinessMatchesAuthority(record, receipt, record.verifiedScope)
+    ) {
       throw new Error("runtime readiness receipt does not match the current plugin authority");
     }
     const updated: PluginAuthorityRecord = {
@@ -510,7 +516,7 @@ export class PluginTransactionHost {
       readiness: receipt,
     };
     this.#store.save(updated);
-    return projectReadiness(updated.lifecycleState, updated.readiness, now);
+    return projectReadiness(updated.lifecycleState, updated.readiness, now, updated.reasonCode);
   }
 
   /** Execute the current-process probe before persisting a fresh readiness receipt. */
@@ -537,17 +543,23 @@ export class PluginTransactionHost {
     if (!isReadinessReceipt(receipt)) {
       throw new Error("runtime readiness probe result does not match the current plugin authority");
     }
-    if (!readinessMatchesAuthority(updated, receipt)) {
-      if (isAuthorityVersionMismatch(updated, receipt)) {
+    if (
+      !readinessMatchesAuthority(
+        record,
+        receipt,
+        record.verifiedScope === null ? undefined : record.verifiedScope,
+      )
+    ) {
+      if (isAuthorityVersionMismatch(record, receipt, record.verifiedScope)) {
         Reflect.deleteProperty(record, "readiness");
         Object.assign(record, { verifiedScope: null });
         this.#store.save(record);
-        return projectReadiness(record.lifecycleState, undefined, now);
+        return projectReadiness(record.lifecycleState, undefined, now, record.reasonCode);
       }
       throw new Error("runtime readiness probe result does not match the current plugin authority");
     }
     this.#store.save(updated);
-    return projectReadiness(updated.lifecycleState, updated.readiness, now);
+    return projectReadiness(updated.lifecycleState, updated.readiness, now, updated.reasonCode);
   }
 
   async #rollbackCurrent(
@@ -667,18 +679,26 @@ export class PluginTransactionHost {
 
 /**
  * The operation authority has plugin/module identity but deliberately does not become a
- * capability registry. Check the receipt's binding tuple against that identity and against
- * its own definition/scope, while leaving canonical capability ownership to #100.
+ * capability registry. Check the receipt's binding tuple against that identity and, when a
+ * prior authority scope exists, that historical scope; canonical scope ownership remains #100's.
  */
 function readinessMatchesAuthority(
   record: PluginAuthorityRecord,
   receipt: ReadinessReceipt,
+  authorityScopeValue: unknown,
 ): boolean {
   const { binding, definition, verifiedScope } = receipt;
   const declaredCapabilityIds = record.operation.resources.flatMap((resource) =>
     resource.capabilityId === undefined ? [] : [resource.capabilityId],
   );
-  const authorityScope = isReadinessScope(record.verifiedScope) ? record.verifiedScope : null;
+  // v0 may have no authority-side resident/lane/operation/host anchor yet. In that case
+  // the evaluator still checks the receipt's internal scope/binding/authorization, but this
+  // function must not pretend that a scope comparison happened. `undefined` means no anchor
+  // exists yet (so a fresh probe may establish one); an explicit null/malformed value means a
+  // ready receipt cannot be projected. Once verifiedScope exists, callers pass the pre-existing
+  // value rather than copying the receipt into it.
+  const hasAuthorityScope = authorityScopeValue !== undefined;
+  const authorityScope = isReadinessScope(authorityScopeValue) ? authorityScopeValue : null;
   const authorityVersion = record.runtimeVersion;
   const versionMatches =
     authorityVersion === undefined
@@ -693,8 +713,11 @@ function readinessMatchesAuthority(
     (declaredCapabilityIds.length === 0 ||
       declaredCapabilityIds.includes(definition.capabilityId)) &&
     (receipt.status !== "ready"
-      ? authorityScope === null || sameReadinessScope(authorityScope, verifiedScope)
-      : authorityScope !== null && sameReadinessScope(authorityScope, verifiedScope)) &&
+      ? !hasAuthorityScope ||
+        authorityScope === null ||
+        sameReadinessScope(authorityScope, verifiedScope)
+      : !hasAuthorityScope ||
+        (authorityScope !== null && sameReadinessScope(authorityScope, verifiedScope))) &&
     versionMatches &&
     verifiedScope.version === definition.version &&
     (binding === null ||
@@ -715,20 +738,21 @@ function readinessMatchesAuthority(
 function isAuthorityVersionMismatch(
   record: PluginAuthorityRecord,
   receipt: ReadinessReceipt,
+  authorityScopeValue: unknown,
 ): boolean {
-  const authorityScope = isReadinessScope(record.verifiedScope) ? record.verifiedScope : null;
+  const authorityScope = isReadinessScope(authorityScopeValue) ? authorityScopeValue : null;
   const { binding, definition, verifiedScope } = receipt;
   const declaredCapabilityIds = record.operation.resources.flatMap((resource) =>
     resource.capabilityId === undefined ? [] : [resource.capabilityId],
   );
   const scopeIdentityMatches =
-    authorityScope !== null &&
-    authorityScope.residentId === verifiedScope.residentId &&
-    authorityScope.lane === verifiedScope.lane &&
-    authorityScope.host === verifiedScope.host &&
-    authorityScope.networkPath === verifiedScope.networkPath &&
-    authorityScope.operations.length === verifiedScope.operations.length &&
-    authorityScope.operations.every((operation) => verifiedScope.operations.includes(operation));
+    authorityScope === null ||
+    (authorityScope.residentId === verifiedScope.residentId &&
+      authorityScope.lane === verifiedScope.lane &&
+      authorityScope.host === verifiedScope.host &&
+      authorityScope.networkPath === verifiedScope.networkPath &&
+      authorityScope.operations.length === verifiedScope.operations.length &&
+      authorityScope.operations.every((operation) => verifiedScope.operations.includes(operation)));
   const bindingIdentityMatches =
     binding === null ||
     (binding.pluginId === record.pluginId &&

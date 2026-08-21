@@ -75,11 +75,19 @@ export async function applyEnabledChange(
       return operationOutcome(store.read(request.pluginId));
     }
     if (request.readinessRequest !== undefined) {
-      await host.recordReadinessFromProbe(request.pluginId, request.readinessRequest);
+      try {
+        await host.recordReadinessFromProbe(request.pluginId, request.readinessRequest);
+      } catch {
+        return readinessRejectedOutcome(store, request.pluginId);
+      }
       return operationOutcome(store.read(request.pluginId));
     }
     if (request.readiness !== undefined) {
-      host.recordReadiness(request.pluginId, request.readiness);
+      try {
+        host.recordReadiness(request.pluginId, request.readiness);
+      } catch {
+        return readinessRejectedOutcome(store, request.pluginId);
+      }
       return operationOutcome(store.read(request.pluginId));
     }
     return operationOutcome(existing); // true→true：已在役 幂等返回 不重进事务
@@ -118,4 +126,14 @@ function readIfPresent(store: PluginOperationStore, pluginId: string) {
   } catch {
     return null;
   }
+}
+
+function readinessRejectedOutcome(
+  store: PluginOperationStore,
+  pluginId: string,
+): PluginOperationOutcome {
+  return {
+    ...operationOutcome(store.read(pluginId)),
+    reasonCode: "CAPABILITY_UNVERIFIED",
+  };
 }
