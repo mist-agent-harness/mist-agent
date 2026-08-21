@@ -477,6 +477,18 @@ describe("runtime readiness / readback contract", () => {
       expect(probeCalls).toEqual({ existence: 3, running: 3, readback: 3 });
       expect(host.readiness(manifest.id, "2026-08-21T00:00:30.000Z").status).toBe("ready");
 
+      const callsBeforeManifestDrift = { ...probeCalls };
+      const driftedManifestRequest = {
+        ...request,
+        manifest: { ...manifest, version: "1.2.4" },
+      };
+      expect((await applyEnabledChange(host, store, driftedManifestRequest)).state).toBe("active");
+      expect(probeCalls).toEqual(callsBeforeManifestDrift);
+      expect(host.readiness(manifest.id).status).toBe("unknown");
+      expect(store.read(manifest.id).readiness).toBeUndefined();
+      expect((await applyEnabledChange(host, store, request)).state).toBe("active");
+      expect(host.readiness(manifest.id, "2026-08-21T00:00:30.000Z").status).toBe("ready");
+
       const wrongVersionRequest = probeRequest({
         definition: { ...definition, pluginId: manifest.id, moduleRef, version: "1.2.4" },
         binding: { ...binding, pluginId: manifest.id, moduleRef, version: "1.2.4" },
@@ -513,7 +525,7 @@ describe("runtime readiness / readback contract", () => {
         },
       };
       expect((await applyEnabledChange(host, store, failingRequest)).state).toBe("active");
-      expect(probeCalls).toEqual({ existence: 5, running: 5, readback: 4 });
+      expect(probeCalls).toEqual({ existence: 6, running: 6, readback: 5 });
       expect(host.readiness(manifest.id).status).toBe("unknown");
     } finally {
       rmSync(directory, { recursive: true, force: true });

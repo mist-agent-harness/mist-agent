@@ -470,6 +470,22 @@ export class PluginTransactionHost {
     return projectReadiness(record.lifecycleState, record.readiness, now);
   }
 
+  /**
+   * Invalidate a receipt when the production manifest no longer describes the active
+   * authority. The lifecycle stays active, but runtime readiness is explicitly unknown
+   * until a matching version is activated and probed again.
+   */
+  invalidateReadiness(pluginId: string, now: string | number = Date.now()): ReadinessProjection {
+    const record = this.#store.read(pluginId);
+    if (record.lifecycleState !== "active") {
+      throw new Error(`plugin ${pluginId} is not active; runtime readiness cannot be invalidated`);
+    }
+    const updated: PluginAuthorityRecord = { ...record, verifiedScope: null };
+    Reflect.deleteProperty(updated, "readiness");
+    this.#store.save(updated);
+    return projectReadiness(updated.lifecycleState, undefined, now);
+  }
+
   /** Persist a fresh external receipt without changing lifecycle or capability definitions. */
   recordReadiness(
     pluginId: string,

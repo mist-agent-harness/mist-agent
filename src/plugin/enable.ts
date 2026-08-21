@@ -70,6 +70,10 @@ export async function applyEnabledChange(
 
   const existing = readIfPresent(store, request.pluginId);
   if (existing?.enabled && existing.lifecycleState === "active") {
+    if (existing.runtimeVersion !== request.manifest.version) {
+      host.invalidateReadiness(request.pluginId);
+      return operationOutcome(store.read(request.pluginId));
+    }
     if (request.readinessRequest !== undefined) {
       await host.recordReadinessFromProbe(request.pluginId, request.readinessRequest);
       return operationOutcome(store.read(request.pluginId));

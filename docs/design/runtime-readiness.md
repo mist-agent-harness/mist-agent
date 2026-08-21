@@ -71,6 +71,8 @@ measurements 只能跟在同一证据行，不得脱离条件单独投影。本�
 生产 enable path 会把 manifest 的 `version` 持久化为 authority 的 `runtimeVersion`；probe receipt
 的 definition、binding、verifiedScope 和每条 evidence 的 version 必须全部与它相等。旧 authority
 没有 `runtimeVersion` 时仍可被读取，但 probe-backed `ready` 会 fail-closed，不会从调用方输入补出版本。
+active true→true 若发现新的 manifest version 与现役 authority 不同，会清除旧 readiness 并保持
+`active/unknown`；必须重新以匹配版本完成启用与现场探针，不能沿用上一代 ready。
 
 ## 与 #97 的接线
 
