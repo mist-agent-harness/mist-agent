@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import type { LifecycleState } from "./lifecycle.ts";
+import { type ReadinessReceipt, isReadinessReceipt } from "./runtime-readiness.ts";
 import type { ReasonCode, ResourceKind } from "./types.ts";
 
 export const PLUGIN_OPERATION_SCHEMA_VERSION = 1 as const;
@@ -78,6 +79,8 @@ export interface PluginAuthorityRecord {
   readonly config: unknown;
   readonly bindings: unknown;
   readonly verifiedScope: unknown;
+  /** Optional runtime receipt; absent means an active lifecycle is not runtime-ready. */
+  readonly readiness?: ReadinessReceipt;
   reasonCode?: ReasonCode;
   readonly operation: PluginOperationRecord;
   quarantine?: PluginQuarantineRecord;
@@ -284,6 +287,10 @@ function parseAuthority(text: string, expectedPluginId: string): PluginAuthority
     throw new Error("plugin authority has an invalid reasonCode");
   }
   const reasonCode = reasonCodeValue as ReasonCode | undefined;
+  const readiness = value.readiness;
+  if (readiness !== undefined && !isReadinessReceipt(readiness)) {
+    throw new Error("plugin authority has an invalid readiness receipt");
+  }
   const quarantine = parseQuarantine(value.quarantine);
   return {
     schemaVersion: PLUGIN_OPERATION_SCHEMA_VERSION,
@@ -294,6 +301,7 @@ function parseAuthority(text: string, expectedPluginId: string): PluginAuthority
     config: value.config,
     bindings: value.bindings,
     verifiedScope: value.verifiedScope,
+    ...(readiness === undefined ? {} : { readiness }),
     operation: parseOperation(value.operation),
     ...(reasonCode === undefined ? {} : { reasonCode }),
     ...(quarantine === undefined ? {} : { quarantine }),

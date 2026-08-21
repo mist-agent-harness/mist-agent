@@ -12,6 +12,7 @@ import { type SecretResolver, resolveEnvironment } from "./environment.ts";
 import { type PluginManifestV0, validateBindings } from "./manifest.ts";
 import type { PluginOperationStore } from "./operation-store.ts";
 import { type PluginOperationOutcome, operationOutcome } from "./recovery-coordinator.ts";
+import type { ReadinessReceipt } from "./runtime-readiness.ts";
 import type { PluginTransactionHost } from "./transaction-host.ts";
 import type { PluginModuleV0, ReasonCode } from "./types.ts";
 
@@ -23,6 +24,8 @@ export interface EnabledChangeRequest {
   /** instance config 全量（含 enabled 目标值）；运行时形状由就绪门定型。 */
   readonly config: unknown;
   readonly resolveSecret: SecretResolver;
+  /** Optional external runtime receipt. Omission deliberately remains unknown. */
+  readonly readiness?: ReadinessReceipt;
 }
 
 export type EnabledChangeResult =
@@ -65,6 +68,10 @@ export async function applyEnabledChange(
 
   const existing = readIfPresent(store, request.pluginId);
   if (existing?.enabled && existing.lifecycleState === "active") {
+    if (request.readiness !== undefined) {
+      host.recordReadiness(request.pluginId, request.readiness);
+      return operationOutcome(store.read(request.pluginId));
+    }
     return operationOutcome(existing); // true→true：已在役 幂等返回 不重进事务
   }
   const assembled = resolveEnvironment(request.manifest, request.config, request.resolveSecret);
@@ -83,9 +90,10 @@ export async function applyEnabledChange(
     config: request.config,
     env: assembled.env,
     bindings: { environment: (request.config as { environment: unknown }).environment },
-    // PV0 占位：readiness gate（F01/F06）尚未实现，此空对象不是验证收据；
-    // 接线前不得将其投影为 ready——消费者应视为 unverified。
-    verifiedScope: {},
+    // Activation and runtime readiness are separate facts. Without an external receipt,
+    // the durable authority carries no verified scope and host projection remains unknown.
+    verifiedScope: request.readiness?.verifiedScope ?? null,
+    ...(request.readiness === undefined ? {} : { readiness: request.readiness }),
   });
 }
 

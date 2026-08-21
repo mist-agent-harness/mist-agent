@@ -12,6 +12,12 @@ import {
   type RecoveryModuleLoader,
   operationOutcome,
 } from "./recovery-coordinator.ts";
+import {
+  type ReadinessProjection,
+  type ReadinessReceipt,
+  isReadinessReceipt,
+  projectReadiness,
+} from "./runtime-readiness.ts";
 import type {
   ActivePlugin,
   DisposableHandle,
@@ -51,6 +57,7 @@ export interface ActivatePluginRequest {
   readonly env: Readonly<Record<string, string>>;
   readonly bindings: unknown;
   readonly verifiedScope: unknown;
+  readonly readiness?: ReadinessReceipt;
 }
 
 export interface PublishedPluginResource {
@@ -113,6 +120,7 @@ export class PluginTransactionHost {
       config: request.config,
       bindings: request.bindings,
       verifiedScope: request.verifiedScope,
+      ...(request.readiness === undefined ? {} : { readiness: request.readiness }),
       operation: {
         operationId,
         operation: "activate",
@@ -223,6 +231,7 @@ export class PluginTransactionHost {
         enabled: false,
         config: deactivation.config,
       };
+      Reflect.deleteProperty(terminal, "readiness");
       this.#store.save(terminal);
       return this.#outcome(terminal);
     }
@@ -255,6 +264,7 @@ export class PluginTransactionHost {
       };
       Reflect.deleteProperty(parked, "reasonCode");
       Reflect.deleteProperty(parked, "quarantine");
+      Reflect.deleteProperty(parked, "readiness");
       this.#store.save(parked);
       this.#published.delete(pluginId);
       parked.lifecycleState = "disposed";
@@ -285,6 +295,7 @@ export class PluginTransactionHost {
     };
     Reflect.deleteProperty(record, "reasonCode");
     Reflect.deleteProperty(record, "quarantine");
+    Reflect.deleteProperty(record, "readiness");
     this.#store.save(record);
     this.#published.delete(pluginId);
 
@@ -370,6 +381,46 @@ export class PluginTransactionHost {
     return (this.#published.get(pluginId) ?? []).map((resource) => ({ ...resource }));
   }
 
+  /** Runtime readiness never defaults from lifecycle `active`; missing receipt is unknown. */
+  readiness(pluginId: string): ReadinessProjection {
+    const record = this.#store.read(pluginId);
+    if (
+      record.readiness !== undefined &&
+      (!isReadinessReceipt(record.readiness) ||
+        record.readiness.definition.pluginId !== record.pluginId ||
+        record.readiness.definition.moduleRef !== record.moduleRef)
+    ) {
+      return {
+        status: "unknown",
+        reasonCode: "CAPABILITY_UNVERIFIED",
+        detail: "runtime readiness receipt does not describe the current plugin authority",
+      };
+    }
+    return projectReadiness(record.lifecycleState, record.readiness);
+  }
+
+  /** Persist a fresh external receipt without changing lifecycle or capability definitions. */
+  recordReadiness(pluginId: string, receipt: ReadinessReceipt): ReadinessProjection {
+    const record = this.#store.read(pluginId);
+    if (record.lifecycleState !== "active") {
+      throw new Error(`plugin ${pluginId} is not active; runtime readiness cannot be recorded`);
+    }
+    if (
+      !isReadinessReceipt(receipt) ||
+      receipt.definition.pluginId !== record.pluginId ||
+      receipt.definition.moduleRef !== record.moduleRef
+    ) {
+      throw new Error("runtime readiness receipt does not match the current plugin authority");
+    }
+    const updated: PluginAuthorityRecord = {
+      ...record,
+      verifiedScope: receipt.verifiedScope,
+      readiness: receipt,
+    };
+    this.#store.save(updated);
+    return projectReadiness(updated.lifecycleState, updated.readiness);
+  }
+
   async #rollbackCurrent(
     record: PluginAuthorityRecord,
     resources: readonly RegisteredResource[],
@@ -402,6 +453,7 @@ export class PluginTransactionHost {
     record.reasonCode = reasonCode;
     record.operation.phase = "completed";
     Reflect.deleteProperty(record, "quarantine");
+    Reflect.deleteProperty(record, "readiness");
     this.#store.save(record);
     return this.#outcome(record);
   }
@@ -447,6 +499,7 @@ export class PluginTransactionHost {
     record.quarantine = { reasonCode, remainingResourceIds, manualActions };
     this.#published.delete(record.pluginId);
     this.#active.delete(record.pluginId);
+    Reflect.deleteProperty(record, "readiness");
     this.#store.save(record);
     return this.#outcome(record);
   }
