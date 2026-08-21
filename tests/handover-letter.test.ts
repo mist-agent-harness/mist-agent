@@ -97,10 +97,21 @@ describe("MV-D06 三档标注条目级", () => {
   it("intent 半每条盖当刻亲笔章：author = residentId + 写下它的那一代", () => {
     const sealed = sealLetter(draft(), ctx({ generation: 3 }));
 
-    expect(sealed.intent[0]?.author).toBe(formatAuthor("resident-a", 3));
+    // 刻意写字面量而不是调 formatAuthor：拿实现自己的构造函数造期望值，
+    // 格式漂了两边一起漂，这条断言就测不出「author 里有没有代际」——
+    // 变异探针（把 author 改成只有 residentId）当场证明过它测不出来。
+    expect(sealed.intent[0]?.author).toBe("resident-a#3");
+    expect(formatAuthor("resident-a", 3)).toBe("resident-a#3");
     expect(sealed.intent[0]?.writtenAt).toBe(NOW);
     // 亲笔纪律只约束 intent 半：state 半允许脚本生成，不盖章。
     expect(sealed.state[0]).not.toHaveProperty("author");
+  });
+
+  it("同一住户不同代际写的信，author 必须不同——代际是亲笔章的一部分", () => {
+    const gen3 = sealLetter(draft(), ctx({ generation: 3 }));
+    const gen4 = sealLetter(draft(), ctx({ generation: 4 }));
+
+    expect(gen3.intent[0]?.author).not.toBe(gen4.intent[0]?.author);
   });
 
   it("commitment 条目必须带 ledgerSeq 指针，且指针只属于 commitment 档", () => {
