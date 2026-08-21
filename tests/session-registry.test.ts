@@ -1,8 +1,189 @@
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { SessionRegistry } from "../src/session/session-registry.ts";
+import {
+  PRIVATE_SCOPE,
+  SessionRegistry,
+  WINDOW_ARCHIVED,
+  WINDOW_REOPEN_INVALID,
+} from "../src/session/session-registry.ts";
 
-describe("SessionRegistry", () => {
-  it("kills the live pointer and in-flight context without touching resident state", () => {
+describe("SessionRegistry：多窗语义", () => {
+  it("MV-A01 同一住户同一 scope 连开两次得到两扇活窗，各自 generation=1", () => {
+    const sessions = new SessionRegistry<null>();
+
+    const w1 = sessions.open("resident-a", { context: null });
+    const w2 = sessions.open("resident-a", { context: null });
+
+    expect(w1.windowId).not.toBe(w2.windowId);
+    expect(w1.generation).toBe(1);
+    expect(w2.generation).toBe(1);
+    expect(sessions.isActive(w1.windowId)).toBe(true);
+    expect(sessions.isActive(w2.windowId)).toBe(true);
+    expect(sessions.windowsOf("resident-a")).toHaveLength(2);
+  });
+
+  it("MV-A04 缺省 scope 落私聊，不落全局", () => {
+    const sessions = new SessionRegistry<null>();
+
+    expect(sessions.open("resident-a", { context: null }).scopeId).toBe(PRIVATE_SCOPE);
+    expect(sessions.open("resident-a", { scopeId: "room-1", context: null }).scopeId).toBe(
+      "room-1",
+    );
+  });
+
+  it("MV-A03 kill 幂等，归档后只读，写入返 WINDOW_ARCHIVED", () => {
+    const sessions = new SessionRegistry<null>();
+    const w1 = sessions.open("resident-a", { headId: "node-1", context: null });
+
+    const first = sessions.kill(w1.windowId);
+    const second = sessions.kill(w1.windowId);
+
+    expect(first).toEqual(second);
+    expect(sessions.isActive(w1.windowId)).toBe(false);
+    expect(sessions.getArchived(w1.windowId)).toMatchObject({ archived: true, headId: "node-1" });
+    expect(() => sessions.setHead(w1.windowId, "node-2")).toThrow(WINDOW_ARCHIVED);
+    expect(() => sessions.issueDispatch(w1.windowId)).toThrow(WINDOW_ARCHIVED);
+  });
+
+  it("MV-A03 killResident 杀掉该住户全部活窗，不碰别人", () => {
+    const sessions = new SessionRegistry<null>();
+    const a1 = sessions.open("resident-a", { context: null });
+    const a2 = sessions.open("resident-a", { context: null });
+    const b1 = sessions.open("resident-b", { context: null });
+
+    expect(sessions.killResident("resident-a")).toHaveLength(2);
+
+    expect(sessions.isActive(a1.windowId)).toBe(false);
+    expect(sessions.isActive(a2.windowId)).toBe(false);
+    expect(sessions.isActive(b1.windowId)).toBe(true);
+  });
+
+  it("MV-B02 代际归窗，住户级问不出「当前代际」", () => {
+    const sessions = new SessionRegistry<null>();
+    const w1 = sessions.open("resident-a", { context: null });
+    sessions.kill(w1.windowId);
+    const reopened = sessions.open("resident-a", { windowId: w1.windowId, context: null });
+    const fresh = sessions.open("resident-a", { context: null });
+
+    expect(reopened.generation).toBe(2);
+    expect(fresh.generation).toBe(1);
+    expect(sessions).not.toHaveProperty("currentGeneration");
+    expect(
+      sessions
+        .windowsOf("resident-a")
+        .map((w) => w.generation)
+        .sort(),
+    ).toEqual([1, 2]);
+  });
+
+  it("显式 windowId 只能重开已归档窗，未知 id fail loud 且不污染内部发号", () => {
+    const sessions = new SessionRegistry<null>();
+
+    expect(() => sessions.open("resident-a", { windowId: "window-000001", context: null })).toThrow(
+      WINDOW_REOPEN_INVALID,
+    );
+
+    const fresh = sessions.open("resident-a", { context: null });
+    expect(fresh.windowId).toBe("window-000001");
+    expect(fresh.generation).toBe(1);
+  });
+
+  it("归档窗不能被另一住户抢注，拒绝后原住户仍可按原 scope 重开", () => {
+    const sessions = new SessionRegistry<null>();
+    const archived = sessions.open("resident-a", { scopeId: "room-1", context: null });
+    sessions.kill(archived.windowId);
+
+    expect(() =>
+      sessions.open("resident-b", {
+        windowId: archived.windowId,
+        scopeId: "room-1",
+        context: null,
+      }),
+    ).toThrow(/resident mismatch/);
+    expect(sessions.isArchived(archived.windowId)).toBe(true);
+
+    const reopened = sessions.open("resident-a", {
+      windowId: archived.windowId,
+      scopeId: "room-1",
+      context: null,
+    });
+    expect(reopened.generation).toBe(2);
+  });
+
+  it("归档窗只能按原 scope 重开，scope 不一致显式拒绝", () => {
+    const sessions = new SessionRegistry<null>();
+    const archived = sessions.open("resident-a", { scopeId: "room-1", context: null });
+    sessions.kill(archived.windowId);
+
+    expect(() =>
+      sessions.open("resident-a", { windowId: archived.windowId, context: null }),
+    ).toThrow(/scope mismatch/);
+    expect(sessions.isArchived(archived.windowId)).toBe(true);
+  });
+
+  it("MV-A03 归档 append 到 JSONL，重启后仍可查询并按下一代重开", () => {
+    const directory = mkdtempSync(join(tmpdir(), "mist-window-archive-"));
+    const archivePath = join(directory, "windows.jsonl");
+    try {
+      const first = new SessionRegistry<null>({ archivePath });
+      const window = first.open("resident-a", {
+        scopeId: "room-1",
+        headId: "node-1",
+        context: null,
+      });
+      first.kill(window.windowId);
+
+      const lines = readFileSync(archivePath, "utf8").trim().split("\n");
+      expect(lines).toHaveLength(2);
+      expect(JSON.parse(lines[0] ?? "null")).toMatchObject({
+        schemaVersion: 1,
+        type: "window_opened",
+        window: { windowId: window.windowId, generation: 1 },
+      });
+      expect(JSON.parse(lines[1] ?? "null")).toMatchObject({
+        schemaVersion: 1,
+        type: "window_archived",
+        window: { windowId: window.windowId, generation: 1, headId: "node-1" },
+      });
+
+      const second = new SessionRegistry<null>({ archivePath });
+      expect(second.getArchived(window.windowId)).toMatchObject({
+        residentId: "resident-a",
+        scopeId: "room-1",
+        generation: 1,
+        headId: "node-1",
+      });
+      const reopened = second.open("resident-a", {
+        windowId: window.windowId,
+        scopeId: "room-1",
+        context: null,
+      });
+      expect(reopened.generation).toBe(2);
+      second.kill(reopened.windowId);
+
+      const third = new SessionRegistry<null>({ archivePath });
+      expect(third.getArchived(window.windowId)?.generation).toBe(2);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("损坏的归档 JSONL 在启动时 fail loud", () => {
+    const directory = mkdtempSync(join(tmpdir(), "mist-window-archive-corrupt-"));
+    const archivePath = join(directory, "windows.jsonl");
+    try {
+      writeFileSync(archivePath, "not-json\n");
+      expect(() => new SessionRegistry<null>({ archivePath })).toThrow(
+        /invalid window archive JSONL at line 1/,
+      );
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("会话态归零不动住户留下的东西", () => {
     const residentState = {
       memories: ["答应过：周五晚上一起看电影"],
       messages: ["记住这件事"],
@@ -11,72 +192,90 @@ describe("SessionRegistry", () => {
     const before = structuredClone(residentState);
     const sessions = new SessionRegistry<{ pending: string[] }>();
 
-    sessions.open("resident-a", "node-2", { pending: ["还没落库的话"] });
-    sessions.kill("resident-a");
+    const w1 = sessions.open("resident-a", {
+      headId: "node-2",
+      context: { pending: ["还没落库的话"] },
+    });
+    sessions.kill(w1.windowId);
 
-    expect(sessions.get("resident-a")).toBeUndefined();
+    expect(sessions.get(w1.windowId)).toBeUndefined();
     expect(residentState).toEqual(before);
   });
+});
 
-  it("is idempotent when the same session is killed twice", () => {
-    const sessions = new SessionRegistry<Record<string, never>>();
-    sessions.open("resident-a", null, {});
-
-    sessions.kill("resident-a");
-    expect(() => sessions.kill("resident-a")).not.toThrow();
-    expect(sessions.isActive("resident-a")).toBe(false);
-  });
-
-  it("does not kill another resident's live session", () => {
-    const sessions = new SessionRegistry<string[]>();
-    sessions.open("resident-a", "node-a", ["a"]);
-    sessions.open("resident-b", "node-b", ["b"]);
-
-    sessions.kill("resident-a");
-
-    expect(sessions.isActive("resident-a")).toBe(false);
-    expect(sessions.get("resident-b")).toEqual({
-      residentId: "resident-b",
-      generation: 1,
-      headId: "node-b",
-      context: ["b"],
-    });
-  });
-
-  it("advances the head inside one active generation", () => {
+describe("SessionRegistry：贯穿场景（A01/A02/A03/B01/B02/B03 一口咬住）", () => {
+  it("杀掉 w1 之后 w2 继续，w1 的迟到回执不落到 w2 身上", () => {
     const sessions = new SessionRegistry<null>();
-    const session = sessions.open("resident-a", null, null);
+    const w1 = sessions.open("resident-a", { context: null });
+    const w2 = sessions.open("resident-a", { context: null });
 
-    sessions.setHead("resident-a", "reply-1");
+    const r1 = sessions.issueDispatch(w1.windowId);
+    const r2 = sessions.issueDispatch(w2.windowId);
 
-    expect(sessions.get("resident-a")).toEqual({
-      ...session,
-      headId: "reply-1",
-    });
+    // 三元组齐全（MV-B03 的日志字段来源）
+    for (const receipt of [r1, r2]) {
+      expect(receipt).toMatchObject({ residentId: "resident-a" });
+      expect(receipt.windowId).toBeTruthy();
+      expect(receipt.generation).toBe(1);
+      expect(receipt.dispatchId).toBeTruthy();
+    }
+    expect(r1.windowId).not.toBe(r2.windowId);
+
+    sessions.kill(w1.windowId);
+
+    // w1 的迟到回执不再属于任何活窗。
+    // 这一条同时是「回到 residentId 单键查找」的回归闸：r1 的 residentId 与
+    // generation 都和 w2 相同（同住户、同为第 1 代），旧实现按 residentId 查
+    // 就会把它认成 w2 的回执；只有按 windowId 查才判得出来。
+    expect(r1.residentId).toBe(w2.residentId);
+    expect(r1.generation).toBe(w2.generation);
+    expect(sessions.belongsToActiveWindow(r1)).toBe(false);
+
+    // w2 完全不受影响——这一步是 MV-A02 的真正判据
+    expect(sessions.isActive(w2.windowId)).toBe(true);
+    expect(sessions.belongsToActiveWindow(r2)).toBe(true);
+    sessions.setHead(w2.windowId, "reply-1");
+    expect(sessions.get(w2.windowId)?.headId).toBe("reply-1");
+    expect(sessions.issueDispatch(w2.windowId).generation).toBe(1);
   });
 
-  it("rejects setting a head when no session is active", () => {
+  it("同窗换代后旧代回执被丢弃", () => {
     const sessions = new SessionRegistry<null>();
+    const w = sessions.open("resident-a", { context: null });
+    const stale = sessions.issueDispatch(w.windowId);
 
-    expect(() => sessions.setHead("resident-a", "reply-1")).toThrow(/no active session/);
+    sessions.kill(w.windowId);
+    const reopened = sessions.open("resident-a", { windowId: w.windowId, context: null });
+
+    expect(reopened.generation).toBe(2);
+    expect(sessions.belongsToActiveWindow(stale)).toBe(false);
+    expect(sessions.belongsToActiveWindow(sessions.issueDispatch(w.windowId))).toBe(true);
   });
 
-  it("marks stale dispatch receipts as not belonging to the active session after kill", () => {
+  it("同住户两窗各有各的 head，杀掉一扇不改另一扇（MV-A02 的 head 面）", () => {
     const sessions = new SessionRegistry<null>();
-    sessions.open("resident-a", null, null);
-    const stale = sessions.issueDispatch("resident-a");
+    const w1 = sessions.open("resident-a", { context: null });
+    const w2 = sessions.open("resident-a", { context: null });
 
-    sessions.kill("resident-a");
-    sessions.open("resident-a", null, null);
+    sessions.setHead(w1.windowId, "node-w1");
+    sessions.setHead(w2.windowId, "node-w2");
+    expect(sessions.get(w1.windowId)?.headId).toBe("node-w1");
+    expect(sessions.get(w2.windowId)?.headId).toBe("node-w2");
 
-    expect(sessions.belongsToActiveSession(stale)).toBe(false);
+    sessions.kill(w1.windowId);
+
+    // 共用一颗 head 的旧实现里，w1 的死会把 w2 的续话位置一起带走。
+    expect(sessions.get(w2.windowId)?.headId).toBe("node-w2");
+    expect(sessions.getArchived(w1.windowId)?.headId).toBe("node-w1");
   });
 
-  it("keeps current-generation dispatch receipts valid while the session is still active", () => {
+  it("回执三元组缺一不认：住户对不上也不算数", () => {
     const sessions = new SessionRegistry<null>();
-    sessions.open("resident-a", null, null);
-    const receipt = sessions.issueDispatch("resident-a");
+    const w = sessions.open("resident-a", { context: null });
+    const receipt = sessions.issueDispatch(w.windowId);
 
-    expect(sessions.belongsToActiveSession(receipt)).toBe(true);
+    expect(sessions.belongsToActiveWindow({ ...receipt, residentId: "resident-b" })).toBe(false);
+    expect(sessions.belongsToActiveWindow({ ...receipt, generation: 99 })).toBe(false);
+    expect(sessions.belongsToActiveWindow(receipt)).toBe(true);
   });
 });
