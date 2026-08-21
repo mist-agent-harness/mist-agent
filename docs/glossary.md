@@ -113,6 +113,17 @@ reason code 跨重启保留；重启不能把它洗成 ready。显式清理重�
 回指该 issuer 的 ref，也不得制造悬空引用。v0 不定义 secretRef 后端、加密、轮换或 issuer 删除后
 现役 ref 的产品处置/迁移语义；登录流程不属于插件协议。
 
+**scopeId（可见性作用域标识）**
+住户的可见性／隔离边界的标识：不是窗，也不是 context injection 的 `scope`。
+隔离只按 scope 划（论证见 issue #69），同一 scope 的多扇 viewport 共享同一份
+可见事实。开窗未显式给出 scopeId 时，只能落「私聊」，不得默认「全局」。
+scopeId 与 lane 是正交维度：lane 是选择执行通道时的用途槽，scopeId 划可见性边界；
+两者互不推导，任一方的合法值都不得从另一方猜出。
+
+**窗三元组（residentId, scopeId, windowId）**
+一扇窗的完整身份，三项缺一不可（图纸 `docs/design/multi-viewport.md` §1.1）。
+generation 不属于三元组：换气是窗内换代，generation + 1，三元组不变（§1.2）。
+
 **viewport（视窗）**
 住户 scope 的一面视野。D7 多活窗模型里，一位住户可同时有多个 viewport，各自独立
 代际；关掉即归档为只读日志／导出证据。viewport 不是隔离单位——同一 scope 下的多个
