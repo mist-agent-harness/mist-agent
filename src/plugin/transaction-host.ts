@@ -112,6 +112,16 @@ export class PluginTransactionHost {
     // （fail-closed，原字节不动）；仅 ENOENT、blocked 显式重试、disposed 重装放行。
     const refused = refuseActiveIdOverwrite(request.pluginId, this.#active, this.#store);
     if (refused !== null) return refused;
+    if (
+      request.readiness?.status === "ready" &&
+      (!isReadinessReceipt(request.readiness) ||
+        !isReadinessScope(request.verifiedScope) ||
+        !sameReadinessScope(request.verifiedScope, request.readiness.verifiedScope))
+    ) {
+      throw new Error(
+        "ready runtime readiness requires an authority verifiedScope matching the receipt",
+      );
+    }
     const operationId = this.#newOperationId();
     const record: PluginAuthorityRecord = {
       schemaVersion: 1,
@@ -563,7 +573,9 @@ function readinessMatchesAuthority(
     definition.moduleRef === record.moduleRef &&
     (declaredCapabilityIds.length === 0 ||
       declaredCapabilityIds.includes(definition.capabilityId)) &&
-    (authorityScope === null || sameReadinessScope(authorityScope, verifiedScope)) &&
+    (receipt.status !== "ready"
+      ? authorityScope === null || sameReadinessScope(authorityScope, verifiedScope)
+      : authorityScope !== null && sameReadinessScope(authorityScope, verifiedScope)) &&
     verifiedScope.version === definition.version &&
     (binding === null ||
       (binding.pluginId === record.pluginId &&

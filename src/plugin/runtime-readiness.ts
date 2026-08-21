@@ -403,6 +403,18 @@ export function isReadinessReceipt(value: unknown): value is ReadinessReceipt {
   if (value.status !== "ready" && value.lastVerifiedAt !== null) return false;
   if (value.status !== "unknown" && evidence.some((item) => item.source !== "external"))
     return false;
+  if (value.status === "ready") {
+    if (value.lastVerifiedAt === null) return false;
+    if (value.lastVerifiedAt !== latestObservedAt(evidence)) return false;
+    if (value.reason !== undefined || value.reasonCode !== undefined) return false;
+    if (
+      value.verificationWindowMs !== undefined &&
+      typeof value.verificationWindowMs === "number" &&
+      !evidenceWithinVerificationWindow(evidence, value.lastVerifiedAt, value.verificationWindowMs)
+    ) {
+      return false;
+    }
+  }
   if (
     value.status === "ready" &&
     (value.lastVerifiedAt === null ||
@@ -529,13 +541,32 @@ function isReceiptCurrent(receipt: ReadinessReceipt, now: string | number): bool
   );
 }
 
+function evidenceWithinVerificationWindow(
+  evidence: readonly RuntimeEvidence[],
+  lastVerifiedAt: string,
+  verificationWindowMs: number,
+): boolean {
+  const verifiedAt = Date.parse(lastVerifiedAt);
+  if (!Number.isFinite(verifiedAt)) return false;
+  return evidence.every((item) => {
+    const observedAt = Date.parse(item.observedAt);
+    return (
+      Number.isFinite(observedAt) &&
+      observedAt <= verifiedAt &&
+      verifiedAt - observedAt <= verificationWindowMs
+    );
+  });
+}
+
 function latestObservedAt(evidence: readonly RuntimeEvidence[]): string {
-  return (
-    evidence
-      .map((item) => item.observedAt)
-      .sort()
-      .at(-1) ?? new Date(0).toISOString()
-  );
+  return evidence.reduce((latest, item) => {
+    const latestAt = Date.parse(latest);
+    const itemAt = Date.parse(item.observedAt);
+    if (itemAt > latestAt || (itemAt === latestAt && item.observedAt > latest)) {
+      return item.observedAt;
+    }
+    return latest;
+  }, new Date(0).toISOString());
 }
 
 function cloneDefinition(value: ReadinessDefinition): ReadinessDefinition {

@@ -242,6 +242,30 @@ describe("runtime readiness / readback contract", () => {
     });
   });
 
+  it("rejects a forged verification timestamp or replayed evidence outside the window", () => {
+    const receipt = evaluateRuntimeReadiness(input());
+    expect(
+      isReadinessReceipt({
+        ...receipt,
+        lastVerifiedAt: "2026-08-21T00:00:01.000Z",
+      }),
+    ).toBe(false);
+
+    const replayedEvidence = {
+      ...receipt,
+      evidence: receipt.evidence.map((item, index) =>
+        index === 0 ? { ...item, observedAt: "2026-08-20T23:00:00.000Z" } : item,
+      ),
+    };
+    expect(isReadinessReceipt(replayedEvidence)).toBe(false);
+  });
+
+  it("rejects a ready receipt that carries a failure reason", () => {
+    const receipt = evaluateRuntimeReadiness(input());
+    expect(isReadinessReceipt({ ...receipt, reasonCode: "PLUGIN_RUNTIME_FAILED" })).toBe(false);
+    expect(isReadinessReceipt({ ...receipt, reason: "readback-failed" })).toBe(false);
+  });
+
   it("rejects evidence legs that reuse one probe identity", () => {
     const receipt = evaluateRuntimeReadiness(
       input({
@@ -353,6 +377,31 @@ describe("runtime readiness / readback contract", () => {
       const receipt = evaluateRuntimeReadiness(
         input({ definition: readyDefinition, binding: readyBinding, evidence: readyEvidence }),
       );
+      await expect(
+        host.activate({
+          pluginId: definition.pluginId,
+          moduleRef,
+          module,
+          config: { enabled: true },
+          env: {},
+          bindings: {},
+          verifiedScope: null,
+          readiness: receipt,
+        }),
+      ).rejects.toThrow("ready runtime readiness requires an authority verifiedScope");
+      expect(() => store.read(definition.pluginId)).toThrow();
+      await expect(
+        host.activate({
+          pluginId: definition.pluginId,
+          moduleRef,
+          module,
+          config: { enabled: true },
+          env: {},
+          bindings: {},
+          verifiedScope: { ...receipt.verifiedScope, residentId: "resident-b" },
+          readiness: receipt,
+        }),
+      ).rejects.toThrow("ready runtime readiness requires an authority verifiedScope");
       await host.activate({
         pluginId: definition.pluginId,
         moduleRef,
@@ -412,6 +461,13 @@ describe("runtime readiness / readback contract", () => {
       expect(() => host.recordReadiness(definition.pluginId, mismatchedBinding)).toThrow(
         "runtime readiness receipt does not match the current plugin authority",
       );
+
+      const authority = store.read(definition.pluginId);
+      store.save({ ...authority, verifiedScope: null });
+      expect(host.readiness(definition.pluginId, "2026-08-21T00:00:30.000Z")).toMatchObject({
+        status: "unknown",
+        reasonCode: "CAPABILITY_UNVERIFIED",
+      });
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
