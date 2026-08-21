@@ -83,6 +83,8 @@ export async function applyEnabledChange(
     config: request.config,
     env: assembled.env,
     bindings: { environment: (request.config as { environment: unknown }).environment },
+    // PV0 占位：readiness gate（F01/F06）尚未实现，此空对象不是验证收据；
+    // 接线前不得将其投影为 ready——消费者应视为 unverified。
     verifiedScope: {},
   });
 }
