@@ -74,6 +74,20 @@
 一次 capability 可用性验证实际覆盖的住户、车道、操作集合与时间点。ready 只在这组边界内
 成立，不能把某一车道、角色或旧时间点的成功投影成全局可用。
 
+**运行态就绪（runtime readiness）**
+某个 capability 在指定 `resident × lane × operation × host/network × version × time`
+边界内，经过独立运行证据和真实路径读回后得到的派生状态。它不改变 definition、binding
+或 authorization；证据不足时为 `unknown`，不能从文件存在、进程自报或全局 health 推成 ready。
+
+**运行态读回（runtime readback）**
+从运行中的目标外部取回的、与请求 scope 和条件绑定的事实，例如实际调用路径的无副作用探针、
+版本查询或 initialize 握手。health 只能是某一条证据，不能代替真实操作路径读回。
+
+**就绪收据（readiness receipt）**
+一次运行态就绪验证的可审计结果，必须把 `verifiedScope` 与 `lastVerifiedAt` 成对保存，
+并在同一证据行携带条件与量化读数。收据不是 definition、授权或 telemetry 的真相源，
+也不把某一次 scope 的成功投影到其他住户、车道、操作、主机、网络路径或版本。
+
 **quarantined**
 插件资源撤销不完整或运行时越界后的持久隔离态。全部对外入口保持关闭，剩余资源 id 与稳定
 reason code 跨重启保留；重启不能把它洗成 ready。显式清理重试是宿主独立操作，不等于重复

@@ -4,6 +4,10 @@
 不声称具体实现已经通过。实现落地时，每项必须成为确定性自动测试；测试违反约束后没有
 明确红灯的条目，不得勾选。
 
+F 系列运行态口径的增量见 [runtime-readiness.md](../docs/design/runtime-readiness.md)，
+对应实测位于 `tests/plugin-runtime-readiness.test.ts` 与
+`tests/pv0/pv0-f-readiness-semantics.test.ts`。
+
 每条测试记录四件事：fixture、动作、确定性断言、失败时的 reason code。含敏感值的
 fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置快照、日志、事件和
 错误输出；凡插件产物会进入模型，还要扫描带来源标记的住户上下文快照。
@@ -236,6 +240,12 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 - [ ] **[PV0-F06](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s4) ready 必须有当前 scope 的可用性收据**：分别用 initialize 握手、版本查询
   和无副作用探针验证三类 capability；未运行探针、探针超时或返回身份不符时返回
   `CAPABILITY_UNVERIFIED` 且不进 ready 工具集。断言只证明可用性，不声称签名或供应链可信。
+
+本次 #101 只落地了确定性 evaluator/readback contract 与窄 fixture（缺运行证据、真实路径失败、
+scope/version/条件漂移和过期收据）；上述 F01/F02/F06 仍需完整的四状态、A–E 失败矩阵和三类
+provider-like readback fixture 后再勾选。`npm run acceptance` 的 C1–C6 六盏灯不替代 PV0 F
+系列验收，故此处保持未勾选。`publishedResources` 仍是生命周期 projection，本切片不声称
+它受 readiness gate 控制；active 无收据时可能仍有已发布资源，但 readiness 必须为 unknown。
 
 ## 逐项 mutation 台账
 

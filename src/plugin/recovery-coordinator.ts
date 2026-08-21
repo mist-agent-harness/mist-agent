@@ -189,6 +189,7 @@ export class PluginRecoveryCoordinator {
   #finish(record: PluginAuthorityRecord, explicitCleanup: boolean): PluginOperationOutcome {
     record.operation.phase = "completed";
     Reflect.deleteProperty(record, "quarantine");
+    Reflect.deleteProperty(record, "readiness");
     if (explicitCleanup || record.operation.operation === "dispose") {
       record.lifecycleState = "disposed";
       if (record.operation.operation === "dispose") record.operation.disposeCompleted = true;
@@ -247,6 +248,7 @@ export class PluginRecoveryCoordinator {
     record.reasonCode = reasonCode;
     record.operation.phase = "quarantined";
     record.quarantine = { reasonCode, remainingResourceIds, manualActions };
+    Reflect.deleteProperty(record, "readiness");
     this.#store.save(record);
     return operationOutcome(record);
   }

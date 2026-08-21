@@ -12,6 +12,7 @@ import { type SecretResolver, resolveEnvironment } from "./environment.ts";
 import { type PluginManifestV0, validateBindings } from "./manifest.ts";
 import type { PluginOperationStore } from "./operation-store.ts";
 import { type PluginOperationOutcome, operationOutcome } from "./recovery-coordinator.ts";
+import type { ReadinessReceipt, RuntimeReadinessRequest } from "./runtime-readiness.ts";
 import type { PluginTransactionHost } from "./transaction-host.ts";
 import type { PluginModuleV0, ReasonCode } from "./types.ts";
 
@@ -23,6 +24,10 @@ export interface EnabledChangeRequest {
   /** instance config 全量（含 enabled 目标值）；运行时形状由就绪门定型。 */
   readonly config: unknown;
   readonly resolveSecret: SecretResolver;
+  /** Legacy compatibility input; a ready receipt is rejected by the host. */
+  readonly readiness?: ReadinessReceipt;
+  /** Current-process probe request; its generated receipt is the only new ready authority. */
+  readonly readinessRequest?: RuntimeReadinessRequest;
 }
 
 export type EnabledChangeResult =
@@ -65,6 +70,26 @@ export async function applyEnabledChange(
 
   const existing = readIfPresent(store, request.pluginId);
   if (existing?.enabled && existing.lifecycleState === "active") {
+    if (existing.runtimeVersion !== request.manifest.version) {
+      host.invalidateReadiness(request.pluginId);
+      return operationOutcome(store.read(request.pluginId));
+    }
+    if (request.readinessRequest !== undefined) {
+      try {
+        await host.recordReadinessFromProbe(request.pluginId, request.readinessRequest);
+      } catch {
+        return readinessRejectedOutcome(store, request.pluginId);
+      }
+      return operationOutcome(store.read(request.pluginId));
+    }
+    if (request.readiness !== undefined) {
+      try {
+        host.recordReadiness(request.pluginId, request.readiness);
+      } catch {
+        return readinessRejectedOutcome(store, request.pluginId);
+      }
+      return operationOutcome(store.read(request.pluginId));
+    }
     return operationOutcome(existing); // true→true：已在役 幂等返回 不重进事务
   }
   const assembled = resolveEnvironment(request.manifest, request.config, request.resolveSecret);
@@ -80,12 +105,18 @@ export async function applyEnabledChange(
     pluginId: request.pluginId,
     moduleRef: request.moduleRef,
     module: request.module,
+    runtimeVersion: request.manifest.version,
     config: request.config,
     env: assembled.env,
     bindings: { environment: (request.config as { environment: unknown }).environment },
-    // PV0 占位：readiness gate（F01/F06）尚未实现，此空对象不是验证收据；
-    // 接线前不得将其投影为 ready——消费者应视为 unverified。
-    verifiedScope: {},
+    // Activation and runtime readiness are separate facts. Without an external receipt,
+    // the durable authority carries no verified scope and host projection remains unknown.
+    verifiedScope:
+      request.readinessRequest === undefined ? (request.readiness?.verifiedScope ?? null) : null,
+    ...(request.readiness === undefined ? {} : { readiness: request.readiness }),
+    ...(request.readinessRequest === undefined
+      ? {}
+      : { readinessRequest: request.readinessRequest }),
   });
 }
 
@@ -95,4 +126,14 @@ function readIfPresent(store: PluginOperationStore, pluginId: string) {
   } catch {
     return null;
   }
+}
+
+function readinessRejectedOutcome(
+  store: PluginOperationStore,
+  pluginId: string,
+): PluginOperationOutcome {
+  return {
+    ...operationOutcome(store.read(pluginId)),
+    reasonCode: "CAPABILITY_UNVERIFIED",
+  };
 }
