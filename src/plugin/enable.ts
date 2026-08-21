@@ -93,6 +93,7 @@ export async function applyEnabledChange(
     pluginId: request.pluginId,
     moduleRef: request.moduleRef,
     module: request.module,
+    runtimeVersion: request.manifest.version,
     config: request.config,
     env: assembled.env,
     bindings: { environment: (request.config as { environment: unknown }).environment },

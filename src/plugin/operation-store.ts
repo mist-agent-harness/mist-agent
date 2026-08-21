@@ -76,6 +76,8 @@ export interface PluginAuthorityRecord {
   lifecycleState: LifecycleState;
   enabled: boolean;
   readonly moduleRef: string;
+  /** Manifest/runtime version captured by the production enable path; absent on legacy records. */
+  readonly runtimeVersion?: string;
   readonly config: unknown;
   readonly bindings: unknown;
   readonly verifiedScope: unknown;
@@ -287,6 +289,7 @@ function parseAuthority(text: string, expectedPluginId: string): PluginAuthority
     throw new Error("plugin authority has an invalid reasonCode");
   }
   const reasonCode = reasonCodeValue as ReasonCode | undefined;
+  const runtimeVersion = optionalString(value, "runtimeVersion");
   const readiness = value.readiness;
   if (readiness !== undefined && !isReadinessReceipt(readiness)) {
     throw new Error("plugin authority has an invalid readiness receipt");
@@ -298,6 +301,7 @@ function parseAuthority(text: string, expectedPluginId: string): PluginAuthority
     lifecycleState: lifecycleState as LifecycleState,
     enabled: value.enabled,
     moduleRef: requiredString(value, "moduleRef"),
+    ...(runtimeVersion === undefined ? {} : { runtimeVersion }),
     config: value.config,
     bindings: value.bindings,
     verifiedScope: value.verifiedScope,

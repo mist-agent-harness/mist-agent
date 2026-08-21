@@ -368,6 +368,10 @@ describe("runtime readiness / readback contract", () => {
       expect(host.publishedResources("fixture.unverified")).toEqual([
         { id: "fixture-unverified-call", kind: "tool", capabilityId: "fixture.call" },
       ]);
+      expect(store.read("fixture.unverified").runtimeVersion).toBeUndefined();
+      expect(new PluginOperationStore(directory).read("fixture.unverified").runtimeVersion).toBe(
+        undefined,
+      );
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -466,7 +470,34 @@ describe("runtime readiness / readback contract", () => {
       expect(() => store.read(manifest.id)).toThrow();
       expect((await applyEnabledChange(host, store, request)).state).toBe("active");
       expect((await applyEnabledChange(host, store, request)).state).toBe("active");
+      expect(store.read(manifest.id).runtimeVersion).toBe(manifest.version);
+      expect(new PluginOperationStore(directory).read(manifest.id).runtimeVersion).toBe(
+        manifest.version,
+      );
       expect(probeCalls).toEqual({ existence: 3, running: 3, readback: 3 });
+      expect(host.readiness(manifest.id, "2026-08-21T00:00:30.000Z").status).toBe("ready");
+
+      const wrongVersionRequest = probeRequest({
+        definition: { ...definition, pluginId: manifest.id, moduleRef, version: "1.2.4" },
+        binding: { ...binding, pluginId: manifest.id, moduleRef, version: "1.2.4" },
+        scope: { ...scope, version: "1.2.4" },
+      });
+      expect(
+        (
+          await applyEnabledChange(host, store, {
+            ...request,
+            readinessRequest: wrongVersionRequest,
+          })
+        ).state,
+      ).toBe("active");
+      expect(host.readiness(manifest.id).status).toBe("unknown");
+      expect(store.read(manifest.id).readiness).toBeUndefined();
+      expect(
+        new PluginTransactionHost({
+          store: new PluginOperationStore(directory),
+        }).readiness(manifest.id).status,
+      ).toBe("unknown");
+      expect((await applyEnabledChange(host, store, request)).state).toBe("active");
       expect(host.readiness(manifest.id, "2026-08-21T00:00:30.000Z").status).toBe("ready");
 
       const failingRequest: typeof request = {
@@ -482,7 +513,7 @@ describe("runtime readiness / readback contract", () => {
         },
       };
       expect((await applyEnabledChange(host, store, failingRequest)).state).toBe("active");
-      expect(probeCalls).toEqual({ existence: 4, running: 4, readback: 3 });
+      expect(probeCalls).toEqual({ existence: 5, running: 5, readback: 4 });
       expect(host.readiness(manifest.id).status).toBe("unknown");
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -532,6 +563,7 @@ describe("runtime readiness / readback contract", () => {
           pluginId: definition.pluginId,
           moduleRef,
           module,
+          runtimeVersion: definition.version,
           config: { enabled: true },
           env: {},
           bindings: {},
@@ -563,6 +595,7 @@ describe("runtime readiness / readback contract", () => {
         pluginId: definition.pluginId,
         moduleRef,
         module,
+        runtimeVersion: definition.version,
         config: { enabled: true },
         env: {},
         bindings: {},

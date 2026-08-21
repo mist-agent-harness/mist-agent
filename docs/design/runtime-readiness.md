@@ -68,6 +68,10 @@ measurements 只能跟在同一证据行，不得脱离条件单独投影。本�
 本切片不把 readiness 当作其 gate；active 且无收据时仍可能有已发布资源，但 readiness projection
 必须是 `unknown`，因此 F06 继续未勾选。
 
+生产 enable path 会把 manifest 的 `version` 持久化为 authority 的 `runtimeVersion`；probe receipt
+的 definition、binding、verifiedScope 和每条 evidence 的 version 必须全部与它相等。旧 authority
+没有 `runtimeVersion` 时仍可被读取，但 probe-backed `ready` 会 fail-closed，不会从调用方输入补出版本。
+
 ## 与 #97 的接线
 
 `PluginAuthorityRecord.verifiedScope` 继续是 #97 的边界字段；运行态收据作为可选同代 receipt
