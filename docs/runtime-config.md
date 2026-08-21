@@ -14,6 +14,7 @@
 |---|---|---|---|
 | `MIST_DATA_DIR` | `src/installer/cli.ts` | `~/.mist` | 住户数据根目录 |
 | `MIST_WINDOW_ARCHIVE_PATH` | `tests/fixtures/session-registry-host.ts` | 空 = 纯内存 | 窗生命周期 JSONL 归档路径（`window_opened` / `window_archived` 追加写）。不设则不持久化，供无持久化需求的嵌入方 |
+| `MIST_TURN_GATE_DATADIR` | `tests/fixtures/turn-gate-host.ts` | 空 = 纯内存 | 开工闸集成宿主的落盘目录：给了则 ResidentStore 与 FactLedger 同目录共存（各自后缀），供父进程 SIGKILL 后原目录拉起，验猝死切点；不设则全内存 |
 | `MIST_DEMO_DATA_DIR` | `demo/main.ts` | `.mist-demo` | demo 数据目录 |
 | `MIST_DEMO_PORT` | `demo/main.ts` | `4317` | demo 服务端口 |
 | `MIST_DEMO_CLAUDE_MODEL` | `demo/main.ts` | 内置默认 | demo 用的模型名 |

@@ -344,9 +344,10 @@ describe("F5 两个真实 MistDriver 共用 dataDir 与 FactLedger", () => {
     const residentId = await driverA.createResident("placeholder-shared");
     await driverA.say(residentId, "占位 A 窗首句");
 
-    // 第二个 driver 以「另一进程」形态进场：同 dataDir 恢复出同一住户、共享
-    // 同一本账。顺序发号时代它会发出与 A 相同的 windowId，在 openViewport
-    // 撞「ack row already exists」——w_ + ULID 之后两窗各开各的。
+    // 同进程两个 driver：B 以同 dataDir 恢复出同一住户、与 A 共享同一本
+    // 内存账（真进程边界由猝死切点测试覆盖）。顺序发号时代它会发出与 A
+    // 相同的 windowId，在 openViewport 撞「ack row already exists」——
+    // w_ + ULID 之后两窗各开各的。
     const driverB = createDriver({
       dataDir: residentsDir,
       factLedger: ledger,
