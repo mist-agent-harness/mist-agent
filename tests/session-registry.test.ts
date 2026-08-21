@@ -85,9 +85,14 @@ describe("SessionRegistry：多窗语义", () => {
       WINDOW_REOPEN_INVALID,
     );
 
+    // 内部发号是 w_ + ULID（图纸 §1.1）：被拒绝的外部 id 不占用、不影响发号，
+    // 连开两窗各自唯一且进程内单调（字典序即开窗序）。
     const fresh = sessions.open("resident-a", { context: null });
-    expect(fresh.windowId).toBe("window-000001");
+    const second = sessions.open("resident-a", { context: null });
+    expect(fresh.windowId).toMatch(/^w_[0-9A-Z]{26}$/);
     expect(fresh.generation).toBe(1);
+    expect(second.windowId).not.toBe(fresh.windowId);
+    expect(second.windowId > fresh.windowId).toBe(true);
   });
 
   it("归档窗不能被另一住户抢注，拒绝后原住户仍可按原 scope 重开", () => {

@@ -7,7 +7,13 @@
  *
  * 闭环跑通之前这份接口就是法律；跑通之后按决策台账 H1 从真实能力反推
  * 能力契约时，允许推翻它。
+ *
+ * 例外登记（MV-A05）：BootPack.currentFacts 引用了 src/store/fact-ledger.ts
+ * 的 LedgerEntry 类型——「不 import src」的口子只开这一个，因为现行有效集
+ * 随启动包注入是图纸定稿的契约，条目形状的唯一权威定义在账侧。
  */
+
+import type { LedgerEntry } from "../src/store/fact-ledger.ts";
 
 /** 一条进了记忆库的记录。内容判等一律用 canonical JSON 的 sha256。 */
 export interface MemoryEntry {
@@ -34,6 +40,13 @@ export interface BootPack {
   identity: string;
   commitments: string[];
   memories: MemoryEntry[];
+  /**
+   * 现行有效集随启动包注入（MV-A05「现行有效集随启动包注入」，图纸
+   * docs/design/multi-viewport.md §3.2 新窗初始对齐）。additive 变更：
+   * 未接权威事实账的驱动不带这个字段，既有判卷路径不受影响。
+   * 条目本身冻结（账侧 Object.freeze），此处是直接引用透传。
+   */
+  currentFacts?: LedgerEntry[];
 }
 
 export interface HarnessDriver {

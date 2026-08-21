@@ -231,6 +231,9 @@ export class ResidentStore {
     for (const file of readdirSync(dataDir).sort()) {
       // .tmp 是没写完的一次写入，旧 .json 才是权威——跳过即可，下次写会覆盖。
       if (!file.endsWith(".json")) continue;
+      // 同目录允许共存 FactLedger 快照（<id>.facts.json）：两边各自认领各自的
+      // 后缀，互不吞档。residentId 字符集 [a-z0-9-]+ 不含点，后缀划分无歧义。
+      if (file.endsWith(".facts.json")) continue;
       const record = JSON.parse(readFileSync(join(dataDir, file), "utf8")) as RoomRecord;
       if (record.schemaVersion !== SCHEMA_VERSION) {
         throw new Error(
@@ -316,12 +319,21 @@ export class ResidentStore {
     return this.#rooms.has(residentId);
   }
 
+  /**
+   * 全部住户 id 的副本（只读枚举）。给总装方做「每户一本账」式的对齐遍历——
+   * 返回副本，调用方改返回值动不了这张表。
+   */
+  residentIds(): string[] {
+    return [...this.#rooms.keys()];
+  }
+
   destroyResident(residentId: string): void {
-    this.#rooms.delete(residentId);
     if (this.#dataDir !== null) {
       // 拆房连档案一起销：留着文件，重启后人会诈尸回来。
+      // 文件先删、内存后删：rm 抛错时房间在、文件在（全在可重试），不半删。
       rmSync(join(this.#dataDir, `${residentId}.json`), { force: true });
     }
+    this.#rooms.delete(residentId);
   }
 
   // --- 记忆库 ---
