@@ -11,6 +11,8 @@ import {
   type ReadinessScope,
   type RuntimeEvidence,
   evaluateRuntimeReadiness,
+  isReadinessReceipt,
+  projectReadiness,
   readRuntimeReadiness,
 } from "../src/plugin/runtime-readiness.ts";
 import { PluginTransactionHost } from "../src/plugin/transaction-host.ts";
@@ -219,6 +221,53 @@ describe("runtime readiness / readback contract", () => {
     expect(receipt.reason).toBe("evidence-stale");
   });
 
+  it("does not create an unbounded ready receipt when maxAgeMs is omitted", () => {
+    const withoutWindow = input();
+    Reflect.deleteProperty(withoutWindow, "maxAgeMs");
+    const receipt = evaluateRuntimeReadiness(withoutWindow);
+    expect(receipt.status).toBe("unknown");
+    expect(receipt.reason).toBe("evidence-stale");
+    expect(receipt.lastVerifiedAt).toBeNull();
+    expect(receipt.verificationWindowMs).toBeNull();
+  });
+
+  it("parses a legacy ready receipt but never projects it without a persisted window", () => {
+    const receipt = evaluateRuntimeReadiness(input());
+    const legacyReceipt = { ...receipt };
+    Reflect.deleteProperty(legacyReceipt, "verificationWindowMs");
+    expect(isReadinessReceipt(legacyReceipt)).toBe(true);
+    expect(projectReadiness("active", legacyReceipt, "2026-08-21T00:00:30.000Z")).toMatchObject({
+      status: "unknown",
+      reasonCode: "CAPABILITY_UNVERIFIED",
+    });
+  });
+
+  it("rejects evidence legs that reuse one probe identity", () => {
+    const receipt = evaluateRuntimeReadiness(
+      input({
+        evidence: [
+          evidence("existence"),
+          evidence("running", "pass", { probeId: "probe-existence" }),
+          evidence("readback"),
+        ],
+      }),
+    );
+    expect(receipt.status).toBe("unknown");
+    expect(receipt.reason).toBe("evidence-not-independent");
+    expect(receipt.reasonCode).toBe("CAPABILITY_UNVERIFIED");
+  });
+
+  it("does not accept an unknown receipt with a successful-verification timestamp", () => {
+    const receipt = evaluateRuntimeReadiness(input({ evidence: [evidence("existence")] }));
+    expect(receipt.lastVerifiedAt).toBeNull();
+    expect(
+      isReadinessReceipt({
+        ...receipt,
+        lastVerifiedAt: "2026-08-21T00:00:00.000Z",
+      }),
+    ).toBe(false);
+  });
+
   it("exposes probe failures as unknown when the independent observer cannot answer", async () => {
     const receipt = await readRuntimeReadiness(input(), {
       existence: async () => evidence("existence"),
@@ -274,7 +323,15 @@ describe("runtime readiness / readback contract", () => {
       const store = new PluginOperationStore(directory);
       const host = new PluginTransactionHost({ store });
       const module: PluginModuleV0 = {
-        async prepare() {
+        async prepare(context) {
+          context.register({
+            id: "fixture-call",
+            kind: "tool",
+            capabilityId: "fixture.call",
+            recoveryKey: "fixture-call-recovery",
+            async activate() {},
+            async dispose() {},
+          });
           return {
             async activate() {
               return {
@@ -306,8 +363,55 @@ describe("runtime readiness / readback contract", () => {
         verifiedScope: receipt.verifiedScope,
         readiness: receipt,
       });
-      expect(host.readiness(definition.pluginId).status).toBe("ready");
-      expect(host.recordReadiness(definition.pluginId, receipt).status).toBe("ready");
+      expect(host.readiness(definition.pluginId, "2026-08-21T00:00:30.000Z").status).toBe("ready");
+      const restartedHost = new PluginTransactionHost({
+        store: new PluginOperationStore(directory),
+      });
+      expect(
+        restartedHost.readiness(definition.pluginId, "2026-08-21T00:01:01.000Z"),
+      ).toMatchObject({
+        status: "unknown",
+        reasonCode: "CAPABILITY_UNVERIFIED",
+      });
+      expect(
+        host.recordReadiness(definition.pluginId, receipt, "2026-08-21T00:00:30.000Z").status,
+      ).toBe("ready");
+
+      const mismatchedCapability = {
+        ...receipt,
+        definition: { ...receipt.definition, capabilityId: "fixture.other" },
+        binding:
+          receipt.binding === null ? null : { ...receipt.binding, capabilityId: "fixture.other" },
+      };
+      expect(isReadinessReceipt(mismatchedCapability)).toBe(true);
+      expect(() => host.recordReadiness(definition.pluginId, mismatchedCapability)).toThrow(
+        "runtime readiness receipt does not match the current plugin authority",
+      );
+
+      const mismatchedVersion = {
+        ...receipt,
+        definition: { ...receipt.definition, version: "1.2.4" },
+      };
+      expect(() => host.recordReadiness(definition.pluginId, mismatchedVersion)).toThrow(
+        "runtime readiness receipt does not match the current plugin authority",
+      );
+
+      const mismatchedBinding = {
+        ...receipt,
+        verifiedScope: { ...receipt.verifiedScope, networkPath: "loopback:19002/call" },
+        binding:
+          receipt.binding === null
+            ? null
+            : { ...receipt.binding, networkPath: "loopback:19002/call" },
+        evidence: receipt.evidence.map((item) => ({
+          ...item,
+          scope: { ...item.scope, networkPath: "loopback:19002/call" },
+        })),
+      };
+      expect(isReadinessReceipt(mismatchedBinding)).toBe(true);
+      expect(() => host.recordReadiness(definition.pluginId, mismatchedBinding)).toThrow(
+        "runtime readiness receipt does not match the current plugin authority",
+      );
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

@@ -88,6 +88,13 @@ export interface ReadinessReceipt {
   readonly verifiedScope: ReadinessScope;
   /** Always present with verifiedScope; null means no successful verification exists. */
   readonly lastVerifiedAt: string | null;
+  /**
+   * Freshness window used to make this receipt. New ready receipts must persist it so a
+   * restarted host can reject the receipt after the same window. It is optional only for
+   * receipts written before #101 added the field; those legacy ready receipts parse but project
+   * unknown until a fresh time-bound receipt is recorded.
+   */
+  readonly verificationWindowMs?: number | null;
   readonly evidence: readonly RuntimeEvidence[];
   readonly reasonCode?: ReasonCode;
   readonly reason?: ReadinessReason;
@@ -143,6 +150,7 @@ export function evaluateRuntimeReadiness(input: ReadinessEvaluationInput): Readi
     authorization: input.authorization === null ? null : cloneAuthorization(input.authorization),
     verifiedScope: cloneScope(input.scope),
     lastVerifiedAt: null,
+    verificationWindowMs: input.maxAgeMs ?? null,
     evidence: cloneEvidence(evidence),
   } as const;
 
@@ -219,20 +227,39 @@ export function evaluateRuntimeReadiness(input: ReadinessEvaluationInput): Readi
   const now = input.now === undefined ? Date.now() : Date.parse(input.now);
   if (!Number.isFinite(now))
     return invalid("evidence-stale", "readiness clock is not a valid ISO timestamp");
-  if (input.maxAgeMs !== undefined && (!Number.isFinite(input.maxAgeMs) || input.maxAgeMs < 0)) {
-    return invalid("evidence-stale", "maxAgeMs must be a non-negative finite number");
+  if (input.maxAgeMs === undefined) {
+    return invalid(
+      "evidence-stale",
+      "a positive maxAgeMs is required to persist a time-bound readiness receipt",
+    );
+  }
+  if (!Number.isFinite(input.maxAgeMs) || input.maxAgeMs <= 0) {
+    return invalid("evidence-stale", "maxAgeMs must be a positive finite number");
   }
 
+  const probeIds = new Set<string>();
   for (const item of evidence) {
     const observed = Date.parse(item.observedAt);
+    if (!validEvidence(item)) {
+      return invalid(
+        "scope-mismatch",
+        "runtime evidence is malformed or outside the requested scope",
+      );
+    }
     if (item.source !== "external") {
       return invalid(
         "evidence-not-independent",
         "runtime evidence is self-reported and cannot prove readiness",
       );
     }
+    if (probeIds.has(item.probeId)) {
+      return invalid(
+        "evidence-not-independent",
+        "existence, running, and readback evidence must use distinct external probe ids",
+      );
+    }
+    probeIds.add(item.probeId);
     if (
-      !validEvidence(item) ||
       !sameIdentityScope(item.scope, input.scope) ||
       item.scope.residentId !== input.scope.residentId ||
       item.scope.lane !== input.scope.lane ||
@@ -326,6 +353,11 @@ export function evaluateRuntimeReadiness(input: ReadinessEvaluationInput): Readi
   };
 }
 
+/** Runtime type guard for the existing #97 verifiedScope authority field. */
+export function isReadinessScope(value: unknown): value is ReadinessScope {
+  return validScope(value);
+}
+
 /** Stable parser used by the durable authority store; malformed receipts cannot project ready. */
 export function isReadinessReceipt(value: unknown): value is ReadinessReceipt {
   if (!isRecord(value)) return false;
@@ -350,7 +382,25 @@ export function isReadinessReceipt(value: unknown): value is ReadinessReceipt {
     (typeof value.lastVerifiedAt !== "string" || !Number.isFinite(Date.parse(value.lastVerifiedAt)))
   )
     return false;
+  if (
+    value.verificationWindowMs !== undefined &&
+    value.verificationWindowMs !== null &&
+    (typeof value.verificationWindowMs !== "number" ||
+      !Number.isFinite(value.verificationWindowMs) ||
+      value.verificationWindowMs <= 0)
+  )
+    return false;
+  if (
+    value.status === "ready" &&
+    value.verificationWindowMs !== undefined &&
+    (typeof value.verificationWindowMs !== "number" ||
+      !Number.isFinite(value.verificationWindowMs) ||
+      value.verificationWindowMs <= 0)
+  )
+    return false;
   if (!Array.isArray(evidence) || !evidence.every(validEvidence)) return false;
+  if (!hasUniqueProbeIds(evidence)) return false;
+  if (value.status !== "ready" && value.lastVerifiedAt !== null) return false;
   if (value.status !== "unknown" && evidence.some((item) => item.source !== "external"))
     return false;
   if (
@@ -409,8 +459,16 @@ export function projectReadiness(
     | "validated"
     | "discovered",
   receipt: ReadinessReceipt | undefined,
+  now: string | number = Date.now(),
 ): ReadinessProjection {
   if (lifecycleState === "active" && receipt !== undefined && isReadinessReceipt(receipt)) {
+    if (receipt.status === "ready" && !isReceiptCurrent(receipt, now)) {
+      return {
+        status: "unknown",
+        reasonCode: "CAPABILITY_UNVERIFIED",
+        detail: "runtime readiness receipt is expired or has no persisted verification window",
+      };
+    }
     return {
       status: receipt.status,
       reasonCode: receipt.reasonCode ?? "CAPABILITY_UNVERIFIED",
@@ -449,6 +507,26 @@ function failedReceipt(
   status: ReadinessStatus = "blocked",
 ): ReadinessReceipt {
   return { ...base, status, reasonCode, reason, detail, lastVerifiedAt: null };
+}
+
+function isReceiptCurrent(receipt: ReadinessReceipt, now: string | number): boolean {
+  if (
+    receipt.status !== "ready" ||
+    receipt.lastVerifiedAt === null ||
+    typeof receipt.verificationWindowMs !== "number" ||
+    !Number.isFinite(receipt.verificationWindowMs) ||
+    receipt.verificationWindowMs <= 0
+  ) {
+    return false;
+  }
+  const verifiedAt = Date.parse(receipt.lastVerifiedAt);
+  const currentTime = typeof now === "number" ? now : Date.parse(now);
+  return (
+    Number.isFinite(verifiedAt) &&
+    Number.isFinite(currentTime) &&
+    verifiedAt <= currentTime &&
+    currentTime - verifiedAt <= receipt.verificationWindowMs
+  );
 }
 
 function latestObservedAt(evidence: readonly RuntimeEvidence[]): string {
@@ -621,6 +699,9 @@ function stringArray(value: unknown): value is readonly string[] {
 function containsAll(haystack: readonly string[], needles: readonly string[]): boolean {
   const values = new Set(haystack);
   return needles.every((value) => values.has(value));
+}
+function hasUniqueProbeIds(evidence: readonly RuntimeEvidence[]): boolean {
+  return new Set(evidence.map((item) => item.probeId)).size === evidence.length;
 }
 function sameDefinition(definition: ReadinessDefinition, binding: ReadinessBinding): boolean {
   return (

@@ -226,9 +226,9 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
 
 ## F. Readiness、投影与闭环
 
-- [x] **[PV0-F01](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s4) readiness 有 scope**：ready/degraded/blocked/quarantined 每种 fixture 都
+- [ ] **[PV0-F01](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s4) readiness 有 scope**：ready/degraded/blocked/quarantined 每种 fixture 都
   返回 resident、lane、operations 和验证时间；换住户或车道后不能沿用旧 ready。
-- [x] **[PV0-F02](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s8) 原因码稳定可判**：A–E 每条失败路径只以 RFC 第 8 节 reason code 之一
+- [ ] **[PV0-F02](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s8) 原因码稳定可判**：A–E 每条失败路径只以 RFC 第 8 节 reason code 之一
   作为机器判决，附加文本变化不影响断言。
 - [ ] **[PV0-F03](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s9) 每条约束都有指定红格**：逐项执行下表登记的 mutation；实测失败集合必须
   包含该 mutation 指定的 PV0 id，不能用“任意一格变红”代替。fixture 的宪法常量独立于
@@ -237,9 +237,14 @@ fixture 统一使用唯一标记 `SECRET_SHOULD_NEVER_APPEAR`，并扫描配置�
   安装在 validate 阶段被拒，现有不变量仍可用。
 - [ ] **[PV0-F05](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s1) 壳共享魂私有**：插件包、manifest、配置导出和诊断中扫描住户人格、记忆、
   聊天 fixture 标记；均不得出现，插件只能经受控 capability 在当前 scope 临时访问。
-- [x] **[PV0-F06](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s4) ready 必须有当前 scope 的可用性收据**：分别用 initialize 握手、版本查询
+- [ ] **[PV0-F06](../docs/design/plugin-protocol-v0.md#plugin-protocol-v0-s4) ready 必须有当前 scope 的可用性收据**：分别用 initialize 握手、版本查询
   和无副作用探针验证三类 capability；未运行探针、探针超时或返回身份不符时返回
   `CAPABILITY_UNVERIFIED` 且不进 ready 工具集。断言只证明可用性，不声称签名或供应链可信。
+
+本次 #101 只落地了确定性 evaluator/readback contract 与窄 fixture（缺运行证据、真实路径失败、
+scope/version/条件漂移和过期收据）；上述 F01/F02/F06 仍需完整的四状态、A–E 失败矩阵和三类
+provider-like readback fixture 后再勾选。`npm run acceptance` 的 C1–C6 六盏灯不替代 PV0 F
+系列验收，故此处保持未勾选。
 
 ## 逐项 mutation 台账
 

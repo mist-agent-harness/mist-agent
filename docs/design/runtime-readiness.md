@@ -25,12 +25,14 @@
 `ReadinessScope` 至少绑定：
 
 ```text
-residentId, lane, operations, host, networkPath, version, lastVerifiedAt
+residentId, lane, operations, host, networkPath, version, lastVerifiedAt, verificationWindowMs
 ```
 
 `ReadinessReceipt` 还保存 definition、binding、authorization、证据清单和稳定 reason code。
 `verifiedScope` 与 `lastVerifiedAt` 始终成对出现；没有成功验证时 timestamp 为 null，状态明确为
-`unknown`，不能把空对象当作空 scope。
+`unknown`，不能把空对象当作空 scope。ready 收据还必须持久化一个正的
+`verificationWindowMs`；宿主重启后按当前时间重新检查窗口，过期或没有窗口的旧收据都投影为
+`unknown/CAPABILITY_UNVERIFIED`。
 
 独立证据分三腿，三腿都需要才可为 `ready`：
 
@@ -39,7 +41,9 @@ residentId, lane, operations, host, networkPath, version, lastVerifiedAt
 3. `readback`：从目标运行路径取回真实操作的确定性结果（initialize、版本查询或无副作用探针）。
 
 证据必须来自 `external` probe，并逐条绑定 scope、runtime version、moduleRef、observedAt 和
-conditions。量化 measurements 只能跟在同一证据行，不得脱离条件单独投影。
+conditions；三条证据腿还必须使用不同的 `probeId`，避免同一观察冒充独立证明。量化
+measurements 只能跟在同一证据行，不得脱离条件单独投影。本切片不引入 provider registry 或
+跨宿主证明协议，独立性的边界止于可观察的 probe 身份和来源。
 
 ## 状态与失败语义
 
@@ -74,7 +78,12 @@ canonical registry，也不把 receipt 当作 binding/authorization 的第二真
 - 仓库、部署、运行时版本或 moduleRef 不一致：scope mismatch → `unknown`；
 - host/network/lane/operation/resident 不匹配：scope mismatch → `unknown`；
 - 自报、过期、条件漂移或探针不可回答：证据不足 → `unknown`；
-- 三腿外部证据、授权和 scope 全部一致：才生成 `lastVerifiedAt` 并返回 `ready`。
+- 三腿外部证据、授权和 scope 全部一致且显式提供正的验证窗口：才生成 `lastVerifiedAt` 并返回
+  `ready`。
+
+当前 PV0 F01/F02/F06 清单仍未勾选：本切片的 deterministic fixtures 覆盖失败语义和收据边界，
+尚未声称完整四状态、A–E 失败矩阵或三类 provider-like readback 已全部验收。`npm run acceptance`
+的 C1–C6 不替代 PV0 F 系列验收。
 
 ### 代价
 
