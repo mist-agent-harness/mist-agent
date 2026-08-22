@@ -26,9 +26,9 @@
 | M1 | 平台与客户端 | 电脑/VPS 后端+手机 remote、web GUI、手机 PWA、macOS/Linux | open-webui（看架构不搬代码） |
 | M2 | 会话内核 | 无限 session、compact 可配、跨 session 同步、retry/edit/fork | opencode + MiMo Code（cycle/rebuild）+ LangGraph（哲学） |
 | M3 | 上下文装配 | 模块化装配器、自定义 prompt、锚点自动更新、截断透明 | EverMind-AI/Raven + dsh spill（体积契约现成实现） |
-| M4 | 记忆与成长 | 蒸馏层、记忆演化、勘误、跨项目 insights | A-MEM + graphiti（勘误语义）+ MiMo（四层+Dream/Distill）+ 年轮（人格生长）+ memU（sidecar 缝） |
+| M4 | 记忆与成长 | 蒸馏层、记忆演化、勘误、跨项目 insights | A-MEM + graphiti（勘误语义）+ MiMo（四层+Dream/Distill）+ 年轮（人格生长）+ memU（sidecar 缝）+ CF Agent Memory（托管管线六手，08-22） |
 | M5 | 多 agent 与模型路由 | 多 agent 协作、子 agent 各选 provider/key、多 CLI/API | litellm Router + opencode 配置形状 + CPA（政策敏感的协议适配） |
-| M6 | 插件系统 | 好写、可插拔、插件自注册环境变量、可开关 | elizaOS Plugin 接口 + goose 配置格式 + Cordis/dsh（一切皆插件可逆注册） |
+| M6 | 插件系统 | 好写、可插拔、插件自注册环境变量、可开关 | elizaOS Plugin 接口 + goose 配置格式 + Cordis/dsh（一切皆插件可逆注册）+ EnvHarness 论文（decorator 协议形状，08-22） |
 | M7 | 自主性与社交边界 | 自主沉默、群/私区分、心跳自唤醒、住户感 | elizaOS 决策层 + OpenClaw 心跳协议 |
 | M8 | 工程质量与自我迭代 | 自带测试/说明/回滚、功能自提升走 PR | hermes-agent + OpenHands resolver |
 
@@ -279,6 +279,13 @@ SillyTavern 留作交互层和 lorebook 触发语义参照。
   反证，不是参照：外壳顶级（Live2D/语音/实时陪伴），内核空占位——记忆包 24 行
   空壳、人格包全文一行 `export {}`。群友原话结论：陪伴外壳不必自研，内核没有现成。
   mist 押 M4/M7 的差异化赌注，这是最强的一侧证据。
+- **Cloudflare Agent Memory（2026-08-22 增补，文档+活体实测）** — 托管记忆服务，
+  beta。参考：supersede 版本链 + 旧向量同步删除、五路召回 RRF 融合（含 HyDE）、
+  写入时预生成检索问题、原始消息全文兜底、双通道抽取 + 对原文逐条验证、
+  时间计算确定性化——六手全部可抄进自建管线。实测发现：assistant 发言同样被当
+  事实抽取（语料必须先干净）；中文查询召回质量有水分；自动 ingest 与「住户亲笔」
+  原则顶牛，若采用须进草稿区由住户裁定。当教材不当家具。
+  详见 [2026-08-22-cloudflare-agent-memory.md](2026-08-22-cloudflare-agent-memory.md)。
 
 **活跃度勘误（2026-08-14，issue #9）**：A-MEM 已停更约 8 个月，「最该抄」降级为
 只能读不能依赖；Second-Me、memobase 已死。本文档后续增补一律带「最后 push」日期。
@@ -388,6 +395,15 @@ MiMo 的 Dream/Distill 给周期维护一个工程样本。
 自建走：elizaOS 的 Plugin 接口 + goose 的 enabled/envs 配置格式 + manifest 上加
 vscode 式 env 声明数组，三件套齐活。Cordis 留作「一切皆插件可逆注册」的设计参照，
 不当底盘。
+
+增补（2026-08-22）：两条新参照。一、EnvHarness 论文（arXiv 2608.19880）的
+decorator 式组件协议——插件是包着壳的壳、默认全委托、只覆盖自己的钩子、
+栈式组合，外加「Blocked 必须带原因」和「验收当冻结 verifier」两条戒律，
+是本模块协议 v0 最值的形状参照，见
+[2026-08-22-envharness-paper.md](2026-08-22-envharness-paper.md)。
+二、 dsh 内核一次升级震碎大批第三方插件的实证——插件化不防破碎，
+防破碎的是内核把接口当冻结契约供起来（Linux「不破坏用户空间」模式）：
+接口面要窄、契约要版本化、内核更新要过「旧插件行为不变」的兼容判卷。
 
 ---
 
