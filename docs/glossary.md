@@ -58,6 +58,20 @@
 工具能力或桥接，但不能绕开宿主的权限闸、凭证库和住户隔离。插件卸载后，它注册的资源
 必须全部失效；协议可逆不等于插件代码可信。
 
+**能力登记（capability registry）**
+一项能力在系统里的**账面事实**：`definition` / `installed` / `registered` / `binding` /
+`authorization` / `superseded` 六个正交格子，以稳定 capability id 为键，跨重启与跨版本存续。
+它与插件实例的运行态生命周期（`src/plugin/lifecycle.ts` 的 discovered…disposed）是两个轴，
+互不推导：实例 disposed 不清除 definition，能力 superseded 不清理旧实例。registry 不拥有
+readiness，也不得被 readiness 收据、telemetry 或 projection 反写。**六格全绿只说明账面齐全，
+不说明住户能用**（图纸 `docs/design/capability-registry-v0.md` §4）。
+
+**superseded（能力登记）**
+能力被新版本取代后的登记态，与上面的**勘误链（supersede chain）**重名不同义：勘误链修订的是
+记忆条目、键是条目 id、消费方是检索层降权；本条修订的是能力登记记录、键是稳定 capability id、
+消费方是目录默认选中 replacement。两者共享「旧的不删」，但不可互相套用语义。
+`unhealthy` / `deprecated` / `superseded` / `removed` 处置动作不同，不得压成同一个 `inactive`。
+
 **上下文注入（context injection）**
 插件希望加入住户模型上下文的非工具文本，例如 skill prompt 段或 MCP instructions。
 它不是普通工具返回值，也不是人格文件：正文必须在插件包内随 manifest 声明、可 diff、
