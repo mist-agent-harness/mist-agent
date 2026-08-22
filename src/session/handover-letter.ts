@@ -102,25 +102,31 @@ export interface SealLetterContext {
 }
 
 /**
- * 粗估 token 数：CJK 按 1 字 1 token，其余按 4 字符 1 token 向上取整。
+ * 粗估 token 数：**ASCII 按 4 字符 1 token，其余一切码点按 1 token**。
  *
  * 这是**估算**。真值取决于具体 tokenizer，本仓库不依赖任何 tokenizer 包，
  * 与其假装精确不如把近似写在名字和文档里：D08 要的是「超上限被拒且错误
  * 信息指明上限与实际」，估算口径下这条依然成立且可判卷；要精确的宿主注入
  * measureTokens 即可。
+ *
+ * 分界线选在 ASCII 而不是枚举 CJK 码点段，是因为估算的偏向必须**偏高**。
+ * 初版按 CJK 段枚举，落在段外的韩文与 emoji 走 /4 分支——那是**偏低**，
+ * 而偏低的长度估算会让上限闸 fail-open：一封真超长的信被算成没超，放行。
+ * 闸宁可误伤（估高，让人多删几句），不可误放（估低，让超长的信进时间线）。
+ * 枚举式白名单永远漏得掉没想到的字符，取反才漏不掉。
  */
 export function estimateTokens(text: string): number {
-  let cjk = 0;
-  let rest = 0;
+  let ascii = 0;
+  let wide = 0;
   for (const char of text) {
-    // 中日韩统一表意文字 + 常用标点段；漏掉的生僻段落只会让估算偏保守。
-    if (/[　-ヿ㐀-䶿一-鿿豈-﫿＀-￯]/.test(char)) {
-      cjk += 1;
+    const code = char.codePointAt(0) ?? 0;
+    if (code < 128) {
+      ascii += 1;
     } else {
-      rest += 1;
+      wide += 1;
     }
   }
-  return cjk + Math.ceil(rest / 4);
+  return wide + Math.ceil(ascii / 4);
 }
 
 /**
@@ -147,7 +153,12 @@ export function sealLetter(draft: LetterDraft, context: SealLetterContext): Seal
   };
 }
 
-/** author 的唯一构造口。判卷与实现共用同一个函数，格式漂了两边一起漂。 */
+/**
+ * author 的唯一构造口。**判卷不许调它造期望值**——测试拿实现自己的构造
+ * 函数量实现，尺子和被量的东西一起漂，「author 里有没有代际」就测不出来
+ * （变异探针实测过：删掉 generation 全绿）。判卷写字面量，这里只保证
+ * 生产侧唯一。
+ */
 export function formatAuthor(residentId: string, generation: number): string {
   return `${residentId}#${generation}`;
 }
@@ -222,8 +233,16 @@ function assertCommitmentShape(item: Record<string, unknown>, at: string): void 
       `${at} 是 commitment 档但缺 ledgerSeq：承诺的真源是账，信只带指针不复印正文`,
     );
   }
-  if (typeof item.ledgerSeq !== "number" || !Number.isInteger(item.ledgerSeq)) {
-    throw new LetterSchemaError(`${at} 的 ledgerSeq 必须是整数 seq`);
+  // 账侧 seq 从 1 起单调递增，0 与负数不是「还没定」也不是「无效指针」，
+  // 它们根本不指向任何条目。这里只能校形状；**指向的 seq 在该住户账上是否
+  // 真的存在，要等信接到账上时才钉得住**——那道校验不在这一层，别把
+  // 「形状对」当成「指得到」。
+  if (
+    typeof item.ledgerSeq !== "number" ||
+    !Number.isInteger(item.ledgerSeq) ||
+    item.ledgerSeq < 1
+  ) {
+    throw new LetterSchemaError(`${at} 的 ledgerSeq 必须是 ≥ 1 的整数 seq`);
   }
 }
 

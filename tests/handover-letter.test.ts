@@ -130,6 +130,14 @@ describe("MV-D06 三档标注条目级", () => {
     expect(ok.state[0]?.ledgerSeq).toBe(7);
   });
 
+  it("ledgerSeq 的 0 与负数不是指针：账侧 seq 从 1 起", () => {
+    for (const seq of [0, -1, 1.5]) {
+      const bad = draft({ state: [{ tier: "commitment", body: "旧承诺", ledgerSeq: seq }] });
+
+      expect(() => sealLetter(bad, ctx())).toThrow(/≥ 1 的整数 seq/);
+    }
+  });
+
   it("承诺在信里不可被作废：带作废标记的条目硬拒，不是静默忽略", () => {
     for (const field of ["revoked", "void", "superseded", "cancelled"]) {
       const bad = draft({
@@ -176,10 +184,16 @@ describe("MV-D08 信长度上限", () => {
     );
   });
 
-  it("估算口径：CJK 一字一 token，ASCII 约四字符一 token", () => {
+  it("估算口径：非 ASCII 一码点一 token，ASCII 约四字符一 token", () => {
     expect(estimateTokens("一二三")).toBe(3);
     expect(estimateTokens("abcd")).toBe(1);
     expect(estimateTokens("")).toBe(0);
+  });
+
+  it("韩文与 emoji 不许走 ASCII 分支——估低会让上限闸 fail-open", () => {
+    // 初版按 CJK 段枚举，这两类落在段外走 /4，一封真超长的信会被算成没超。
+    expect(estimateTokens("한국어")).toBe(3);
+    expect(estimateTokens("🐙🪲")).toBe(2);
   });
 });
 
@@ -200,8 +214,14 @@ describe("封缄结果与草稿互不别名", () => {
   });
 });
 
-describe("MV-D10 换气不改窗身份", () => {
-  it("换气前后 windowId 逐字不变，只有 generation + 1", () => {
+/**
+ * 注意这一组测的是 **kill + 带 windowId 重开**（泳道 1 已有的归档换代路径），
+ * 不是图纸 §4.1 那条窗内换气——换气不经归档。D10 因此没勾：这里钉住的是
+ * 「同一 windowId 重开后身份不变」这个更弱的性质，真正的换气流程接上之后
+ * 要重打一遍。describe 不写「换气」二字，免得下一刀把 kill 当成 forge。
+ */
+describe("MV-D10 判卷（归档换代路径）：窗身份不随代际变", () => {
+  it("kill 后按同一 windowId 重开，windowId 逐字不变，只有 generation + 1", () => {
     const sessions = new SessionRegistry<null>();
     const before = sessions.open("resident-a", { context: null });
 
@@ -215,7 +235,7 @@ describe("MV-D10 换气不改窗身份", () => {
     expect(sessions.windowsOf("resident-a")).toHaveLength(1);
   });
 
-  it("换气后旧 windowId 仍解析到同一扇窗，不出现悬空引用", () => {
+  it("重开后旧 windowId 仍解析到同一扇窗，不出现悬空引用", () => {
     const sessions = new SessionRegistry<null>();
     const before = sessions.open("resident-a", { headId: "node-1", context: null });
     const heldReference = before.windowId;
@@ -223,12 +243,12 @@ describe("MV-D10 换气不改窗身份", () => {
     sessions.kill(heldReference);
     sessions.open("resident-a", { windowId: heldReference, context: null });
 
-    // 判红样例②：换气后旧 windowId 查不到该窗。
+    // 判红样例②：重开后旧 windowId 查不到该窗。
     expect(sessions.isActive(heldReference)).toBe(true);
     expect(sessions.get(heldReference)?.residentId).toBe("resident-a");
   });
 
-  it("旧代际的派发回执在换气后被丢弃，但窗身份不变", () => {
+  it("旧代际的派发回执在重开后被丢弃，但窗身份不变", () => {
     const sessions = new SessionRegistry<null>();
     const before = sessions.open("resident-a", { context: null });
     const staleReceipt = sessions.issueDispatch(before.windowId);
