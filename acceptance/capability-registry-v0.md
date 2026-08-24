@@ -79,7 +79,14 @@
 - [ ] **[CR0-F02](../docs/design/capability-registry-v0.md#capability-registry-v0-s4) registry 不得自产 ready**：registry 的对外接口中不存在
   任何返回 `ready` 的路径；以接口层断言证明（缺省即证明，另配一条「若新增则红灯」的检查）。
 
-## 未决（等主笔裁，见图纸 §2.1）
+## 已定：`exposed` / `selected` 的归属（主笔 2026-08-22 裁，见图纸 §2.1）
 
-`exposed` 与 `selected` 两态在 #100 / #101 两卡均未收，本清单**暂不为其立条目**。
-裁定归属后再补，不先占位——占位本身会变成第二张说自己是真相的表。
+`exposed` 与 `selected` **均不收**进能力登记 v0，本清单**不为其立条目**：
+
+- `exposed` 归 **projection** 层，可有损可裁剪；验收要求落在投影侧——
+  投影必须标注「这不是全库」与省略原因，**不在本清单范围内**。
+- `selected` 归 **dispatch** 路径，是一次调用的瞬时选择，不是登记事实，
+  由多 viewport / dispatch 侧安置，**不在本清单范围内**。
+
+v0 六格就此收敛为 `definition` / `installed` / `registered` / `binding` /
+`authorization` / `superseded`，本清单条目仅覆盖这六格。
