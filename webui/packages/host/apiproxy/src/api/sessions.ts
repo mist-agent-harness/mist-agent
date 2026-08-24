@@ -176,6 +176,12 @@ export type QueueAction =
 /** One Session list entry. */
 export interface SessionSummary {
   sessionId: SessionId
+  /** Mist multi-viewport visibility boundary; absent on non-Mist hosts. */
+  scopeId?: string
+  /** Current or final generation of the window represented by sessionId. */
+  generation?: number
+  /** True when this row is a read-only archived window. */
+  archived?: boolean
   /**
    * The later of creation and the latest human-authored prompt. Attached
    * Sessions fold their live log; cold Sessions use a projection-cache hint or
@@ -258,8 +264,15 @@ export interface SessionsApi {
    * id fails with `agent-preset-not-found`, and a preset whose composition
    * cannot be mounted fails with `agent-preset-invalid`.
    */
-  create(request: RpcRequest<{ workspaceId?: WorkspaceId; cwd?: string; sessionId?: SessionId; agentPreset?: string }>):
-  Promise<RpcResponse<{ sessionId: SessionId; agentPreset?: string }>>
+  create(request: RpcRequest<{
+    workspaceId?: WorkspaceId
+    cwd?: string
+    sessionId?: SessionId
+    agentPreset?: string
+    /** Mist visibility boundary; omission uses the host's private scope. */
+    scopeId?: string
+  }>):
+  Promise<RpcResponse<{ sessionId: SessionId; agentPreset?: string; generation?: number }>>
 
   /**
    * Reads a window of history events; page boundaries align to append-origin message

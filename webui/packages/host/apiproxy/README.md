@@ -22,6 +22,8 @@ Wire messages form a four-quadrant discriminated union — who initiates × requ
 
 The layering/protocol decisions are recorded in the [GUI layering and RPC protocol RFC](../../../.agents/notes/implemented/architecture/2026-07-19-gui-layering-and-rpc-protocol.md); the browser-side consumption architecture in the [web client architecture RFC](../../../.agents/notes/implemented/architecture/2026-07-19-gui-web-client-architecture.md).
 
+The shared Session shapes reserve optional fields for Mist's multi-viewport adapter without changing other hosts. A Mist `session.create` may take `scopeId` and returns `generation`; its `session.list` rows add `scopeId`, `generation`, and `archived`, with `sessionId` equal to the host-minted window id. The adapter rejects caller-preallocated `sessionId` and generic `workspaceId`, `cwd`, or `agentPreset` inputs rather than silently guessing window-model mappings; it binds the resident outside the wire and reads both live and archived history without reviving a window.
+
 Question responses are validated against their pending request before the first answer claims it. A multi-select item may carry both requested option labels in `selected` and non-empty `custom` text; a single-select item must use one or the other. Duplicate labels, unknown labels, mismatched ids, incomplete batches, and empty custom text are rejected as `bad-response`.
 
 `session.history` reads an attached Session in memory or inspects a cold log through persistence without resuming or publishing an Agent, then pages on append-origin message boundaries. `maxMessages` counts `user/message` and `assistant/message` events that entered the surface by appending, so a model-only replacement copy consumes no quota. Each page stays one contiguous raw event range, which keeps a compaction's log-only `compaction/summary` record on the same page as the replacement that cites it.
@@ -74,6 +76,7 @@ None; this package neither assembles nor sends a provider request.
 
 ## Known Limitations and Deferred Work
 
+- **The Mist multi-viewport adapter is not installed into the frontend plugin** — the plugin-handler delivery channel is deferred to protocol v0.1, so the shipped plugin still uses its mock handler.
 - **Forwarded Remote events are parasitic on this legacy frame union** — `host/remote-event` lives in `HostFrame` so the delivery path could reuse the existing host stream instead of opening a third downlink, which makes it read as if this package owned the Remote event contract. It does not: the allowlist is `dsh-api-remotes`' and the consumer verb is `ctx.remote.$on`. When the host stream moves off this package, the frame moves with it and the consumer contract is unaffected ([rationale](../../../.agents/notes/implemented/architecture/2026-08-10-remote-event-delivery.md)).
 - **Pending-interaction state is host-side** — the wire uses POST `/api/respond` plus `RpcReceipt`; the table in `src/api-proxy.ts` handles questions only and has no approval entries.
 - **Reserved seams stay out of `RpcMethodMap`** — `prompt.mode: 'inject'`, `job.list`, and a describe `hostInstanceId` are documented reservations; model discovery uses `llm.models`. An unknown method fails loud at envelope parse rather than getting a not-implemented code.

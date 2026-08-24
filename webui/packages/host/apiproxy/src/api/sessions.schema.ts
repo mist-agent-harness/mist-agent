@@ -51,6 +51,9 @@ export const sessionEventSchema = z.object({
 /** SessionSummary row of session.list (`projections` reuses the history block's shape and schema). */
 export const sessionSummarySchema = z.object({
   sessionId: sessionIdSchema,
+  scopeId: z.string().min(1).optional(),
+  generation: z.number().int().positive().optional(),
+  archived: z.boolean().optional(),
   updatedAt: z.number(),
   running: z.boolean(),
   blank: z.boolean(),
@@ -104,6 +107,7 @@ export const sessionCreateRequestSchema = z.object({
   cwd: z.string().optional(),
   sessionId: sessionIdSchema.optional(),
   agentPreset: z.string().optional(),
+  scopeId: z.string().min(1).optional(),
 }).refine(
   payload => payload.workspaceId === undefined || payload.cwd === undefined,
   { message: 'session.create accepts workspaceId or cwd, not both' },
@@ -113,6 +117,7 @@ export const sessionCreateRequestSchema = z.object({
 export const sessionCreateValueSchema = z.object({
   sessionId: sessionIdSchema,
   agentPreset: z.string().optional(),
+  generation: z.number().int().positive().optional(),
 }) satisfies z.ZodType<Wire<ResponseValue<'session.create'>>>
 
 /** session.rename request payload (raw title; host-side normalization decides acceptance). */
