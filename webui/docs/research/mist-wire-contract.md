@@ -2,6 +2,7 @@
 
 单A 连接层的可执行规格：弟弟的 mock 按此实现，实现即契约测试桩；最终随上游 PR 提交 mist 定稿。
 证据等级：**实查**（对冻结树 47f9438 读码 + 追调用点；boot 时序另经 ConnectionController 源码核实）。
+`session.list / session.create / session.history` 的窗口语义唯一以 `docs/design/session-api.md` §1.1 为准；下表只作线侧摘要。
 
 ## 总原则
 
@@ -20,10 +21,10 @@ connected = `events.mux` onOpen + `events.host` onOpen + `host.describe` unary �
 | 方法 | 触发点 | mist 侧映射 |
 |---|---|---|
 | `host.describe` | 每代就绪握手 | 静态描述（名称/能力位）；**不含 dsh 品牌** |
-| `session.list` | onConnected resync | 住户可见会话列表（消息树 heads） |
-| `session.create` | 新会话 | SessionRegistry.open + 树锚点 |
-| `session.history` | 打开会话/重连重拉 | history snapshot + **单 session 递增 seq**（弟弟四面之一） |
-| `session.prompt` | 发消息 | submit turn → dispatch 收据（residentId+generation+dispatchId 关联键） |
+| `session.list` | onConnected resync | handler 所绑定住户的活窗 + 归档窗；`sessionId=windowId`，返回 scope/generation/archived，不暴露 resident |
+| `session.create` | 新会话 | `open(handler-bound residentId, scopeId)`；宿主签发 `sessionId=windowId` 与 generation，不映射的通用参数显式拒绝 |
+| `session.history` | 打开会话/重连重拉 | 按 `sessionId=windowId` 只读活窗或归档窗的权威流水，不 reopen；**单窗递增 seq** |
+| `session.prompt` | 发消息 | submit turn → dispatch 收据（residentId+windowId+generation+dispatchId 关联键） |
 | `session.cancel` | 停止按钮 | cancel 在途 turn |
 | `settings.describe` | 欢迎声明加载 | 返回含 `ui-onboarding` 的可写 namespace views |
 | `settings.mutate` | 欢迎声明确认 | 通用 path set/unset；内存持久化已读版本并返回新 view |

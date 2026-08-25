@@ -206,6 +206,64 @@ describe("SessionRegistry：多窗语义", () => {
     expect(sessions.get(w1.windowId)).toBeUndefined();
     expect(residentState).toEqual(before);
   });
+
+  it("按住户枚举归档窗，不混入活窗或其他住户", () => {
+    const sessions = new SessionRegistry<null>();
+    const archivedA = sessions.open("resident-a", { context: null });
+    const liveA = sessions.open("resident-a", { context: null });
+    const archivedB = sessions.open("resident-b", { context: null });
+
+    sessions.kill(archivedA.windowId);
+    sessions.kill(archivedB.windowId);
+
+    expect(sessions.archivedWindowsOf("resident-a")).toEqual([
+      expect.objectContaining({ residentId: "resident-a", windowId: archivedA.windowId }),
+    ]);
+    expect(sessions.archivedWindowsOf("resident-a")).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ windowId: liveA.windowId }),
+        expect.objectContaining({ windowId: archivedB.windowId }),
+      ]),
+    );
+  });
+
+  it("归档返回值是深副本，运行期变异不改权威记录或住户边界", () => {
+    const sessions = new SessionRegistry<null>();
+    const opened = sessions.open("resident-a", {
+      scopeId: "room-1",
+      headId: "node-1",
+      context: null,
+    });
+    const killed = sessions.kill(opened.windowId);
+    const fetched = sessions.getArchived(opened.windowId);
+    const listed = sessions.archivedWindowsOf("resident-a")[0];
+
+    expect(killed).toBeDefined();
+    expect(fetched).toBeDefined();
+    expect(listed).toBeDefined();
+    for (const snapshot of [killed, fetched, listed]) {
+      if (snapshot === undefined) throw new Error("expected archived snapshot");
+      Object.assign(snapshot, {
+        residentId: "resident-b",
+        scopeId: "room-mutated",
+        generation: 99,
+        headId: "node-mutated",
+      });
+    }
+
+    const expected = {
+      residentId: "resident-a",
+      windowId: opened.windowId,
+      scopeId: "room-1",
+      generation: 1,
+      headId: "node-1",
+      archived: true,
+    };
+    expect(sessions.getArchived(opened.windowId)).toEqual(expected);
+    expect(sessions.archivedWindowsOf("resident-a")).toEqual([expected]);
+    expect(sessions.archivedWindowsOf("resident-b")).toEqual([]);
+    expect(sessions.kill(opened.windowId)).toEqual(expected);
+  });
 });
 
 describe("SessionRegistry：贯穿场景（A01/A02/A03/B01/B02/B03 一口咬住）", () => {

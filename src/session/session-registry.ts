@@ -67,6 +67,10 @@ export interface ArchivedWindow {
   archived: true;
 }
 
+function cloneArchivedWindow(window: ArchivedWindow): ArchivedWindow {
+  return structuredClone(window);
+}
+
 export interface DispatchReceipt {
   residentId: string;
   windowId: string;
@@ -350,7 +354,8 @@ export class SessionRegistry<TContext> {
   }
 
   getArchived(windowId: string): ArchivedWindow | undefined {
-    return this.#archived.get(windowId);
+    const archived = this.#archived.get(windowId);
+    return archived === undefined ? undefined : cloneArchivedWindow(archived);
   }
 
   getHead(windowId: string): string | null {
@@ -368,6 +373,13 @@ export class SessionRegistry<TContext> {
   /** 一位住户此刻的全部活窗。多开合法，所以这里返回的是列表而不是一格。 */
   windowsOf(residentId: string): ActiveWindow<TContext>[] {
     return [...this.#active.values()].filter((window) => window.residentId === residentId);
+  }
+
+  /** 一位住户的全部归档窗。线协议列窗时与 windowsOf 合并，不复活任何窗。 */
+  archivedWindowsOf(residentId: string): ArchivedWindow[] {
+    return [...this.#archived.values()]
+      .filter((window) => window.residentId === residentId)
+      .map(cloneArchivedWindow);
   }
 
   hasLiveWindow(residentId: string): boolean {
@@ -412,7 +424,10 @@ export class SessionRegistry<TContext> {
   /** 幂等归档一扇窗。归档后只读，写入返 WINDOW_ARCHIVED（MV-A03）。 */
   kill(windowId: string): ArchivedWindow | undefined {
     const window = this.#active.get(windowId);
-    if (window === undefined) return this.#archived.get(windowId);
+    if (window === undefined) {
+      const archived = this.#archived.get(windowId);
+      return archived === undefined ? undefined : cloneArchivedWindow(archived);
+    }
     const archived: ArchivedWindow = {
       residentId: window.residentId,
       windowId: window.windowId,
@@ -425,7 +440,7 @@ export class SessionRegistry<TContext> {
     this.#appendArchive(archived);
     this.#active.delete(windowId);
     this.#archived.set(windowId, archived);
-    return archived;
+    return cloneArchivedWindow(archived);
   }
 
   /** 杀掉一位住户的全部活窗（MV-A03 后半）。 */

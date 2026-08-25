@@ -160,7 +160,17 @@ describe('sessions domain schemas', () => {
   it('validates the per-method request/value pairs', () => {
     expect(sessionListRequestSchema.parse({})).toEqual({})
     expect(sessionListRequestSchema.parse({ cursor: 'c' }).cursor).toBe('c')
-    expect(sessionListValueSchema.parse({ items: [] }).items).toEqual([])
+    expect(sessionListValueSchema.parse({
+      items: [{
+        sessionId: 'w_01', scopeId: 'private', generation: 2, archived: true,
+        updatedAt: 1, running: false, blank: false,
+      }],
+    }).items).toEqual([expect.objectContaining({
+      sessionId: 'w_01', scopeId: 'private', generation: 2, archived: true,
+    })])
+    expect(sessionListValueSchema.parse({
+      items: [{ sessionId: 's1', updatedAt: 1, running: false, blank: true }],
+    }).items).toEqual([expect.objectContaining({ sessionId: 's1' })])
     expect(sessionSearchRequestSchema.parse({ query: '  exact phrase  ' })).toEqual({ query: 'exact phrase' })
     expect(() => sessionSearchRequestSchema.parse({ query: '   ' })).toThrow()
     expect(() => sessionSearchRequestSchema.parse({ query: 'bad\0query' })).toThrow(/NUL/)
@@ -191,11 +201,17 @@ describe('sessions domain schemas', () => {
       ),
       hasMore: true,
     })).toThrow()
-    expect(sessionCreateRequestSchema.parse({ cwd: '/w' }).cwd).toBe('/w')
+    expect(sessionCreateRequestSchema.parse({ cwd: '/w', scopeId: 'private' })).toMatchObject({
+      cwd: '/w', scopeId: 'private',
+    })
+    expect(() => sessionCreateRequestSchema.parse({ scopeId: '' })).toThrow()
     // The refine's both-sides branch: workspaceId alone passes, workspaceId+cwd rejects.
     expect(sessionCreateRequestSchema.parse({ workspaceId: 'w1', sessionId: 's1' }).sessionId).toBe('s1')
     expect(() => sessionCreateRequestSchema.parse({ workspaceId: 'w1', cwd: '/w' })).toThrow(/not both/)
-    expect(sessionCreateValueSchema.parse({ sessionId: 's1' }).sessionId).toBe('s1')
+    expect(sessionCreateValueSchema.parse({ sessionId: 's1', generation: 1 })).toEqual({
+      sessionId: 's1', generation: 1,
+    })
+    expect(sessionCreateValueSchema.parse({ sessionId: 's1' })).toEqual({ sessionId: 's1' })
     expect(sessionHistoryRequestSchema.parse({ sessionId: 's1', beforeSeq: 3, maxMessages: 5 }).beforeSeq).toBe(3)
     expect(() => sessionHistoryRequestSchema.parse({ sessionId: 's1', maxMessages: 0 })).toThrow()
     expect(sessionHistoryValueSchema.parse({
