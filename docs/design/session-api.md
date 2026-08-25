@@ -35,7 +35,7 @@ mist 不替前端保管任何东西。线协议里的一个 session 对应一扇
 - `session.create`：调用 `open(residentId, scopeId)`；`residentId` 来自 handler 绑定，`scopeId` 可省略并落私聊。返回宿主签发的 `sessionId=windowId` 与 generation；客户端预分配 sessionId 被拒绝。共享 schema 中没有明确窗模型映射的 `workspaceId / cwd / agentPreset` 也在 Mist adapter 边界显式返回 `bad-request`，不静默猜测。
 - `session.history`：以 `sessionId=windowId` 读取该窗的只读流水；活窗和归档窗走同一读口，读取不得复活或改写窗。具体流水字节由只读 history port 提供，窗口注册表只负责身份、代际与归档状态。
 
-这三个端点属于 control/evidence 能力面，“协议可接线”不自动等于 “P1-conformant”。P1-conformant 用户面只有一条 canonical user-visible stream：可以进入仍有行动意义的活工作区，但不把 `session.list` 渲染成永久聊天列表，也不把归档窗的 `session.history` 变成第二本权威 transcript；关闭后主流只留 typed closure/result 与权威证据指针（#84 定案）。
+这三个端点属于 control/evidence 能力面，“协议可接线”不自动等于 “P1-conformant”。P1-conformant 用户面只有一条 canonical user-visible stream：可以进入仍有行动意义的活工作区，但不把 `session.list` 渲染成永久聊天列表，也不把归档窗的 `session.history` 变成第二本权威 transcript；关闭后主流只留 typed closure/result 与权威证据指针（方向未定，待 #84 收口）。
 
 **代价**：列表需要同时读活窗与归档窗；history 必须由窗流水的权威存储提供只读端口，不能拿 `residentId` 级整棵消息树冒充某一窗的流水。真实 handler 如何交到 frontend 插件仍待协议 v0.1，本次映射不改变 mock 默认边界。
 
