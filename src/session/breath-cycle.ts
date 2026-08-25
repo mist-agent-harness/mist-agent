@@ -47,11 +47,11 @@ export class BreathCycleError extends Error {
 }
 
 /**
- * 失败分档。`seal` 与 `append` 发生在换代之前——窗一根汗毛没动；
+ * 失败分档。`seal`、`append` 与 `inject` 发生在换代之前——窗一根汗毛没动；
  * `swap` 是换代本身失败，窗可能停在归档态，本模块会尽力回滚并在通知里
  * 标出 `windowRecovered`，让人知道该不该手动捞。
  */
-export type BreathFailureStage = "seal" | "append" | "swap";
+export type BreathFailureStage = "seal" | "append" | "inject" | "swap";
 
 /** 对人可见的换气通知（MV-D09）。落日志字段不算数，这个要送到人眼前。 */
 export type BreathNotification =
@@ -190,6 +190,18 @@ export class BreathCycle<TContext> {
     const archivedHeadId = current.headId;
     const scopeId = current.scopeId;
     const residentId = current.residentId;
+    // ④ 注入先算完，再动窗。参数在调用前求值——若把 injectLetter 写在
+    // open(...) 的参数位上，它一抛错就落在 kill 之后、open 之前：窗已归档、
+    // 新代没开，正好违反模块头的「失败且窗没动过」。（cursor 08-25 抓的）
+    let nextContext: TContext;
+    try {
+      nextContext = injectLetter(current.context, letter);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      // 窗一个字没动：kill 还没执行，如实报 recovered=true。
+      this.#fail(windowId, fromGeneration, "inject", reason, true);
+      throw new BreathCycleError("inject", reason, { cause: error });
+    }
     let reopened: ActiveWindow<TContext>;
     try {
       registry.kill(windowId);
@@ -197,8 +209,8 @@ export class BreathCycle<TContext> {
         windowId,
         scopeId,
         headId: archivedHeadId,
-        // ④ 注入：新代醒来时信全文已在上下文里，不需要任何工具调用。
-        context: injectLetter(current.context, letter),
+        // 新代醒来时信全文已在上下文里，不需要任何工具调用。
+        context: nextContext,
       });
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);

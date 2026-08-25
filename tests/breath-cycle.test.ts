@@ -127,6 +127,31 @@ describe("信先落定，再换代", () => {
     expect(notices.at(-1)).toMatchObject({ kind: "failed", stage: "append" });
   });
 
+  it("注入抛错时窗仍活、代际不变——kill 不许先于注入求值（cursor 08-25）", () => {
+    // 病根:参数在调用前求值。injectLetter 若写在 open(...) 的参数位上,
+    // 它抛错的落点是 kill 之后、open 之前——窗已归档,新代没开,
+    // 恰好违反模块头的「失败且窗没动过」。这条钉住"注入先算完,再动窗"。
+    const { registry, cycle, window, timeline, notices } = harness({
+      injectLetter: () => {
+        throw new Error("letter does not fit this context");
+      },
+    });
+    const id = window.windowId;
+
+    expect(() => cycle.breathe(id, draft())).toThrow(BreathCycleError);
+
+    // 窗一根汗毛没动:还活着,还是第一代。
+    expect(registry.isActive(id)).toBe(true);
+    expect(registry.get(id)?.generation).toBe(1);
+    // 信已落时间线(顺序在注入之前,这是既定语义);失败档位是 inject 不是 swap。
+    expect(timeline).toHaveLength(1);
+    expect(notices.at(-1)).toMatchObject({
+      kind: "failed",
+      stage: "inject",
+      windowRecovered: true,
+    });
+  });
+
   it("信校验不过时停在封缄这一步，时间线一个字都不写", () => {
     const { registry, timeline, cycle, window, notices } = harness();
     const id = window.windowId;
