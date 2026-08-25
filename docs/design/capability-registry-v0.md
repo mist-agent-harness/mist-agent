@@ -56,7 +56,7 @@
    registered + bound + authorized + current，仍然只说明账面齐全，说明不了住户敲得开门。
    为什么，见 [§4](#capability-registry-v0-s4)。
 
-### 2.1 卡面六态与露娜八态的差集（提请主笔裁）
+### 2.1 卡面六态与露娜八态的差集（主笔已裁，2026-08-22）
 
 #100 卡面列了六态；露娜在 #35 第 5 节的最小验收矩阵第 1 条列的是八项：
 `definition、installed、registered、bound、authorized、ready、exposed、selected`。差集需要显式处置，
@@ -66,14 +66,17 @@
 - `superseded` —— 卡面有、露娜第 5 节未列，但其第 4 节明确要求
   `unhealthy / deprecated / superseded / removed` 不得压成同一个 `inactive`。本图纸收，
   作为独立格（见 [§5](#capability-registry-v0-s5)）。
-- `exposed`、`selected` —— **两卡都没收，是真空。** 本图纸的建议：
-  - `exposed`（能力在某 scope 的目录里对住户可见）属于 **projection**，不是 canonical 登记态。
-    它可以有损、可以被裁剪，按露娜四分法不得反写 registry；建议**不收进本图纸的格子**，
-    但要求投影侧标注「这不是全库」与省略原因。
+- `exposed`、`selected` —— **两卡都没收，是真空。** 主笔 2026-08-22 裁定：两者**均不收**进
+  能力登记 v0 的格子，按本图纸原建议落地。
+  - `exposed`（能力在某 scope 的目录里对住户可见）归 **projection** 层，不是 canonical 登记态。
+    它可以有损、可以被裁剪，按露娜四分法不得反写 registry；**不收进本图纸的格子**，
+    但投影侧**必须**标注「这不是全库」与省略原因。
   - `selected`（dispatch 时选中了哪条 lane 绑定）是**一次调用的瞬时选择**，不是能力的登记事实，
-    属于 dispatch 路径；建议**不收**，另由多 viewport / dispatch 侧安置。
+    归 **dispatch** 路径；**不收**，另由多 viewport / dispatch 侧安置。
 
-  两条都请主笔裁；在裁定之前，本图纸不为它们预留格子，以免又长出一张说自己是真相的表。
+  **据此 v0 六格收敛为**：`definition` / `installed` / `registered` / `binding` /
+  `authorization` / `superseded`。本图纸不为 `exposed` / `selected` 预留格子，
+  以免又长出一张说自己是真相的表。
 
 <a id="capability-registry-v0-s3"></a>
 ## 3. `binding` 不是单值——两类账，互不推导
@@ -155,8 +158,8 @@ v0 若不分开立词条，后面一定有人拿记忆勘误链的语义去读�
 ## 7. v0 不做什么
 
 不定 schema、不选存储后端、不碰后台调度、不实现 registry 本体、不扩 readiness 语义、
-不为 `exposed` / `selected` 预留格子（等主笔裁 §2.1）。边界与验收收敛、主笔点头之后，
-再开只做一件事的实现 PR。
+不为 `exposed` / `selected` 预留格子（主笔 2026-08-22 已裁不收，见 §2.1）。
+边界与验收已收敛、主笔已点头，可以开只做一件事的实现 PR。
 
 ### 代价
 
