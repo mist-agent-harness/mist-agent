@@ -43,5 +43,5 @@
 
 ## E. 线协议对齐
 
-- [ ] **MV-E01 session 映射**：`session.list/create/history` 三个端点的行为与本图纸 §5 映射表一致；webui 侧不需要感知住户级概念。[集成]
-- [ ] **MV-E02 文档同步**：实现合入的同一 PR 更新 docs/design/session-api.md §1.1（「将要变成什么」降为已实现语义，差距段清零）。人工勾。
+- [x] **MV-E01 session 映射**：`session.list/create/history` 三个端点的行为与本图纸 §5 映射表一致；webui 侧不需要感知住户级概念。[集成]
+- [x] **MV-E02 文档同步**：实现合入的同一 PR 更新 docs/design/session-api.md §1.1（「将要变成什么」降为已实现语义，差距段清零）。人工勾。
