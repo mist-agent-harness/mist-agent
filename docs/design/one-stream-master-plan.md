@@ -1,6 +1,6 @@
 # 一位住户，一条权威生命线：master plan
 
-- 状态：draft for implementation review
+- 状态：approved；PR A implemented locally，等待提交复核
 - 主单：issue #84
 - 验收真源：`acceptance/one-stream.md`（OS-01～OS-06）
 - 决策真源：`docs/decisions.md` D9、`docs/design/session-api.md` §1.1
@@ -361,3 +361,19 @@ commit；先写红测试和 mutation，再写生产实现。
 3. 哪些能力仍未接、哪些成本仍未测。
 
 不以“文件写了”“接口存在”“测试对象能返回期望值”冒充完成。
+
+## 16. PR A 本地施工回执
+
+PR A 已完成 canonical event contract、每 resident durable snapshot store、进程内唯一 writer、
+幂等 receipt 与 cursor projection，并补齐真实子进程宿主 fixture。当前证据如下：
+
+- OS-01/02 已由 `tests/one-stream-host.test.ts`（3 项）和
+  `tests/one-stream-core.test.ts`（5 项）点亮；两处 crash window、换内容重试、payload
+  mutation、坏 snapshot 与同进程双 writer 均有转红断言；
+- `npm run typecheck`、`npm run lint`、`npm run acceptance` 通过；全仓 `npm test` 为
+  41 个文件通过、3 个跳过，448 项通过、38 项 todo；
+- 100 条事件时最终 snapshot 为 85,022 bytes，累计写入 4,294,176 bytes，约为最终快照的
+  50.5 倍，证实 v0 全量 snapshot 的写入成本随 stream 增长，暂不凭这一组数据拍阈值。
+
+这刀尚未接 message turn、MessageTree/head、first-party read model 或真实 frontend，因此只
+声称 OS-01/02 成立，不声称 D9 或 #84 整体完成。下一决策闸仍按 §12 评估 PR B。
