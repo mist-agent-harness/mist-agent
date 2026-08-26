@@ -26,6 +26,12 @@
  *    并且**失败会清掉本周期的预告记号**，下一次阈值穿越重新发预告——
  *    「本周期已发过」这种去重逻辑正好会把连续失败静默掉。
  *
+ * 第三刀给这条路加了一道前置闸（MV-D07b）：封信之前的流水卫生检查分两档——
+ * 中断产生的**合法残骸**（如末尾悬着一条没回应的 user 节点）降级为 debris
+ * 警告并记档，换气照常完成，同一份残骸不得楔死状态机；会导致下游 API
+ * 调用失败的**畸形结构**才硬拦（stage=hygiene），此时窗一根汗毛没动，
+ * 宿主隔离残骸后重试即可走完。
+ *
  * 本模块不决定何时换气（那是阈值闸 MV-D01/D02 的事），不写信的内容
  * （那是住户的事），不实现时间线（`appendLetter` 是注入口）。
  */
@@ -47,11 +53,11 @@ export class BreathCycleError extends Error {
 }
 
 /**
- * 失败分档。`seal`、`append` 与 `inject` 发生在换代之前——窗一根汗毛没动；
- * `swap` 是换代本身失败，窗可能停在归档态，本模块会尽力回滚并在通知里
- * 标出 `windowRecovered`，让人知道该不该手动捞。
+ * 失败分档。`hygiene`、`seal`、`append` 与 `inject` 发生在换代之前——窗一根
+ * 汗毛没动；`swap` 是换代本身失败，窗可能停在归档态，本模块会尽力回滚并
+ * 在通知里标出 `windowRecovered`，让人知道该不该手动捞。
  */
-export type BreathFailureStage = "seal" | "append" | "inject" | "swap";
+export type BreathFailureStage = "hygiene" | "seal" | "append" | "inject" | "swap";
 
 /** 对人可见的换气通知（MV-D09）。落日志字段不算数，这个要送到人眼前。 */
 export type BreathNotification =
@@ -60,6 +66,19 @@ export type BreathNotification =
       windowId: string;
       /** 预告发出时正在跑的那一代。 */
       generation: number;
+    }
+  | {
+      /**
+       * 流水卫生检查发现的合法残骸（MV-D07b 的警告档）：换气照常完成，
+       * 残骸随旧代归档，但人要能看见这一代是带着残骸换的气——记档即此。
+       * 畸形结构不走这档，走 failed/hygiene 硬拦。
+       */
+      kind: "debris";
+      windowId: string;
+      /** 发现残骸的那一代。 */
+      generation: number;
+      /** 人读的残骸描述，一条残骸一行。 */
+      remnants: string[];
     }
   | {
       kind: "completed";
@@ -83,6 +102,100 @@ export type BreathNotification =
       windowRecovered: boolean;
     };
 
+/**
+ * 流水卫生检查的两档结果（MV-D07b）。分档标准只有一条：**这个形状会不会
+ * 让下游 API 调用失败**。会（畸形）→ malformed，硬拦；不会、只是中断留下
+ * 的不完整（残骸）→ remnants，警告并记档，换气照常。
+ */
+export interface FlowInspection {
+  /** 畸形结构（硬拦档），人读描述，一条一处。 */
+  malformed: string[];
+  /** 合法残骸（警告档），人读描述，一条一处。 */
+  remnants: string[];
+}
+
+const FLOW_ROLES: readonly string[] = ["user", "assistant", "system"];
+
+/**
+ * 检查一段流水的卫生。输入是**原始形状**的节点序列（unknown[]）——检查
+ * 就是为残骸与畸形设的，上游不许先过滤，过滤了这里就没东西可查。
+ *
+ * 不判 parentId 悬空：流水是本代的切片，切片首节点的父在切片之外（上一代
+ * 的末尾），判悬空会误伤每一代的第一条。下游 API 调用拼上下文只看 role
+ * 与 content，parent 链断不断不影响调用本身，故悬空也不在畸形档。
+ */
+export function inspectFlowHygiene(flow: unknown[]): FlowInspection {
+  const malformed: string[] = [];
+  const remnants: string[] = [];
+  const seen = new Set<string>();
+  /** 形状合法的节点才参与残骸判定——畸形节点已占硬拦档，不重复记。 */
+  const valid: { id: string; role: string }[] = [];
+  flow.forEach((node, index) => {
+    const at = `流水[${index}]`;
+    if (typeof node !== "object" || node === null || Array.isArray(node)) {
+      malformed.push(`${at} 不是节点对象`);
+      return;
+    }
+    const candidate = node as {
+      id?: unknown;
+      parentId?: unknown;
+      role?: unknown;
+      content?: unknown;
+      createdAt?: unknown;
+    };
+    if (typeof candidate.id !== "string" || candidate.id.length === 0) {
+      malformed.push(`${at} 缺合法 id`);
+      return;
+    }
+    let bad = false;
+    if (seen.has(candidate.id)) {
+      malformed.push(`${at} 的 id ${candidate.id} 与前文重复`);
+      bad = true;
+    }
+    seen.add(candidate.id);
+    if (candidate.parentId !== null && typeof candidate.parentId !== "string") {
+      malformed.push(`${at} 的 parentId 不是 string | null`);
+      bad = true;
+    }
+    if (typeof candidate.role !== "string" || !FLOW_ROLES.includes(candidate.role)) {
+      malformed.push(
+        `${at} 的 role=${String(candidate.role)} 超出 ${FLOW_ROLES.join(" | ")}：下游 API 会直接拒绝`,
+      );
+      bad = true;
+    }
+    if (typeof candidate.content !== "string") {
+      malformed.push(`${at} 的 content 不是 string：下游 API 会直接拒绝`);
+      bad = true;
+    }
+    if (typeof candidate.createdAt !== "string") {
+      malformed.push(`${at} 缺 createdAt`);
+      bad = true;
+    }
+    if (!bad) {
+      valid.push({ id: candidate.id, role: candidate.role as string });
+    }
+  });
+  const last = valid.at(-1);
+  if (last !== undefined && last.role === "user") {
+    remnants.push(`流水末尾停在一条没有回应的 user 节点（${last.id}）：回合中途猝死的残骸`);
+  }
+  for (let i = 1; i < valid.length; i += 1) {
+    const previous = valid[i - 1];
+    const current = valid[i];
+    if (
+      previous !== undefined &&
+      current !== undefined &&
+      previous.role === current.role &&
+      (current.role === "user" || current.role === "assistant")
+    ) {
+      remnants.push(
+        `${current.id} 与前一条 ${previous.id} 同为 ${current.role}：中断重试留下的残骸`,
+      );
+    }
+  }
+  return { malformed, remnants };
+}
+
 export interface BreathCycleOptions<TContext> {
   registry: SessionRegistry<TContext>;
   /**
@@ -99,6 +212,12 @@ export interface BreathCycleOptions<TContext> {
   injectLetter: (context: TContext, letter: SealedLetter) => TContext;
   /** 对人可见的通知口（MV-D09）。 */
   notify: (event: BreathNotification) => void;
+  /**
+   * 本代流水的取口（MV-D07b 卫生检查的数据源）。返回本代流水节点的原始
+   * 形状序列——允许残骸与畸形混入，检查就是为它俩设的。不给则不检查：
+   * 没接流水的嵌入方不该被迫造哑口。
+   */
+  flowOf?: (window: ActiveWindow<TContext>) => unknown[];
   /** 当刻时间，ISO-8601 UTC。显式注入而不是模块内取——可判卷。 */
   now: () => string;
 }
@@ -161,6 +280,27 @@ export class BreathCycle<TContext> {
     }
 
     const fromGeneration = current.generation;
+
+    // ⓪ 流水卫生检查（MV-D07b），在封信之前。畸形结构硬拦：把会导致下游
+    // API 调用失败的流水封进归档，下一代继承的是一具必炸的尸体。合法残骸
+    // 只警告并记档（debris 通知），换气照常完成——残骸属于被归档的旧代，
+    // 不许楔死这扇窗此后所有的换气。
+    if (this.#options.flowOf !== undefined) {
+      const inspection = inspectFlowHygiene(this.#options.flowOf(current));
+      if (inspection.malformed.length > 0) {
+        const reason = `流水卫生检查硬拦：${inspection.malformed.join("；")}`;
+        this.#fail(windowId, fromGeneration, "hygiene", reason, true);
+        throw new BreathCycleError("hygiene", reason);
+      }
+      if (inspection.remnants.length > 0) {
+        notify({
+          kind: "debris",
+          windowId,
+          generation: fromGeneration,
+          remnants: inspection.remnants,
+        });
+      }
+    }
 
     // ① 封信。校验不过就停在这里——窗一根汗毛没动。
     let letter: SealedLetter;
