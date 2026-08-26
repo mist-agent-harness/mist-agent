@@ -4,6 +4,14 @@ Ox Alpha 起草、Elio 独立复核），2026-08-24 主笔冻结评审通过后�
 落仓只动了三处：标题与状态行改为已冻结（事实更新）、两处 <details> 折叠壳拆为小节，
 其余逐字保留原稿。v1 素材病例（chaodeng060-source / Laurie / 小墨 / 阿问，
 2026-08-22 至 08-24）留在 #90 楼内，不进本文件。
+
+后续修正（2026-08-26）：PR #114 落仓时只改了标题与状态行，正文 §5、§7 的 5c、
+§7 自查结论、附录 A schema 的 title/description 仍写着 freeze candidate /
+not yet frozen，与文件头「已冻结」互相矛盾。Elio 在 #90 楼内标了这处
+合并 blocker（comment 2026-08-26T05:07:48Z），#114 在修正前已被合入。
+本次把上述承担现行语义的几处改为 frozen，冻结前措辞只留在明确标注的
+历史留档块（文件头第 13 行、§5 末段）；「runner / fixture / 确定性评估器 /
+rubric 正文 / 真实样本 / E2E 均未实现、未验证」这一事实一字未减。
 -->
 
 # v0 评测契约：小机可读性（零上下文住户自维修）— v0 frozen（2026-08-24 冻结）
@@ -165,9 +173,11 @@ fixture 的 `inject.sh` 必须内置以上断言，任一不满足即注入失�
 
 ## §5 冻结范围声明
 
-本轮冻结候选的覆盖面：四个 case 的定义（同 v2 稿 §1，未改动）、gate 定义与必填矩阵（§1）、C3 时间线（§2）、已拍判据的落位（§3）、嵌套边界（§4）。**未冻结/未开始**：runner 实现、fixture 文件、确定性评估器代码、rubric 正文文本、真实样本接入。v2 稿 §7 状态表整体继续有效（一切「未实现/未验证」照抄）。
+本次冻结的覆盖面：四个 case 的定义（同 v2 稿 §1，未改动）、gate 定义与必填矩阵（§1）、C3 时间线（§2）、已拍判据的落位（§3）、嵌套边界（§4）。**不在冻结范围、且均未开工**：runner 实现、fixture 文件、确定性评估器代码、rubric 正文文本、真实样本接入——这几项一件都不存在，冻结不代表它们已实现或已验证。v2 稿 §7 状态表整体继续有效（一切「未实现/未验证」照抄）。
 
-**冻结状态措辞（独立复核修正）**：本契约是 **v0 freeze candidate / ready for maintainer freeze review**——维护者尚未宣布冻结；在维护者明确冻结之前，任何产物不得自称 frozen。
+**冻结状态措辞**：本契约已 **frozen（v0，2026-08-24 主笔冻结评审通过）**，自该评审起 §1～§4 为判卷法律。冻结只覆盖纸面契约；runner、fixture、确定性评估器、rubric 正文、真实样本、E2E 一律未实现、未验证，任何产物不得借本文件的 frozen 状态自称已实现。
+
+冻结前措辞留档：本文件在 2026-08-24 之前的状态是 v0 freeze candidate / ready for maintainer freeze review（维护者尚未宣布冻结）。该措辞仅为历史留档，不再承担现行语义。
 
 ## §6 仍未解决的 owner decision（沿 v2 稿 §6，本轮无新增未决项、也无一项被静默决定）
 
@@ -204,9 +214,9 @@ fixture 的 `inject.sh` 必须内置以上断言，任一不满足即注入失�
 | 4b | scope 封口：无 pending 提案残留，新增能力默认归 v1 | §6 pending→adopted 记录；§3.9 封口声明 | done |
 | 5a | coverage checklist 逐条锚点 | 本表 | done |
 | 5b | 未把设计写成已实现/已验证 | 状态行 + §5 | done |
-| 5c | 冻结状态措辞：v0 freeze candidate / ready for maintainer freeze review，不自称 frozen | 标题 + 状态行 + §5 | done（独立复核修正后） |
+| 5c | 冻结状态措辞与项目层实际状态一致：现为 v0 frozen（2026-08-24），冻结前的 freeze candidate 措辞只留在明确的历史留档块 | 标题 + 状态行 + §5 | done（2026-08-24 冻结后更新） |
 
-自查结论：全文无一处宣称 runner/fixture/gate/E2E 已实现或已验证；所有「done」均指纸面契约条目落位，不指实现；冻结状态一律表述为 freeze candidate awaiting maintainer review。
+自查结论：全文无一处宣称 runner/fixture/gate/E2E 已实现或已验证；所有「done」均指纸面契约条目落位，不指实现；冻结状态一律表述为 v0 frozen（2026-08-24 主笔冻结评审通过），冻结前的 freeze candidate 措辞只出现在明确标注的历史留档处。
 
 
 ---
@@ -217,8 +227,8 @@ fixture 的 `inject.sh` 必须内置以上断言，任一不满足即注入失�
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://mist-agent-harness/mr-eval/result.schema.v0.json",
-  "title": "mr-eval per-case result (v0 freeze candidate)",
-  "description": "Result schema for the small-machine-readability zero-context self-repair evaluation (issue #90). Freeze CANDIDATE: ready for maintainer freeze review, not yet frozen by a maintainer. Gates carry structured values; status is strictly pass/fail/n-a; n/a is legal ONLY for G4/G5 and only under the v0 nested-child-process observation boundary with the exact boundary rationale; verdict=green is impossible while any gate is fail or any illegal n/a exists; per-case required gates are enforced via if/then; unknown fields are rejected.",
+  "title": "mr-eval per-case result (v0 frozen 2026-08-24)",
+  "description": "Result schema for the small-machine-readability zero-context self-repair evaluation (issue #90). FROZEN: v0 contract frozen by the maintainer's freeze review on 2026-08-24; the runner, fixtures, deterministic evaluator, rubric body, real samples and E2E remain unimplemented and unverified. Gates carry structured values; status is strictly pass/fail/n-a; n/a is legal ONLY for G4/G5 and only under the v0 nested-child-process observation boundary with the exact boundary rationale; verdict=green is impossible while any gate is fail or any illegal n/a exists; per-case required gates are enforced via if/then; unknown fields are rejected.",
   "type": "object",
   "properties": {
     "case_id": {
