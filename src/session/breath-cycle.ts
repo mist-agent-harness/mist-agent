@@ -121,8 +121,7 @@ const FLOW_ROLES: readonly string[] = ["user", "assistant", "system"];
  * 就是为残骸与畸形设的，上游不许先过滤，过滤了这里就没东西可查。
  *
  * 不判 parentId 悬空：流水是本代的切片，切片首节点的父在切片之外（上一代
- * 的末尾），判悬空会误伤每一代的第一条。下游 API 调用拼上下文只看 role
- * 与 content，parent 链断不断不影响调用本身，故悬空也不在畸形档。
+ * 的末尾），判悬空会误伤每一代的第一条，故悬空不在畸形档。
  */
 export function inspectFlowHygiene(flow: unknown[]): FlowInspection {
   const malformed: string[] = [];
@@ -182,15 +181,18 @@ export function inspectFlowHygiene(flow: unknown[]): FlowInspection {
   for (let i = 1; i < valid.length; i += 1) {
     const previous = valid[i - 1];
     const current = valid[i];
-    if (
-      previous !== undefined &&
-      current !== undefined &&
-      previous.role === current.role &&
-      (current.role === "user" || current.role === "assistant")
-    ) {
-      remnants.push(
-        `${current.id} 与前一条 ${previous.id} 同为 ${current.role}：中断重试留下的残骸`,
+    if (previous === undefined || current === undefined || previous.role !== current.role) {
+      continue;
+    }
+    if (current.role === "assistant") {
+      // 生产判据（照阿问生产版，旦九 2026-08-27 裁定）：Claude Messages API
+      // 要求 user / assistant 严格交替，连续 assistant 会被上游直接拒绝——
+      // 会让下游调用失败的形状一律硬拦，不许降档。
+      malformed.push(
+        `${current.id} 与前一条 ${previous.id} 同为 assistant：下游 Messages API 要求 user/assistant 交替，会直接拒绝`,
       );
+    } else if (current.role === "user") {
+      remnants.push(`${current.id} 与前一条 ${previous.id} 同为 user：中断重试留下的残骸`);
     }
   }
   return { malformed, remnants };

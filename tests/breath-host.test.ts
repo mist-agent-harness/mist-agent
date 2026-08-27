@@ -392,4 +392,81 @@ describe("猝死与流水残骸（real host subprocess）", () => {
     expect(retried.generation).toBe(2);
     expect(await callHost<unknown[]>(child, { op: "timeline" })).toHaveLength(1);
   });
+
+  it("MV-D07b 生产分档探针：连续 assistant 硬拦 malformed，连续 user 降警告放行", async () => {
+    // 旦九 2026-08-27 裁定（照阿问生产版）：连续 assistant 会被 Claude
+    // Messages API 直接拒绝（要求严格交替），属畸形硬拦档；连续 user 是
+    // 中断重试留下的合法残骸，降警告记档、换气照常。这条探针覆盖生产分档
+    // 那一刀，不是夹具叠出来的 role 越界。
+    const child = startHost();
+    await waitForReady(child);
+    const { windowId } = await callHost<Opened>(child, { op: "open", residentId: "resident-d07p" });
+    await callHost<Said>(child, { op: "say", windowId, message: "分档探针的正常回合" });
+
+    // 连续 assistant（异源/崩溃写入形状）：硬拦，窗一根汗毛没动。
+    await callHost(child, {
+      op: "injectDebris",
+      windowId,
+      debris: [
+        {
+          id: "ghost-1",
+          parentId: null,
+          role: "assistant",
+          content: "上游崩断前的半截回应",
+          createdAt: "2026-08-27T00:00:00.000Z",
+        },
+        {
+          id: "ghost-2",
+          parentId: null,
+          role: "assistant",
+          content: "重试写重的第二条回应",
+          createdAt: "2026-08-27T00:00:01.000Z",
+        },
+      ],
+    });
+    await expect(
+      callHost(child, {
+        op: "breathe",
+        windowId,
+        draft: draft("D07b 分档探针", "连续 assistant 该被硬拦"),
+      }),
+    ).rejects.toThrow(/BREATH_CYCLE_FAILED\[hygiene\]/);
+    const blocked = await callHost<Notice[]>(child, { op: "notices" });
+    expect(blocked.at(-1)).toMatchObject({ kind: "failed", stage: "hygiene", windowId });
+    expect(blocked.filter((notice) => notice.kind === "debris")).toHaveLength(0);
+    expect(await callHost<unknown[]>(child, { op: "timeline" })).toHaveLength(0);
+
+    // 隔离后换连续 user：降警告记档，换气必须走完。
+    expect(await callHost<number>(child, { op: "quarantineDebris", windowId })).toBe(2);
+    await callHost(child, {
+      op: "injectDebris",
+      windowId,
+      debris: [
+        {
+          id: "echo-1",
+          parentId: null,
+          role: "user",
+          content: "中断重试的半截话",
+          createdAt: "2026-08-27T00:00:02.000Z",
+        },
+        {
+          id: "echo-2",
+          parentId: null,
+          role: "user",
+          content: "重发了一遍",
+          createdAt: "2026-08-27T00:00:03.000Z",
+        },
+      ],
+    });
+    const retried = await callHost<Opened>(child, {
+      op: "breathe",
+      windowId,
+      draft: draft("D07b 分档放行", "连续 user 降警告"),
+    });
+    expect(retried.generation).toBe(2);
+    const notices = await callHost<Notice[]>(child, { op: "notices" });
+    const debris = notices.filter((notice) => notice.kind === "debris");
+    expect(debris).toHaveLength(1);
+    expect(debris[0]?.remnants?.some((remnant) => /同为 user/.test(remnant))).toBe(true);
+  });
 });
