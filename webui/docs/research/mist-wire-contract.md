@@ -112,6 +112,6 @@ mock 锁定的 turn 映射如下：
 
 ## 插件装载边界（#61 核验采纳 · 2026-08-18）
 
-- **按插件协议 v0 装载后，webui 服务的仍是 mock 数据**：`PluginPrepareContext` v0 只有 `pluginId / config / register`，没有宿主向 frontend 插件交付服务实现的通道，`mist-plugin.ts` 的 handler 因此固定为 `createMockMistHandler()`。「真身：mist 会话编排层背同一套 /api」要等 RFC v0.1 定义 handler 交付通道后另出适配（协议侧欠账，Review 席自领 follow-up）。
+- **正式插件路径已装载宿主交付的真实 handler**：`mist-plugin.ts` 通过版本化的 `mist.session-handler` 只读句柄取得实现；服务缺失或版本不兼容时在 `prepare` 前 fail-closed，不退回 mock。独立 dev/mock server 仍是显式开发底座。这里不宣称 history 已持久化：生产 `MistWindowHistoryPort` 仍缺位（#120），夹具只证明 `session.history` 通道正确。
 - **装载前提是完整 build**：`pnpm run build` 的四步顺序不可拆着跑——跳过 `build:lib:host` 直接 `build:lib:client` 会因 typert 生成的 `/remote` 类型缺 host 面而报错（Review 席 2026-08-18 实测 31 个 TS 错）；`mist-plugin.ts` 的 `prepare` 对缺 dist fail-loud。
 - **配置唯一来源是 `context.config`**：manifest 不声明 `env` 绑定（v0 未定义 env 值如何交付给插件，声明即死承诺）；RFC 补齐 env 交付语义后再回来声明。

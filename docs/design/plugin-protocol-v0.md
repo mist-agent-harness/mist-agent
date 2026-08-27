@@ -45,6 +45,7 @@ interface PluginManifestV0 {
   capabilities: readonly CapabilityDeclaration[];
   contextInjections: readonly ContextInjectionDeclaration[];
   env: readonly EnvironmentDeclaration[];
+  hostServices?: readonly HostServiceRequirement[]; // v0.1：显式宿主服务依赖
   credentials: readonly CredentialRequirement[];
   permissions: readonly PermissionGrant[];
 }
@@ -68,6 +69,11 @@ interface EnvironmentDeclaration {
   description: string;
   required: boolean;
   secret: boolean;
+}
+
+interface HostServiceRequirement {
+  id: string;
+  requires: string; // 与 requiresMist 相同的严格 SemVer range 子集
 }
 
 type CredentialType = "claude_oauth" | "codex_oauth" | "grok_oauth" | "api_key";
@@ -171,7 +177,16 @@ interface PluginPrepareContext {
   readonly operationId: string; // 宿主先写盘再传入；也是整次 prepare 的稳定恢复键
   readonly config: unknown;
   readonly env: Readonly<Record<string, string>>; // 只含 manifest 已声明且已绑定的 name，见第 2 节
+  readonly services: {
+    get<T extends object = object>(id: string): HostServiceHandle<T>;
+  };
   register(resource: ResourceDeclaration): DisposableHandle;
+}
+
+interface HostServiceHandle<T extends object> {
+  readonly id: string;
+  readonly version: string;
+  readonly service: Readonly<T>; // 宿主持有并随 rollback/dispose 撤销的代理
 }
 
 type ResourceKind = "route" | "tool" | "listener" | "timer" | "connection";
@@ -574,12 +589,22 @@ scope 的 ready。
   无法回指现役 issuer 的 ref，也不得制造悬空 ref；现役 ref 的删除语义由产品另行决定；
 - 不允许插件协议改写已决的通道政策、住户连续性或权限审批点。
 
-## 11. v0 已登记、留待 v0.1 的缺口
+## 11. v0.1 宿主服务交付
 
-由首个真实消费者（#61，webui 整包 `frontend` 插件）暴露、本稿明确不在 v0 设计的空白：
+首个真实消费者（#61/#111，webui 整包 `frontend` 插件）把 v0 的宿主服务空白补成以下
+最小协议：
 
-- `frontend` 插件的宿主服务通道：v0 的 `PluginPrepareContext` 不向 `frontend` 插件交付
-  宿主已 active 的服务实现（例如会话编排层背后的 `/api` handler），插件只能自带实现或
-  桩。在 v0.1 定义交付形状（候选：`context.services.get(capabilityId)` 返回随 dispose
-  一起撤销的只读句柄）之前，`frontend` 插件的 manifest 与文档必须明示其后端为何物，
-  不得让「已按协议装载」被读成「已接上宿主真身」。
+- 插件在 manifest 的 `hostServices` 中以 `{ id, requires }` 显式声明所需服务；`requires`
+  使用与 `requiresMist` 相同的严格 SemVer range 子集。未声明的服务不可读取，重复 id、非法
+  id 或未知 range 语法按 `MANIFEST_INVALID` 拒装。
+- 宿主在写入首笔 lifecycle 权威记录、调用 `prepare` 之前，逐项核服务是否存在且版本满足
+  range；缺失或不兼容以 `REQUIREMENT_MISSING` fail-closed，不允许插件静默退回 mock。
+- `PluginPrepareContext.services.get(id)` 返回宿主持有的只读版本化句柄
+  `{ id, version, service }`，不是裸服务引用。插件不能撤销或替换服务；宿主在 activation
+  rollback 与 dispose 开始时撤销句柄，已保存的代理与方法引用随后都必须失败。
+- 服务读取只解决依赖交付，不注册资源、不改 capability registry，也不替代插件既有的
+  `register → activate → dispose` 事务。
+
+官方 frontend 现通过 `mist.session-handler@^1.0.0` 消费真实 handler；显式 dev/test 入口仍可
+使用 mock。这个通道不等于 history 已持久化：生产 `MistWindowHistoryPort` 尚未实现，由 #120
+承接；本卡使用 history fixture 的组合验收只证明 `session.history` 路由正确，不能证明数据留存。

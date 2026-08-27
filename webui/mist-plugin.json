@@ -9,6 +9,12 @@
   "capabilities": [],
   "contextInjections": [],
   "env": [],
+  "hostServices": [
+    {
+      "id": "mist.session-handler",
+      "requires": "^1.0.0"
+    }
+  ],
   "credentials": [],
   "permissions": []
 }

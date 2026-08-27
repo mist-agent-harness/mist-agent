@@ -25,7 +25,7 @@ import type { PluginOperationStore } from "./operation-store.ts";
 export interface PluginActivateRefusal {
   readonly pluginId: string;
   readonly state: "blocked";
-  readonly reasonCode: "PLUGIN_ID_CONFLICT" | "LIFECYCLE_RECOVERY_PENDING";
+  readonly reasonCode: "PLUGIN_ID_CONFLICT" | "LIFECYCLE_RECOVERY_PENDING" | "REQUIREMENT_MISSING";
   readonly detail: string;
 }
 

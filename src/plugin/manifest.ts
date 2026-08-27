@@ -13,7 +13,7 @@
  */
 
 import { parseRange, parseSemVer, satisfies } from "./semver.ts";
-import type { ReasonCode } from "./types.ts";
+import type { HostServiceRequirement, ReasonCode } from "./types.ts";
 
 export type PluginKind = "channel_adapter" | "frontend" | "tool_capability" | "bridge";
 export type Effect = "read" | "reversible" | "irreversible";
@@ -65,6 +65,7 @@ export interface PluginManifestV0 {
   readonly capabilities: readonly CapabilityDeclaration[];
   readonly contextInjections: readonly ContextInjectionDeclaration[];
   readonly env: readonly EnvironmentDeclaration[];
+  readonly hostServices?: readonly HostServiceRequirement[];
   readonly credentials: readonly CredentialRequirement[];
   readonly permissions: readonly PermissionGrant[];
 }
@@ -243,6 +244,22 @@ export function validateManifest(raw: unknown, hostVersion: string): ManifestVal
     if (typeof e.description !== "string") return invalid(`env ${e.name}: description`);
     if (typeof e.required !== "boolean") return invalid(`env ${e.name}: required`);
     if (typeof e.secret !== "boolean") return invalid(`env ${e.name}: secret`);
+  }
+
+  if (raw.hostServices !== undefined) {
+    if (!Array.isArray(raw.hostServices)) return invalid("hostServices must be an array");
+    const serviceIds = new Set<string>();
+    for (const service of raw.hostServices) {
+      if (!isRecord(service)) return invalid("host service requirement must be an object");
+      if (typeof service.id !== "string" || !PLUGIN_ID_RE.test(service.id)) {
+        return invalid(`host service id is invalid: ${String(service.id)}`);
+      }
+      if (serviceIds.has(service.id)) return invalid(`duplicate host service id: ${service.id}`);
+      serviceIds.add(service.id);
+      if (typeof service.requires !== "string" || parseRange(service.requires) === null) {
+        return invalid(`host service ${service.id}: requires must be a supported SemVer range`);
+      }
+    }
   }
 
   if (!Array.isArray(raw.credentials)) return invalid("credentials must be an array");
