@@ -18,6 +18,11 @@
  * 本模块不推进状态机、不写信、不碰阈值——它只回答「这个输入算不算换气
  * 触发，算的话进哪个状态」。阈值那半（MV-D01/D02）挂在开工闸上，是
  * turn-gate 那条线的事。
+ *
+ * 输入路径的接法（MV-D03）：MistDriver.say 在落树前过 parseManualBreath，
+ * 命中即抛 BreathCommandError——命令不是发言，落了树就会被模型当成她说
+ * 的一句话，而真正的换气被旁路。错误把统一触发原样带出，接住它的宿主
+ * 不需要、也不许区分三条命令走的是哪条路。
  */
 
 /** 图纸 §4.1 的状态集，顺序即推进顺序。 */
@@ -43,6 +48,23 @@ export interface BreathTrigger {
   state: BreathState;
   /** 手动触发时是哪条命令；阈值触发为 null。 */
   command: string | null;
+}
+
+export const BREATH_COMMAND = "BREATH_COMMAND" as const;
+
+/**
+ * 输入路径拦下的手动换气命令（MV-D03）。携带统一触发，由宿主路由进换气
+ * 状态机。用响亮的、可按名捕获的错误而不是静默返回值：宿主若没接这条路，
+ * 命令必须炸在人眼前，不许被当成一句普通发言落树。
+ */
+export class BreathCommandError extends Error {
+  readonly code = BREATH_COMMAND;
+  readonly trigger: BreathTrigger;
+  constructor(trigger: BreathTrigger) {
+    super(`${BREATH_COMMAND}: ${trigger.command ?? trigger.source} → ${trigger.state}`);
+    this.name = "BreathCommandError";
+    this.trigger = trigger;
+  }
 }
 
 /**

@@ -15,10 +15,18 @@
  * 普通动作（读历史这类不对外生效的事）不走 beforeTurn，走 noteOrdinaryAction：
  * 查账失败只记 gate_unknown 日志然后放行——闸的 fail-closed 周长只圈裁定级
  * 动作，普通动作被误伤是图纸 §3.2 明写的代价，不在这里加码。
+ *
+ * 换气阈值硬闸（MV-D01/D02）也挂在这道闸上（breath-trigger.ts 模块头指的路）：
+ * 判断权在账侧，临线的窗无权自判（D8 补记一）。容差由检查点的位置保证——
+ * 闸只在回合边界检查用量，撞线的那一轮（含其工具调用）已经跑完，拦的是
+ * 下一轮。阈值只能在窗开工时配置：本代首回合过闸后配置锁定到下一代，
+ * 运行中（尤其临近红线）的修改请求一律 CONFIG_INVALID（D8：临近红线的窗
+ * 无权给自己续命）。
  */
 
 import type { TurnGate, TurnPass } from "../message-tree/service.ts";
 import type { FactLedger, LedgerEntry } from "../store/fact-ledger.ts";
+import { type BreathTrigger, thresholdBreath } from "./breath-trigger.ts";
 
 /**
  * 查账失败时闸拒绝开工的错。fail-closed 的形状必须是一种响亮的、可按名
@@ -34,6 +42,48 @@ export class GateUnavailableError extends Error {
   }
 }
 
+export const CONFIG_INVALID = "CONFIG_INVALID" as const;
+export const BREATH_THRESHOLD_REACHED = "BREATH_THRESHOLD_REACHED" as const;
+
+/** 换气阈值默认值（图纸 §4.1：成员配置的绝对 token 数，默认 300k）。 */
+export const DEFAULT_BREATH_THRESHOLD_TOKENS = 300_000;
+
+/**
+ * 阈值配置被拒（MV-D02）。两种形状同罪：本代已有回合过闸后还来改阈值
+ * （临线的窗无权自调），以及阈值本身形状不合法。响亮的、可按 code 捕获的
+ * 错误——配置被拒必须炸在请求方眼前，不许静默忽略让人以为续命成功。
+ */
+export class ConfigInvalidError extends Error {
+  readonly code = CONFIG_INVALID;
+  constructor(reason: string) {
+    super(`${CONFIG_INVALID}: ${reason}`);
+    this.name = "ConfigInvalidError";
+  }
+}
+
+/**
+ * 阈值硬闸拦下新回合（MV-D01）。到线即换气（D8：没有「到线写信继续跑」）。
+ * 携带统一触发：接住它的宿主直接进换气状态机入口，不用自己再造一个——
+ * 阈值触发与手动触发共用同一个 state，入口统一就统一在这个对象上。
+ */
+export class BreathThresholdError extends Error {
+  readonly code = BREATH_THRESHOLD_REACHED;
+  readonly windowId: string;
+  readonly usage: number;
+  readonly threshold: number;
+  readonly trigger: BreathTrigger;
+  constructor(windowId: string, usage: number, threshold: number) {
+    super(
+      `${BREATH_THRESHOLD_REACHED}: 上下文用量 ${usage} ≥ 阈值 ${threshold}（window=${windowId}）：到线即换气，本窗不再开新回合`,
+    );
+    this.name = "BreathThresholdError";
+    this.windowId = windowId;
+    this.usage = usage;
+    this.threshold = threshold;
+    this.trigger = thresholdBreath();
+  }
+}
+
 /**
  * 闸事件。日志必须带完整三元组 (residentId, windowId, generation)——
  * 多窗之后回执链路多一层维度，缺一个字段排查就是噩梦（图纸 §2 代价行）。
@@ -41,7 +91,13 @@ export class GateUnavailableError extends Error {
  * 用在 registry 之外的窗上）为 null，不伪报。
  */
 export interface TurnGateEvent {
-  event: "gate_clear" | "gate_gap_pulled" | "gate_ack" | "ack_failed" | "gate_unknown";
+  event:
+    | "gate_clear"
+    | "gate_gap_pulled"
+    | "gate_ack"
+    | "ack_failed"
+    | "gate_unknown"
+    | "threshold_reached";
   residentId: string;
   windowId: string;
   generation: number | null;
@@ -53,11 +109,26 @@ export interface TurnEventLogger {
   log(event: TurnGateEvent): void;
 }
 
+/**
+ * 换气阈值硬闸的计量口（MV-D01）。与账无关——阈值管的是这扇窗的上下文
+ * 用量，不是缺口；所以它是可选挂接，不接则闸的行为与接之前完全一致。
+ */
+export interface BreathThresholdOptions {
+  /**
+   * 上下文用量计（token）。口径**不含交接信**（MV-D04 / D8 补记二：阈值
+   * 核算与上下文预算都不含交接信——信有自己的长度上限管着，计入核算等于
+   * 让信给上下文顶缸）。返回 null = 这扇窗无计量，阈值闸对它不触发。
+   */
+  usageOf: (windowId: string) => number | null;
+}
+
 export interface ViewportTurnGateOptions {
   /** 默认 no-op：不接日志的嵌入方不该被迫造一个哑 logger。 */
   logger?: TurnEventLogger;
   /** 窗代际查询口，一般由宿主的 SessionRegistry 适配；不给则事件里 generation 恒为 null。 */
   generationOf?: (windowId: string) => number | null;
+  /** 换气阈值计量口；不给则阈值硬闸整体不启用（既有路径一个字不变）。 */
+  breath?: BreathThresholdOptions;
 }
 
 const noopLogger: TurnEventLogger = {
@@ -89,11 +160,17 @@ export class ViewportTurnGate implements TurnGate {
   readonly #ledger: FactLedger;
   readonly #logger: TurnEventLogger;
   readonly #generationOf: ((windowId: string) => number | null) | undefined;
+  readonly #breath: BreathThresholdOptions | undefined;
+  /** 窗级阈值配置（MV-D02）；没配过的窗用 DEFAULT_BREATH_THRESHOLD_TOKENS。 */
+  readonly #thresholds = new Map<string, number>();
+  /** 本代已有回合过闸的窗 → 过闸时的代际号。阈值配置自此锁定到下一代开工。 */
+  readonly #turnStarted = new Map<string, number>();
 
   constructor(ledger: FactLedger, options: ViewportTurnGateOptions = {}) {
     this.#ledger = ledger;
     this.#logger = options.logger ?? noopLogger;
     this.#generationOf = options.generationOf;
+    this.#breath = options.breath;
   }
 
   #log(event: TurnGateEvent["event"], residentId: string, windowId: string, detail: string): void {
@@ -106,7 +183,54 @@ export class ViewportTurnGate implements TurnGate {
     });
   }
 
+  /**
+   * 窗开工时配置换气阈值（MV-D02）。「开工时」的判据在闸侧而不在窗侧：
+   * 本代还没有回合过闸才可配，首回合过闸后本代锁定，换代后重新可配——
+   * 每一次配置生效的时刻都是一代的开工，运行中（尤其临近红线）来改
+   * 一律 CONFIG_INVALID。判不了开工状态的窗（不在册）同罪：配置落在一扇
+   * 闸看不见的窗上等于没配，静默收下比拒绝更坏。
+   */
+  configureThreshold(windowId: string, tokens: number): void {
+    if (!Number.isInteger(tokens) || tokens < 1) {
+      throw new ConfigInvalidError(`阈值必须是 ≥ 1 的整数 token 数，实际 ${String(tokens)}`);
+    }
+    const generation = this.#generationOf?.(windowId) ?? null;
+    if (generation === null) {
+      throw new ConfigInvalidError(`窗不在册（${windowId}）：判不了开工状态，阈值配置无处生效`);
+    }
+    if (this.#turnStarted.get(windowId) === generation) {
+      throw new ConfigInvalidError(
+        `窗 ${windowId} 的第 ${generation} 代已有回合过闸：阈值只能在开工时配置，临线的窗无权自调`,
+      );
+    }
+    this.#thresholds.set(windowId, tokens);
+  }
+
+  /** 回合过闸即本代已开工：阈值配置就此锁定到下一代（MV-D02）。 */
+  #markTurnStarted(windowId: string): void {
+    const generation = this.#generationOf?.(windowId) ?? null;
+    if (generation !== null) {
+      this.#turnStarted.set(windowId, generation);
+    }
+  }
+
   beforeTurn(residentId: string, windowId: string): TurnPass {
+    // 阈值硬闸（MV-D01）在查账之前：到线的窗连缺口都不该再拉——这一轮
+    // 根本不许开始。容差由检查点的位置保证：撞线的那轮（含其工具调用）
+    // 已经跑完，这里拦的是下一轮。
+    const usage = this.#breath?.usageOf(windowId) ?? null;
+    if (usage !== null) {
+      const threshold = this.#thresholds.get(windowId) ?? DEFAULT_BREATH_THRESHOLD_TOKENS;
+      if (usage >= threshold) {
+        this.#log(
+          "threshold_reached",
+          residentId,
+          windowId,
+          `上下文用量 ${usage} ≥ 阈值 ${threshold}：硬闸拦下新回合`,
+        );
+        throw new BreathThresholdError(windowId, usage, threshold);
+      }
+    }
     const probe = this.#ledger.probeGap(residentId, windowId);
     if (probe.status === "unknown") {
       this.#log("gate_unknown", residentId, windowId, `缺口未知：${probe.cause}`);
@@ -129,6 +253,7 @@ export class ViewportTurnGate implements TurnGate {
       this.#log("gate_clear", residentId, windowId, detail);
       // ackedSeq 已平 latestSeq，无需 ack；commit 只负责确认交付（幂等）——
       // assistantReply 失败时 commit 不被调用，快照保留，下轮原样重交。
+      this.#markTurnStarted(windowId);
       return {
         contextPrefix: initialLines,
         commit: () => {
@@ -151,6 +276,7 @@ export class ViewportTurnGate implements TurnGate {
         ? `pulled ${entries.length} entries (${seqRange})`
         : `pulled ${entries.length} entries (${seqRange})；初始对齐交付 ${initialLines.length} 条现行有效集`,
     );
+    this.#markTurnStarted(windowId);
     return {
       contextPrefix: [...initialLines, ...entries.map(formatGapEntry)],
       commit: () => {

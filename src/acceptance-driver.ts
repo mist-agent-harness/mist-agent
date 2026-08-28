@@ -29,6 +29,7 @@ import {
   type TurnGate,
 } from "./message-tree/index.ts";
 import { createResidentMigrationService } from "./migration/resident-store-migration.ts";
+import { BreathCommandError, parseManualBreath } from "./session/breath-trigger.ts";
 import { SessionRegistry } from "./session/session-registry.ts";
 import { type TurnEventLogger, ViewportTurnGate } from "./session/turn-gate.ts";
 import { type FactLedger, LedgerNotFoundError } from "./store/fact-ledger.ts";
@@ -261,6 +262,13 @@ class MistDriver implements HarnessDriver {
   // --- P2：消息树 ---
 
   async say(residentId: string, message: string): Promise<HistoryNode> {
+    // 手动换气入口（MV-D03）：/new、/clear、/compact 不是发言，是同一状态机
+    // 入口的提前触发（D8：流程里没有 compact 这个选项）。在落树之前拦截——
+    // 命令进了树，模型会把它当成她说的一句话，而真正的换气被旁路。
+    const breath = parseManualBreath(message);
+    if (breath !== null) {
+      throw new BreathCommandError(breath);
+    }
     this.#ensureMessageRoom(residentId);
     return this.#messageTree.say(residentId, message, this.#windowIdOf(residentId));
   }
