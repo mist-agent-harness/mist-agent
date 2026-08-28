@@ -41,6 +41,26 @@ export interface DisposableHandle {
   revoke(): Promise<void>;
 }
 
+/** A versioned host service requirement declared by the plugin manifest. */
+export interface HostServiceRequirement {
+  readonly id: string;
+  readonly requires: string;
+}
+
+/**
+ * Host-owned view of one delivered service. The service proxy is read-only and is
+ * revoked by the host when activation rolls back or disposal begins.
+ */
+export interface HostServiceHandle<T extends object = object> {
+  readonly id: string;
+  readonly version: string;
+  readonly service: Readonly<T>;
+}
+
+export interface PluginHostServices {
+  get<T extends object = object>(id: string): HostServiceHandle<T>;
+}
+
 /**
  * What a plugin sees during prepare. RFC §2/§3 (#62):
  * - `operationId`: host-generated, persisted to disk BEFORE `prepare` is called; also
@@ -55,6 +75,7 @@ export interface PluginPrepareContext {
   readonly operationId: string;
   readonly config: unknown;
   readonly env: Readonly<Record<string, string>>;
+  readonly services: PluginHostServices;
   register(resource: ResourceDeclaration): DisposableHandle;
 }
 

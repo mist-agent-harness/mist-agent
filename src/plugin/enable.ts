@@ -108,6 +108,7 @@ export async function applyEnabledChange(
     runtimeVersion: request.manifest.version,
     config: request.config,
     env: assembled.env,
+    requiredServices: request.manifest.hostServices ?? [],
     bindings: { environment: (request.config as { environment: unknown }).environment },
     // Activation and runtime readiness are separate facts. Without an external receipt,
     // the durable authority carries no verified scope and host projection remains unknown.

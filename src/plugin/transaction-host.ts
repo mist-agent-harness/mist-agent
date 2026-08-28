@@ -22,9 +22,12 @@ import {
   projectReadiness,
   readRuntimeReadiness,
 } from "./runtime-readiness.ts";
+import { parseRange, parseSemVer, satisfies } from "./semver.ts";
 import type {
   ActivePlugin,
   DisposableHandle,
+  HostServiceHandle,
+  HostServiceRequirement,
   PluginModuleV0,
   PluginPrepareContext,
   PreparedPlugin,
@@ -61,6 +64,8 @@ export interface ActivatePluginRequest {
   readonly runtimeVersion?: string;
   readonly config: unknown;
   readonly env: Readonly<Record<string, string>>;
+  /** Manifest-declared host services; production callers derive this from the manifest. */
+  readonly requiredServices?: readonly HostServiceRequirement[];
   readonly bindings: unknown;
   readonly verifiedScope: unknown;
   /** Legacy compatibility input: ready receipts are rejected unless produced by a probe. */
@@ -84,10 +89,23 @@ interface RegisteredResource {
 interface ActiveRuntime {
   readonly activePlugin: ActivePlugin;
   readonly resources: RegisteredResource[];
+  readonly serviceLeases: ServiceLease[];
+}
+
+export interface HostServiceRegistration<T extends object = object> {
+  readonly id: string;
+  readonly version: string;
+  readonly service: T;
+}
+
+interface ServiceLease {
+  readonly handle: HostServiceHandle;
+  revoke(): void;
 }
 
 export interface PluginTransactionHostOptions {
   readonly store: PluginOperationStore;
+  readonly services?: readonly HostServiceRegistration[];
   readonly newOperationId?: () => string;
   readonly checkpoint?: (checkpoint: PluginCheckpoint) => Promise<void>;
 }
@@ -97,6 +115,7 @@ export class PluginTransactionHost {
   readonly #store: PluginOperationStore;
   readonly #newOperationId: () => string;
   readonly #checkpoint: (checkpoint: PluginCheckpoint) => Promise<void>;
+  readonly #services = new Map<string, HostServiceRegistration>();
   readonly #active = new Map<string, ActiveRuntime>();
   readonly #published = new Map<string, PublishedPluginResource[]>();
   readonly #recovery: PluginRecoveryCoordinator;
@@ -105,6 +124,15 @@ export class PluginTransactionHost {
     this.#store = options.store;
     this.#newOperationId = options.newOperationId ?? randomUUID;
     this.#checkpoint = options.checkpoint ?? (async () => undefined);
+    for (const service of options.services ?? []) {
+      if (service.id.length === 0 || this.#services.has(service.id)) {
+        throw new Error(`duplicate or empty host service id: ${service.id}`);
+      }
+      if (parseSemVer(service.version) === null) {
+        throw new Error(`host service ${service.id} has invalid SemVer: ${service.version}`);
+      }
+      this.#services.set(service.id, service);
+    }
     this.#recovery = new PluginRecoveryCoordinator(options.store);
   }
 
@@ -119,6 +147,9 @@ export class PluginTransactionHost {
     // （fail-closed，原字节不动）；仅 ENOENT、blocked 显式重试、disposed 重装放行。
     const refused = refuseActiveIdOverwrite(request.pluginId, this.#active, this.#store);
     if (refused !== null) return refused;
+    const requiredServices = request.requiredServices ?? [];
+    const serviceRefusal = this.#checkServiceRequirements(request.pluginId, requiredServices);
+    if (serviceRefusal !== null) return serviceRefusal;
     if (request.readiness?.status === "ready") {
       throw new Error(
         "ready runtime readiness must be produced by a current-process readback probe",
@@ -162,6 +193,8 @@ export class PluginTransactionHost {
     await this.#emit("operation-persisted", record);
 
     const resources: RegisteredResource[] = [];
+    const serviceLeases = new Map<string, ServiceLease>();
+    const declaredServiceIds = new Set(requiredServices.map((requirement) => requirement.id));
     const recoveryKeys = new Set<string>();
     const resourceIds = new Set<string>();
     const context: PluginPrepareContext = {
@@ -169,6 +202,23 @@ export class PluginTransactionHost {
       operationId,
       config: request.config,
       env: Object.freeze({ ...request.env }),
+      services: Object.freeze({
+        get: <T extends object = object>(id: string): HostServiceHandle<T> => {
+          if (!declaredServiceIds.has(id)) {
+            throw new Error(`HOST_SERVICE_UNDECLARED: ${id}`);
+          }
+          let lease = serviceLeases.get(id);
+          if (lease === undefined) {
+            const registration = this.#services.get(id);
+            if (registration === undefined) {
+              throw new Error(`HOST_SERVICE_MISSING: ${id}`);
+            }
+            lease = this.#serviceLease(registration);
+            serviceLeases.set(id, lease);
+          }
+          return lease.handle as HostServiceHandle<T>;
+        },
+      }),
       register: (declaration) => {
         this.#validateDeclaration(declaration, resourceIds, recoveryKeys);
         const resourceRecord: PluginOperationResourceRecord = {
@@ -197,7 +247,9 @@ export class PluginTransactionHost {
     try {
       prepared = await request.module.prepare(context);
     } catch {
-      return this.#rollbackCurrent(record, resources, undefined, "PREPARE_FAILED");
+      return this.#rollbackCurrent(record, resources, undefined, "PREPARE_FAILED", [
+        ...serviceLeases.values(),
+      ]);
     }
 
     // Resource capability declarations are only authoritative after prepare(). A readiness
@@ -213,10 +265,14 @@ export class PluginTransactionHost {
       } catch {
         // Normal probe failures become an explicit non-ready receipt. Malformed probe output
         // can still fail during evaluation and must roll back the in-flight transaction.
-        return this.#rollbackCurrent(record, resources, prepared, "ACTIVATE_FAILED");
+        return this.#rollbackCurrent(record, resources, prepared, "ACTIVATE_FAILED", [
+          ...serviceLeases.values(),
+        ]);
       }
       if (!isReadinessReceipt(generated)) {
-        return this.#rollbackCurrent(record, resources, prepared, "ACTIVATE_FAILED");
+        return this.#rollbackCurrent(record, resources, prepared, "ACTIVATE_FAILED", [
+          ...serviceLeases.values(),
+        ]);
       }
       if (
         !readinessMatchesAuthority(
@@ -229,7 +285,9 @@ export class PluginTransactionHost {
         // lifecycle activation usable, but never persist that receipt as this authority's
         // readiness. Other identity/scope mismatches remain activation failures.
         if (!isAuthorityVersionMismatch(record, generated, record.verifiedScope)) {
-          return this.#rollbackCurrent(record, resources, prepared, "ACTIVATE_FAILED");
+          return this.#rollbackCurrent(record, resources, prepared, "ACTIVATE_FAILED", [
+            ...serviceLeases.values(),
+          ]);
         }
         Reflect.deleteProperty(record, "readiness");
         Object.assign(record, { verifiedScope: null });
@@ -246,7 +304,9 @@ export class PluginTransactionHost {
       (!isReadinessReceipt(request.readiness) ||
         !readinessMatchesAuthority(record, request.readiness, null))
     ) {
-      return this.#rollbackCurrent(record, resources, prepared, "ACTIVATE_FAILED");
+      return this.#rollbackCurrent(record, resources, prepared, "ACTIVATE_FAILED", [
+        ...serviceLeases.values(),
+      ]);
     }
 
     record.lifecycleState = "prepared";
@@ -262,7 +322,9 @@ export class PluginTransactionHost {
         this.#store.save(record);
       }
     } catch {
-      return this.#rollbackCurrent(record, resources, prepared, "ACTIVATE_FAILED");
+      return this.#rollbackCurrent(record, resources, prepared, "ACTIVATE_FAILED", [
+        ...serviceLeases.values(),
+      ]);
     }
 
     await this.#emit("before-active-authority-commit", record);
@@ -275,7 +337,9 @@ export class PluginTransactionHost {
     try {
       activePlugin = await prepared.activate();
     } catch {
-      return this.#rollbackCurrent(record, resources, prepared, "ACTIVATE_FAILED");
+      return this.#rollbackCurrent(record, resources, prepared, "ACTIVATE_FAILED", [
+        ...serviceLeases.values(),
+      ]);
     }
     record.operation.phase = "published";
     this.#store.save(record);
@@ -284,7 +348,11 @@ export class PluginTransactionHost {
     Reflect.deleteProperty(record, "reasonCode");
     Reflect.deleteProperty(record, "quarantine");
     this.#store.save(record);
-    this.#active.set(request.pluginId, { activePlugin, resources });
+    this.#active.set(request.pluginId, {
+      activePlugin,
+      resources,
+      serviceLeases: [...serviceLeases.values()],
+    });
     this.#published.set(
       request.pluginId,
       resources.map((resource) => this.#public(resource.record)),
@@ -373,6 +441,7 @@ export class PluginTransactionHost {
     Reflect.deleteProperty(record, "readiness");
     this.#store.save(record);
     this.#published.delete(pluginId);
+    for (const lease of runtime.serviceLeases) lease.revoke();
 
     const failures: string[] = [];
     const failedResourceIds: string[] = [];
@@ -567,7 +636,9 @@ export class PluginTransactionHost {
     resources: readonly RegisteredResource[],
     prepared: PreparedPlugin | undefined,
     reasonCode: "PREPARE_FAILED" | "ACTIVATE_FAILED",
+    serviceLeases: readonly ServiceLease[],
   ): Promise<PluginOperationOutcome> {
+    for (const lease of serviceLeases) lease.revoke();
     const failures: string[] = [];
     for (const resource of [...resources].reverse()) {
       try {
@@ -597,6 +668,79 @@ export class PluginTransactionHost {
     Reflect.deleteProperty(record, "readiness");
     this.#store.save(record);
     return this.#outcome(record);
+  }
+
+  #checkServiceRequirements(
+    pluginId: string,
+    requirements: readonly HostServiceRequirement[],
+  ): PluginActivateRefusal | null {
+    const seen = new Set<string>();
+    for (const requirement of requirements) {
+      if (seen.has(requirement.id)) {
+        return {
+          pluginId,
+          state: "blocked",
+          reasonCode: "REQUIREMENT_MISSING",
+          detail: `duplicate host service requirement: ${requirement.id}`,
+        };
+      }
+      seen.add(requirement.id);
+      const range = parseRange(requirement.requires);
+      const registration = this.#services.get(requirement.id);
+      const version = registration === undefined ? null : parseSemVer(registration.version);
+      if (range === null || version === null || !satisfies(version, range)) {
+        return {
+          pluginId,
+          state: "blocked",
+          reasonCode: "REQUIREMENT_MISSING",
+          detail:
+            registration === undefined
+              ? `required host service is unavailable: ${requirement.id} (${requirement.requires})`
+              : `host service ${requirement.id}@${registration.version} does not satisfy ${requirement.requires}`,
+        };
+      }
+    }
+    return null;
+  }
+
+  #serviceLease(registration: HostServiceRegistration): ServiceLease {
+    let revoked = false;
+    const methodWrappers = new Map<PropertyKey, (...args: unknown[]) => unknown>();
+    const assertLive = () => {
+      if (revoked) throw new Error(`HOST_SERVICE_REVOKED: ${registration.id}`);
+    };
+    const service = new Proxy(registration.service, {
+      get: (target, property) => {
+        assertLive();
+        const value: unknown = Reflect.get(target, property, target);
+        if (typeof value !== "function") return value;
+        let wrapper = methodWrappers.get(property);
+        if (wrapper === undefined) {
+          wrapper = (...args: unknown[]) => {
+            assertLive();
+            return Reflect.apply(value, target, args);
+          };
+          methodWrappers.set(property, wrapper);
+        }
+        return wrapper;
+      },
+      set: () => false,
+      defineProperty: () => false,
+      deleteProperty: () => false,
+      setPrototypeOf: () => false,
+      preventExtensions: () => false,
+    });
+    const handle = Object.freeze({
+      id: registration.id,
+      version: registration.version,
+      service,
+    });
+    return {
+      handle,
+      revoke: () => {
+        revoked = true;
+      },
+    };
   }
 
   #handle(record: PluginAuthorityRecord, resource: RegisteredResource): DisposableHandle {

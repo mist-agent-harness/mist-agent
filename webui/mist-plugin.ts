@@ -21,16 +21,18 @@ import { dirname, join } from 'node:path'
 import { existsSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { randomBytes } from 'node:crypto'
-// Root-level entry: the workspace alias '@mist-webui/mock-contract' is not linkable from the
-// repo root, so the mock handler is imported by its in-tree path (apps/mist-mock-server).
-import { createMockMistHandler } from './apps/mist-mock-server/src/index.ts'
 import { composeBootGraph } from './apps/dev-server/src/boot-graph.ts'
+import type { MistHandler } from './apps/dev-server/src/handler.ts'
 import { createDevServer, type DevServer } from './apps/dev-server/src/server.ts'
+
+export const MIST_SESSION_HANDLER_SERVICE_ID = 'mist.session-handler'
+export const MIST_SESSION_HANDLER_SERVICE_RANGE = '^1.0.0'
 
 interface ResourceDeclaration {
   readonly id: string
   readonly kind: 'route' | 'tool' | 'listener' | 'timer' | 'connection'
   readonly capabilityId?: string
+  readonly recoveryKey: string
   activate(): Promise<void>
   dispose(): Promise<void>
 }
@@ -42,7 +44,16 @@ interface DisposableHandle {
 
 interface PluginPrepareContext {
   readonly pluginId: string
+  readonly operationId: string
   readonly config: unknown
+  readonly env: Readonly<Record<string, string>>
+  readonly services: {
+    get<T extends object = object>(id: string): {
+      readonly id: string
+      readonly version: string
+      readonly service: Readonly<T>
+    }
+  }
   register(resource: ResourceDeclaration): DisposableHandle
 }
 
@@ -120,6 +131,7 @@ const RESOURCES: readonly { id: string; kind: ResourceDeclaration['kind'] }[] = 
 /** PluginModuleV0.prepare — see contract note in the file header. */
 export async function prepare(context: PluginPrepareContext): Promise<PreparedWebuiPlugin> {
   const config = readConfig(context.config)
+  const handler = context.services.get<MistHandler>(MIST_SESSION_HANDLER_SERVICE_ID).service
   const here = dirname(fileURLToPath(import.meta.url))
   const distDir = config.distDir ?? join(here, 'apps', 'web', 'dist')
   if (!existsSync(join(distDir, 'index.html'))) {
@@ -134,7 +146,7 @@ export async function prepare(context: PluginPrepareContext): Promise<PreparedWe
   // lands — until then hosts must not persist this key into snapshots (debt tracked on #62).
   const token = config.token ?? randomBytes(24).toString('base64url')
   const server: DevServer = createDevServer({
-    handler: createMockMistHandler(),
+    handler,
     distDir,
     bootGraph: composeBootGraph(here),
     bind,
@@ -176,6 +188,7 @@ export async function prepare(context: PluginPrepareContext): Promise<PreparedWe
     context.register({
       id,
       kind,
+      recoveryKey: `${context.pluginId}:${id}`,
       activate: () => {
         hostActivated.add(id)
         return Promise.resolve()

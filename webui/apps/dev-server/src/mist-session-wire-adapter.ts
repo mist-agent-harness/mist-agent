@@ -123,9 +123,9 @@ function sessionMissing(sessionId: SessionId): UnaryResult {
 /**
  * Standalone session.* adapter for the multi-viewport model.
  *
- * It is deliberately not installed into the frontend plugin: plugin-to-host
- * handler delivery belongs to the deferred protocol v0.1 follow-up. The
- * current mock remains the default dev/plugin handler.
+ * Production composition delivers this handler through the versioned
+ * `mist.session-handler` host service. The history port remains an independent
+ * seam; no production persistence implementation is claimed here.
  */
 export class MistSessionWireAdapter<TContext> implements MistHandler {
   readonly #residentId: string

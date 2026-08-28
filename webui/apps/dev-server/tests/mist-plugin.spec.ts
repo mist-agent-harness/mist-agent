@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { prepare } from '../../../mist-plugin.ts'
 import type { PluginPrepareContext, ResourceDeclaration } from '../../../mist-plugin.ts'
+import { createMockMistHandler } from '../../mist-mock-server/src/index.ts'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 
@@ -22,11 +23,17 @@ interface FakeHost {
 
 function makeHost(config: unknown): FakeHost {
   const registered: ResourceDeclaration[] = []
+  const handler = createMockMistHandler()
   return {
     registered,
     context: {
       pluginId: 'mist-official-skin',
+      operationId: 'test-operation',
       config,
+      env: {},
+      services: {
+        get: () => ({ id: 'mist.session-handler', version: '1.0.0', service: handler }),
+      },
       register: (resource) => {
         registered.push(resource)
         return { id: resource.id, revoke: () => resource.dispose() }
@@ -53,6 +60,9 @@ describe('manifest', () => {
     // Config is the only settings source until env delivery lands (#62): the RFC §2 manifest
     // shape requires the `env` field, so it is present and empty — zero promises, valid shape.
     expect(manifest['env']).toEqual([])
+    expect(manifest['hostServices']).toEqual([
+      { id: 'mist.session-handler', requires: '^1.0.0' },
+    ])
   })
 })
 
