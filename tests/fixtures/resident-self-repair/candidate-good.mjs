@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
 const mode = process.argv[2] ?? "good";
 const request = JSON.parse(readFileSync(".mr-eval/request.json", "utf8"));
+if (mode === "close-stdin") process.stdin.destroy();
 const trace = [];
 let offset = 1;
 

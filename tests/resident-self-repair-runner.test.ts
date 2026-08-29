@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -224,6 +224,25 @@ describe("resident self-repair runner", () => {
       evidence_refs: [],
     });
     expect(nested.deterministic.G5.status).toBe("n/a");
+  });
+
+  it("accepts an early stdin close as child lifecycle state instead of leaking EPIPE", async () => {
+    const fixtureCopy = join(tempParent, "c4-early-stdin-close");
+    await cp(resolve(fixtures, "C4"), fixtureCopy, { recursive: true });
+    const manifestPath = join(fixtureCopy, "fixture.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest.prompt = "synthetic prompt payload ".repeat(100_000);
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+
+    const bundle = await runCandidate({
+      fixtureRoot: fixtureCopy,
+      candidate: { name: "synthetic-candidate", version: "1" },
+      command: { bin: process.execPath, args: [candidateScript, "close-stdin"] },
+      timeoutMs: 10_000,
+      tempParent,
+    });
+    expect(bundle.case_id).toBe("C4");
+    expect(bundle.deterministic.G4?.status).toBe("pass");
   });
 
   it("hashes empty directories and refuses symlinks in a runner tree", async () => {

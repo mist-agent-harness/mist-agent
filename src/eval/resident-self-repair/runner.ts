@@ -54,6 +54,11 @@ interface ProcessResult {
   signal: NodeJS.Signals | null;
 }
 
+function isBenignStdinClosure(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "EPIPE" || code === "ERR_STREAM_DESTROYED";
+}
+
 interface CollectedEvidence {
   artifactRefs: string[];
   records: RedactionRecord[];
@@ -253,6 +258,11 @@ async function runProcess(options: {
       stderr += chunk;
     });
     let forceKill: ReturnType<typeof setTimeout> | undefined;
+    let stdinError: unknown;
+    child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+      stdinError = error;
+      if (!isBenignStdinClosure(error)) child.kill("SIGTERM");
+    });
     const timeout = setTimeout(() => {
       child.kill("SIGTERM");
       forceKill = setTimeout(() => child.kill("SIGKILL"), 2_000);
@@ -265,9 +275,18 @@ async function runProcess(options: {
     child.once("close", (exitCode, signal) => {
       clearTimeout(timeout);
       if (forceKill) clearTimeout(forceKill);
+      if (stdinError && !isBenignStdinClosure(stdinError)) {
+        reject(stdinError);
+        return;
+      }
       resolvePromise({ stdout, stderr, exitCode, signal });
     });
-    child.stdin.end(options.stdin ?? "");
+    try {
+      child.stdin.end(options.stdin ?? "");
+    } catch (error) {
+      stdinError = error;
+      if (!isBenignStdinClosure(error)) child.kill("SIGTERM");
+    }
   });
 }
 
