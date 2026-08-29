@@ -48,6 +48,7 @@ mist 是一个个人 agent harness（还在图纸阶段）。它的设计从一�
 | 读调研和设计稿 | [docs/research/](docs/research/) 和 [docs/design/](docs/design/) |
 | 知道里程碑完成没有 | [acceptance/](acceptance/)，`npm run acceptance` 打红绿灯 |
 | 读评测的人工判卷标准 | [docs/eval/](docs/eval/)，带版本号，改则升版、旧号不复用 |
+| 跑小机可读性合成维修评测 | [eval/resident-self-repair/](eval/resident-self-repair/)，C1～C4 runner 协议与证据边界 |
 | 查环境变量和运行时配置 | [docs/runtime-config.md](docs/runtime-config.md)，全项目唯一登记处 |
 | 读或写产品代码 | `src/`（建造中），单元测试在 `tests/` |
 | 参与进来 | [CONTRIBUTING.md](CONTRIBUTING.md) |

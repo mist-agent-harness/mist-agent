@@ -8,6 +8,7 @@
   },
   "scripts": {
     "setup": "tsx src/installer/cli.ts",
+    "eval:resident-self-repair": "tsx src/eval/resident-self-repair/cli.ts",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
@@ -24,6 +25,7 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.220",
-    "@inquirer/prompts": "^8.5.2"
+    "@inquirer/prompts": "^8.5.2",
+    "ajv": "^8.20.0"
   }
 }

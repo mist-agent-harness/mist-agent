@@ -1,0 +1,6 @@
+{
+  "archive_export": {
+    "enabled": true,
+    "module": "src/archive-export.mjs"
+  }
+}
