@@ -4,30 +4,28 @@
 本页只钉行为与证据，不替 #84 决定 schema、字段名或端点名；下面出现的
 `eventId`、`streamSeq` 都表示 #84 已拍板的语义把手，最终拼写随其第一刀落地后对齐。
 
-认领口径（#120 楼内，issuecomment-5447844494；2026-08-29 按 PR #123 评审意见
-修订）：**一份物理底座，两个逻辑 stream namespace**——resident canonical
-user-visible stream 归 #84，窗流水归本单；窗流水是 control/evidence plane 的
-只读证据（session-api.md §1 规矩 2），不是第二条用户权威历史。window history
-是窗流水按 `(windowId, generation)` 的只读 projection，**不是 canonical stream
-的投影**；port 零写入，不构成第二条写入路径。本选边按 #120 要求待与 #84 双方
-在楼里当面确认，确认前是记录在案的倾向、不作判红法律；确认结论若改，本页随改。
+认领口径（#120 楼内，issuecomment-5447844494；先决①于 2026-08-29 经 #120
+楼里当面确认——望舒主笔授意批字认可「一份」，issuecomment-5461040293）：
+**一份底座**——canonical stream event store 是唯一底座与唯一写方；window
+history 是它按 `(windowId, generation)` 的只读 projection，不构成第二条写入
+路径。「分开逻辑流」只到视图层——list 摘要与 history 分页可以分开渲染；Clare
+的「共用物理底座、分开逻辑流」随批驳回。本选边已是楼里裁定，作判红依据。
 
 ## 判卷边界
 
 - **port 只读**：判卷对象是 projection 与底座之间的契约——summarize/read 的行为、
   故障语义、跨进程持久性。canonical stream 自身的 writer、eventId、streamSeq 语义
   归 #84 的 OS-01/02 判，本页不重判、不另造第二套成功语义。
-- **port 零写入**：任何让 window history port 自带写入路径、或维护第二份需要
-  裁定权威的数据的实现，直接判红，不进入逐条判卷。「一份物理底座、两个逻辑
-  namespace」的选边在与 #84 当面确认前只作倾向记录，不单独作判红依据
-  （见上「认领口径」段）。
+- **一份底座**：任何让 window history 自带写入路径、或维护第二份需要裁定权威的
+  数据的实现，直接判红，不进入逐条判卷。（先决①批字见上「认领口径」段。）
 - **只判可核事实**：比较字节、序号、hash、结构化错误与真实副作用；不判
   「看起来像有历史」。读不到与读到是空必须机器可分。
 
 代价：projection 不自带写入路径意味着 #84 未落地前本单无法点灯，排期被上游锁死；
 fail-closed 会把一部分「其实没事」的读取故障显式报红，增加误报处理成本；格式版本
-字段与墓碑让每一条记录为未必发生的迁移付钱；选边挂起待确认意味着确认结论若与本页
-倾向相左，本页要返工一次。这些是「history 不活在内存里」的代价。
+字段与墓碑让每一条记录为未必发生的迁移付钱；「一份」裁定下 history 投影主流与
+OS-03/04「局部 transcript 不入主流、归档流水只进证据面」的并存语义，留待施工时
+交代清楚，不在清单里含糊。这些是「history 不活在内存里」的代价。
 
 ## 六盏灯
 
@@ -73,9 +71,9 @@ fail-closed 会把一部分「其实没事」的读取故障显式报红，增�
   要么迁移本身原子；重启后 port 读出 v1/v2 混合页而被当作正常数据，判红。
 
 - [ ] **WH-06 写入路径唯一** [静态]：`MistWindowHistoryPort` 类型上无写入口
-  （`summarize`/`read` 之外无方法）；生产组装中只有唯一写方持有底座的写句柄
-  （窗流水的 writer 归属按 #120 第二件、与 #84 当面确认的结论落定）；全局检索
-  发现第二条写入 window-event 记录的路径，本条判红。
+  （`summarize`/`read` 之外无方法）；生产组装中只有唯一写方（canonical stream
+  writer，先决①已定）持有底座的写句柄；全局检索发现第二条写入 window-event
+  记录的路径，本条判红。
 
 ## 变绿条件
 
