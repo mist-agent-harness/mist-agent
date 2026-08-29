@@ -4,7 +4,8 @@
 
 | 文件 | 判什么 | 状态 |
 |---|---|---|
-| [rubric-v0.1.0.md](rubric-v0.1.0.md) | 小机可读性零上下文自维修评测的 G1 / G3 / G6 盲评面，加 G4 的③④ | 现行 |
+| [rubric-v0.1.1.md](rubric-v0.1.1.md) | 小机可读性零上下文自维修评测的 G1 / G3 / G6 盲评面，加 G4 的③④ | 现行 |
+| [rubric-v0.1.0.md](rubric-v0.1.0.md) | 同上；仲裁人回避一节漏抄两条客观禁入 | 已被 v0.1.1 取代，原地不改不删 |
 
 判什么由冻结契约定，见
 [docs/design/resident-self-repair-eval-v0.md](../design/resident-self-repair-eval-v0.md)（v0 frozen）。
