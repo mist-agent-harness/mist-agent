@@ -35,19 +35,12 @@ export class ReviewPendingError extends Error {
 
 interface ReviewRoles {
   blindReviewerIds?: Set<string>;
-  acceptanceSeatId?: string;
 }
 
-function registerAcceptanceSeat(roles: ReviewRoles, reviewerId: string): void {
+function validateAcceptanceSeat(roles: ReviewRoles, reviewerId: string): void {
   if (roles.blindReviewerIds?.has(reviewerId)) {
     throw new ReviewPendingError("The acceptance seat cannot be either blind reviewer");
   }
-  if (roles.acceptanceSeatId !== undefined && roles.acceptanceSeatId !== reviewerId) {
-    throw new ReviewPendingError(
-      `Acceptance-seat identity changed within one run: expected ${roles.acceptanceSeatId}, got ${reviewerId}`,
-    );
-  }
-  roles.acceptanceSeatId = reviewerId;
 }
 
 function registerReviewPairRoles<T extends SemanticReviewRecord | PositiveControlReviewRecord>(
@@ -68,7 +61,7 @@ function registerReviewPairRoles<T extends SemanticReviewRecord | PositiveContro
       "The same two blind reviewer ids must review every gate in one run",
     );
   }
-  if (pair.arbitration) registerAcceptanceSeat(roles, pair.arbitration.reviewer_id);
+  if (pair.arbitration) validateAcceptanceSeat(roles, pair.arbitration.reviewer_id);
 }
 
 export function escalationId(options: {
@@ -310,7 +303,6 @@ export function resolveReviews(options: {
     );
   }
 
-  const blindReviewerIds = roles.blindReviewerIds ?? new Set<string>();
   const raisedById = new Map<string, RaisedEscalationRecord>();
   for (const escalation of raisedEscalations) {
     if (raisedById.has(escalation.escalation_id)) {
@@ -356,10 +348,7 @@ export function resolveReviews(options: {
         `Escalation disposition cites evidence outside the blind packet: ${invalidRefs.join(",")}`,
       );
     }
-    if (blindReviewerIds.has(disposition.acceptance_seat_id)) {
-      throw new ReviewPendingError("The acceptance seat cannot be either blind reviewer");
-    }
-    registerAcceptanceSeat(roles, disposition.acceptance_seat_id);
+    validateAcceptanceSeat(roles, disposition.acceptance_seat_id);
     dispositionByEscalation.set(disposition.escalation_id, disposition);
   }
   const pendingEscalations = [...raisedById.keys()].filter(

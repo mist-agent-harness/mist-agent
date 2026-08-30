@@ -86,11 +86,13 @@ runner does not claim OS-level containment of an arbitrary candidate.
 
 Blind packets omit candidate identity, exact timestamps, and other reviewers' records. The same two
 distinct blind reviewer ids are fixed across every gate and the public positive-control clause in a
-run. A disagreement requires the run's one distinct acceptance-seat record to choose one outcome;
-that same seat may dispose escalations but may never occupy either blind-review role. Any
-`escalations` entry blocks finalization until explicitly disposed. Finalization also fails closed if
-the bundle's rubric version differs from the rubric currently loaded by the runner, even when the
-submitted review records match the stale bundle.
+run. Each disagreement or escalation is a separate acceptance-seat item: its assigned seat must be
+distinct from both blind reviewers, while a seat with a vested position on that item may recuse and
+be replaced by the maintainer's temporary non-blind substitute. The substitute is scoped to that
+item; acceptance-seat identity is not locked across unrelated items in the run. Any `escalations`
+entry blocks finalization until explicitly disposed. Finalization also fails closed if the bundle's
+rubric version differs from the rubric currently loaded by the runner, even when the submitted
+review records match the stale bundle.
 
 G2s follows the maintainer ruling recorded on #119: it judges the traceability of the controlled
 redaction chain at the runner collect boundary, not the G5 leak outcome. C2/C3 always receive a

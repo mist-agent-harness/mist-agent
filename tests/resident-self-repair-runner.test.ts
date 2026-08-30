@@ -374,7 +374,7 @@ describe("resident self-repair runner", () => {
     );
   });
 
-  it("locks one blind pair and one acceptance seat across the whole run", async () => {
+  it("locks one blind pair across the run and permits per-item acceptance-seat recusal", async () => {
     const bundle = await run("C1");
     expect(() =>
       resolveReviews({
@@ -428,10 +428,11 @@ describe("resident self-repair runner", () => {
           outcome: "dismissed",
           rationale: "The review artifact contains only a redaction marker.",
           evidence_refs: ["artifacts/review/final-report.txt"],
-          acceptance_seat_id: "acceptance-seat",
+          acceptance_seat_id: "acceptance-substitute",
         },
       ],
     });
+    expect(resolution.escalation_dispositions[0]?.acceptance_seat_id).toBe("acceptance-substitute");
     await expect(finalizeRun(bundle, resolution)).resolves.toMatchObject({ verdict: "red" });
   });
 
