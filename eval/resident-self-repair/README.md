@@ -4,7 +4,7 @@ This directory contains the **synthetic-only** C1–C4 fixtures for the frozen v
 small-machine-readability evaluation. The legal sources are not repeated here:
 
 - frozen contract: `docs/design/resident-self-repair-eval-v0.md`;
-- current human rubric: `docs/eval/rubric-v0.1.1.md`.
+- current human rubric: `docs/eval/rubric-v0.1.2.md`.
 
 The runner loads both files directly. It does not keep a copied result schema or an in-code copy of
 the human rubric.
@@ -44,13 +44,16 @@ npm run eval:resident-self-repair -- finalize \
   --reviews <review-input.json>
 ```
 
-`review-input.json` uses `schema_version=resident-self-repair-review-input.v0`, a `gates` map whose
+`review-input.json` uses `schema_version=resident-self-repair-review-input.v1`, a `gates` map whose
 entries contain `first`, `second`, and optional `arbitration` records, plus the same optional pair at
-`positive_control`. A raised `escalations` entry remains pending until `escalation_dispositions`
-contains exactly one acceptance-seat record for that text. The only disposition gate is G5; the
-outcome is either `dismissed` or `run_invalid`. A disposition never rewrites G2s or any other
-deterministic gate. Record fields are consumed literally from the current rubric; the CLI does not
-invent missing evidence, normalize statuses, or silently resolve disagreements.
+`positive_control`. Each `escalations` entry is `{gate: "G4" | "G5", text}`. The runner derives a
+stable id from case, target gate, reviewer, and that reviewer's per-gate ordinal; the source record is
+retained as audit metadata. `escalation_dispositions` references that `escalation_id`, not the prose.
+Equal text from distinct sources therefore remains distinct. G4 is legal only for a C4 runner-signed
+boundary `n/a`; G5 remains the leak side channel.
+For either gate the outcome is `dismissed` or `run_invalid`. A disposition never rewrites G4, G5,
+G2s, or another deterministic gate. Record fields are consumed literally from the current rubric;
+the CLI does not invent missing evidence, normalize statuses, or silently resolve disagreements.
 
 ## Boundary and evidence model
 
@@ -85,9 +88,9 @@ redaction chain at the runner collect boundary, not the G5 leak outcome. C2/C3 a
 pass/fail G2s result. Its evidence refs include the runner-owned raw diagnostic, the review artifact,
 and the audit that proves same-source hashes, literal-scan results, non-sensitive-byte preservation,
 and the four always-visible diagnostic fields. Missing raw evidence, a broken pair, a changed
-projection, or sensitive text on the review surface makes G2s fail. A blind-review escalation is a
-G5 side channel only: the acceptance seat may dismiss it or invalidate the run, but cannot back-write
-G2s.
+projection, or sensitive text on the review surface makes G2s fail. A blind-review escalation targets
+G5 for leak evidence or G4 for a disputed runner-signed boundary `n/a`: the acceptance seat may
+dismiss it or invalidate the run, but cannot back-write the deterministic gate or G2s.
 
 The public positive-control clause has the stable id
 `positive-control-failure-attribution-v1`. Any C1-C4 receipt with a failure attribution requires its

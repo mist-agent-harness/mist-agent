@@ -7,7 +7,7 @@ const CONTRACT_URL = new URL(
   "../../../docs/design/resident-self-repair-eval-v0.md",
   import.meta.url,
 );
-const RUBRIC_URL = new URL("../../../docs/eval/rubric-v0.1.1.md", import.meta.url);
+const RUBRIC_URL = new URL("../../../docs/eval/rubric-v0.1.2.md", import.meta.url);
 const SCHEMA_HEADING = "## 附录 A：结果 JSON Schema（Draft 2020-12）";
 
 export class FrozenSchemaError extends Error {

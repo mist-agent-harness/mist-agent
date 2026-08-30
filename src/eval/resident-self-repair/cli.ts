@@ -7,6 +7,7 @@ import { runCandidate } from "./runner.ts";
 import type {
   EscalationDispositionRecord,
   PositiveControlReviewRecord,
+  ReviewEscalation,
   ReviewGate,
   RunBundle,
   SemanticReviewRecord,
@@ -28,7 +29,7 @@ interface FinalizeCliOptions {
 }
 
 interface ReviewInput {
-  schema_version: "resident-self-repair-review-input.v0";
+  schema_version: "resident-self-repair-review-input.v1";
   gates: Partial<Record<ReviewGate, ReviewPair<SemanticReviewRecord>>>;
   positive_control?: ReviewPair<PositiveControlReviewRecord>;
   escalation_dispositions?: EscalationDispositionRecord[];
@@ -72,6 +73,21 @@ function strings(value: unknown, label: string, requireNonEmpty = false): string
   return value as string[];
 }
 
+function parseEscalations(value: unknown, label: string): ReviewEscalation[] {
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+  return value.map((entry, index) => {
+    const escalation = object(entry, `${label}[${index}]`);
+    exactKeys(escalation, ["gate", "text"], [], `${label}[${index}]`);
+    if (escalation.gate !== "G4" && escalation.gate !== "G5") {
+      throw new Error(`${label}[${index}].gate must equal G4 or G5`);
+    }
+    return {
+      gate: escalation.gate,
+      text: nonEmptyString(escalation.text, `${label}[${index}].text`),
+    };
+  });
+}
+
 function parseSemanticReview(value: unknown, label: string): SemanticReviewRecord {
   const input = object(value, label);
   exactKeys(
@@ -105,7 +121,7 @@ function parseSemanticReview(value: unknown, label: string): SemanticReviewRecor
     status: input.status,
     rationale: nonEmptyString(input.rationale, `${label}.rationale`),
     evidence_refs: strings(input.evidence_refs, `${label}.evidence_refs`, true),
-    escalations: strings(input.escalations, `${label}.escalations`),
+    escalations: parseEscalations(input.escalations, `${label}.escalations`),
     reviewer_id: nonEmptyString(input.reviewer_id, `${label}.reviewer_id`),
   };
 }
@@ -143,7 +159,7 @@ function parsePositiveControlReview(value: unknown, label: string): PositiveCont
     status: input.status,
     rationale: nonEmptyString(input.rationale, `${label}.rationale`),
     evidence_refs: strings(input.evidence_refs, `${label}.evidence_refs`, true),
-    escalations: strings(input.escalations, `${label}.escalations`),
+    escalations: parseEscalations(input.escalations, `${label}.escalations`),
     reviewer_id: nonEmptyString(input.reviewer_id, `${label}.reviewer_id`),
   };
 }
@@ -152,17 +168,19 @@ function parseEscalationDisposition(value: unknown, label: string): EscalationDi
   const input = object(value, label);
   exactKeys(
     input,
-    ["escalation", "gate", "outcome", "rationale", "evidence_refs", "acceptance_seat_id"],
+    ["escalation_id", "gate", "outcome", "rationale", "evidence_refs", "acceptance_seat_id"],
     [],
     label,
   );
-  if (input.gate !== "G5") throw new Error(`${label}.gate must equal G5`);
+  if (input.gate !== "G4" && input.gate !== "G5") {
+    throw new Error(`${label}.gate must equal G4 or G5`);
+  }
   if (input.outcome !== "dismissed" && input.outcome !== "run_invalid") {
     throw new Error(`${label}.outcome must be dismissed or run_invalid`);
   }
   return {
-    escalation: nonEmptyString(input.escalation, `${label}.escalation`),
-    gate: "G5",
+    escalation_id: nonEmptyString(input.escalation_id, `${label}.escalation_id`),
+    gate: input.gate,
     outcome: input.outcome,
     rationale: nonEmptyString(input.rationale, `${label}.rationale`),
     evidence_refs: strings(input.evidence_refs, `${label}.evidence_refs`, true),
@@ -269,8 +287,8 @@ function parseReviewInput(value: unknown): ReviewInput {
     ["positive_control", "escalation_dispositions"],
     "review input",
   );
-  if (input.schema_version !== "resident-self-repair-review-input.v0") {
-    throw new Error("review input schema_version must equal resident-self-repair-review-input.v0");
+  if (input.schema_version !== "resident-self-repair-review-input.v1") {
+    throw new Error("review input schema_version must equal resident-self-repair-review-input.v1");
   }
   const rawGates = object(input.gates, "review input gates");
   const allowedGates: ReviewGate[] = ["G1", "G3", "G4", "G6"];
@@ -287,7 +305,7 @@ function parseReviewInput(value: unknown): ReviewInput {
     }
   }
   return {
-    schema_version: "resident-self-repair-review-input.v0",
+    schema_version: "resident-self-repair-review-input.v1",
     gates,
     ...(input.positive_control === undefined
       ? {}

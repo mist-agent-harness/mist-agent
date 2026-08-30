@@ -52,7 +52,7 @@ function assertResolutionComplete(bundle: RunBundle, resolution: ReviewResolutio
   }
   if (resolution.invalidated_escalations.length > 0) {
     throw new FinalizationBlockedError(
-      `Acceptance seat invalidated this run on G5 evidence: ${resolution.invalidated_escalations.join(" | ")}`,
+      `Acceptance seat invalidated this run on G4/G5 evidence: ${resolution.invalidated_escalations.join(" | ")}`,
     );
   }
   if (bundle.receipt.failure_attribution !== null && !resolution.positive_control) {

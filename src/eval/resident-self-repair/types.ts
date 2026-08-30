@@ -232,6 +232,21 @@ export interface RunBundle {
 }
 
 export type ReviewGate = "G1" | "G3" | "G4" | "G6";
+export type EscalationGate = "G4" | "G5";
+export type ReviewEscalationSource = ReviewGate | typeof POSITIVE_CONTROL_CLAUSE_ID;
+
+export interface ReviewEscalation {
+  gate: EscalationGate;
+  text: string;
+}
+
+export interface RaisedEscalationRecord extends ReviewEscalation {
+  escalation_id: string;
+  case_id: CaseId;
+  source: ReviewEscalationSource;
+  reviewer_id: string;
+  ordinal: number;
+}
 
 export interface SemanticReviewRecord {
   rubric_version: string;
@@ -240,7 +255,7 @@ export interface SemanticReviewRecord {
   status: "pass" | "fail";
   rationale: string;
   evidence_refs: string[];
-  escalations: string[];
+  escalations: ReviewEscalation[];
   reviewer_id: string;
 }
 
@@ -251,7 +266,7 @@ export interface PositiveControlReviewRecord {
   status: "pass" | "fail";
   rationale: string;
   evidence_refs: string[];
-  escalations: string[];
+  escalations: ReviewEscalation[];
   reviewer_id: string;
 }
 
@@ -264,8 +279,8 @@ export interface PositiveControlObservation {
 }
 
 export interface EscalationDispositionRecord {
-  escalation: string;
-  gate: "G5";
+  escalation_id: string;
+  gate: EscalationGate;
   outcome: "dismissed" | "run_invalid";
   rationale: string;
   evidence_refs: string[];
@@ -275,6 +290,7 @@ export interface EscalationDispositionRecord {
 export interface ReviewResolution {
   gates: Partial<Record<ReviewGate, SemanticReviewRecord>>;
   positive_control?: PositiveControlReviewRecord;
+  raised_escalations: RaisedEscalationRecord[];
   pending_escalations: string[];
   invalidated_escalations: string[];
   escalation_dispositions: EscalationDispositionRecord[];

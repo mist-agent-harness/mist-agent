@@ -3,6 +3,8 @@ import type {
   CaseId,
   EscalationDispositionRecord,
   PositiveControlReviewRecord,
+  RaisedEscalationRecord,
+  ReviewEscalationSource,
   ReviewGate,
   ReviewResolution,
   RunBundle,
@@ -29,6 +31,22 @@ export class ReviewPendingError extends Error {
     super(message);
     this.name = "ReviewPendingError";
   }
+}
+
+export function escalationId(options: {
+  caseId: CaseId;
+  gate: "G4" | "G5";
+  reviewerId: string;
+  ordinal: number;
+}): string {
+  return [
+    "esc",
+    "v1",
+    options.caseId,
+    options.gate,
+    encodeURIComponent(options.reviewerId),
+    String(options.ordinal),
+  ].join(":");
 }
 
 export function createBlindReviewPacket(bundle: RunBundle): BlindReviewPacket {
@@ -82,6 +100,13 @@ function validateBaseRecord(
   if (record.evidence_refs.length === 0 || record.rationale.length === 0) {
     throw new ReviewPendingError("Review records require a rationale and non-empty evidence_refs");
   }
+  for (const [index, escalation] of record.escalations.entries()) {
+    if ((escalation.gate !== "G4" && escalation.gate !== "G5") || escalation.text.length === 0) {
+      throw new ReviewPendingError(
+        `Review escalation ${index + 1} requires gate G4/G5 and non-empty text`,
+      );
+    }
+  }
   const allowedRefs = reviewArtifactRefs(bundle);
   const invalidRefs = record.evidence_refs.filter((ref) => !evidenceRefAllowed(ref, allowedRefs));
   if (invalidRefs.length > 0) {
@@ -89,6 +114,39 @@ function validateBaseRecord(
       `Review records cite evidence outside the blind packet: ${invalidRefs.join(",")}`,
     );
   }
+}
+
+function raisedFromRecord(
+  bundle: RunBundle,
+  record: SemanticReviewRecord | PositiveControlReviewRecord,
+  source: ReviewEscalationSource,
+  nextOrdinal: (gate: "G4" | "G5") => number,
+): RaisedEscalationRecord[] {
+  return record.escalations.map((escalation) => {
+    if (
+      escalation.gate === "G4" &&
+      (bundle.case_id !== "C4" || bundle.deterministic.G4?.status !== "n/a")
+    ) {
+      throw new ReviewPendingError(
+        "G4 escalation is only legal for a C4 runner-signed boundary n/a",
+      );
+    }
+    const ordinal = nextOrdinal(escalation.gate);
+    return {
+      escalation_id: escalationId({
+        caseId: record.case_id,
+        gate: escalation.gate,
+        reviewerId: record.reviewer_id,
+        ordinal,
+      }),
+      case_id: record.case_id,
+      source,
+      gate: escalation.gate,
+      reviewer_id: record.reviewer_id,
+      ordinal,
+      text: escalation.text,
+    };
+  });
 }
 
 function resolvePair<T extends SemanticReviewRecord | PositiveControlReviewRecord>(
@@ -100,7 +158,12 @@ function resolvePair<T extends SemanticReviewRecord | PositiveControlReviewRecor
   if (pair.first.reviewer_id === pair.second.reviewer_id) {
     throw new ReviewPendingError("The two blind reviews must come from distinct reviewer ids");
   }
-  if (pair.first.status === pair.second.status) return pair.first;
+  if (pair.first.status === pair.second.status) {
+    if (pair.arbitration) {
+      throw new ReviewPendingError("Arbitration is only allowed when blind reviews disagree");
+    }
+    return pair.first;
+  }
   const arbitration = pair.arbitration;
   if (!arbitration) {
     throw new ReviewPendingError("Blind reviews disagree; acceptance-seat arbitration is required");
@@ -135,8 +198,18 @@ export function resolveReviews(options: {
   escalationDispositions?: EscalationDispositionRecord[];
 }): ReviewResolution {
   const gates: ReviewResolution["gates"] = {};
-  const raisedEscalations: string[] = [];
+  const raisedEscalations: RaisedEscalationRecord[] = [];
   const reviewRecords: ReviewResolution["review_records"] = [];
+  const escalationOrdinals = new Map<string, number>();
+  const nextOrdinal = (
+    record: SemanticReviewRecord | PositiveControlReviewRecord,
+    gate: "G4" | "G5",
+  ): number => {
+    const key = JSON.stringify([record.case_id, gate, record.reviewer_id]);
+    const ordinal = (escalationOrdinals.get(key) ?? 0) + 1;
+    escalationOrdinals.set(key, ordinal);
+    return ordinal;
+  };
   for (const gate of requiredReviewGates(options.bundle)) {
     const pair = options.gates[gate];
     if (!pair) throw new ReviewPendingError(`Missing blind-review pair for ${gate}`);
@@ -148,13 +221,22 @@ export function resolveReviews(options: {
       throw new ReviewPendingError(`Review record is wired to the wrong gate: expected ${gate}`);
     }
     const resolved = resolvePair(options.bundle, pair);
+    const arbitration = pair.arbitration;
     gates[gate] = resolved;
     reviewRecords.push(pair.first, pair.second);
-    if (pair.arbitration) reviewRecords.push(pair.arbitration);
+    if (arbitration) reviewRecords.push(arbitration);
     raisedEscalations.push(
-      ...pair.first.escalations,
-      ...pair.second.escalations,
-      ...(pair.arbitration?.escalations ?? []),
+      ...raisedFromRecord(options.bundle, pair.first, gate, (targetGate) =>
+        nextOrdinal(pair.first, targetGate),
+      ),
+      ...raisedFromRecord(options.bundle, pair.second, gate, (targetGate) =>
+        nextOrdinal(pair.second, targetGate),
+      ),
+      ...(arbitration
+        ? raisedFromRecord(options.bundle, arbitration, gate, (targetGate) =>
+            nextOrdinal(arbitration, targetGate),
+          )
+        : []),
     );
   }
 
@@ -165,35 +247,54 @@ export function resolveReviews(options: {
         "A failure attribution requires the public positive-control clause review",
       );
     }
-    positiveControl = resolvePair(options.bundle, options.positiveControl);
-    reviewRecords.push(options.positiveControl.first, options.positiveControl.second);
-    if (options.positiveControl.arbitration) {
-      reviewRecords.push(options.positiveControl.arbitration);
+    const positivePair = options.positiveControl;
+    positiveControl = resolvePair(options.bundle, positivePair);
+    const { first, second, arbitration } = positivePair;
+    reviewRecords.push(first, second);
+    if (arbitration) {
+      reviewRecords.push(arbitration);
     }
     raisedEscalations.push(
-      ...options.positiveControl.first.escalations,
-      ...options.positiveControl.second.escalations,
-      ...(options.positiveControl.arbitration?.escalations ?? []),
+      ...raisedFromRecord(options.bundle, first, first.clause_id, (targetGate) =>
+        nextOrdinal(first, targetGate),
+      ),
+      ...raisedFromRecord(options.bundle, second, second.clause_id, (targetGate) =>
+        nextOrdinal(second, targetGate),
+      ),
+      ...(arbitration
+        ? raisedFromRecord(options.bundle, arbitration, arbitration.clause_id, (targetGate) =>
+            nextOrdinal(arbitration, targetGate),
+          )
+        : []),
     );
   }
 
   const reviewerIds = new Set(reviewRecords.map((record) => record.reviewer_id));
-  const escalationSet = new Set(raisedEscalations);
+  const raisedById = new Map<string, RaisedEscalationRecord>();
+  for (const escalation of raisedEscalations) {
+    if (raisedById.has(escalation.escalation_id)) {
+      throw new ReviewPendingError(`Duplicate escalation identity: ${escalation.escalation_id}`);
+    }
+    raisedById.set(escalation.escalation_id, escalation);
+  }
   const dispositions = options.escalationDispositions ?? [];
   const dispositionByEscalation = new Map<string, EscalationDispositionRecord>();
   for (const disposition of dispositions) {
-    if (!escalationSet.has(disposition.escalation)) {
+    const raised = raisedById.get(disposition.escalation_id);
+    if (!raised) {
       throw new ReviewPendingError(
-        `Escalation disposition does not match a raised escalation: ${disposition.escalation}`,
+        `Escalation disposition does not match a raised escalation id: ${disposition.escalation_id}`,
       );
     }
-    if (dispositionByEscalation.has(disposition.escalation)) {
+    if (dispositionByEscalation.has(disposition.escalation_id)) {
       throw new ReviewPendingError(
-        `Escalation has more than one disposition: ${disposition.escalation}`,
+        `Escalation has more than one disposition: ${disposition.escalation_id}`,
       );
     }
-    if (disposition.gate !== "G5") {
-      throw new ReviewPendingError("Acceptance-seat escalation dispositions may only target G5");
+    if (disposition.gate !== raised.gate) {
+      throw new ReviewPendingError(
+        `Escalation disposition gate mismatch: ${disposition.escalation_id} targets ${raised.gate}`,
+      );
     }
     if (disposition.outcome !== "dismissed" && disposition.outcome !== "run_invalid") {
       throw new ReviewPendingError(
@@ -219,17 +320,18 @@ export function resolveReviews(options: {
         "The acceptance-seat disposition cannot be signed by either blind reviewer",
       );
     }
-    dispositionByEscalation.set(disposition.escalation, disposition);
+    dispositionByEscalation.set(disposition.escalation_id, disposition);
   }
-  const pendingEscalations = [...escalationSet].filter(
-    (escalation) => !dispositionByEscalation.has(escalation),
+  const pendingEscalations = [...raisedById.keys()].filter(
+    (escalationId) => !dispositionByEscalation.has(escalationId),
   );
   const invalidatedEscalations = dispositions
     .filter((disposition) => disposition.outcome === "run_invalid")
-    .map((disposition) => disposition.escalation);
+    .map((disposition) => disposition.escalation_id);
   return {
     gates,
     ...(positiveControl === undefined ? {} : { positive_control: positiveControl }),
+    raised_escalations: raisedEscalations,
     pending_escalations: pendingEscalations,
     invalidated_escalations: invalidatedEscalations,
     escalation_dispositions: dispositions,

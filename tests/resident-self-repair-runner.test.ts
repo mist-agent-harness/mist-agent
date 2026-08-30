@@ -12,12 +12,14 @@ import { snapshotTree } from "../src/eval/resident-self-repair/hash-tree.ts";
 import {
   type ReviewPair,
   ReviewPendingError,
+  escalationId,
   requiredReviewGates,
   resolveReviews,
 } from "../src/eval/resident-self-repair/review.ts";
 import { runCandidate } from "../src/eval/resident-self-repair/runner.ts";
 import type {
   PositiveControlReviewRecord,
+  ReviewEscalation,
   ReviewGate,
   RunBundle,
   SemanticReviewRecord,
@@ -85,7 +87,7 @@ function positive(
 
 function reviewPairs(
   bundle: RunBundle,
-  escalation?: string,
+  escalation?: ReviewEscalation,
 ): Partial<Record<ReviewGate, ReviewPair<SemanticReviewRecord>>> {
   const pairs: Partial<Record<ReviewGate, ReviewPair<SemanticReviewRecord>>> = {};
   for (const gate of requiredReviewGates(bundle)) {
@@ -283,6 +285,20 @@ describe("resident self-repair runner", () => {
         gates: {
           G1: {
             first: review(bundle, "G1", "r1"),
+            second: review(bundle, "G1", "r2"),
+            arbitration: review(bundle, "G1", "acceptance-seat"),
+          },
+          G6: { first: review(bundle, "G6", "r1"), second: review(bundle, "G6", "r2") },
+        },
+      }),
+    ).toThrow("only allowed when blind reviews disagree");
+
+    expect(() =>
+      resolveReviews({
+        bundle,
+        gates: {
+          G1: {
+            first: review(bundle, "G1", "r1"),
             second: review(bundle, "G1", "r2", "fail"),
           },
           G6: { first: review(bundle, "G6", "r1"), second: review(bundle, "G6", "r2") },
@@ -291,7 +307,10 @@ describe("resident self-repair runner", () => {
     ).toThrow(ReviewPendingError);
 
     const escalatedFirst = review(bundle, "G1", "r1");
-    escalatedFirst.escalations.push("possible deterministic G5 issue");
+    escalatedFirst.escalations.push({
+      gate: "G5",
+      text: "possible deterministic G5 issue",
+    });
     const escalated = resolveReviews({
       bundle,
       gates: {
@@ -423,7 +442,16 @@ describe("resident self-repair runner", () => {
 
   it("keeps G5 escalation disposition separate from deterministic G2s", async () => {
     const bundle = await run("C2");
-    const escalation = "possible unredacted source in the human projection";
+    const escalation: ReviewEscalation = {
+      gate: "G5",
+      text: "possible unredacted source in the human projection",
+    };
+    const escalation_id = escalationId({
+      caseId: bundle.case_id,
+      gate: "G5",
+      reviewerId: "r1",
+      ordinal: 1,
+    });
     const resolution = resolveReviews({
       bundle,
       gates: reviewPairs(bundle, escalation),
@@ -433,7 +461,7 @@ describe("resident self-repair runner", () => {
       },
       escalationDispositions: [
         {
-          escalation,
+          escalation_id,
           gate: "G5",
           outcome: "dismissed",
           rationale: "The cited artifact contains only a synthetic replacement marker.",
@@ -457,7 +485,7 @@ describe("resident self-repair runner", () => {
       },
       escalationDispositions: [
         {
-          escalation,
+          escalation_id,
           gate: "G5",
           outcome: "run_invalid",
           rationale: "The deterministic G5 collector missed the cited review-surface leak.",
@@ -467,5 +495,149 @@ describe("resident self-repair runner", () => {
       ],
     });
     await expect(finalizeRun(bundle, invalidated)).rejects.toBeInstanceOf(FinalizationBlockedError);
+  });
+
+  it("lets the acceptance seat dispose a runner-signed G4 n/a dispute", async () => {
+    const bundle = await run("C4", "nested-c4");
+    const escalation: ReviewEscalation = {
+      gate: "G4",
+      text: "The nested-process boundary does not apply to this observation.",
+    };
+    const escalation_id = escalationId({
+      caseId: "C4",
+      gate: "G4",
+      reviewerId: "r1",
+      ordinal: 1,
+    });
+    const dismissed = resolveReviews({
+      bundle,
+      gates: reviewPairs(bundle, escalation),
+      escalationDispositions: [
+        {
+          escalation_id,
+          gate: "G4",
+          outcome: "dismissed",
+          rationale: "The cited trace confirms that the observation is inside a nested child.",
+          evidence_refs: ["artifacts/review/trace.jsonl"],
+          acceptance_seat_id: "acceptance-seat",
+        },
+      ],
+    });
+    await expect(finalizeRun(bundle, dismissed)).resolves.toMatchObject({
+      verdict: "green",
+      gates: { G4: { status: "n/a" }, G5: { status: "n/a" } },
+    });
+
+    const invalidated = resolveReviews({
+      bundle,
+      gates: reviewPairs(bundle, escalation),
+      escalationDispositions: [
+        {
+          escalation_id,
+          gate: "G4",
+          outcome: "run_invalid",
+          rationale: "The cited trace proves the observation was not inside a nested child.",
+          evidence_refs: ["artifacts/review/trace.jsonl"],
+          acceptance_seat_id: "acceptance-seat",
+        },
+      ],
+    });
+    await expect(finalizeRun(bundle, invalidated)).rejects.toBeInstanceOf(FinalizationBlockedError);
+
+    expect(() =>
+      resolveReviews({
+        bundle,
+        gates: reviewPairs(bundle, escalation),
+        escalationDispositions: [
+          {
+            escalation_id,
+            gate: "G5",
+            outcome: "dismissed",
+            rationale: "A mismatched target gate must fail closed.",
+            evidence_refs: ["artifacts/review/trace.jsonl"],
+            acceptance_seat_id: "acceptance-seat",
+          },
+        ],
+      }),
+    ).toThrow("gate mismatch");
+
+    const nonBoundaryBundle = await run("C4");
+    expect(() =>
+      resolveReviews({
+        bundle: nonBoundaryBundle,
+        gates: reviewPairs(nonBoundaryBundle, escalation),
+      }),
+    ).toThrow("G4 escalation is only legal for a C4 runner-signed boundary n/a");
+  });
+
+  it("keeps equal escalation text distinct and keys identity independently from prose", async () => {
+    const bundle = await run("C1");
+    const text = "possible deterministic boundary issue";
+    const makeGates = (firstText: string) => {
+      const g1First = review(bundle, "G1", "r1");
+      const g6First = review(bundle, "G6", "r1");
+      g1First.escalations.push({ gate: "G5", text: firstText });
+      g6First.escalations.push({ gate: "G5", text });
+      return {
+        G1: { first: g1First, second: review(bundle, "G1", "r2") },
+        G6: { first: g6First, second: review(bundle, "G6", "r2") },
+      };
+    };
+
+    const first = resolveReviews({ bundle, gates: makeGates(text) });
+    expect(first.raised_escalations).toHaveLength(2);
+    expect(new Set(first.pending_escalations).size).toBe(2);
+    expect(first.raised_escalations.map((entry) => entry.text)).toEqual([text, text]);
+    expect(first.raised_escalations.map((entry) => entry.ordinal)).toEqual([1, 2]);
+
+    const edited = resolveReviews({ bundle, gates: makeGates("edited wording") });
+    expect(edited.raised_escalations[0]?.escalation_id).toBe(
+      first.raised_escalations[0]?.escalation_id,
+    );
+    expect(edited.raised_escalations[0]?.text).toBe("edited wording");
+
+    const [firstId, secondId] = first.pending_escalations;
+    if (!firstId || !secondId) throw new Error("expected two escalation ids");
+    const oneDisposed = resolveReviews({
+      bundle,
+      gates: makeGates(text),
+      escalationDispositions: [
+        {
+          escalation_id: firstId,
+          gate: "G5",
+          outcome: "dismissed",
+          rationale: "Only the cited G1-source escalation was reviewed.",
+          evidence_refs: ["artifacts/review/final-report.txt"],
+          acceptance_seat_id: "acceptance-seat",
+        },
+      ],
+    });
+    expect(oneDisposed.pending_escalations).toEqual([secondId]);
+    await expect(finalizeRun(bundle, oneDisposed)).rejects.toBeInstanceOf(FinalizationBlockedError);
+
+    expect(() =>
+      resolveReviews({
+        bundle,
+        gates: makeGates(text),
+        escalationDispositions: [
+          {
+            escalation_id: firstId,
+            gate: "G5",
+            outcome: "dismissed",
+            rationale: "first disposition",
+            evidence_refs: ["artifacts/review/final-report.txt"],
+            acceptance_seat_id: "acceptance-seat",
+          },
+          {
+            escalation_id: firstId,
+            gate: "G5",
+            outcome: "run_invalid",
+            rationale: "duplicate disposition",
+            evidence_refs: ["artifacts/review/final-report.txt"],
+            acceptance_seat_id: "acceptance-seat",
+          },
+        ],
+      }),
+    ).toThrow("more than one disposition");
   });
 });

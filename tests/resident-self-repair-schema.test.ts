@@ -44,7 +44,7 @@ describe("frozen resident self-repair result schema", () => {
   it("loads the schema directly from the frozen contract and locks the current rubric version", async () => {
     const schema = await loadFrozenResultSchema();
     expect(schema.$id).toBe("https://mist-agent-harness/mr-eval/result.schema.v0.json");
-    await expect(loadRubricVersion()).resolves.toBe("rubric-v0.1.1");
+    await expect(loadRubricVersion()).resolves.toBe("rubric-v0.1.2");
   });
 
   it("redacts only secret values and can recompute projection integrity", () => {
