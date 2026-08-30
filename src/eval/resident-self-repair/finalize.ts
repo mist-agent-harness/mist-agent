@@ -1,6 +1,7 @@
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { validateFrozenResult } from "./schema.ts";
+import { loadRubricVersion } from "./schema.ts";
 import type { EvaluationResult, GateResult, ReviewResolution, RunBundle } from "./types.ts";
 
 export class FinalizationBlockedError extends Error {
@@ -64,6 +65,12 @@ export async function finalizeRun(
   bundle: RunBundle,
   resolution: ReviewResolution,
 ): Promise<EvaluationResult> {
+  const currentRubricVersion = await loadRubricVersion();
+  if (bundle.rubric_version !== currentRubricVersion) {
+    throw new FinalizationBlockedError(
+      `Run bundle rubric version ${bundle.rubric_version} does not match current ${currentRubricVersion}`,
+    );
+  }
   assertResolutionComplete(bundle, resolution);
   const gates: EvaluationResult["gates"] = {
     ...semanticGateForCase(bundle, resolution),

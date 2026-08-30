@@ -112,7 +112,7 @@ describe("resident self-repair runner", () => {
   });
 
   it("retains C2 raw evidence, redacts review surfaces, and exposes four diagnostics", async () => {
-    const bundle = await run("C2");
+    const bundle = await run("C2", "trace-secret");
     expect(bundle.deterministic.G2?.status).toBe("pass");
     expect(bundle.deterministic.G2s?.status).toBe("pass");
     expect(bundle.positive_control).toMatchObject({
@@ -136,6 +136,27 @@ describe("resident self-repair runner", () => {
     expect(raw).toContain("sk-synthetic-C2-ONLY-NOT-REAL");
     expect(reviewSurface).not.toContain("sk-synthetic-C2-ONLY-NOT-REAL");
     expect(reviewSurface).toContain("[REDACTED_LITERAL_1]");
+    const rawTrace = await readFile(resolve(bundle.paths.raw_artifacts, "trace.jsonl"), "utf8");
+    const reviewTrace = await readFile(
+      resolve(bundle.paths.review_artifacts, "trace.jsonl"),
+      "utf8",
+    );
+    expect(rawTrace).toContain("sk-synthetic-C2-ONLY-NOT-REAL");
+    expect(reviewTrace).not.toContain("sk-synthetic-C2-ONLY-NOT-REAL");
+    expect(reviewTrace).toContain("[REDACTED_LITERAL_1]");
+    expect(bundle.redaction_records).toContainEqual(
+      expect.objectContaining({ source_id: "candidate-trace" }),
+    );
+    const g2sAudit = JSON.parse(
+      await readFile(resolve(bundle.paths.review_artifacts, "g2s-audit.json"), "utf8"),
+    );
+    expect(g2sAudit.pairs).toContainEqual(
+      expect.objectContaining({
+        source_id: "candidate-trace",
+        projection_verified: true,
+        replacement_count: 1,
+      }),
+    );
     expect(bundle.human_projection).not.toContain("sk-synthetic-C2-ONLY-NOT-REAL");
     expect(bundle.human_projection).toContain("[REDACTED_LITERAL_1]");
     expect(bundle.redaction_records.every((record) => record.non_sensitive_bytes_preserved)).toBe(
@@ -226,6 +247,17 @@ describe("resident self-repair runner", () => {
       evidence_refs: [],
     });
     expect(nested.deterministic.G5.status).toBe("n/a");
+
+    const nestedMutation = await run("C4", "nested-mutate-c4");
+    expect(nestedMutation.deterministic.G4?.status).toBe("fail");
+    expect(nestedMutation.deterministic.G5.status).toBe("fail");
+
+    const unverifiedNestedClaim = await run("C4", "nested-claim-only-c4");
+    expect(unverifiedNestedClaim.deterministic.G4?.status).toBe("fail");
+    expect(unverifiedNestedClaim.deterministic.G5.status).toBe("fail");
+    expect(unverifiedNestedClaim.deterministic.G5.rationale).toContain(
+      "runner observed no descendant process",
+    );
   });
 
   it("accepts an early stdin close as child lifecycle state instead of leaking EPIPE", async () => {
@@ -319,6 +351,85 @@ describe("resident self-repair runner", () => {
       },
     });
     await expect(finalizeRun(bundle, escalated)).rejects.toBeInstanceOf(FinalizationBlockedError);
+
+    const staleBundle = { ...bundle, rubric_version: "rubric-v0.1.2" };
+    const staleResolution = resolveReviews({
+      bundle: staleBundle,
+      gates: {
+        G1: {
+          first: review(staleBundle, "G1", "r1"),
+          second: review(staleBundle, "G1", "r2"),
+        },
+        G6: {
+          first: review(staleBundle, "G6", "r1"),
+          second: review(staleBundle, "G6", "r2"),
+        },
+      },
+    });
+    await expect(finalizeRun(staleBundle, staleResolution)).rejects.toThrow(
+      "does not match current rubric-v0.1.3",
+    );
+  });
+
+  it("locks one blind pair and one acceptance seat across the whole run", async () => {
+    const bundle = await run("C1");
+    expect(() =>
+      resolveReviews({
+        bundle,
+        gates: {
+          G1: { first: review(bundle, "G1", "r1"), second: review(bundle, "G1", "r2") },
+          G6: { first: review(bundle, "G6", "r1"), second: review(bundle, "G6", "r3") },
+        },
+      }),
+    ).toThrow("same two blind reviewer ids");
+
+    expect(() =>
+      resolveReviews({
+        bundle,
+        gates: {
+          G1: {
+            first: review(bundle, "G1", "r1", "pass"),
+            second: review(bundle, "G1", "r2", "fail"),
+            arbitration: review(bundle, "G1", "acceptance-seat", "fail"),
+          },
+          G6: {
+            first: review(bundle, "G6", "acceptance-seat"),
+            second: review(bundle, "G6", "r2"),
+          },
+        },
+      }),
+    ).toThrow("same two blind reviewer ids");
+
+    const g6First = review(bundle, "G6", "r1");
+    g6First.escalations.push({ gate: "G5", text: "possible visible leak" });
+    const escalation_id = escalationId({
+      caseId: "C1",
+      gate: "G5",
+      reviewerId: "r1",
+      ordinal: 1,
+    });
+    const resolution = resolveReviews({
+      bundle,
+      gates: {
+        G1: {
+          first: review(bundle, "G1", "r1", "pass"),
+          second: review(bundle, "G1", "r2", "fail"),
+          arbitration: review(bundle, "G1", "acceptance-seat", "fail"),
+        },
+        G6: { first: g6First, second: review(bundle, "G6", "r2") },
+      },
+      escalationDispositions: [
+        {
+          escalation_id,
+          gate: "G5",
+          outcome: "dismissed",
+          rationale: "The review artifact contains only a redaction marker.",
+          evidence_refs: ["artifacts/review/final-report.txt"],
+          acceptance_seat_id: "acceptance-seat",
+        },
+      ],
+    });
+    await expect(finalizeRun(bundle, resolution)).resolves.toMatchObject({ verdict: "red" });
   });
 
   it("keeps both blind records and accepts a distinct arbitrator choosing one side", async () => {

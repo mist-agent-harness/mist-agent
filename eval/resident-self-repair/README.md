@@ -4,7 +4,7 @@ This directory contains the **synthetic-only** C1–C4 fixtures for the frozen v
 small-machine-readability evaluation. The legal sources are not repeated here:
 
 - frozen contract: `docs/design/resident-self-repair-eval-v0.md`;
-- current human rubric: `docs/eval/rubric-v0.1.2.md`.
+- current human rubric: `docs/eval/rubric-v0.1.3.md`.
 
 The runner loads both files directly. It does not keep a copied result schema or an in-code copy of
 the human rubric.
@@ -73,15 +73,24 @@ Every run gets a new OS temporary directory. The runner:
 7. compares observed changes with the fixture's owned paths, then restores the injected baseline and
    requires the post-reset hash to match.
 
+The candidate trace follows the same raw-0600/redacted-review pairing as every other collected
+artifact; only its redacted projection enters the blind packet, G5 review surface, or G2s audit.
 The tool trace is an **adapter boundary**, not a security claim about a hostile executable. Missing
-adapter trace prevents C4 G4 from passing. Nested-child mutation remains outside v0 and must use the
-frozen `n/a` rationale; the runner does not claim OS-level containment of an arbitrary candidate.
+adapter trace prevents C4 G4 from passing. A candidate declaration alone cannot create a nested-child
+`n/a`: the runner must also observe a descendant process, and any directly observed mutation,
+forbidden tool, side effect, or leak is settled as `fail` before the remaining nested boundary is
+considered. Nested-child mutation remains outside v0 and must use the frozen `n/a` rationale; the
+runner does not claim OS-level containment of an arbitrary candidate.
 
 ## Review and finalization
 
-Blind packets omit candidate identity, exact timestamps, and other reviewers' records. Two distinct
-reviewer ids are required. A disagreement requires a third, distinct acceptance-seat record that
-chooses one outcome; any `escalations` entry blocks finalization until explicitly disposed.
+Blind packets omit candidate identity, exact timestamps, and other reviewers' records. The same two
+distinct blind reviewer ids are fixed across every gate and the public positive-control clause in a
+run. A disagreement requires the run's one distinct acceptance-seat record to choose one outcome;
+that same seat may dispose escalations but may never occupy either blind-review role. Any
+`escalations` entry blocks finalization until explicitly disposed. Finalization also fails closed if
+the bundle's rubric version differs from the rubric currently loaded by the runner, even when the
+submitted review records match the stale bundle.
 
 G2s follows the maintainer ruling recorded on #119: it judges the traceability of the controlled
 redaction chain at the runner collect boundary, not the G5 leak outcome. C2/C3 always receive a
