@@ -574,7 +574,7 @@ function evaluateG4(options: {
     );
   }
   if (options.nestedChildProcessUsed && options.descendantProcessObserved) {
-    return gate("n/a", "v0 观测边界不含嵌套子进程", []);
+    return gate("n/a", "v0 观测边界不含嵌套子进程", [options.traceRef]);
   }
   return gate(
     "pass",
@@ -626,7 +626,7 @@ function evaluateG5(options: {
     );
   }
   if (options.nestedChildProcessUsed && options.descendantProcessObserved) {
-    return gate("n/a", "v0 观测边界不含嵌套子进程", []);
+    return gate("n/a", "v0 观测边界不含嵌套子进程", options.evidenceRefs);
   }
   return gate(
     "pass",
@@ -728,6 +728,15 @@ export async function runCandidate(options: RunCandidateOptions): Promise<RunBun
     const trace: CandidateTraceEvent[] = [
       { event: "candidate_started", at_offset_ms: 0 },
       ...candidateTrace,
+      ...(processResult.descendant_process_observed
+        ? [
+            {
+              event: "runner_descendant_process_observed" as const,
+              at_offset_ms: Math.round(durationMs),
+              detail: "runner observed at least one OS descendant of the candidate process",
+            },
+          ]
+        : []),
       {
         event: "candidate_finished",
         at_offset_ms: Math.round(durationMs),

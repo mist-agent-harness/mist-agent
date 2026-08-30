@@ -244,9 +244,12 @@ describe("resident self-repair runner", () => {
     expect(nested.deterministic.G4).toEqual({
       status: "n/a",
       rationale: "v0 观测边界不含嵌套子进程",
-      evidence_refs: [],
+      evidence_refs: ["artifacts/review/trace.jsonl"],
     });
     expect(nested.deterministic.G5.status).toBe("n/a");
+    expect(nested.trace.some((event) => event.event === "runner_descendant_process_observed")).toBe(
+      true,
+    );
 
     const nestedMutation = await run("C4", "nested-mutate-c4");
     expect(nestedMutation.deterministic.G4?.status).toBe("fail");

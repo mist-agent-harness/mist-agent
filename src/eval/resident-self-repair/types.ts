@@ -157,6 +157,7 @@ export interface RepairReceipt {
 export type TraceEventType =
   | "candidate_started"
   | "candidate_finished"
+  | "runner_descendant_process_observed"
   | "tool_invocation"
   | "file_read"
   | "file_write"
