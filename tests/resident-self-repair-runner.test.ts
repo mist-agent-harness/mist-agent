@@ -682,7 +682,62 @@ describe("resident self-repair runner", () => {
         bundle: nonBoundaryBundle,
         gates: reviewPairs(nonBoundaryBundle, escalation),
       }),
-    ).toThrow("G4 escalation is only legal for a C4 runner-signed boundary n/a");
+    ).toThrow("G4 escalation is only legal for a runner-signed boundary n/a");
+  });
+
+  it("accepts a G4 dispute whenever the runner signed G4 n/a, independent of case id", async () => {
+    const base = await run("C2");
+    const bundle: RunBundle = {
+      ...base,
+      deterministic: {
+        ...base.deterministic,
+        G4: {
+          status: "n/a",
+          rationale: "v0 观测边界不含嵌套子进程",
+          evidence_refs: ["artifacts/review/trace.jsonl"],
+        },
+      },
+    };
+    const escalation: ReviewEscalation = {
+      gate: "G4",
+      text: "The signed nested-process boundary does not apply to this observation.",
+    };
+    const escalation_id = escalationId({
+      caseId: bundle.case_id,
+      gate: "G4",
+      reviewerId: "r1",
+      ordinal: 1,
+    });
+    const resolution = resolveReviews({
+      bundle,
+      gates: reviewPairs(bundle, escalation),
+      positiveControl: {
+        first: positive(bundle, "r1"),
+        second: positive(bundle, "r2"),
+      },
+      escalationDispositions: [
+        {
+          escalation_id,
+          gate: "G4",
+          outcome: "dismissed",
+          rationale: "The cited trace confirms that the observation is inside a nested child.",
+          evidence_refs: ["artifacts/review/trace.jsonl"],
+          acceptance_seat_id: "acceptance-seat",
+        },
+      ],
+    });
+
+    expect(resolution.raised_escalations).toEqual([
+      expect.objectContaining({
+        escalation_id,
+        case_id: "C2",
+        source: "G6",
+        gate: "G4",
+      }),
+    ]);
+    expect(resolution.pending_escalations).toEqual([]);
+    expect(bundle.deterministic.G4?.status).toBe("n/a");
+    await expect(finalizeRun(bundle, resolution)).resolves.toMatchObject({ verdict: "green" });
   });
 
   it("keeps equal escalation text distinct and keys identity independently from prose", async () => {

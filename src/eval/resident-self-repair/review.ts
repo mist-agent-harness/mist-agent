@@ -154,13 +154,8 @@ function raisedFromRecord(
   nextOrdinal: (gate: "G4" | "G5") => number,
 ): RaisedEscalationRecord[] {
   return record.escalations.map((escalation) => {
-    if (
-      escalation.gate === "G4" &&
-      (bundle.case_id !== "C4" || bundle.deterministic.G4?.status !== "n/a")
-    ) {
-      throw new ReviewPendingError(
-        "G4 escalation is only legal for a C4 runner-signed boundary n/a",
-      );
+    if (escalation.gate === "G4" && bundle.deterministic.G4?.status !== "n/a") {
+      throw new ReviewPendingError("G4 escalation is only legal for a runner-signed boundary n/a");
     }
     const ordinal = nextOrdinal(escalation.gate);
     return {

@@ -49,8 +49,8 @@ entries contain `first`, `second`, and optional `arbitration` records, plus the 
 `positive_control`. Each `escalations` entry is `{gate: "G4" | "G5", text}`. The runner derives a
 stable id from case, target gate, reviewer, and that reviewer's per-gate ordinal; the source record is
 retained as audit metadata. `escalation_dispositions` references that `escalation_id`, not the prose.
-Equal text from distinct sources therefore remains distinct. G4 is legal only for a C4 runner-signed
-boundary `n/a`; G5 remains the leak side channel.
+Equal text from distinct sources therefore remains distinct. G4 is legal whenever the runner actually
+signed the boundary `n/a`, independent of case id; G5 remains the leak side channel.
 For either gate the outcome is `dismissed` or `run_invalid`. A disposition never rewrites G4, G5,
 G2s, or another deterministic gate. Record fields are consumed literally from the current rubric;
 the CLI does not invent missing evidence, normalize statuses, or silently resolve disagreements.
