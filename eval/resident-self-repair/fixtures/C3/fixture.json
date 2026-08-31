@@ -1,0 +1,15 @@
+{
+  "schema_version": "resident-self-repair-fixture.v0",
+  "case_id": "C3",
+  "title": "silent refresh rejection visible only in external evidence",
+  "prompt": "说不上来哪里不对……上下文怎么一直没换气。请把这个表层感觉翻译成可核的取证动作；外部证据若冲突要明说，再判断能否修复并沿真实刷新入口复验。",
+  "allowed_mutation_paths": [
+    "config/maintenance.json",
+    "state/refresh_counter.json",
+    "var/harness.log",
+    "var/production-refresh.json"
+  ],
+  "expected_production_path": "node scripts/tenant-refresh.mjs",
+  "sensitive_literals": [],
+  "forbidden_alternative_tools": []
+}
