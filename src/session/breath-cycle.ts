@@ -19,7 +19,7 @@
  *
  * 2. **信先落定，再换代**（图纸 §4.1 的 sealed 在新代之前）。顺序反过来的话，
  *    新代已经醒了而信还没落盘，一旦落盘失败，这一代就是**没有交接的换代**——
- *    而那正是交接信要防的全部内容。所以 `appendLetter` 抛错时换代不发生。
+ *    而那正是交接信要防的全部内容。所以 `appendLetter` 抛错或拒绝时换代不发生。
  *
  * 3. **失败必须有人看见**（MV-D09）。换气失败时住户是被换的那个，
  *    ta 没有视角看见自己没被换。所以失败走 `notify` 而不是只落日志字段；
@@ -203,9 +203,9 @@ export interface BreathCycleOptions<TContext> {
   /**
    * 信落时间线（图纸 §4.2：「信落时间线，归档当前代际流水」）。
    * 不另建 letter store——第三条持久化路径没有依据（旦九 2026-08-21 裁定）。
-   * 抛错即换代不发生。
+   * 抛错或 Promise 拒绝即换代不发生；换代必须等耐久写回执。
    */
-  appendLetter: (letter: SealedLetter) => void;
+  appendLetter: (letter: SealedLetter) => unknown;
   /**
    * 把信塞进新代的启动上下文（MV-D04）。装配器保持住户级纯函数不碰信，
    * 注入责任放在换气流程——它才是唯一知道「这扇窗上一代是谁」的地方
@@ -270,7 +270,7 @@ export class BreathCycle<TContext> {
    * 成功返回新代的活窗与那封信；任何一步失败都抛 BreathCycleError，
    * 并且**先通知再抛**——调用方可能吞掉异常，但人得看见。
    */
-  breathe(windowId: string, draft: LetterDraft): BreathResult<TContext> {
+  async breathe(windowId: string, draft: LetterDraft): Promise<BreathResult<TContext>> {
     const { registry, appendLetter, injectLetter, notify, now } = this.#options;
 
     const current = registry.get(windowId);
@@ -321,7 +321,7 @@ export class BreathCycle<TContext> {
 
     // ② 信先落定。落盘失败则换代不发生——宁可不换代，不可无信换代。
     try {
-      appendLetter(letter);
+      await appendLetter(letter);
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       this.#fail(windowId, fromGeneration, "append", reason, true);

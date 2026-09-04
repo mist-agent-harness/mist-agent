@@ -226,9 +226,9 @@ async function execute(command: HostCommand): Promise<unknown> {
       const before = requireLive(windowId);
       breathAttemptSeq += 1;
       const noticeStart = notices.length;
-      let result: ReturnType<typeof cycle.breathe>;
+      let result: Awaited<ReturnType<typeof cycle.breathe>>;
       try {
-        result = cycle.breathe(windowId, command.draft);
+        result = await cycle.breathe(windowId, command.draft);
       } catch (error) {
         const failure = notices
           .slice(noticeStart)
