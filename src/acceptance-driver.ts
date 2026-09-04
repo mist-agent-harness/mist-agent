@@ -23,6 +23,7 @@ import type { BootPack, HarnessDriver, HistoryNode, MemoryEntry } from "../accep
 import { buildBootPack as assembleBootPack } from "./bootpack.ts";
 import {
   type AssistantReply,
+  type DispatchEventLogger,
   MessageTreeService,
   MessageTreeStore,
   type SessionHeadPort,
@@ -45,6 +46,8 @@ export interface CreateDriverOptions {
   factLedger?: FactLedger;
   /** 闸事件日志口；不给则事件落 no-op（ViewportTurnGate 的默认）。 */
   turnEventLogger?: TurnEventLogger;
+  /** 真正 responder 派发、成功回执与迟到丢弃的窗级事件日志（MV-B03）。 */
+  dispatchEventLogger?: DispatchEventLogger;
 }
 
 /**
@@ -118,6 +121,10 @@ class MistDriver implements HarnessDriver {
         assistantReply: options.reply ?? ((_residentId, message) => `收到：${message}`),
         // exactOptionalPropertyTypes 下不能显式塞 undefined：有闸才带这个键。
         ...(turnGate === null ? {} : { turnGate }),
+        dispatch: this.#sessions,
+        ...(options.dispatchEventLogger === undefined
+          ? {}
+          : { dispatchEventLogger: options.dispatchEventLogger }),
       },
     );
     this.#migration = createResidentMigrationService(this.#store, this.#messageTreeStore);

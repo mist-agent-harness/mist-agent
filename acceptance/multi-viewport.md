@@ -15,7 +15,7 @@
 
 - [x] **MV-B01 回执窗级归属**：两窗并行派发，互相的迟到回执在对方窗不被误杀；同窗换代后旧代回执被丢弃。断言四象限全对。[集成]
 - [x] **MV-B02 住户级无当前代际**：试图在住户级查询「当前 generation」的 API 不存在或显式报错。[单测]
-- [ ] **MV-B03 日志三元组**：派发、回执、丢弃事件的日志必带完整 `(residentId, windowId, generation)`；出现缺字段的日志本条变红。[集成]
+- [x] **MV-B03 日志三元组**：派发、回执、丢弃事件的日志必带完整 `(residentId, windowId, generation)`；出现缺字段的日志本条变红。[集成]（2026-09-04 墨衡勾：`tests/dispatch-logging-host.test.ts` 经真实 MistDriver 子进程调用 responder；成功链逐条产出 dispatch/receipt，回应在途时 kill 原窗则产出 dropped，三类事件均逐字段断言完整三元组与同一 dispatchId；迟到结果零落树。删任一三元组字段或旁路 SessionRegistry 回执，专项即红）
 
 ## C. 权威事实账与开工闸
 

@@ -20,6 +20,48 @@ export interface SessionHeadPort {
 export type AssistantReply = (residentId: string, message: string) => string | Promise<string>;
 
 /**
+ * 一次真实模型派发的窗级凭证。形状与 SessionRegistry.DispatchReceipt 一致，
+ * 但消息树只依赖这份窄端口，不反向拥有会话注册表。
+ */
+export interface WindowDispatchReceipt {
+  residentId: string;
+  windowId: string;
+  generation: number;
+  dispatchId: string;
+}
+
+/** 派发链三个可观察落点（MV-B03）；每一类都必须带完整窗三元组。 */
+export interface DispatchEvent extends WindowDispatchReceipt {
+  event: "dispatch" | "receipt" | "dropped";
+  detail: string;
+}
+
+export interface DispatchEventLogger {
+  log(event: DispatchEvent): void;
+}
+
+/**
+ * 会话层给真实 responder 的回执接缝：开工前签发，结果回来后按窗与代际验归属。
+ */
+export interface DispatchLifecyclePort {
+  issueDispatch(windowId: string): WindowDispatchReceipt;
+  belongsToActiveWindow(receipt: WindowDispatchReceipt): boolean;
+}
+
+export const DISPATCH_RESULT_DROPPED = "DISPATCH_RESULT_DROPPED" as const;
+
+/** 迟到结果被代际闸丢弃；响亮失败，调用方不得把它当成已落树回应。 */
+export class DispatchResultDroppedError extends Error {
+  readonly code = DISPATCH_RESULT_DROPPED;
+  constructor(receipt: WindowDispatchReceipt) {
+    super(
+      `${DISPATCH_RESULT_DROPPED}: ${receipt.residentId}/${receipt.windowId} generation=${receipt.generation} dispatch=${receipt.dispatchId}`,
+    );
+    this.name = "DispatchResultDroppedError";
+  }
+}
+
+/**
  * 一轮开工的通行凭证（开工闸的回件，图纸 docs/design/multi-viewport.md §3.2）。
  *
  * 闸在模型调用之前发凭证：contextPrefix 是本轮必须先进上下文的缺口条目，
@@ -53,6 +95,10 @@ export interface MessageTreeServiceOptions {
   assistantReply?: AssistantReply;
   /** 不接闸时行为与接闸前完全一致——既有路径一个字不变。 */
   turnGate?: TurnGate;
+  /** 不接派发端口时保留旧的直调 responder 行为，供纯消息树嵌入方使用。 */
+  dispatch?: DispatchLifecyclePort;
+  /** 派发事件日志口；不提供时只执行回执过滤，不产生日志。 */
+  dispatchEventLogger?: DispatchEventLogger;
 }
 
 /**
@@ -67,6 +113,8 @@ export interface MessageCommitBoundary {
 
 export interface MessageTreeSayOptions {
   readonly commitBoundary?: MessageCommitBoundary;
+  /** Caller-specific window authority; replaces the default port, never issues a second receipt. */
+  readonly dispatch?: DispatchLifecyclePort;
   /** Host-owned operation identity for crash-safe retry after tree commit but before outer receipt. */
   readonly idempotencyKey?: string;
 }
@@ -83,6 +131,8 @@ export class MessageTreeService {
   readonly #sessionHeads: SessionHeadPort;
   readonly #assistantReply: AssistantReply;
   readonly #turnGate: TurnGate | undefined;
+  readonly #dispatch: DispatchLifecyclePort | undefined;
+  readonly #dispatchEventLogger: DispatchEventLogger | undefined;
 
   constructor(
     store: MessageTreeStore,
@@ -93,6 +143,16 @@ export class MessageTreeService {
     this.#sessionHeads = sessionHeads;
     this.#assistantReply = options.assistantReply ?? echoReply;
     this.#turnGate = options.turnGate;
+    this.#dispatch = options.dispatch;
+    this.#dispatchEventLogger = options.dispatchEventLogger;
+  }
+
+  #logDispatch(
+    event: DispatchEvent["event"],
+    receipt: WindowDispatchReceipt,
+    detail: string,
+  ): void {
+    this.#dispatchEventLogger?.log({ event, ...receipt, detail });
   }
 
   /** 原子落 user + assistant；两节点都存在以后才允许推进会话 head。 */
@@ -151,8 +211,25 @@ export class MessageTreeService {
       pass !== undefined && pass.contextPrefix.length > 0
         ? [...pass.contextPrefix, message].join("\n\n")
         : message;
+    // Only a fresh responder call issues a receipt. Callers may narrow the authority port,
+    // but issuance and lifecycle logging stay here; committed replays bypass both.
+    const dispatch = options.dispatch ?? this.#dispatch;
+    const dispatchReceipt = dispatch?.issueDispatch(windowId);
+    if (dispatchReceipt !== undefined) {
+      this.#logDispatch("dispatch", dispatchReceipt, "responder 已开始处理本轮");
+    }
     const assistantContent = await this.#assistantReply(residentId, prompt);
     const commit = (): HistoryNode => {
+      // Check inside the final synchronous mutation, including any caller boundary. A stale
+      // result must be logged with its original dispatch ID before touching the tree or head.
+      if (
+        dispatchReceipt !== undefined &&
+        dispatch !== undefined &&
+        !dispatch.belongsToActiveWindow(dispatchReceipt)
+      ) {
+        this.#logDispatch("dropped", dispatchReceipt, "结果返回时原窗代际已不再活跃");
+        throw new DispatchResultDroppedError(dispatchReceipt);
+      }
       const pair =
         options.idempotencyKey === undefined
           ? this.#store.appendPair(residentId, message, assistantContent, parentId)
@@ -167,6 +244,9 @@ export class MessageTreeService {
       // 回执只在落树 + head 推进都成功之后发出：先 ack 后落树会让「已确认」
       // 覆盖「没送到」，回执丢失归传播机制的前提是先证明这轮真的开工了（MV-C05）。
       pass?.commit();
+      if (dispatchReceipt !== undefined) {
+        this.#logDispatch("receipt", dispatchReceipt, "回应已落树且窗 head 已推进");
+      }
       return pair.assistant;
     };
     return options.commitBoundary?.commit(commit) ?? commit();
