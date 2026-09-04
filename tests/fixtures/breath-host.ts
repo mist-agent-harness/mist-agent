@@ -2,7 +2,7 @@
  * 换气集成宿主：子进程里装配生产件——SessionRegistry、MessageTreeStore +
  * Service、ViewportTurnGate（接阈值计量口）、BreathCycle（接流水卫生检查），
  * 父进程经 IPC 驱动，覆盖验收清单 D 区的 [集成] 半格
- * （MV-D01/D02/D04 后半/D07/D07b）。
+ * （MV-D01/D02/D04 后半/D07/D07b/D10）。
  *
  * 形状仿 turn-gate-host.ts。关键装配口径：
  *
@@ -26,7 +26,11 @@ import {
   type SealedLetter,
   estimateTokens,
 } from "../../src/session/handover-letter.ts";
-import { type ActiveWindow, SessionRegistry } from "../../src/session/session-registry.ts";
+import {
+  type ActiveWindow,
+  type DispatchReceipt,
+  SessionRegistry,
+} from "../../src/session/session-registry.ts";
 import { type TurnGateEvent, ViewportTurnGate } from "../../src/session/turn-gate.ts";
 import { FactLedger } from "../../src/store/fact-ledger.ts";
 
@@ -133,6 +137,9 @@ type HostCommand = {
     | "events"
     | "debrisLog"
     | "timeline"
+    | "live"
+    | "issueDispatch"
+    | "belongsToActiveWindow"
     | "stop";
   residentId?: string;
   windowId?: string;
@@ -141,6 +148,7 @@ type HostCommand = {
   tokens?: number;
   draft?: LetterDraft;
   debris?: unknown[];
+  receipt?: DispatchReceipt;
 };
 
 function requireString(value: string | undefined, field: string): string {
@@ -253,6 +261,24 @@ async function execute(command: HostCommand): Promise<unknown> {
       return debrisLog;
     case "timeline":
       return timeline;
+    case "live": {
+      // MV-D10 的解析口：按 windowId 查活窗。换气后旧 windowId 必须仍能查到——
+      // 查不到就是判红样例「换气后旧 windowId 查不到该窗」。
+      const window = registry.get(requireString(command.windowId, "windowId"));
+      if (window === undefined) return null;
+      return {
+        residentId: window.residentId,
+        windowId: window.windowId,
+        scopeId: window.scopeId,
+        generation: window.generation,
+        headId: window.headId,
+      };
+    }
+    case "issueDispatch":
+      return registry.issueDispatch(requireString(command.windowId, "windowId"));
+    case "belongsToActiveWindow":
+      if (command.receipt === undefined) throw new Error("missing receipt");
+      return registry.belongsToActiveWindow(command.receipt);
     case "stop":
       return null;
   }

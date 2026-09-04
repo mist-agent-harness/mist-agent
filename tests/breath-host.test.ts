@@ -470,3 +470,138 @@ describe("猝死与流水残骸（real host subprocess）", () => {
     expect(debris[0]?.remnants?.some((remnant) => /同为 user/.test(remnant))).toBe(true);
   });
 });
+
+type Receipt = { residentId: string; windowId: string; generation: number; dispatchId: string };
+type Live = {
+  residentId: string;
+  windowId: string;
+  scopeId: string;
+  generation: number;
+  headId: string | null;
+} | null;
+type Letter = { title: string; windowId: string; residentId: string; generation: number };
+type Ctx = { notes: string[]; letter?: Letter };
+
+/**
+ * MV-D10 换气不改窗身份（real host subprocess）。
+ *
+ * 这一组走的是图纸 §4.1 的**换气**（BreathCycle.breathe：信落定 → 同一 windowId
+ * 换代），不是泳道 1 的 kill + 带 windowId 重开——tests/handover-letter.test.ts
+ * 那组只钉了「同 id 重开身份不变」这个更弱的性质，并明说 D10 要在真换气上重打。
+ *
+ * 判红样例两条都要被钉住：换气流程中重新签发 windowId；换气后旧 windowId 查不到该窗。
+ */
+describe("MV-D10 换气不改窗身份（real host subprocess）", () => {
+  it("windowId 逐字不变，只 generation + 1；旧 windowId 换气后仍解析到同一扇活窗", async () => {
+    const child = startHost();
+    await waitForReady(child);
+    const opened = await callHost<Opened>(child, { op: "open", residentId: "resident-d10" });
+    expect(opened.generation).toBe(1);
+
+    await callHost<Said>(child, { op: "say", windowId: opened.windowId, message: "换气前的一句" });
+    const before = await callHost<Live>(child, { op: "live", windowId: opened.windowId });
+    expect(before).not.toBeNull();
+
+    const breathed = await callHost<Opened>(child, {
+      op: "breathe",
+      windowId: opened.windowId,
+      draft: draft("D10 第一次换气", "身份不变只换代"),
+    });
+    // 逐字相等：不是「等价」，是同一串字节。
+    expect(breathed.windowId).toBe(opened.windowId);
+    expect(breathed.generation).toBe(opened.generation + 1);
+
+    // 旧 windowId 仍解析到活窗（判红样例二：换气后旧 windowId 查不到该窗）。
+    const after = await callHost<Live>(child, { op: "live", windowId: opened.windowId });
+    expect(after).not.toBeNull();
+    expect(after?.windowId).toBe(opened.windowId);
+    expect(after?.residentId).toBe(before?.residentId);
+    expect(after?.scopeId).toBe(before?.scopeId);
+    expect(after?.generation).toBe(2);
+    // 换气不是归档：同一 id 在归档簿里查不到「一扇死窗」。
+    const archived = await callHost<unknown>(child, { op: "archived", windowId: opened.windowId });
+    expect(archived).toBeNull();
+  });
+
+  it("换气前的派发回执换气后仍解析到同一扇窗：旧代回执按 generation 判旧，不是悬空", async () => {
+    const child = startHost();
+    await waitForReady(child);
+    const { windowId } = await callHost<Opened>(child, { op: "open", residentId: "resident-d10b" });
+
+    const stale = await callHost<Receipt>(child, { op: "issueDispatch", windowId });
+    expect(stale).toMatchObject({ residentId: "resident-d10b", windowId, generation: 1 });
+    expect(await callHost<boolean>(child, { op: "belongsToActiveWindow", receipt: stale })).toBe(
+      true,
+    );
+
+    await callHost<Opened>(child, {
+      op: "breathe",
+      windowId,
+      draft: draft("D10 回执跨代", "回执按代际判旧"),
+    });
+
+    // 回执里的 windowId 换气后照样查得到窗——引用没有悬空。
+    const resolved = await callHost<Live>(child, { op: "live", windowId: stale.windowId });
+    expect(resolved?.windowId).toBe(windowId);
+    expect(resolved?.generation).toBe(2);
+    // 旧代回执被判旧（generation 不匹配），而不是「窗不存在」；新代回执立即有效。
+    expect(await callHost<boolean>(child, { op: "belongsToActiveWindow", receipt: stale })).toBe(
+      false,
+    );
+    const fresh = await callHost<Receipt>(child, { op: "issueDispatch", windowId });
+    expect(fresh.windowId).toBe(stale.windowId);
+    expect(fresh.generation).toBe(2);
+    expect(await callHost<boolean>(child, { op: "belongsToActiveWindow", receipt: fresh })).toBe(
+      true,
+    );
+  });
+
+  it("时间线锚点与外部绑定跨代仍指向同一扇窗；连续三次换气 id 不动、代际单调", async () => {
+    const child = startHost();
+    await waitForReady(child);
+    const { windowId } = await callHost<Opened>(child, { op: "open", residentId: "resident-d10c" });
+    // 外部绑定：调用方拿到 windowId 当句柄，换气前配了阈值、开过回合。
+    await callHost(child, { op: "configureThreshold", windowId, tokens: 10_000 });
+    await callHost<Said>(child, { op: "say", windowId, message: "第一代的话" });
+
+    let generation = 1;
+    for (const title of ["D10 换气一", "D10 换气二", "D10 换气三"]) {
+      const breathed = await callHost<Opened>(child, {
+        op: "breathe",
+        windowId,
+        draft: draft(title, `第 ${generation} 代封缄`),
+      });
+      expect(breathed.windowId).toBe(windowId);
+      expect(breathed.generation).toBe(generation + 1);
+      generation = breathed.generation;
+
+      // 换气后阈值重新可配（新代尚无回合过闸），仍用同一个 windowId 句柄（MV-D02 的换代口径）。
+      await callHost(child, { op: "configureThreshold", windowId, tokens: 10_000 });
+      // 同一个句柄，换气后不重新 open、不重新登记，照常开工（外部绑定不悬空）。
+      const said = await callHost<Said>(child, {
+        op: "say",
+        windowId,
+        message: `第 ${generation} 代的话`,
+      });
+      expect(said.node.role).toBe("assistant");
+    }
+    expect(generation).toBe(4);
+
+    // 时间线锚点：每封信钉着同一 windowId 与写信那一代；新代 context 里的信指回同一扇窗。
+    const timeline = await callHost<Letter[]>(child, { op: "timeline" });
+    expect(timeline.map((letter) => letter.windowId)).toEqual([windowId, windowId, windowId]);
+    expect(timeline.map((letter) => letter.generation)).toEqual([1, 2, 3]);
+    expect(timeline.map((letter) => letter.title)).toEqual([
+      "D10 换气一",
+      "D10 换气二",
+      "D10 换气三",
+    ]);
+    const context = await callHost<Ctx>(child, { op: "context", windowId });
+    expect(context.letter?.windowId).toBe(windowId);
+    expect(context.letter?.generation).toBe(3);
+
+    // 全程只有一扇窗：归档簿里查不到它，活窗簿里它是第 4 代。
+    expect(await callHost<unknown>(child, { op: "archived", windowId })).toBeNull();
+    expect((await callHost<Live>(child, { op: "live", windowId }))?.generation).toBe(4);
+  });
+});
