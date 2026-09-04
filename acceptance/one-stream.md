@@ -78,8 +78,9 @@
   `purpose=lifecycle` 的 canonical event；宿主是 reporter，受影响 viewport 是 subject，
   `effect.state=failed-not-effective`。自动重试与需人处理是两种封闭 handling：前者明确
   `requiresUserAction=false`，后者必须带非空 action。`tests/breath-host.test.ts` 复用
-  MV-D09 的真实 `BreathCycle` 子进程夹具，注入时间线 append 失败，同时断言本地 notice、
-  canonical stream 事件与失败后重新预告；只有 notice、删掉主流写入时专项稳定转红。
+  MV-D09 的真实 `BreathCycle` 子进程夹具，分别注入时间线 append 失败与换代 reopen 失败，
+  同时断言本地 notice、canonical stream 事件、自动重试／需人捞窗分档和失败后重新预告；
+  只有 notice、删掉主流写入，或把需人处理压成自动重试时专项稳定转红。
   `tests/one-stream-lifecycle.test.ts` 另证需人捞窗时动作文字必填，viewport 不能自签为 host。
 
 - [ ] **OS-06 用户回话按把手路由，歧义时不猜** [集成]：两个工作区同时产生需要回答的

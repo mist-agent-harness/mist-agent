@@ -31,7 +31,11 @@ import {
   type SealedLetter,
   estimateTokens,
 } from "../../src/session/handover-letter.ts";
-import { type ActiveWindow, SessionRegistry } from "../../src/session/session-registry.ts";
+import {
+  type ActiveWindow,
+  type OpenOptions,
+  SessionRegistry,
+} from "../../src/session/session-registry.ts";
 import { type TurnGateEvent, ViewportTurnGate } from "../../src/session/turn-gate.ts";
 import { FactLedger } from "../../src/store/fact-ledger.ts";
 
@@ -40,7 +44,23 @@ interface Ctx {
   letter?: SealedLetter;
 }
 
-const registry = new SessionRegistry<Ctx>();
+class FixtureSessionRegistry extends SessionRegistry<Ctx> {
+  #failNextReopen = false;
+
+  failNextReopen(): void {
+    this.#failNextReopen = true;
+  }
+
+  override open(residentId: string, options: OpenOptions<Ctx>): ActiveWindow<Ctx> {
+    if (options.windowId !== undefined && this.#failNextReopen) {
+      this.#failNextReopen = false;
+      throw new Error("injected viewport reopen failure");
+    }
+    return super.open(residentId, options);
+  }
+}
+
+const registry = new FixtureSessionRegistry();
 const ledger = new FactLedger();
 const store = new MessageTreeStore();
 const events: TurnGateEvent[] = [];
@@ -152,6 +172,7 @@ type HostCommand = {
     | "timeline"
     | "canonicalEvents"
     | "failNextAppend"
+    | "failNextSwap"
     | "stop";
   residentId?: string;
   windowId?: string;
@@ -312,6 +333,9 @@ async function execute(command: HostCommand): Promise<unknown> {
       return canonicalStore.events(requireString(command.residentId, "residentId"));
     case "failNextAppend":
       failNextAppend = true;
+      return null;
+    case "failNextSwap":
+      registry.failNextReopen();
       return null;
     case "stop":
       await canonicalWriter.close();

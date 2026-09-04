@@ -318,6 +318,50 @@ describe("OS-05 宿主换气失败进入 canonical stream", () => {
     const notices = await callHost<Notice[]>(child, { op: "notices" });
     expect(notices.filter((notice) => notice.kind === "announced")).toHaveLength(2);
   });
+
+  it("真实 swap 失败把需要人捞窗的动作写进 canonical stream", async () => {
+    const child = startHost();
+    await waitForReady(child);
+    const residentId = "resident-os05-swap";
+    const { windowId } = await callHost<Opened>(child, { op: "open", residentId });
+
+    await callHost(child, { op: "failNextSwap" });
+    await expect(
+      callHost(child, {
+        op: "breathe",
+        windowId,
+        draft: draft("OS-05 换代失败", "旧窗已归档，新窗没有重开"),
+      }),
+    ).rejects.toThrow(/BREATH_CYCLE_FAILED\[swap\]/);
+
+    expect(await callHost(child, { op: "archived", windowId })).toMatchObject({
+      generation: 1,
+      archived: true,
+    });
+    const events = await callHost<CanonicalEvent[]>(child, {
+      op: "canonicalEvents",
+      residentId,
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      purpose: "lifecycle",
+      residentId,
+      effect: {
+        state: "failed-not-effective",
+        requiresUserAction: true,
+        retry: "awaiting-external",
+      },
+      payload: {
+        kind: "host-lifecycle-failed",
+        action: "breath",
+        stage: "swap",
+        reason: "injected viewport reopen failure",
+        windowRecovered: false,
+        userAction: `Recover viewport ${windowId} before retrying breath`,
+      },
+    });
+    expect(events[0]?.payload).toMatchObject({ userAction: expect.any(String) });
+  });
 });
 
 describe("猝死与流水残骸（real host subprocess）", () => {
