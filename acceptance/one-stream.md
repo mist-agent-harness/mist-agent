@@ -111,6 +111,14 @@
   工作区均不得收到该回复。按最近事件、当前焦点、viewport 创建时间或模型推测偷偷分配，
   任一种都判红。
 
+  证据：`BlockedReplyRouter` 的候选集只来自 canonical stream 中仍需回答的 blocked event 与
+  SessionRegistry 当前活代；输入面只有 `replyToEventId`、`workRef` 或裸回复，没有 recent、
+  focus、createdAt、active tab 等猜测口。`MessageTreeWorkspaceReplyDelivery` 走真实
+  MessageTreeService 派发，只有 user/assistant 两节点落树并推进目标 head 后才返回
+  workspace-committed receipt，失败不标 resolved。`tests/one-stream-reply-router.test.ts` 同时
+  建两扇 blocked 窗：裸回复零投递并返回两个把手；显式 event/work 抵达第一窗；剩唯一候选后
+  裸回复抵达第二窗；陌生、冲突、失效把手与 responder 失败均不旁落另一窗。
+
 ## 变绿条件
 
 本页合入只代表判卷程序已写清，六盏默认保持未勾。实现 PR 必须给出相应的可重复测试，
