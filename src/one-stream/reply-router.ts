@@ -267,6 +267,7 @@ export class MessageTreeWorkspaceReplyDelivery implements WorkspaceReplyDelivery
       request.text,
       request.viewport.windowId,
       {
+        idempotencyKey: `blocked-reply-delivery:${request.eventId}`,
         commitBoundary: {
           commit: (mutation) => {
             if (!this.#sessions.belongsToActiveWindow(dispatch)) {

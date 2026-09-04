@@ -115,7 +115,10 @@
   SessionRegistry 当前活代；输入面只有 `replyToEventId`、`workRef` 或裸回复，没有 recent、
   focus、createdAt、active tab 等猜测口。成功投递后，宿主把 resolved receipt 写回同一条
   canonical stream；router、port 与 stream store 从磁盘重建后仍能拒绝重复回复，同一 blocker
-  的并发回复也在首次派发前串行化。`MessageTreeWorkspaceReplyDelivery` 走真实
+  的并发回复也在首次派发前串行化。若 workspace pair 已提交而 resolved receipt 尚未落盘，
+  blocker event 派生的稳定投递键会在 MessageTree 自己的不可变节点中找回同一 pair；重建
+  tree/service/router 后只补 resolved receipt，不再调用 responder 或追加第二对节点。临时拔掉
+  该投递键时，这条 crash-gap 回归精准转红。`MessageTreeWorkspaceReplyDelivery` 走真实
   MessageTreeService 派发，并把签发的 generation receipt 带到 responder 返回后的同步
   tree/head commit boundary；in-flight kill 后以同一 windowId 重开时，旧代回复响亮拒绝且
   user/assistant 树与新代 head 都零写入。`tests/one-stream-reply-router.test.ts` 还同时建立两扇

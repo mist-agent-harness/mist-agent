@@ -67,6 +67,8 @@ export interface MessageCommitBoundary {
 
 export interface MessageTreeSayOptions {
   readonly commitBoundary?: MessageCommitBoundary;
+  /** Host-owned operation identity for crash-safe retry after tree commit but before outer receipt. */
+  readonly idempotencyKey?: string;
 }
 
 const echoReply: AssistantReply = (_residentId, message) => message;
@@ -108,6 +110,22 @@ export class MessageTreeService {
     if (parentId !== null && !roomHistory.some((node) => node.id === parentId)) {
       throw nodeUnavailable();
     }
+    const replay =
+      options.idempotencyKey === undefined
+        ? null
+        : this.#store.idempotentPair(residentId, options.idempotencyKey, message);
+    if (replay !== null) {
+      if (parentId !== replay.user.parentId && parentId !== replay.assistant.id) {
+        throw nodeUnavailable();
+      }
+      const commitReplay = (): HistoryNode => {
+        if (parentId !== replay.assistant.id) {
+          this.#sessionHeads.setHead(windowId, replay.assistant.id);
+        }
+        return replay.assistant;
+      };
+      return options.commitBoundary?.commit(commitReplay) ?? commitReplay();
+    }
     // 开工闸在校验之后、模型调用之前：闸拒（抛错）时 responder 零调用、零写入。
     const pass = this.#turnGate?.beforeTurn(residentId, windowId);
     // 缺口条目只进发给模型的文本，不进落树的 user 节点——注入是上下文装配，
@@ -118,7 +136,16 @@ export class MessageTreeService {
         : message;
     const assistantContent = await this.#assistantReply(residentId, prompt);
     const commit = (): HistoryNode => {
-      const pair = this.#store.appendPair(residentId, message, assistantContent, parentId);
+      const pair =
+        options.idempotencyKey === undefined
+          ? this.#store.appendPair(residentId, message, assistantContent, parentId)
+          : this.#store.appendPairOnce(
+              residentId,
+              message,
+              assistantContent,
+              parentId,
+              options.idempotencyKey,
+            );
       this.#sessionHeads.setHead(windowId, pair.assistant.id);
       // 回执只在落树 + head 推进都成功之后发出：先 ack 后落树会让「已确认」
       // 覆盖「没送到」，回执丢失归传播机制的前提是先证明这轮真的开工了（MV-C05）。

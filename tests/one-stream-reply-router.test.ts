@@ -229,6 +229,85 @@ describe("OS-06 canonical blocked reply routing", () => {
     }
   });
 
+  it("recovers a committed tree delivery when the durable resolved receipt failed", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "mist-reply-crash-gap-"));
+    let closeWriter = async (): Promise<void> => undefined;
+    let responderCalls = 0;
+    try {
+      const built = await assembly({
+        dataDir,
+        assistantReply: async (_residentId, message) => {
+          responderCalls += 1;
+          await closeWriter();
+          return `reply:${message}`;
+        },
+      });
+      closeWriter = () => built.writer.close();
+
+      await expect(
+        built.router.route({
+          residentId: "resident-a",
+          text: "answer-survives-receipt-crash",
+          replyToEventId: built.blocked[0]?.eventId,
+        }),
+      ).rejects.toThrow("canonical stream writer is closed");
+      expect(built.tree.history("resident-a")).toHaveLength(2);
+      expect(responderCalls).toBe(1);
+
+      const restoredStream = new CanonicalStreamStore({ dataDir });
+      const restoredWriter = new CanonicalStreamWriter(restoredStream);
+      const restoredTree = new MessageTreeStore();
+      restoredTree.createRoom("resident-a");
+      restoredTree.importTree("resident-a", built.tree.exportTree("resident-a"));
+      const restoredService = new MessageTreeService(
+        restoredTree,
+        {
+          getHead: (windowId) => built.sessions.getHead(windowId),
+          setHead: (windowId, headId) => built.sessions.setHead(windowId, headId),
+        },
+        {
+          assistantReply: () => {
+            responderCalls += 1;
+            throw new Error("committed delivery must not invoke responder again");
+          },
+        },
+      );
+      const rebuilt = new BlockedReplyRouter(
+        restoredStream,
+        built.sessions,
+        new MessageTreeWorkspaceReplyDelivery(restoredService, built.sessions),
+        new CanonicalBlockedReplyResolutionPort(restoredStream, restoredWriter, {
+          authoritySource: { kind: "host", id: "mist-host" },
+        }),
+      );
+
+      await expect(
+        rebuilt.route({
+          residentId: "resident-a",
+          text: "answer-survives-receipt-crash",
+          replyToEventId: built.blocked[0]?.eventId,
+        }),
+      ).resolves.toMatchObject({ status: "routed" });
+      expect(responderCalls).toBe(1);
+      expect(restoredTree.history("resident-a")).toHaveLength(2);
+      expect(
+        restoredStream
+          .eventsAfter("resident-a", 0)
+          .filter((event) => event.payload.kind === "blocked-reply-resolved"),
+      ).toHaveLength(1);
+      await expect(
+        rebuilt.route({
+          residentId: "resident-a",
+          text: "answer-survives-receipt-crash",
+          replyToEventId: built.blocked[0]?.eventId,
+        }),
+      ).rejects.toMatchObject({ code: "REPLY_TARGET_RESOLVED" });
+      await restoredWriter.close();
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it("serializes concurrent replies to one blocker before either can dispatch twice", async () => {
     let releaseReply = (): void => undefined;
     let markStarted = (): void => undefined;
