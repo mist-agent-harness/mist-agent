@@ -153,4 +153,35 @@ describe("OS-03 workspace and evidence capability split", () => {
     expect(await lifecycle.reconcile("resident-a")).toEqual([]);
     await writer.close();
   });
+
+  it("reconciles a crash after archive without creating a second result", async () => {
+    let crash = true;
+    const { store, writer, sessions, lifecycle } = assembly((name) => {
+      if (crash && name === "workspace-archived") throw new Error("simulated post-archive crash");
+    });
+    const opened = lifecycle.create("resident-a", { context: null });
+    const request = {
+      residentId: "resident-a",
+      windowId: opened.handle.windowId,
+      generation: opened.handle.generation,
+      workRef: "work-post-archive-recovery",
+      artifactRef: "evidence:post-archive-recovery",
+      idempotencyKey: "close-post-archive-recovery",
+      occurredAt: "2026-09-04T08:02:00.000Z",
+      summary: "recover result after archive",
+    } as const;
+
+    await expect(lifecycle.close(request)).rejects.toThrow("simulated post-archive crash");
+    expect(sessions.isArchived(opened.handle.windowId)).toBe(true);
+    expect(store.eventsAfter("resident-a", 0).map((event) => event.purpose)).toEqual(["closure"]);
+
+    crash = false;
+    expect(await lifecycle.reconcile("resident-a")).toHaveLength(1);
+    expect(store.eventsAfter("resident-a", 0).map((event) => event.purpose)).toEqual([
+      "closure",
+      "result",
+    ]);
+    expect(await lifecycle.reconcile("resident-a")).toEqual([]);
+    await writer.close();
+  });
 });
