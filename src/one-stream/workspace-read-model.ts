@@ -84,6 +84,26 @@ export class WorkspaceCapabilityError extends Error {
   }
 }
 
+/** Host-side issuer. A matching string is not authority; the exact issued token is. */
+export class EvidenceAuthority {
+  readonly #issued = new WeakSet<object>();
+
+  issue(principalId: string): EvidencePrincipal {
+    const principal = Object.freeze({
+      principalId: nonEmpty(principalId, "principalId"),
+      capability: "viewport-evidence:read" as const,
+    });
+    this.#issued.add(principal);
+    return principal;
+  }
+
+  assert(principal: EvidencePrincipal): void {
+    if (typeof principal !== "object" || principal === null || !this.#issued.has(principal)) {
+      throw new WorkspaceCapabilityError("host-issued evidence principal is required");
+    }
+  }
+}
+
 function nonEmpty(value: unknown, name: string): string {
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new WorkspaceCapabilityError(`${name} must be a non-empty string`);
@@ -392,15 +412,10 @@ export class EvidenceViewportReader {
   constructor(
     stream: CanonicalStreamReadPort,
     history: ViewportHistoryReadPort,
+    authority: EvidenceAuthority,
     principal: EvidencePrincipal,
   ) {
-    if (
-      principal.capability !== "viewport-evidence:read" ||
-      typeof principal.principalId !== "string" ||
-      principal.principalId.trim().length === 0
-    ) {
-      throw new WorkspaceCapabilityError("explicit evidence principal is required");
-    }
+    authority.assert(principal);
     this.#stream = stream;
     this.#history = history;
   }

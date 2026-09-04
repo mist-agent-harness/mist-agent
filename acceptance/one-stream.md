@@ -63,7 +63,8 @@
 
   证据：`FirstPartyResidentView` 只投影 canonical stream 与仍活着的 workspace handle，接口不含
   archive/history/resume；`WorkspaceLifecycleOwner` 先写 durable closure request，再归档窗，
-  最后写 committed-effective result，两个间隙都可按同一幂等键 reconcile。显式授权的
+  最后写 committed-effective result，两个间隙都可按同一幂等键 reconcile。`EvidenceAuthority`
+  只认宿主签发的对象身份，不把一段可伪造的 capability 字符串当授权；获授权的
   `EvidenceViewportReader` 只能拿 canonical result eventId，沿其中绑定的 artifactRef 与
   viewport identity 调只读 `MessageTreeViewportHistory`；无权主体、closure intent 或裸 windowId
   都不能成为读取入口。`tests/one-stream-workspace.test.ts` 用真实 SessionRegistry、MessageTree

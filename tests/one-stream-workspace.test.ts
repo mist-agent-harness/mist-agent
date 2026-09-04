@@ -3,6 +3,7 @@ import { MessageTreeService, MessageTreeStore } from "../src/message-tree/index.
 import {
   CanonicalStreamStore,
   CanonicalStreamWriter,
+  EvidenceAuthority,
   EvidenceViewportReader,
   FirstPartyResidentView,
   MessageTreeViewportHistory,
@@ -74,18 +75,25 @@ describe("OS-03 workspace and evidence capability split", () => {
       ),
     ).toBe(true);
 
+    const authority = new EvidenceAuthority();
     expect(
       () =>
-        new EvidenceViewportReader(store, new MessageTreeViewportHistory(tree, sessions), {
-          principalId: "first-party-user",
-          capability: "wrong" as "viewport-evidence:read",
-        }),
+        new EvidenceViewportReader(
+          store,
+          new MessageTreeViewportHistory(tree, sessions),
+          authority,
+          {
+            principalId: "first-party-user",
+            capability: "viewport-evidence:read",
+          },
+        ),
     ).toThrow(WorkspaceCapabilityError);
 
     const evidence = new EvidenceViewportReader(
       store,
       new MessageTreeViewportHistory(tree, sessions),
-      { principalId: "auditor-a", capability: "viewport-evidence:read" },
+      authority,
+      authority.issue("auditor-a"),
     );
     expect(
       evidence.read({ residentId: "resident-a", resultEventId: closed.effective.eventId }),

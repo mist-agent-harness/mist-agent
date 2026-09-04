@@ -39,6 +39,7 @@ export {
   WriterOwnershipError,
 } from "./writer.ts";
 export {
+  EvidenceAuthority,
   EvidenceViewportReader,
   FirstPartyResidentView,
   MessageTreeViewportHistory,
