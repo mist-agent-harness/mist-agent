@@ -371,7 +371,7 @@ PR A 已完成 canonical event contract、每 resident durable snapshot store、
   `tests/one-stream-core.test.ts`（5 项）点亮；两处 crash window、换内容重试、payload
   mutation、坏 snapshot 与同进程双 writer 均有转红断言；
 - `npm run typecheck`、`npm run lint`、`npm run acceptance` 通过；全仓 `npm test` 为
-  41 个文件通过、3 个跳过，448 项通过、38 项 todo；
+  46 个文件通过、3 个跳过，488 项通过、38 项 todo；
 - 100 条事件时最终 snapshot 为 85,022 bytes，累计写入 4,294,176 bytes，约为最终快照的
   50.5 倍，证实 v0 全量 snapshot 的写入成本随 stream 增长，暂不凭这一组数据拍阈值。
 
