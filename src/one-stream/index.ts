@@ -93,6 +93,12 @@ export {
   HostLifecycleFailureError,
   HostLifecycleFailurePort,
 } from "./host-lifecycle-failures.ts";
+export { CanonicalHandoverTimeline, HandoverTimelineError } from "./handover-letters.ts";
+export type {
+  CanonicalHandoverTimelineOptions,
+  HandoverLetterAnchor,
+  HandoverLetterRecall,
+} from "./handover-letters.ts";
 export type {
   HostLifecycleFailurePortOptions,
   HostLifecycleFailureSubmission,

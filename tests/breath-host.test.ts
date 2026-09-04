@@ -1,9 +1,12 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import type { HistoryNode } from "../acceptance/driver.ts";
 import type { CanonicalEvent } from "../src/one-stream/index.ts";
-import { estimateTokens } from "../src/session/handover-letter.ts";
+import { type SealedLetter, estimateTokens } from "../src/session/handover-letter.ts";
 
 type HostReply = {
   requestId?: string;
@@ -32,11 +35,18 @@ type GateEvent = {
 };
 
 const children: ChildProcess[] = [];
+const roots: string[] = [];
 const fixture = fileURLToPath(new URL("./fixtures/breath-host.ts", import.meta.url));
 
-function startHost(): ChildProcess {
+function freshDataDir(): string {
+  const root = mkdtempSync(join(tmpdir(), "mist-breath-host-"));
+  roots.push(root);
+  return root;
+}
+
+function startHost(dataDir = freshDataDir()): ChildProcess {
   const child = spawn(process.execPath, ["--import", "tsx", fixture], {
-    env: { ...process.env },
+    env: { ...process.env, MIST_BREATH_DATA_DIR: dataDir },
     stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
   children.push(child);
@@ -123,6 +133,7 @@ afterEach(async () => {
       }
     }),
   );
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
 function draft(title: string, body: string) {
@@ -135,6 +146,50 @@ function draft(title: string, body: string) {
 
 type Opened = { windowId: string; generation: number };
 type Said = { node: HistoryNode; prompt: string };
+
+describe("MV-D05 canonical handover recall (real host subprocess)", () => {
+  it("persists through the host path and a fresh process recalls the generation by title alone", async () => {
+    const dataDir = freshDataDir();
+    const residentId = "resident-d05-host";
+    const title = "跨进程交接锚点";
+
+    const first = startHost(dataDir);
+    await waitForReady(first);
+    const opened = await callHost<Opened>(first, { op: "open", residentId });
+    await callHost(first, {
+      op: "breathe",
+      windowId: opened.windowId,
+      draft: draft(title, "第一台宿主写下的细节"),
+    });
+    const committed = await callHost<CanonicalEvent[]>(first, {
+      op: "canonicalEvents",
+      residentId,
+    });
+    expect(committed).toHaveLength(1);
+    expect(committed[0]).toMatchObject({
+      purpose: "lifecycle",
+      payload: { kind: "handover-letter" },
+    });
+    await stopHost(first);
+
+    const restarted = startHost(dataDir);
+    await waitForReady(restarted);
+    const recalled = await callHost<{
+      kind: string;
+      letter?: SealedLetter;
+    }>(restarted, { op: "recallLetter", residentId, title });
+    expect(recalled).toMatchObject({
+      kind: "found",
+      letter: {
+        residentId,
+        windowId: opened.windowId,
+        generation: 1,
+        title,
+        state: [{ body: "状态半：第一台宿主写下的细节" }],
+      },
+    });
+  });
+});
 
 describe("换气阈值硬闸与手动入口（real host subprocess）", () => {
   it("MV-D01 阈值硬闸 + 回合容差：过线回合跑完，下一回合被拦，换气后放行", async () => {
@@ -342,8 +397,12 @@ describe("OS-05 宿主换气失败进入 canonical stream", () => {
       op: "canonicalEvents",
       residentId,
     });
-    expect(events).toHaveLength(1);
+    expect(events).toHaveLength(2);
     expect(events[0]).toMatchObject({
+      purpose: "lifecycle",
+      payload: { kind: "handover-letter" },
+    });
+    expect(events[1]).toMatchObject({
       purpose: "lifecycle",
       residentId,
       effect: {
@@ -360,7 +419,7 @@ describe("OS-05 宿主换气失败进入 canonical stream", () => {
         userAction: `Recover viewport ${windowId} before retrying breath`,
       },
     });
-    expect(events[0]?.payload).toMatchObject({ userAction: expect.any(String) });
+    expect(events[1]?.payload).toMatchObject({ userAction: expect.any(String) });
   });
 });
 

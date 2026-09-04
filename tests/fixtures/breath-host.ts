@@ -21,6 +21,7 @@
 
 import { MessageTreeService, MessageTreeStore } from "../../src/message-tree/index.ts";
 import {
+  CanonicalHandoverTimeline,
   CanonicalStreamStore,
   CanonicalStreamWriter,
   HostLifecycleFailurePort,
@@ -65,10 +66,15 @@ const ledger = new FactLedger();
 const store = new MessageTreeStore();
 const events: TurnGateEvent[] = [];
 const notices: BreathNotification[] = [];
-const timeline: SealedLetter[] = [];
 const debrisLog: string[] = [];
-const canonicalStore = new CanonicalStreamStore();
+const residentIds = new Set<string>();
+const canonicalDataDir = process.env.MIST_BREATH_DATA_DIR;
+if (canonicalDataDir === undefined) throw new Error("MIST_BREATH_DATA_DIR is required");
+const canonicalStore = new CanonicalStreamStore({ dataDir: canonicalDataDir });
 const canonicalWriter = new CanonicalStreamWriter(canonicalStore);
+const handoverTimeline = new CanonicalHandoverTimeline(canonicalWriter, canonicalStore, {
+  authoritySource: { kind: "host", id: "mist-host" },
+});
 const lifecycleFailures = new HostLifecycleFailurePort(canonicalWriter, {
   authoritySource: { kind: "host", id: "mist-host" },
 });
@@ -134,12 +140,12 @@ const service = new MessageTreeService(
 
 const cycle = new BreathCycle<Ctx>({
   registry,
-  appendLetter: (letter) => {
+  appendLetter: async (letter) => {
     if (failNextAppend) {
       failNextAppend = false;
       throw new Error("injected timeline append failure");
     }
-    timeline.push(letter);
+    await handoverTimeline.append(letter);
   },
   injectLetter: (context, letter) => ({ ...context, letter }),
   notify: (event) => {
@@ -170,6 +176,7 @@ type HostCommand = {
     | "events"
     | "debrisLog"
     | "timeline"
+    | "recallLetter"
     | "canonicalEvents"
     | "failNextAppend"
     | "failNextSwap"
@@ -178,6 +185,7 @@ type HostCommand = {
   windowId?: string;
   message?: string;
   content?: string;
+  title?: string;
   tokens?: number;
   draft?: LetterDraft;
   debris?: unknown[];
@@ -192,6 +200,7 @@ async function execute(command: HostCommand): Promise<unknown> {
   switch (command.op) {
     case "open": {
       const residentId = requireString(command.residentId, "residentId");
+      residentIds.add(residentId);
       ledger.createLedger(residentId);
       if (!canonicalStore.has(residentId)) canonicalStore.createStream(residentId);
       store.createRoom(residentId);
@@ -226,9 +235,9 @@ async function execute(command: HostCommand): Promise<unknown> {
       const before = requireLive(windowId);
       breathAttemptSeq += 1;
       const noticeStart = notices.length;
-      let result: ReturnType<typeof cycle.breathe>;
+      let result: Awaited<ReturnType<typeof cycle.breathe>>;
       try {
-        result = cycle.breathe(windowId, command.draft);
+        result = await cycle.breathe(windowId, command.draft);
       } catch (error) {
         const failure = notices
           .slice(noticeStart)
@@ -328,7 +337,15 @@ async function execute(command: HostCommand): Promise<unknown> {
     case "debrisLog":
       return debrisLog;
     case "timeline":
-      return timeline;
+      return [...residentIds]
+        .flatMap((residentId) => canonicalStore.eventsAfter(residentId, 0))
+        .filter((event) => event.payload.kind === "handover-letter")
+        .map((event) => event.payload.letter);
+    case "recallLetter":
+      return handoverTimeline.recall({
+        residentId: requireString(command.residentId, "residentId"),
+        title: requireString(command.title, "title"),
+      });
     case "canonicalEvents":
       return canonicalStore.events(requireString(command.residentId, "residentId"));
     case "failNextAppend":

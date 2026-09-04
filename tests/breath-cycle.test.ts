@@ -45,10 +45,10 @@ function harness(overrides: Partial<Record<string, unknown>> = {}) {
 }
 
 describe("MV-D10 换气不改窗身份", () => {
-  it("换气前后 windowId 逐字不变，只有 generation + 1", () => {
+  it("换气前后 windowId 逐字不变，只有 generation + 1", async () => {
     const { cycle, window } = harness();
 
-    const result = cycle.breathe(window.windowId, draft());
+    const result = await cycle.breathe(window.windowId, draft());
 
     expect(result.window.windowId).toBe(window.windowId);
     expect(result.window.generation).toBe(window.generation + 1);
@@ -56,11 +56,11 @@ describe("MV-D10 换气不改窗身份", () => {
     expect(result.window.scopeId).toBe(PRIVATE_SCOPE);
   });
 
-  it("换气后旧 windowId 仍解析到同一扇活窗，不留悬空引用", () => {
+  it("换气后旧 windowId 仍解析到同一扇活窗，不留悬空引用", async () => {
     const { registry, cycle, window } = harness();
     const id = window.windowId;
 
-    cycle.breathe(id, draft());
+    await cycle.breathe(id, draft());
 
     // 判红样例：换气流程若重新签发 windowId，这三条一起塌。
     expect(registry.isActive(id)).toBe(true);
@@ -68,31 +68,34 @@ describe("MV-D10 换气不改窗身份", () => {
     expect(registry.getArchived(id)).toBeUndefined();
   });
 
-  it("换气三次，windowId 始终是同一个，代际单调递增", () => {
+  it("换气三次，windowId 始终是同一个，代际单调递增", async () => {
     const { cycle, window } = harness();
     const id = window.windowId;
 
-    const generations = [1, 2, 3].map(() => cycle.breathe(id, draft()).window.generation);
+    const generations: number[] = [];
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      generations.push((await cycle.breathe(id, draft())).window.generation);
+    }
 
     expect(generations).toEqual([2, 3, 4]);
   });
 });
 
 describe("MV-D04 信随新代注入", () => {
-  it("新代醒来时上下文里信全文已在，无需任何工具调用", () => {
+  it("新代醒来时上下文里信全文已在，无需任何工具调用", async () => {
     const { cycle, window } = harness();
 
-    const result = cycle.breathe(window.windowId, draft());
+    const result = await cycle.breathe(window.windowId, draft());
 
     expect(result.window.context.letter).toBeDefined();
     expect(result.window.context.letter?.title).toBe("泳道 3 第二刀：换气流程接线");
     expect(result.window.context.letter?.intent[0]?.body).toBe("宁可不换代，不可无信换代");
   });
 
-  it("信盖的是写信那一代的章，不是醒来那一代的", () => {
+  it("信盖的是写信那一代的章，不是醒来那一代的", async () => {
     const { cycle, window } = harness();
 
-    const result = cycle.breathe(window.windowId, draft());
+    const result = await cycle.breathe(window.windowId, draft());
 
     // 窗从 generation 1 换到 2；信是 1 写的。
     expect(result.letter.generation).toBe(1);
@@ -100,18 +103,18 @@ describe("MV-D04 信随新代注入", () => {
     expect(result.window.generation).toBe(2);
   });
 
-  it("注入不脏旧上下文：新代改包不影响换气前那份", () => {
+  it("注入不脏旧上下文：新代改包不影响换气前那份", async () => {
     const { cycle, window } = harness();
     const before = window.context;
 
-    cycle.breathe(window.windowId, draft());
+    await cycle.breathe(window.windowId, draft());
 
     expect(before).not.toHaveProperty("letter");
   });
 });
 
 describe("信先落定，再换代", () => {
-  it("信落时间线的顺序在换代之前——落盘失败则一代都不换", () => {
+  it("信落时间线的顺序在换代之前——落盘失败则一代都不换", async () => {
     const { registry, cycle, window, notices } = harness({
       appendLetter: () => {
         throw new Error("timeline is full");
@@ -119,7 +122,7 @@ describe("信先落定，再换代", () => {
     });
     const id = window.windowId;
 
-    expect(() => cycle.breathe(id, draft())).toThrow(BreathCycleError);
+    await expect(cycle.breathe(id, draft())).rejects.toThrow(BreathCycleError);
 
     // 窗一根汗毛没动：还活着，还是第一代。
     expect(registry.isActive(id)).toBe(true);
@@ -127,7 +130,7 @@ describe("信先落定，再换代", () => {
     expect(notices.at(-1)).toMatchObject({ kind: "failed", stage: "append" });
   });
 
-  it("注入抛错时窗仍活、代际不变——kill 不许先于注入求值（cursor 08-25）", () => {
+  it("注入抛错时窗仍活、代际不变——kill 不许先于注入求值（cursor 08-25）", async () => {
     // 病根:参数在调用前求值。injectLetter 若写在 open(...) 的参数位上,
     // 它抛错的落点是 kill 之后、open 之前——窗已归档,新代没开,
     // 恰好违反模块头的「失败且窗没动过」。这条钉住"注入先算完,再动窗"。
@@ -138,7 +141,7 @@ describe("信先落定，再换代", () => {
     });
     const id = window.windowId;
 
-    expect(() => cycle.breathe(id, draft())).toThrow(BreathCycleError);
+    await expect(cycle.breathe(id, draft())).rejects.toThrow(BreathCycleError);
 
     // 窗一根汗毛没动:还活着,还是第一代。
     expect(registry.isActive(id)).toBe(true);
@@ -152,21 +155,23 @@ describe("信先落定，再换代", () => {
     });
   });
 
-  it("信校验不过时停在封缄这一步，时间线一个字都不写", () => {
+  it("信校验不过时停在封缄这一步，时间线一个字都不写", async () => {
     const { registry, timeline, cycle, window, notices } = harness();
     const id = window.windowId;
 
-    expect(() => cycle.breathe(id, draft({ title: "   " }))).toThrow(/LETTER_SCHEMA_INVALID/);
+    await expect(cycle.breathe(id, draft({ title: "   " }))).rejects.toThrow(
+      /LETTER_SCHEMA_INVALID/,
+    );
 
     expect(timeline).toHaveLength(0);
     expect(registry.get(id)?.generation).toBe(1);
     expect(notices.at(-1)).toMatchObject({ kind: "failed", stage: "seal" });
   });
 
-  it("成功路径下，信进时间线的那一封与注入新代的是同一封", () => {
+  it("成功路径下，信进时间线的那一封与注入新代的是同一封", async () => {
     const { timeline, cycle, window } = harness();
 
-    const result = cycle.breathe(window.windowId, draft());
+    const result = await cycle.breathe(window.windowId, draft());
 
     expect(timeline).toHaveLength(1);
     expect(timeline[0]).toBe(result.letter);
@@ -175,14 +180,14 @@ describe("信先落定，再换代", () => {
 });
 
 describe("MV-D09 换气失败必须外显", () => {
-  it("失败产生对人可见的通知，不是只落一个日志字段", () => {
+  it("失败产生对人可见的通知，不是只落一个日志字段", async () => {
     const { cycle, window, notices } = harness({
       appendLetter: () => {
         throw new Error("disk is on fire");
       },
     });
 
-    expect(() => cycle.breathe(window.windowId, draft())).toThrow(BreathCycleError);
+    await expect(cycle.breathe(window.windowId, draft())).rejects.toThrow(BreathCycleError);
 
     const failure = notices.at(-1);
     expect(failure?.kind).toBe("failed");
@@ -194,7 +199,7 @@ describe("MV-D09 换气失败必须外显", () => {
     });
   });
 
-  it("失败后的下一次阈值穿越必须重新发预告，不因「本周期已发过」而静默", () => {
+  it("失败后的下一次阈值穿越必须重新发预告，不因「本周期已发过」而静默", async () => {
     const { cycle, window, notices } = harness({
       appendLetter: () => {
         throw new Error("still on fire");
@@ -206,7 +211,7 @@ describe("MV-D09 换气失败必须外显", () => {
     // 同一周期内重复穿越只发一次——这是去重，正常。
     expect(cycle.announce(id)).toBe(false);
 
-    expect(() => cycle.breathe(id, draft())).toThrow(BreathCycleError);
+    await expect(cycle.breathe(id, draft())).rejects.toThrow(BreathCycleError);
 
     // 判红样例：失败若不清预告记号，这一条会返回 false，
     // 于是连续失败对人完全静默。
@@ -216,22 +221,22 @@ describe("MV-D09 换气失败必须外显", () => {
     expect(announced).toHaveLength(2);
   });
 
-  it("换气成功也清预告记号：下一周期的穿越照常发", () => {
+  it("换气成功也清预告记号：下一周期的穿越照常发", async () => {
     const { cycle, window, notices } = harness();
     const id = window.windowId;
 
     expect(cycle.announce(id)).toBe(true);
-    cycle.breathe(id, draft());
+    await cycle.breathe(id, draft());
     expect(cycle.announce(id)).toBe(true);
 
     expect(notices.filter((event) => event.kind === "announced")).toHaveLength(2);
     expect(notices.filter((event) => event.kind === "completed")).toHaveLength(1);
   });
 
-  it("成功也通知，且带着新旧两代——人要能分清换到了第几代", () => {
+  it("成功也通知，且带着新旧两代——人要能分清换到了第几代", async () => {
     const { cycle, window, notices } = harness();
 
-    cycle.breathe(window.windowId, draft());
+    await cycle.breathe(window.windowId, draft());
 
     expect(notices.at(-1)).toMatchObject({
       kind: "completed",
@@ -242,10 +247,10 @@ describe("MV-D09 换气失败必须外显", () => {
     });
   });
 
-  it("对不存在的窗换气：报错且外显，不静默返回", () => {
+  it("对不存在的窗换气：报错且外显，不静默返回", async () => {
     const { cycle, notices } = harness();
 
-    expect(() => cycle.breathe("w_not_a_window", draft())).toThrow(/window is not live/);
+    await expect(cycle.breathe("w_not_a_window", draft())).rejects.toThrow(/window is not live/);
 
     expect(notices.at(-1)).toMatchObject({
       kind: "failed",
@@ -262,11 +267,11 @@ describe("MV-D09 换气失败必须外显", () => {
 });
 
 describe("同住户多窗互不串气", () => {
-  it("换一扇窗的气，不动另一扇窗的代际", () => {
+  it("换一扇窗的气，不动另一扇窗的代际", async () => {
     const { registry, cycle, window } = harness();
     const other = registry.open("resident-a", { context: { notes: ["另一扇"] } });
 
-    cycle.breathe(window.windowId, draft());
+    await cycle.breathe(window.windowId, draft());
 
     expect(other.windowId).not.toBe(window.windowId);
     expect(registry.get(other.windowId)?.generation).toBe(1);
