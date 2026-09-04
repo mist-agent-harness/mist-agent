@@ -173,6 +173,86 @@ afterEach(async () => {
 });
 
 describe("one canonical stream real host", () => {
+  it("accepts only bounded work events and leaves the stream unchanged on rejected context", async () => {
+    const directory = temporaryDirectory();
+    const child = startHost(directory);
+    await waitForReady(child);
+    const residentId = "resident-bounded";
+    await callHost(child, { op: "create", residentId });
+
+    const purposes = ["progress", "blocked", "result"] as const;
+    for (const [index, purpose] of purposes.entries()) {
+      const receipt = await callHost<DeliveryReceipt>(child, {
+        op: "submitWorkEvent",
+        workEvent: {
+          residentId,
+          idempotencyKey: `work-${purpose}`,
+          purpose,
+          occurredAt: `2026-08-26T00:00:0${index}.000Z`,
+          workRef: "work-alpha",
+          artifactRef: `artifact:${purpose}`,
+          source: { windowId: "window-a", generation: 1 },
+          effect: {
+            state: purpose === "result" ? "committed-effective" : "attempted",
+            requiresUserAction: purpose === "blocked",
+            retry: purpose === "blocked" ? "awaiting-external" : "none",
+          },
+          summary: `${purpose} summary`,
+        },
+      });
+      expect(receipt.phase).toBe("delivered");
+    }
+
+    const legalEvents = await callHost<CanonicalEvent[]>(child, { op: "events", residentId });
+    expect(legalEvents.map((event) => event.purpose)).toEqual(purposes);
+    expect(legalEvents.map((event) => event.origin.viewport)).toEqual([
+      { windowId: "window-a", generation: 1 },
+      { windowId: "window-a", generation: 1 },
+      { windowId: "window-a", generation: 1 },
+    ]);
+    expect(legalEvents.map((event) => event.workRef)).toEqual([
+      "work-alpha",
+      "work-alpha",
+      "work-alpha",
+    ]);
+    expect(legalEvents.map((event) => event.artifactRef)).toEqual([
+      "artifact:progress",
+      "artifact:blocked",
+      "artifact:result",
+    ]);
+    expect(legalEvents.every((event) => event.authoritySource.id === "mist-host")).toBe(true);
+
+    const snapshotPath = join(directory, `${residentId}.stream.json`);
+    const beforeRejected = readFileSync(snapshotPath, "utf8");
+    const base = {
+      residentId,
+      idempotencyKey: "work-invalid",
+      purpose: "progress",
+      occurredAt: "2026-08-26T00:00:04.000Z",
+      workRef: "work-alpha",
+      artifactRef: "artifact:progress",
+      source: { windowId: "window-a", generation: 1 },
+      effect: { state: "attempted", requiresUserAction: false, retry: "none" },
+      summary: "legal summary",
+    };
+
+    for (const workEvent of [
+      { ...base, transcript: ["local turn"] },
+      { ...base, messages: [{ role: "user", content: "local turn" }] },
+      { ...base, context: "local context" },
+      { ...base, authoritySource: { kind: "viewport", id: "window-a" } },
+      "untyped free text",
+    ]) {
+      await expect(callHost(child, { op: "submitWorkEvent", workEvent })).rejects.toThrow(
+        "BOUNDED_WORK_EVENT",
+      );
+      expect(readFileSync(snapshotPath, "utf8")).toBe(beforeRejected);
+    }
+
+    expect(await callHost<CanonicalEvent[]>(child, { op: "events", residentId })).toHaveLength(3);
+    await stopHost(child);
+  });
+
   it("orders concurrent viewport events once and gives all projections identical bytes", async () => {
     const directory = temporaryDirectory();
     const child = startHost(directory);
