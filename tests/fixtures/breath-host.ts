@@ -2,7 +2,7 @@
  * 换气集成宿主：子进程里装配生产件——SessionRegistry、MessageTreeStore +
  * Service、ViewportTurnGate（接阈值计量口）、BreathCycle（接流水卫生检查），
  * 父进程经 IPC 驱动，覆盖验收清单 D 区的 [集成] 半格
- * （MV-D01/D02/D04 后半/D07/D07b）。
+ * （MV-D01/D02/D04 后半/D07/D07b/D09）。
  *
  * 形状仿 turn-gate-host.ts。关键装配口径：
  *
@@ -11,6 +11,8 @@
  *   不进新代的用量核算与卫生检查（MV-D07：猝死窗流水不自动注入）。
  * - 上下文用量计（MV-D01/D04）：口径 = 本代流水 + 在途 notes，**不含交接信**
  *   （D8 补记二）。信经 injectLetter 进 context.letter，用量计不看它。
+ * - 阈值闸的 announce 口直连 BreathCycle 的人可见通知口（MV-D09）：换气失败
+ *   清掉预告去重位后，仍然过线的下一回合会重新送出预告。
  * - 畸形残骸进不了 MessageTreeStore（契约闸会拒），所以畸形注入走 fixture
  *   自管的原始碎片带，叠在流水切片之上交给卫生检查——它模拟的是异源/
  *   崩溃写入留下的、绕过店内校验的流水。合法残骸（半截回合）用
@@ -42,6 +44,7 @@ const events: TurnGateEvent[] = [];
 const notices: BreathNotification[] = [];
 const timeline: SealedLetter[] = [];
 const debrisLog: string[] = [];
+let appendFailure: string | null = null;
 
 /** windowId → 本代流水的插入序起点。 */
 const boundaries = new Map<string, number>();
@@ -74,6 +77,22 @@ function usageOf(windowId: string): number | null {
   return flowTokens + noteTokens;
 }
 
+const cycle = new BreathCycle<Ctx>({
+  registry,
+  appendLetter: (letter) => {
+    if (appendFailure !== null) {
+      throw new Error(appendFailure);
+    }
+    timeline.push(letter);
+  },
+  injectLetter: (context, letter) => ({ ...context, letter }),
+  notify: (event) => {
+    notices.push(event);
+  },
+  flowOf: (window) => [...flowSlice(window), ...(rawDebris.get(window.windowId) ?? [])],
+  now: () => new Date().toISOString(),
+});
+
 const gate = new ViewportTurnGate(ledger, {
   logger: {
     log: (event) => {
@@ -81,7 +100,12 @@ const gate = new ViewportTurnGate(ledger, {
     },
   },
   generationOf: (windowId) => registry.get(windowId)?.generation ?? null,
-  breath: { usageOf },
+  breath: {
+    usageOf,
+    announce: (windowId) => {
+      cycle.announce(windowId);
+    },
+  },
 });
 
 let lastPrompt: string | null = null;
@@ -100,19 +124,6 @@ const service = new MessageTreeService(
   },
 );
 
-const cycle = new BreathCycle<Ctx>({
-  registry,
-  appendLetter: (letter) => {
-    timeline.push(letter);
-  },
-  injectLetter: (context, letter) => ({ ...context, letter }),
-  notify: (event) => {
-    notices.push(event);
-  },
-  flowOf: (window) => [...flowSlice(window), ...(rawDebris.get(window.windowId) ?? [])],
-  now: () => new Date().toISOString(),
-});
-
 type HostCommand = {
   requestId: string;
   op:
@@ -128,6 +139,7 @@ type HostCommand = {
     | "reopen"
     | "injectRemnant"
     | "injectDebris"
+    | "setAppendFailure"
     | "quarantineDebris"
     | "notices"
     | "events"
@@ -138,6 +150,7 @@ type HostCommand = {
   windowId?: string;
   message?: string;
   content?: string;
+  reason?: string;
   tokens?: number;
   draft?: LetterDraft;
   debris?: unknown[];
@@ -235,6 +248,9 @@ async function execute(command: HostCommand): Promise<unknown> {
     }
     case "injectDebris":
       rawDebris.set(requireString(command.windowId, "windowId"), command.debris ?? []);
+      return null;
+    case "setAppendFailure":
+      appendFailure = requireString(command.reason, "reason");
       return null;
     case "quarantineDebris": {
       const windowId = requireString(command.windowId, "windowId");

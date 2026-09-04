@@ -120,6 +120,11 @@ export interface BreathThresholdOptions {
    * 让信给上下文顶缸）。返回 null = 这扇窗无计量，阈值闸对它不触发。
    */
   usageOf: (windowId: string) => number | null;
+  /**
+   * 阈值穿越的对人可见预告口（MV-D09）。日志不是通知：硬闸在抛错前必须
+   * 同时走这条宿主出口。实现方负责同周期去重，并在换气失败后释放去重位。
+   */
+  announce: (windowId: string) => void;
 }
 
 export interface ViewportTurnGateOptions {
@@ -228,6 +233,7 @@ export class ViewportTurnGate implements TurnGate {
           windowId,
           `上下文用量 ${usage} ≥ 阈值 ${threshold}：硬闸拦下新回合`,
         );
+        this.#breath?.announce(windowId);
         throw new BreathThresholdError(windowId, usage, threshold);
       }
     }
