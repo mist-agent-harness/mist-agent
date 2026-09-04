@@ -29,8 +29,6 @@ const TIERS = new Set<LetterTier>(["commitment", "fact", "judgment"]);
 
 export interface HandoverLetterAnchor {
   readonly residentId: string;
-  readonly windowId: string;
-  readonly generation: number;
   readonly title: string;
 }
 
@@ -159,20 +157,9 @@ function artifactRef(windowId: string, generation: number): string {
   return `handover-letter:${windowId}:${generation}`;
 }
 
-function anchorOf(letter: SealedLetter): HandoverLetterAnchor {
-  return {
-    residentId: letter.residentId,
-    windowId: letter.windowId,
-    generation: letter.generation,
-    title: letter.title,
-  };
-}
-
 function parseAnchor(value: HandoverLetterAnchor): HandoverLetterAnchor {
   return {
     residentId: nonEmpty(value.residentId, "anchor.residentId"),
-    windowId: nonEmpty(value.windowId, "anchor.windowId"),
-    generation: positiveInteger(value.generation, "anchor.generation"),
     title: nonEmpty(value.title, "anchor.title").trim(),
   };
 }
@@ -184,7 +171,7 @@ function letterFromEvent(event: CanonicalEvent): SealedLetter | null {
   const letter = parseLetter(event.payload.letter);
   const viewport = event.origin.viewport;
   if (
-    event.purpose !== "message" ||
+    event.purpose !== "lifecycle" ||
     event.workRef !== null ||
     event.authoritySource.kind !== "host" ||
     event.origin.reporter.kind !== "resident" ||
@@ -235,13 +222,15 @@ function receiptFor(event: CanonicalEvent): DeliveryReceipt {
 /**
  * Host-owned handover port backed by the resident's one canonical stream.
  *
- * A window generation gets exactly one letter event. Recall always includes the title together
- * with windowId and generation, so equal titles in another window or generation cannot bleed in.
+ * A window generation gets exactly one letter event. A title is unique within a resident's
+ * canonical timeline, so recall needs only the resident and title and returns the matching
+ * window/generation as detail rather than requiring the caller to know them in advance.
  */
 export class CanonicalHandoverTimeline {
   readonly #writer: CanonicalStreamWriter;
   readonly #readPort: CanonicalStreamReadPort;
   readonly #authoritySource: EventActor;
+  readonly #queues = new Map<string, Promise<void>>();
 
   constructor(
     writer: CanonicalStreamWriter,
@@ -258,8 +247,12 @@ export class CanonicalHandoverTimeline {
 
   async append(value: SealedLetter): Promise<DeliveryReceipt> {
     const letter = parseLetter(value);
+    return this.#enqueue(letter.residentId, () => this.#append(letter));
+  }
+
+  async #append(letter: SealedLetter): Promise<DeliveryReceipt> {
     const canonicalLetter = JSON.parse(stableJson(letter)) as JsonObject;
-    const existing = this.#eventAt(anchorOf(letter), true);
+    const existing = this.#existingForAppend(letter, true);
     if (existing !== null) return this.#recover(existing, letter);
 
     try {
@@ -267,7 +260,7 @@ export class CanonicalHandoverTimeline {
         residentId: letter.residentId,
         idempotencyKey: artifactRef(letter.windowId, letter.generation),
         draft: {
-          purpose: "message",
+          purpose: "lifecycle",
           occurredAt: letter.sealedAt,
           workRef: null,
           authoritySource: this.#authoritySource,
@@ -288,7 +281,7 @@ export class CanonicalHandoverTimeline {
     } catch (error) {
       // The writer can die after the durable rename and before its receipt reaches this caller.
       // Re-read the one stream: a matching event is the receipt; absence preserves the real error.
-      const committed = this.#eventAt(anchorOf(letter), true);
+      const committed = this.#existingForAppend(letter, true);
       if (committed !== null) return this.#recover(committed, letter);
       throw error;
     }
@@ -298,7 +291,7 @@ export class CanonicalHandoverTimeline {
     const anchor = parseAnchor(value);
     let event: CanonicalEvent | null;
     try {
-      event = this.#eventAt(anchor);
+      event = this.#eventByTitle(anchor);
     } catch (error) {
       if (error instanceof StreamNotFoundError) {
         return { kind: "unavailable", anchor, reason: "canonical-stream-not-found" };
@@ -307,7 +300,7 @@ export class CanonicalHandoverTimeline {
     }
     if (event === null) return { kind: "not-found", anchor };
     const letter = letterFromEvent(event);
-    if (letter === null || letter.title !== anchor.title) return { kind: "not-found", anchor };
+    if (letter === null) return { kind: "not-found", anchor };
     return {
       kind: "found",
       anchor,
@@ -328,28 +321,63 @@ export class CanonicalHandoverTimeline {
     }
   }
 
-  #eventAt(anchor: HandoverLetterAnchor, missingIsEmpty = false): CanonicalEvent | null {
+  #handoverEvents(
+    residentId: string,
+    missingIsEmpty = false,
+  ): { event: CanonicalEvent; letter: SealedLetter }[] {
     let events: CanonicalEvent[];
     try {
-      events = this.#events(anchor.residentId);
+      events = this.#events(residentId);
     } catch (error) {
-      if (missingIsEmpty && error instanceof StreamNotFoundError) return null;
+      if (missingIsEmpty && error instanceof StreamNotFoundError) return [];
       throw error;
     }
-    const matches = events.filter((event) => {
+    return events.flatMap((event) => {
       const letter = letterFromEvent(event);
-      return (
-        letter !== null &&
-        letter.windowId === anchor.windowId &&
-        letter.generation === anchor.generation
-      );
+      return letter === null ? [] : [{ event, letter }];
     });
+  }
+
+  #eventByTitle(anchor: HandoverLetterAnchor): CanonicalEvent | null {
+    const matches = this.#handoverEvents(anchor.residentId).filter(
+      ({ letter }) => letter.title === anchor.title,
+    );
     if (matches.length > 1) {
       throw new HandoverTimelineError(
-        `multiple handover letters for ${anchor.residentId}/${anchor.windowId}#${anchor.generation}`,
+        `multiple handover letters for title ${anchor.residentId}/${anchor.title}`,
       );
     }
-    return matches[0] ?? null;
+    return matches[0]?.event ?? null;
+  }
+
+  #existingForAppend(letter: SealedLetter, missingIsEmpty = false): CanonicalEvent | null {
+    const entries = this.#handoverEvents(letter.residentId, missingIsEmpty);
+    const generationMatches = entries.filter(
+      (entry) =>
+        entry.letter.windowId === letter.windowId && entry.letter.generation === letter.generation,
+    );
+    if (generationMatches.length > 1) {
+      throw new HandoverTimelineError(
+        `multiple handover letters for ${letter.residentId}/${letter.windowId}#${letter.generation}`,
+      );
+    }
+    const titleMatches = entries.filter((entry) => entry.letter.title === letter.title);
+    if (titleMatches.length > 1) {
+      throw new HandoverTimelineError(
+        `multiple handover letters for title ${letter.residentId}/${letter.title}`,
+      );
+    }
+    const generationMatch = generationMatches[0];
+    const titleMatch = titleMatches[0];
+    if (
+      titleMatch !== undefined &&
+      (generationMatch === undefined || titleMatch.event.eventId !== generationMatch.event.eventId)
+    ) {
+      throw new HandoverTimelineError(
+        `handover title already exists for ${letter.residentId}: ${letter.title}`,
+      );
+    }
+    return generationMatch?.event ?? null;
   }
 
   #recover(event: CanonicalEvent, attempted: SealedLetter): DeliveryReceipt {
@@ -360,5 +388,23 @@ export class CanonicalHandoverTimeline {
       );
     }
     return receiptFor(event);
+  }
+
+  #enqueue<T>(residentId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.#queues.get(residentId) ?? Promise.resolve();
+    let release = (): void => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const marker = previous.then(
+      () => gate,
+      () => gate,
+    );
+    this.#queues.set(residentId, marker);
+
+    return previous.then(operation, operation).finally(() => {
+      release();
+      if (this.#queues.get(residentId) === marker) this.#queues.delete(residentId);
+    });
   }
 }
