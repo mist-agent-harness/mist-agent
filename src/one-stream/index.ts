@@ -49,6 +49,7 @@ export {
 export type {
   CloseWorkspaceReceipt,
   CloseWorkspaceRequest,
+  CreateWorkspaceOptions,
   EvidencePrincipal,
   EvidenceReadRequest,
   EvidenceViewportRecord,

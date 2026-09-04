@@ -63,13 +63,16 @@
 
   证据：`FirstPartyResidentView` 只投影 canonical stream 与仍活着的 workspace handle，接口不含
   archive/history/resume；`WorkspaceLifecycleOwner` 先写 durable closure request，再归档窗，
-  最后写 committed-effective result，两个间隙都可按同一幂等键 reconcile。`EvidenceAuthority`
-  只认宿主签发的对象身份，不把一段可伪造的 capability 字符串当授权；获授权的
-  `EvidenceViewportReader` 只能拿 canonical result eventId，沿其中绑定的 artifactRef 与
-  viewport identity 调只读 `MessageTreeViewportHistory`；无权主体、closure intent 或裸 windowId
-  都不能成为读取入口。`tests/one-stream-workspace.test.ts` 用真实 SessionRegistry、MessageTree
-  分支与 canonical writer 验证两扇活窗、关一扇后入口消失、另一扇仍活、证据分支只读以及
-  closure-delivered 后猝死再对账。
+  最后写 committed-effective result，两个间隙都可按同一幂等键 reconcile；closure 同时保存
+  host 恢复归档所需的 scope/head 快照，因此 file-backed stream 与 SessionRegistry 一起重建后也
+  能闭合第一段间隙。用户面的 `create` 只收 context 与可选 scope，不能传 windowId/headId 重开
+  归档窗。`EvidenceAuthority` 只认宿主签发的对象身份，不把一段可伪造的 capability 字符串当
+  授权；`EvidenceViewportReader` 还会核 closure/result 都由同一 host 签发，并逐项配对
+  workRef、artifactRef、operationId、subject 与 viewport identity，不相干 result 不能压掉待恢复
+  closure，viewport 自签的事件对也不能解锁历史。获授权的 reader 只能拿 canonical result
+  eventId 调只读 `MessageTreeViewportHistory`；无权主体、closure intent 或裸 windowId 都不能成为
+  读取入口。`tests/one-stream-workspace.test.ts` 用真实 file store、SessionRegistry、MessageTree
+  分支与 canonical writer 验证两扇活窗、两处 crash recovery 以及上述三支反例。
 
 - [ ] **OS-04 有界投递不夹带局部 transcript** [集成]：progress、blocked、result 三类
   合法 envelope 各投一次，来源 viewport、发生时刻、工作把手、权威产物指针与效果状态

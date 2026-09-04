@@ -26,6 +26,7 @@ const ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 export const WINDOW_ARCHIVED = "WINDOW_ARCHIVED" as const;
 export const WINDOW_REOPEN_INVALID = "WINDOW_REOPEN_INVALID" as const;
+export const WINDOW_ARCHIVE_RECOVERY_INVALID = "WINDOW_ARCHIVE_RECOVERY_INVALID" as const;
 
 export class WindowArchivedError extends Error {
   readonly code = WINDOW_ARCHIVED;
@@ -40,6 +41,14 @@ export class WindowReopenError extends Error {
   constructor(windowId: string, reason: string) {
     super(`${WINDOW_REOPEN_INVALID}: ${windowId}: ${reason}`);
     this.name = "WindowReopenError";
+  }
+}
+
+export class WindowArchiveRecoveryError extends Error {
+  readonly code = WINDOW_ARCHIVE_RECOVERY_INVALID;
+  constructor(windowId: string, reason: string) {
+    super(`${WINDOW_ARCHIVE_RECOVERY_INVALID}: ${windowId}: ${reason}`);
+    this.name = "WindowArchiveRecoveryError";
   }
 }
 
@@ -441,6 +450,65 @@ export class SessionRegistry<TContext> {
     this.#active.delete(windowId);
     this.#archived.set(windowId, archived);
     return cloneArchivedWindow(archived);
+  }
+
+  /**
+   * Finish a host-owned close operation after restart. The caller must supply the exact durable
+   * snapshot recorded before the active window disappeared; this method cannot invent or resume
+   * an active context. It only restores the archived evidence record for the latest issued
+   * generation of an already-known window identity.
+   */
+  recoverArchived(window: ArchivedWindow): ArchivedWindow {
+    if (
+      window.archived !== true ||
+      typeof window.residentId !== "string" ||
+      window.residentId.length === 0 ||
+      typeof window.windowId !== "string" ||
+      window.windowId.length === 0 ||
+      typeof window.scopeId !== "string" ||
+      window.scopeId.length === 0 ||
+      !Number.isSafeInteger(window.generation) ||
+      window.generation < 1
+    ) {
+      throw new WindowArchiveRecoveryError(window.windowId, "archive snapshot is invalid");
+    }
+    const existing = this.#archived.get(window.windowId);
+    if (existing !== undefined) {
+      if (
+        existing.residentId !== window.residentId ||
+        existing.scopeId !== window.scopeId ||
+        existing.generation !== window.generation ||
+        existing.headId !== window.headId ||
+        window.archived !== true
+      ) {
+        throw new WindowArchiveRecoveryError(window.windowId, "archive snapshot mismatch");
+      }
+      return cloneArchivedWindow(existing);
+    }
+    if (this.#active.has(window.windowId)) {
+      throw new WindowArchiveRecoveryError(window.windowId, "window is still active");
+    }
+    const identity = this.#windowIdentity.get(window.windowId);
+    if (
+      identity === undefined ||
+      identity.residentId !== window.residentId ||
+      identity.scopeId !== window.scopeId
+    ) {
+      throw new WindowArchiveRecoveryError(window.windowId, "window identity mismatch");
+    }
+    if (this.#lastGeneration.get(window.windowId) !== window.generation) {
+      throw new WindowArchiveRecoveryError(window.windowId, "generation is not the latest issued");
+    }
+    if (
+      window.headId !== null &&
+      (typeof window.headId !== "string" || window.headId.length === 0)
+    ) {
+      throw new WindowArchiveRecoveryError(window.windowId, "headId is invalid");
+    }
+    const recovered = cloneArchivedWindow({ ...window, archived: true });
+    this.#appendArchive(recovered);
+    this.#archived.set(recovered.windowId, recovered);
+    return cloneArchivedWindow(recovered);
   }
 
   /** 杀掉一位住户的全部活窗（MV-A03 后半）。 */

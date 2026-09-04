@@ -1,11 +1,6 @@
 import type { HistoryNode } from "../../acceptance/driver.ts";
 import type { MessageTreeStore } from "../message-tree/store.ts";
-import type {
-  ActiveWindow,
-  ArchivedWindow,
-  OpenOptions,
-  SessionRegistry,
-} from "../session/session-registry.ts";
+import type { ActiveWindow, ArchivedWindow, SessionRegistry } from "../session/session-registry.ts";
 import type { CanonicalEvent, DeliveryReceipt, EventActor } from "./event-contract.ts";
 import type { CanonicalStreamReadPort } from "./store.ts";
 import type { CanonicalStreamWriter } from "./writer.ts";
@@ -20,6 +15,11 @@ export interface WorkspaceHandle {
 export interface WorkspaceCreatedReceipt {
   readonly phase: "workspace-created";
   readonly handle: WorkspaceHandle;
+}
+
+export interface CreateWorkspaceOptions<TContext> {
+  readonly context: TContext;
+  readonly scopeId?: string;
 }
 
 export interface FirstPartyResidentSnapshot {
@@ -130,6 +130,67 @@ function closureEventId(event: CanonicalEvent): string | null {
   return typeof value === "string" ? value : null;
 }
 
+function operationId(event: CanonicalEvent): string | null {
+  const value = event.payload.operationId;
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function sameActor(left: EventActor, right: EventActor): boolean {
+  return left.kind === right.kind && left.id === right.id;
+}
+
+function hostIssued(event: CanonicalEvent): boolean {
+  return (
+    event.authoritySource.kind === "host" &&
+    event.origin.reporter.kind === "host" &&
+    sameActor(event.authoritySource, event.origin.reporter)
+  );
+}
+
+function viewportSubjectMatches(event: CanonicalEvent): boolean {
+  return (
+    event.origin.viewport !== null &&
+    event.origin.subject.kind === "viewport" &&
+    event.origin.subject.id === event.origin.viewport.windowId
+  );
+}
+
+function authoritativeClosureRequest(event: CanonicalEvent): boolean {
+  return (
+    event.purpose === "closure" &&
+    event.effect.state === "attempted" &&
+    event.effect.requiresUserAction === false &&
+    event.effect.retry === "automatic" &&
+    closurePhase(event) === "requested" &&
+    event.workRef !== null &&
+    event.artifactRef !== null &&
+    operationId(event) !== null &&
+    hostIssued(event) &&
+    viewportSubjectMatches(event)
+  );
+}
+
+function authoritativeClosurePair(requested: CanonicalEvent, result: CanonicalEvent): boolean {
+  return (
+    authoritativeClosureRequest(requested) &&
+    result.purpose === "result" &&
+    result.effect.state === "committed-effective" &&
+    result.effect.requiresUserAction === false &&
+    result.effect.retry === "none" &&
+    closurePhase(result) === "closed" &&
+    closureEventId(result) === requested.eventId &&
+    result.residentId === requested.residentId &&
+    result.workRef === requested.workRef &&
+    result.artifactRef === requested.artifactRef &&
+    operationId(result) === operationId(requested) &&
+    hostIssued(result) &&
+    viewportSubjectMatches(result) &&
+    sameActor(result.authoritySource, requested.authoritySource) &&
+    result.origin.viewport?.windowId === requested.origin.viewport?.windowId &&
+    result.origin.viewport?.generation === requested.origin.viewport?.generation
+  );
+}
+
 function sameWindow(
   window: Pick<ActiveWindow<unknown> | ArchivedWindow, "residentId" | "windowId" | "generation">,
   event: CanonicalEvent,
@@ -191,15 +252,30 @@ export class WorkspaceLifecycleOwner<TContext> {
     this.#checkpoint = options.checkpoint;
   }
 
-  create(residentId: string, options: OpenOptions<TContext>): WorkspaceCreatedReceipt {
+  create(residentId: string, options: CreateWorkspaceOptions<TContext>): WorkspaceCreatedReceipt {
     nonEmpty(residentId, "residentId");
-    const window = this.#sessions.open(residentId, options);
+    const keys = Object.keys(options).sort();
+    if (
+      keys.length < 1 ||
+      keys.length > 2 ||
+      keys[0] !== "context" ||
+      (keys.length === 2 && keys[1] !== "scopeId")
+    ) {
+      throw new WorkspaceCapabilityError(
+        "first-party workspace create accepts only context and optional scopeId",
+      );
+    }
+    const window = this.#sessions.open(residentId, {
+      context: options.context,
+      ...(options.scopeId === undefined ? {} : { scopeId: options.scopeId }),
+    });
     return Object.freeze({ phase: "workspace-created", handle: handle(window) });
   }
 
   async close(request: CloseWorkspaceRequest): Promise<CloseWorkspaceReceipt> {
     this.#assertRequest(request);
-    const requested = await this.#submitRequested(request);
+    const snapshot = this.#workspaceSnapshot(request);
+    const requested = await this.#submitRequested(request, snapshot);
     await this.#checkpoint?.("closure-delivered");
     const archived = this.#archiveExact(request);
     await this.#checkpoint?.("workspace-archived");
@@ -210,21 +286,11 @@ export class WorkspaceLifecycleOwner<TContext> {
   async reconcile(residentId: string): Promise<CloseWorkspaceReceipt[]> {
     nonEmpty(residentId, "residentId");
     const events = this.#stream.eventsAfter(residentId, 0);
-    const completed = new Set(
-      events
-        .filter((event) => event.purpose === "result" && closurePhase(event) === "closed")
-        .map(closureEventId)
-        .filter((eventId): eventId is string => eventId !== null),
-    );
     const recovered: CloseWorkspaceReceipt[] = [];
     for (const event of events) {
       if (
-        event.purpose !== "closure" ||
-        closurePhase(event) !== "requested" ||
-        completed.has(event.eventId) ||
-        event.origin.viewport === null ||
-        event.workRef === null ||
-        event.artifactRef === null
+        !authoritativeClosureRequest(event) ||
+        events.some((candidate) => authoritativeClosurePair(event, candidate))
       ) {
         continue;
       }
@@ -232,17 +298,21 @@ export class WorkspaceLifecycleOwner<TContext> {
       if (typeof summary !== "string") {
         throw new WorkspaceCapabilityError(`closure ${event.eventId} has no summary`);
       }
+      const viewport = event.origin.viewport;
+      if (viewport === null) {
+        throw new WorkspaceCapabilityError(`closure ${event.eventId} has no viewport`);
+      }
       const request: CloseWorkspaceRequest = {
         residentId,
-        windowId: event.origin.viewport.windowId,
-        generation: event.origin.viewport.generation,
-        workRef: event.workRef,
-        artifactRef: event.artifactRef,
+        windowId: viewport.windowId,
+        generation: viewport.generation,
+        workRef: nonEmpty(event.workRef, "closure workRef"),
+        artifactRef: nonEmpty(event.artifactRef, "closure artifactRef"),
         idempotencyKey: nonEmpty(event.payload.operationId, "closure operationId"),
         occurredAt: event.occurredAt,
         summary,
       };
-      const archived = this.#archiveExact(request);
+      const archived = this.#archiveExact(request, event);
       const effective = await this.#submitEffective(request, event.eventId);
       recovered.push({
         requested: {
@@ -278,6 +348,15 @@ export class WorkspaceLifecycleOwner<TContext> {
     }
   }
 
+  #workspaceSnapshot(request: CloseWorkspaceRequest): ActiveWindow<TContext> | ArchivedWindow {
+    const current =
+      this.#sessions.get(request.windowId) ?? this.#sessions.getArchived(request.windowId);
+    if (current === undefined || !sameWindow(current, this.#eventShape(request))) {
+      throw new WorkspaceCapabilityError("workspace identity does not match the requested closure");
+    }
+    return current;
+  }
+
   #eventShape(request: CloseWorkspaceRequest): CanonicalEvent {
     return {
       schemaVersion: 1,
@@ -300,7 +379,10 @@ export class WorkspaceLifecycleOwner<TContext> {
     };
   }
 
-  async #submitRequested(request: CloseWorkspaceRequest): Promise<DeliveryReceipt> {
+  async #submitRequested(
+    request: CloseWorkspaceRequest,
+    snapshot: ActiveWindow<TContext> | ArchivedWindow,
+  ): Promise<DeliveryReceipt> {
     return this.#writer.submit({
       residentId: request.residentId,
       idempotencyKey: `${request.idempotencyKey}:requested`,
@@ -317,24 +399,44 @@ export class WorkspaceLifecycleOwner<TContext> {
         effect: { state: "attempted", requiresUserAction: false, retry: "automatic" },
         artifactRef: request.artifactRef,
         payload: {
+          headId: snapshot.headId,
           operationId: request.idempotencyKey,
           phase: "requested",
+          scopeId: snapshot.scopeId,
           summary: request.summary,
         },
       },
     });
   }
 
-  #archiveExact(request: CloseWorkspaceRequest): ArchivedWindow {
+  #archiveExact(request: CloseWorkspaceRequest, closure?: CanonicalEvent): ArchivedWindow {
     const live = this.#sessions.get(request.windowId);
     if (live !== undefined && !sameWindow(live, this.#eventShape(request))) {
       throw new WorkspaceCapabilityError("refusing to archive a different workspace generation");
     }
     const archived = this.#sessions.kill(request.windowId);
-    if (archived === undefined || !sameWindow(archived, this.#eventShape(request))) {
-      throw new WorkspaceCapabilityError("closure points to a missing or mismatched workspace");
+    if (archived !== undefined) {
+      if (!sameWindow(archived, this.#eventShape(request))) {
+        throw new WorkspaceCapabilityError("closure points to a mismatched workspace");
+      }
+      return archived;
     }
-    return archived;
+    if (closure === undefined) {
+      throw new WorkspaceCapabilityError("closure points to a missing workspace");
+    }
+    const scopeId = nonEmpty(closure.payload.scopeId, "closure scopeId");
+    const rawHeadId = closure.payload.headId;
+    if (rawHeadId !== null && (typeof rawHeadId !== "string" || rawHeadId.length === 0)) {
+      throw new WorkspaceCapabilityError("closure headId must be null or a non-empty string");
+    }
+    return this.#sessions.recoverArchived({
+      residentId: request.residentId,
+      windowId: request.windowId,
+      generation: request.generation,
+      scopeId,
+      headId: rawHeadId,
+      archived: true,
+    });
   }
 
   async #submitEffective(
@@ -434,6 +536,8 @@ export class EvidenceViewportReader {
       event.purpose !== "result" ||
       event.effect.state !== "committed-effective" ||
       closurePhase(event) !== "closed" ||
+      !hostIssued(event) ||
+      !viewportSubjectMatches(event) ||
       event.origin.viewport === null ||
       event.artifactRef === null
     ) {
@@ -441,16 +545,7 @@ export class EvidenceViewportReader {
     }
     const requestedEventId = closureEventId(event);
     const requested = events.find((candidate) => candidate.eventId === requestedEventId);
-    if (
-      requested === undefined ||
-      requested.purpose !== "closure" ||
-      requested.effect.state !== "attempted" ||
-      closurePhase(requested) !== "requested" ||
-      requested.workRef !== event.workRef ||
-      requested.artifactRef !== event.artifactRef ||
-      requested.origin.viewport?.windowId !== event.origin.viewport.windowId ||
-      requested.origin.viewport.generation !== event.origin.viewport.generation
-    ) {
+    if (requested === undefined || !authoritativeClosurePair(requested, event)) {
       throw new WorkspaceCapabilityError("result event does not bind to its closure request");
     }
     const binding: ViewportEvidenceBinding = {
