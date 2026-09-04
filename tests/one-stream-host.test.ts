@@ -240,6 +240,8 @@ describe("one canonical stream real host", () => {
       { ...base, transcript: ["local turn"] },
       { ...base, messages: [{ role: "user", content: "local turn" }] },
       { ...base, context: "local context" },
+      { ...base, source: { ...base.source, transcript: "nested local transcript" } },
+      { ...base, effect: { ...base.effect, context: "nested local context" } },
       { ...base, authoritySource: { kind: "viewport", id: "window-a" } },
       "untyped free text",
     ]) {
