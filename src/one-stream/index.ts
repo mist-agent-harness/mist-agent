@@ -38,6 +38,26 @@ export {
   WriterClosedError,
   WriterOwnershipError,
 } from "./writer.ts";
+export {
+  EvidenceViewportReader,
+  FirstPartyResidentView,
+  MessageTreeViewportHistory,
+  WorkspaceCapabilityError,
+  WorkspaceLifecycleOwner,
+} from "./workspace-read-model.ts";
+export type {
+  CloseWorkspaceReceipt,
+  CloseWorkspaceRequest,
+  EvidencePrincipal,
+  EvidenceReadRequest,
+  EvidenceViewportRecord,
+  FirstPartyResidentSnapshot,
+  ViewportEvidenceBinding,
+  ViewportHistoryReadPort,
+  WorkspaceCreatedReceipt,
+  WorkspaceHandle,
+  WorkspaceLifecycleOptions,
+} from "./workspace-read-model.ts";
 export type {
   CanonicalEventSubmission,
   CanonicalStreamWriterOptions,

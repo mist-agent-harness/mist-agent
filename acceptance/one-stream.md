@@ -61,6 +61,15 @@
   只读流水，不能续聊或写回。`session.create` 的成功回执是工作区已存在，不是“创建了一条
   新聊天”。这四项由协议响应和 first-party read model 的结构化结果判定，不靠肉眼看 UI。
 
+  证据：`FirstPartyResidentView` 只投影 canonical stream 与仍活着的 workspace handle，接口不含
+  archive/history/resume；`WorkspaceLifecycleOwner` 先写 durable closure request，再归档窗，
+  最后写 committed-effective result，两个间隙都可按同一幂等键 reconcile。显式授权的
+  `EvidenceViewportReader` 只能拿 canonical result eventId，沿其中绑定的 artifactRef 与
+  viewport identity 调只读 `MessageTreeViewportHistory`；无权主体、closure intent 或裸 windowId
+  都不能成为读取入口。`tests/one-stream-workspace.test.ts` 用真实 SessionRegistry、MessageTree
+  分支与 canonical writer 验证两扇活窗、关一扇后入口消失、另一扇仍活、证据分支只读以及
+  closure-delivered 后猝死再对账。
+
 - [ ] **OS-04 有界投递不夹带局部 transcript** [集成]：progress、blocked、result 三类
   合法 envelope 各投一次，来源 viewport、发生时刻、工作把手、权威产物指针与效果状态
   可核，三条均进入 canonical stream。随后在同类 payload 中夹带局部 transcript、消息数组
