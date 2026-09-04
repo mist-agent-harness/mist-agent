@@ -20,6 +20,11 @@
  */
 
 import { MessageTreeService, MessageTreeStore } from "../../src/message-tree/index.ts";
+import {
+  CanonicalStreamStore,
+  CanonicalStreamWriter,
+  HostLifecycleFailurePort,
+} from "../../src/one-stream/index.ts";
 import { BreathCycle, type BreathNotification } from "../../src/session/breath-cycle.ts";
 import {
   type LetterDraft,
@@ -42,6 +47,11 @@ const events: TurnGateEvent[] = [];
 const notices: BreathNotification[] = [];
 const timeline: SealedLetter[] = [];
 const debrisLog: string[] = [];
+const canonicalStore = new CanonicalStreamStore();
+const canonicalWriter = new CanonicalStreamWriter(canonicalStore);
+const lifecycleFailures = new HostLifecycleFailurePort(canonicalWriter, {
+  authoritySource: { kind: "host", id: "mist-host" },
+});
 
 /** windowId → 本代流水的插入序起点。 */
 const boundaries = new Map<string, number>();
@@ -50,6 +60,8 @@ const rawDebris = new Map<string, unknown[]>();
 /** 已在账上开过确认位的 windowId——openViewport 对同一窗只能开一次。 */
 const viewportRows = new Set<string>();
 let remnantSeq = 0;
+let breathAttemptSeq = 0;
+let failNextAppend = false;
 
 function requireLive(windowId: string): ActiveWindow<Ctx> {
   const window = registry.get(windowId);
@@ -103,6 +115,10 @@ const service = new MessageTreeService(
 const cycle = new BreathCycle<Ctx>({
   registry,
   appendLetter: (letter) => {
+    if (failNextAppend) {
+      failNextAppend = false;
+      throw new Error("injected timeline append failure");
+    }
     timeline.push(letter);
   },
   injectLetter: (context, letter) => ({ ...context, letter }),
@@ -120,6 +136,7 @@ type HostCommand = {
     | "say"
     | "usage"
     | "configureThreshold"
+    | "announce"
     | "breathe"
     | "context"
     | "history"
@@ -133,6 +150,8 @@ type HostCommand = {
     | "events"
     | "debrisLog"
     | "timeline"
+    | "canonicalEvents"
+    | "failNextAppend"
     | "stop";
   residentId?: string;
   windowId?: string;
@@ -153,6 +172,7 @@ async function execute(command: HostCommand): Promise<unknown> {
     case "open": {
       const residentId = requireString(command.residentId, "residentId");
       ledger.createLedger(residentId);
+      if (!canonicalStore.has(residentId)) canonicalStore.createStream(residentId);
       store.createRoom(residentId);
       const window = registry.open(residentId, { context: { notes: [] } });
       ledger.openViewport(residentId, window.windowId);
@@ -177,10 +197,45 @@ async function execute(command: HostCommand): Promise<unknown> {
         command.tokens ?? Number.NaN,
       );
       return null;
+    case "announce":
+      return cycle.announce(requireString(command.windowId, "windowId"));
     case "breathe": {
       const windowId = requireString(command.windowId, "windowId");
       if (command.draft === undefined) throw new Error("missing draft");
-      const result = cycle.breathe(windowId, command.draft);
+      const before = requireLive(windowId);
+      breathAttemptSeq += 1;
+      const noticeStart = notices.length;
+      let result: ReturnType<typeof cycle.breathe>;
+      try {
+        result = cycle.breathe(windowId, command.draft);
+      } catch (error) {
+        const failure = notices
+          .slice(noticeStart)
+          .findLast(
+            (notice): notice is Extract<BreathNotification, { kind: "failed" }> =>
+              notice.kind === "failed" &&
+              notice.windowId === windowId &&
+              notice.generation === before.generation,
+          );
+        if (failure === undefined) throw new Error("breath failed without a failure notice");
+        await lifecycleFailures.submit({
+          residentId: before.residentId,
+          idempotencyKey: `breath:${windowId}:${before.generation}:${breathAttemptSeq}`,
+          occurredAt: new Date().toISOString(),
+          action: "breath",
+          subject: { windowId, generation: before.generation },
+          stage: failure.stage,
+          reason: failure.reason,
+          windowRecovered: failure.windowRecovered,
+          handling: failure.windowRecovered
+            ? { kind: "automatic-retry" }
+            : {
+                kind: "user-action",
+                action: `Recover viewport ${windowId} before retrying breath`,
+              },
+        });
+        throw error;
+      }
       // 换代即边界：旧代流水（含残骸）出切片，不进新代的核算与检查。
       boundaries.set(windowId, store.history(result.window.residentId).length);
       return {
@@ -253,7 +308,13 @@ async function execute(command: HostCommand): Promise<unknown> {
       return debrisLog;
     case "timeline":
       return timeline;
+    case "canonicalEvents":
+      return canonicalStore.events(requireString(command.residentId, "residentId"));
+    case "failNextAppend":
+      failNextAppend = true;
+      return null;
     case "stop":
+      await canonicalWriter.close();
       return null;
   }
 }

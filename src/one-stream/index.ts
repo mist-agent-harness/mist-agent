@@ -44,3 +44,12 @@ export type {
   WriterCheckpoint,
   WriterCheckpointName,
 } from "./writer.ts";
+export {
+  HostLifecycleFailureError,
+  HostLifecycleFailurePort,
+} from "./host-lifecycle-failures.ts";
+export type {
+  HostLifecycleFailurePortOptions,
+  HostLifecycleFailureSubmission,
+  LifecycleFailureHandling,
+} from "./host-lifecycle-failures.ts";

@@ -2,6 +2,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import type { HistoryNode } from "../acceptance/driver.ts";
+import type { CanonicalEvent } from "../src/one-stream/index.ts";
 import { estimateTokens } from "../src/session/handover-letter.ts";
 
 type HostReply = {
@@ -262,6 +263,60 @@ describe("换气阈值硬闸与手动入口（real host subprocess）", () => {
       message: "背着信的第一句",
     });
     expect(after.node.role).toBe("assistant");
+  });
+});
+
+describe("OS-05 宿主换气失败进入 canonical stream", () => {
+  it("真实换气失败由宿主签发、明确未生效，并在下一次阈值穿越重新预告", async () => {
+    const child = startHost();
+    await waitForReady(child);
+    const residentId = "resident-os05";
+    const { windowId } = await callHost<Opened>(child, { op: "open", residentId });
+
+    expect(await callHost<boolean>(child, { op: "announce", windowId })).toBe(true);
+    await callHost(child, { op: "failNextAppend" });
+    await expect(
+      callHost(child, {
+        op: "breathe",
+        windowId,
+        draft: draft("OS-05 换气失败", "时间线写入失败，不得静默"),
+      }),
+    ).rejects.toThrow(/BREATH_CYCLE_FAILED\[append\]/);
+
+    const events = await callHost<CanonicalEvent[]>(child, {
+      op: "canonicalEvents",
+      residentId,
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      purpose: "lifecycle",
+      residentId,
+      authoritySource: { kind: "host", id: "mist-host" },
+      origin: {
+        reporter: { kind: "host", id: "mist-host" },
+        subject: { kind: "viewport", id: windowId },
+        viewport: { windowId, generation: 1 },
+      },
+      effect: {
+        state: "failed-not-effective",
+        requiresUserAction: false,
+        retry: "automatic",
+      },
+      payload: {
+        kind: "host-lifecycle-failed",
+        action: "breath",
+        stage: "append",
+        reason: "injected timeline append failure",
+        windowRecovered: true,
+        userAction: null,
+      },
+    });
+
+    // 若实现只留 BreathCycle 的本地 notice、没有主流事件，上面的长度断言直接判红。
+    // 失败会清预告记号：下一次阈值穿越必须再次对人发出预告。
+    expect(await callHost<boolean>(child, { op: "announce", windowId })).toBe(true);
+    const notices = await callHost<Notice[]>(child, { op: "notices" });
+    expect(notices.filter((notice) => notice.kind === "announced")).toHaveLength(2);
   });
 });
 
