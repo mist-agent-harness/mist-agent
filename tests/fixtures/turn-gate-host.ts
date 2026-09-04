@@ -169,11 +169,16 @@ async function execute(command: HostCommand): Promise<unknown> {
       await driver.killSession(requireString(command.residentId, "residentId"));
       return null;
     case "appendRuling":
-      return ledger.append(requireString(command.residentId, "residentId"), {
-        author: requireString(command.author, "author"),
-        kind: command.kind ?? "ruling",
-        body: requireString(command.body, "body"),
-      });
+      // 主线程/管理员落账：显式 system 来源，不受 C04 落后窗闸（豁免必须自报）。
+      return ledger.append(
+        requireString(command.residentId, "residentId"),
+        {
+          author: requireString(command.author, "author"),
+          kind: command.kind ?? "ruling",
+          body: requireString(command.body, "body"),
+        },
+        { kind: "system", reason: "main-thread ledger write" },
+      );
     // C04：B 窗署名的裁定级写入——同一个 append 入口，只多一个发起方。
     // 窗「自查与否」在这条路径上不存在：装置故意不做任何前置检查，
     // 拦不拦全看账侧。
@@ -186,10 +191,11 @@ async function execute(command: HostCommand): Promise<unknown> {
           kind: command.kind ?? "ruling",
           body: requireString(command.body, "body"),
         },
-        { viewportId: windowBOf(residentId) },
+        { kind: "viewport", viewportId: windowBOf(residentId) },
       );
     }
     case "supersede":
+      // 主线程解除：显式 system 来源。
       return ledger.supersede(
         requireString(command.residentId, "residentId"),
         command.targetSeq ?? -1,
@@ -197,6 +203,7 @@ async function execute(command: HostCommand): Promise<unknown> {
           author: requireString(command.author, "author"),
           reason: requireString(command.reason, "reason"),
         },
+        { kind: "system", reason: "main-thread supersede" },
       );
     case "supersedeFromB": {
       const residentId = requireString(command.residentId, "residentId");
@@ -207,7 +214,7 @@ async function execute(command: HostCommand): Promise<unknown> {
           author: requireString(command.author, "author"),
           reason: requireString(command.reason, "reason"),
         },
-        { viewportId: windowBOf(residentId) },
+        { kind: "viewport", viewportId: windowBOf(residentId) },
       );
     }
     case "entries":

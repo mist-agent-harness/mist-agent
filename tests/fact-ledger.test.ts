@@ -45,9 +45,21 @@ describe("发号与 append-only", () => {
   it("seq 由账侧发号，从 1 起单调递增", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
-    const a = ledger.append("r", { author: "main", kind: "ruling", body: "第一条" });
-    const b = ledger.append("r", { author: "main", kind: "active_rule", body: "第二条" });
-    const c = ledger.append("r", { author: "main", kind: "confirmed_preference", body: "第三条" });
+    const a = ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "第一条" },
+      { kind: "system", reason: "test" },
+    );
+    const b = ledger.append(
+      "r",
+      { author: "main", kind: "active_rule", body: "第二条" },
+      { kind: "system", reason: "test" },
+    );
+    const c = ledger.append(
+      "r",
+      { author: "main", kind: "confirmed_preference", body: "第三条" },
+      { kind: "system", reason: "test" },
+    );
     expect([a.seq, b.seq, c.seq]).toEqual([1, 2, 3]);
     expect(ledger.latestSeq("r")).toBe(3);
   });
@@ -65,18 +77,26 @@ describe("发号与 append-only", () => {
     // 运行时校验给绕过类型系统的调用方：没有 supersedesSeq 指针的「解除」
     // 会毒化推导视图，必须当场炸。
     expect(() =>
-      ledger.append("r", {
-        author: "main",
-        kind: "supersede" as never,
-        body: "伪装成事实的解除",
-      }),
+      ledger.append(
+        "r",
+        {
+          author: "main",
+          kind: "supersede" as never,
+          body: "伪装成事实的解除",
+        },
+        { kind: "system", reason: "test" },
+      ),
     ).toThrow(/supersede\(\)/);
   });
 
   it("拿到的是副本，改返回值涂改不了账", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
-    const appended = ledger.append("r", { author: "main", kind: "ruling", body: "原话" });
+    const appended = ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "原话" },
+      { kind: "system", reason: "test" },
+    );
     (appended as { body: string }).body = "涂改后的假话";
     const listed = ledger.entries("r");
     (listed[0] as { body: string }).body = "又一次涂改";
@@ -86,7 +106,11 @@ describe("发号与 append-only", () => {
   it("账面条目在运行时是冻结的", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
-    ledger.append("r", { author: "main", kind: "ruling", body: "正文" });
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "正文" },
+      { kind: "system", reason: "test" },
+    );
     // entries() 返回副本，这里直接探账内引用做不到——但 append 的返回
     // 与账内条目同形，冻结行为用恢复路径间接验（持久化一节）。
     // 这里至少保证：账侧给出的任何条目形状都带齐六字段。
@@ -103,9 +127,29 @@ describe("发号与 append-only", () => {
   it("重复开户显式报错，不静默重置", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
-    ledger.append("r", { author: "main", kind: "ruling", body: "不能丢" });
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "不能丢" },
+      { kind: "system", reason: "test" },
+    );
     expect(() => ledger.createLedger("r")).toThrow(/already exists/);
     expect(ledger.latestSeq("r")).toBe(1);
+  });
+
+  // C04（渡渡家内审 P1）：豁免必须显式署名，不是缺省得到。system 来源
+  // 空 reason 不算署名——拒收，且账上零多写。origin 省略在类型层已是编译
+  // 错误，这里钉的是运行期「空署名等于没署名」这一半。
+  it("system 来源空 reason 被拒，账上不多写", () => {
+    const ledger = new FactLedger();
+    ledger.createLedger("r");
+    expect(() =>
+      ledger.append(
+        "r",
+        { author: "main", kind: "ruling", body: "无名豁免" },
+        { kind: "system", reason: "  " },
+      ),
+    ).toThrow(/non-empty reason/);
+    expect(ledger.latestSeq("r")).toBe(0);
   });
 });
 
@@ -113,9 +157,18 @@ describe("supersede 是追加不是涂改（MV-C07 账侧）", () => {
   it("解除后旧条目字节不变", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
-    ledger.append("r", { author: "main", kind: "ruling", body: "周六一起去图书馆" });
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "周六一起去图书馆" },
+      { kind: "system", reason: "test" },
+    );
     const before = JSON.stringify(ledger.entries("r")[0]);
-    ledger.supersede("r", 1, { author: "main", reason: "她改成周日了" });
+    ledger.supersede(
+      "r",
+      1,
+      { author: "main", reason: "她改成周日了" },
+      { kind: "system", reason: "test" },
+    );
     const after = JSON.stringify(ledger.entries("r")[0]);
     expect(after).toBe(before);
   });
@@ -123,9 +176,22 @@ describe("supersede 是追加不是涂改（MV-C07 账侧）", () => {
   it("解除是一条自带序号的新账目，supersedesSeq 指旧 seq", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
-    ledger.append("r", { author: "main", kind: "ruling", body: "旧裁定" });
-    ledger.append("r", { author: "main", kind: "active_rule", body: "夹在中间的规矩" });
-    const s = ledger.supersede("r", 1, { author: "main", reason: "解除旧裁定" });
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "旧裁定" },
+      { kind: "system", reason: "test" },
+    );
+    ledger.append(
+      "r",
+      { author: "main", kind: "active_rule", body: "夹在中间的规矩" },
+      { kind: "system", reason: "test" },
+    );
+    const s = ledger.supersede(
+      "r",
+      1,
+      { author: "main", reason: "解除旧裁定" },
+      { kind: "system", reason: "test" },
+    );
     expect(s.seq).toBe(3);
     expect(s.kind).toBe("supersede");
     expect(s.supersedesSeq).toBe(1);
@@ -138,8 +204,17 @@ describe("supersede 是追加不是涂改（MV-C07 账侧）", () => {
   it("现行有效集不再含被解除的条目", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
-    ledger.append("r", { author: "main", kind: "ruling", body: "旧裁定" });
-    ledger.supersede("r", 1, { author: "main", reason: "解除" });
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "旧裁定" },
+      { kind: "system", reason: "test" },
+    );
+    ledger.supersede(
+      "r",
+      1,
+      { author: "main", reason: "解除" },
+      { kind: "system", reason: "test" },
+    );
     expect(ledger.currentSet("r")).toEqual([]);
     // 但归档查询仍能追到它——「曾被解除的条目」本身是可查事实。
     expect(ledger.entries("r")).toHaveLength(2);
@@ -148,10 +223,19 @@ describe("supersede 是追加不是涂改（MV-C07 账侧）", () => {
   it("已 ack 旧条目的窗，下一轮经缺口通道可见该解除", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
-    ledger.append("r", { author: "main", kind: "ruling", body: "旧裁定" });
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "旧裁定" },
+      { kind: "system", reason: "test" },
+    );
     ledger.openViewport("r", "w-a");
     ledger.ack("r", "w-a", 1); // 窗已确认旧裁定
-    const s = ledger.supersede("r", 1, { author: "main", reason: "解除" });
+    const s = ledger.supersede(
+      "r",
+      1,
+      { author: "main", reason: "解除" },
+      { kind: "system", reason: "test" },
+    );
     // 已 ack ≠ 仍然有效：解除经同一条缺口通道送达。
     const missing = ledger.gapEntries("r", "w-a");
     expect(missing).toHaveLength(1);
@@ -162,44 +246,85 @@ describe("supersede 是追加不是涂改（MV-C07 账侧）", () => {
   it("解除不存在的 seq 报错", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
-    ledger.append("r", { author: "main", kind: "ruling", body: "只有一条" });
-    expect(() => ledger.supersede("r", 2, { author: "main", reason: "x" })).toThrow(
-      LedgerEntryNotFoundError,
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "只有一条" },
+      { kind: "system", reason: "test" },
     );
-    expect(() => ledger.supersede("r", 0, { author: "main", reason: "x" })).toThrow(
-      LedgerEntryNotFoundError,
-    );
+    expect(() =>
+      ledger.supersede("r", 2, { author: "main", reason: "x" }, { kind: "system", reason: "test" }),
+    ).toThrow(LedgerEntryNotFoundError);
+    expect(() =>
+      ledger.supersede("r", 0, { author: "main", reason: "x" }, { kind: "system", reason: "test" }),
+    ).toThrow(LedgerEntryNotFoundError);
   });
 
   it("不能解除一条 supersede", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
-    ledger.append("r", { author: "main", kind: "ruling", body: "裁定" });
-    ledger.supersede("r", 1, { author: "main", reason: "解除" });
-    expect(() => ledger.supersede("r", 2, { author: "main", reason: "解除那条解除" })).toThrow(
-      InvalidSupersedeError,
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "裁定" },
+      { kind: "system", reason: "test" },
     );
+    ledger.supersede(
+      "r",
+      1,
+      { author: "main", reason: "解除" },
+      { kind: "system", reason: "test" },
+    );
+    expect(() =>
+      ledger.supersede(
+        "r",
+        2,
+        { author: "main", reason: "解除那条解除" },
+        { kind: "system", reason: "test" },
+      ),
+    ).toThrow(InvalidSupersedeError);
   });
 
   it("重复解除同一条显式报错", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
-    ledger.append("r", { author: "main", kind: "ruling", body: "裁定" });
-    ledger.supersede("r", 1, { author: "main", reason: "第一次解除" });
-    // 静默放行会把「操作方以为还没解除过」藏起来。
-    expect(() => ledger.supersede("r", 1, { author: "main", reason: "第二次解除" })).toThrow(
-      /already superseded/,
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "裁定" },
+      { kind: "system", reason: "test" },
     );
+    ledger.supersede(
+      "r",
+      1,
+      { author: "main", reason: "第一次解除" },
+      { kind: "system", reason: "test" },
+    );
+    // 静默放行会把「操作方以为还没解除过」藏起来。
+    expect(() =>
+      ledger.supersede(
+        "r",
+        1,
+        { author: "main", reason: "第二次解除" },
+        { kind: "system", reason: "test" },
+      ),
+    ).toThrow(/already superseded/);
   });
 
   it("跨住户解除报错，且那本账毫发无损", () => {
     const ledger = new FactLedger();
     ledger.createLedger("a");
     ledger.createLedger("b");
-    ledger.append("a", { author: "main", kind: "ruling", body: "A 的裁定" });
-    expect(() => ledger.supersede("b", 1, { author: "main", reason: "B 想解除 A 的" })).toThrow(
-      LedgerEntryNotFoundError,
+    ledger.append(
+      "a",
+      { author: "main", kind: "ruling", body: "A 的裁定" },
+      { kind: "system", reason: "test" },
     );
+    expect(() =>
+      ledger.supersede(
+        "b",
+        1,
+        { author: "main", reason: "B 想解除 A 的" },
+        { kind: "system", reason: "test" },
+      ),
+    ).toThrow(LedgerEntryNotFoundError);
     expect(ledger.entries("a")).toHaveLength(1);
     expect(ledger.currentSet("a")).toHaveLength(1);
   });
@@ -209,9 +334,21 @@ describe("现行有效集是推导视图", () => {
   it("同一种 kind 多条并行生效是常态（2026-08-20 主笔拍板的新语义）", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
-    ledger.append("r", { author: "main", kind: "ruling", body: "裁定一" });
-    ledger.append("r", { author: "main", kind: "ruling", body: "裁定二" });
-    ledger.append("r", { author: "main", kind: "active_rule", body: "规矩一" });
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "裁定一" },
+      { kind: "system", reason: "test" },
+    );
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "裁定二" },
+      { kind: "system", reason: "test" },
+    );
+    ledger.append(
+      "r",
+      { author: "main", kind: "active_rule", body: "规矩一" },
+      { kind: "system", reason: "test" },
+    );
     // 不是「每条 kind 的最新一条」——未被指名的全部现行，按 seq 升序。
     const current = ledger.currentSet("r");
     expect(current.map((e) => e.body)).toEqual(["裁定一", "裁定二", "规矩一"]);
@@ -220,30 +357,74 @@ describe("现行有效集是推导视图", () => {
   it("supersede 精确指向单条：解除两条并行 ruling 中的一条，另一条仍在", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
-    ledger.append("r", { author: "main", kind: "ruling", body: "裁定一" });
-    ledger.append("r", { author: "main", kind: "ruling", body: "裁定二" });
-    ledger.supersede("r", 2, { author: "main", reason: "只解除裁定二" });
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "裁定一" },
+      { kind: "system", reason: "test" },
+    );
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "裁定二" },
+      { kind: "system", reason: "test" },
+    );
+    ledger.supersede(
+      "r",
+      2,
+      { author: "main", reason: "只解除裁定二" },
+      { kind: "system", reason: "test" },
+    );
     expect(ledger.currentSet("r").map((e) => e.body)).toEqual(["裁定一"]);
     // 不存在「回退」——裁定一自始至终都在集里，不是被解除后重新浮上来的。
-    ledger.supersede("r", 1, { author: "main", reason: "解除裁定一" });
+    ledger.supersede(
+      "r",
+      1,
+      { author: "main", reason: "解除裁定一" },
+      { kind: "system", reason: "test" },
+    );
     expect(ledger.currentSet("r")).toEqual([]);
   });
 
   it("解除一条不影响其他 kind 的并行条目", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
-    ledger.append("r", { author: "main", kind: "ruling", body: "裁定一" });
-    ledger.append("r", { author: "main", kind: "active_rule", body: "规矩一" });
-    ledger.append("r", { author: "main", kind: "confirmed_preference", body: "偏好一" });
-    ledger.supersede("r", 1, { author: "main", reason: "只解除裁定一" });
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "裁定一" },
+      { kind: "system", reason: "test" },
+    );
+    ledger.append(
+      "r",
+      { author: "main", kind: "active_rule", body: "规矩一" },
+      { kind: "system", reason: "test" },
+    );
+    ledger.append(
+      "r",
+      { author: "main", kind: "confirmed_preference", body: "偏好一" },
+      { kind: "system", reason: "test" },
+    );
+    ledger.supersede(
+      "r",
+      1,
+      { author: "main", reason: "只解除裁定一" },
+      { kind: "system", reason: "test" },
+    );
     expect(ledger.currentSet("r").map((e) => e.body)).toEqual(["规矩一", "偏好一"]);
   });
 
   it("supersede 条目自身不是事实，不进现行有效集", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
-    ledger.append("r", { author: "main", kind: "ruling", body: "裁定一" });
-    ledger.supersede("r", 1, { author: "main", reason: "解除" });
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "裁定一" },
+      { kind: "system", reason: "test" },
+    );
+    ledger.supersede(
+      "r",
+      1,
+      { author: "main", reason: "解除" },
+      { kind: "system", reason: "test" },
+    );
     // 集是空的——解除记录留在全史里查（entries），不冒充一条现行事实。
     expect(ledger.currentSet("r")).toEqual([]);
     expect(ledger.entries("r")).toHaveLength(2);
@@ -252,7 +433,11 @@ describe("现行有效集是推导视图", () => {
   it("视图拿到的是副本，改它毒化不了账", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
-    ledger.append("r", { author: "main", kind: "ruling", body: "现行裁定" });
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "现行裁定" },
+      { kind: "system", reason: "test" },
+    );
     const view = ledger.currentSet("r");
     (view[0] as { body: string }).body = "毒化";
     expect(ledger.currentSet("r")[0]?.body).toBe("现行裁定");
@@ -264,7 +449,11 @@ describe("新窗 baseline（MV-A05 账侧）", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
     for (let i = 0; i < 50; i += 1) {
-      ledger.append("r", { author: "main", kind: "ruling", body: `历史裁定 ${i + 1}` });
+      ledger.append(
+        "r",
+        { author: "main", kind: "ruling", body: `历史裁定 ${i + 1}` },
+        { kind: "system", reason: "test" },
+      );
     }
     const baseline = ledger.openViewport("r", "w-new");
     expect(baseline).toBe(50);
@@ -291,7 +480,11 @@ describe("新窗 baseline（MV-A05 账侧）", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
     for (let i = 0; i < 50; i += 1) {
-      ledger.append("r", { author: "main", kind: "ruling", body: `历史裁定 ${i + 1}` });
+      ledger.append(
+        "r",
+        { author: "main", kind: "ruling", body: `历史裁定 ${i + 1}` },
+        { kind: "system", reason: "test" },
+      );
     }
     ledger.openViewport("r", "w-new");
     // 新窗不背全史 ≠ 历史不可达：归档查询是另一条路。
@@ -305,7 +498,11 @@ describe("拉式缺口与回执（MV-C01/C02/C05 账侧）", () => {
     ledger.createLedger("r");
     ledger.openViewport("r", "w-a");
     ledger.openViewport("r", "w-b");
-    const ruling = ledger.append("r", { author: "main", kind: "ruling", body: "新裁定" });
+    const ruling = ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "新裁定" },
+      { kind: "system", reason: "test" },
+    );
     // 无推送通道，拉是唯一正确性来源——账侧只有拉与回执两个动作（C02 的落点）。
     expect(ledger.gap("r", "w-b")).toEqual({ latestSeq: 1, ackedSeq: 0 });
     const missing = ledger.gapEntries("r", "w-b");
@@ -320,7 +517,11 @@ describe("拉式缺口与回执（MV-C01/C02/C05 账侧）", () => {
     ledger.createLedger("r");
     ledger.openViewport("r", "w-a");
     ledger.openViewport("r", "w-b");
-    ledger.append("r", { author: "main", kind: "ruling", body: "裁定" });
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "裁定" },
+      { kind: "system", reason: "test" },
+    );
     ledger.ack("r", "w-a", 1);
     expect(ledger.gap("r", "w-a").ackedSeq).toBe(1);
     expect(ledger.gap("r", "w-b").ackedSeq).toBe(0);
@@ -331,7 +532,11 @@ describe("拉式缺口与回执（MV-C01/C02/C05 账侧）", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
     ledger.openViewport("r", "w-a");
-    ledger.append("r", { author: "main", kind: "ruling", body: "裁定" });
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "裁定" },
+      { kind: "system", reason: "test" },
+    );
     // 回执丢失 = ack 从未到账：账上不存在「已知悉」的痕迹，也没有「违约」标记——
     // 传播机制的账不算窗的（C05）。窗重拉，缺口条目还在，补 ack 即闭合。
     expect(ledger.gapEntries("r", "w-a")).toHaveLength(1);
@@ -343,7 +548,11 @@ describe("拉式缺口与回执（MV-C01/C02/C05 账侧）", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
     ledger.openViewport("r", "w-a");
-    ledger.append("r", { author: "main", kind: "ruling", body: "裁定" });
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "裁定" },
+      { kind: "system", reason: "test" },
+    );
     ledger.ack("r", "w-a", 1);
     expect(() => ledger.ack("r", "w-a", 1)).not.toThrow();
     expect(ledger.ackedSeq("r", "w-a")).toBe(1);
@@ -353,8 +562,16 @@ describe("拉式缺口与回执（MV-C01/C02/C05 账侧）", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
     ledger.openViewport("r", "w-a");
-    ledger.append("r", { author: "main", kind: "ruling", body: "一" });
-    ledger.append("r", { author: "main", kind: "ruling", body: "二" });
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "一" },
+      { kind: "system", reason: "test" },
+    );
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "二" },
+      { kind: "system", reason: "test" },
+    );
     ledger.ack("r", "w-a", 2);
     expect(() => ledger.ack("r", "w-a", 1)).toThrow(AckError);
     expect(ledger.ackedSeq("r", "w-a")).toBe(2);
@@ -364,7 +581,11 @@ describe("拉式缺口与回执（MV-C01/C02/C05 账侧）", () => {
     const ledger = new FactLedger();
     ledger.createLedger("r");
     ledger.openViewport("r", "w-a");
-    ledger.append("r", { author: "main", kind: "ruling", body: "裁定" });
+    ledger.append(
+      "r",
+      { author: "main", kind: "ruling", body: "裁定" },
+      { kind: "system", reason: "test" },
+    );
     expect(() => ledger.ack("r", "w-a", 2)).toThrow(AckError);
     expect(() => ledger.ack("r", "w-a", -1)).toThrow(AckError);
   });
@@ -480,9 +701,13 @@ describe("住户隔离", () => {
   it("跨住户读写一律抛 LedgerNotFoundError", () => {
     const ledger = new FactLedger();
     ledger.createLedger("a");
-    expect(() => ledger.append("b", { author: "main", kind: "ruling", body: "x" })).toThrow(
-      LedgerNotFoundError,
-    );
+    expect(() =>
+      ledger.append(
+        "b",
+        { author: "main", kind: "ruling", body: "x" },
+        { kind: "system", reason: "test" },
+      ),
+    ).toThrow(LedgerNotFoundError);
     expect(() => ledger.entries("b")).toThrow(LedgerNotFoundError);
     expect(() => ledger.currentSet("b")).toThrow(LedgerNotFoundError);
     expect(() => ledger.openViewport("b", "w-x")).toThrow(LedgerNotFoundError);
@@ -493,11 +718,19 @@ describe("住户隔离", () => {
     const ledger = new FactLedger();
     ledger.createLedger("a");
     ledger.createLedger("b");
-    ledger.append("a", { author: "main", kind: "ruling", body: "A 的秘密裁定" });
+    ledger.append(
+      "a",
+      { author: "main", kind: "ruling", body: "A 的秘密裁定" },
+      { kind: "system", reason: "test" },
+    );
     expect(ledger.latestSeq("a")).toBe(1);
     expect(ledger.latestSeq("b")).toBe(0);
     expect(ledger.entries("b")).toEqual([]);
-    const bFirst = ledger.append("b", { author: "main", kind: "ruling", body: "B 的第一条" });
+    const bFirst = ledger.append(
+      "b",
+      { author: "main", kind: "ruling", body: "B 的第一条" },
+      { kind: "system", reason: "test" },
+    );
     expect(bFirst.seq).toBe(1);
   });
 });
@@ -507,17 +740,34 @@ describe("持久化", () => {
     withTempDir((dataDir) => {
       const ledger = new FactLedger({ dataDir });
       ledger.createLedger("r");
-      ledger.append("r", { author: "main", kind: "ruling", body: "裁定一" });
-      ledger.append("r", { author: "main", kind: "active_rule", body: "规矩一" });
+      ledger.append(
+        "r",
+        { author: "main", kind: "ruling", body: "裁定一" },
+        { kind: "system", reason: "test" },
+      );
+      ledger.append(
+        "r",
+        { author: "main", kind: "active_rule", body: "规矩一" },
+        { kind: "system", reason: "test" },
+      );
       ledger.openViewport("r", "w-a"); // baseline=2，窗已对齐到规矩一
-      ledger.supersede("r", 1, { author: "main", reason: "解除裁定一" });
+      ledger.supersede(
+        "r",
+        1,
+        { author: "main", reason: "解除裁定一" },
+        { kind: "system", reason: "test" },
+      );
 
       const restored = new FactLedger({ dataDir });
       expect(restored.entries("r")).toEqual(ledger.entries("r"));
       expect(restored.gap("r", "w-a")).toEqual({ latestSeq: 3, ackedSeq: 2 });
       expect(restored.gapEntries("r", "w-a").map((e) => e.kind)).toEqual(["supersede"]);
       expect(restored.currentSet("r").map((e) => e.body)).toEqual(["规矩一"]);
-      const next = restored.append("r", { author: "main", kind: "ruling", body: "裁定二" });
+      const next = restored.append(
+        "r",
+        { author: "main", kind: "ruling", body: "裁定二" },
+        { kind: "system", reason: "test" },
+      );
       expect(next.seq).toBe(4);
     });
   });
@@ -528,16 +778,46 @@ describe("持久化", () => {
       // 在线 append 松（同型事故），视图推导也可能在两条路径上悄悄分叉。
       const ledger = new FactLedger({ dataDir });
       ledger.createLedger("r");
-      ledger.append("r", { author: "main", kind: "ruling", body: "裁定一" });
-      ledger.append("r", { author: "main", kind: "ruling", body: "裁定二" });
-      ledger.append("r", { author: "main", kind: "active_rule", body: "规矩一" });
-      ledger.append("r", { author: "main", kind: "confirmed_preference", body: "偏好一" });
+      ledger.append(
+        "r",
+        { author: "main", kind: "ruling", body: "裁定一" },
+        { kind: "system", reason: "test" },
+      );
+      ledger.append(
+        "r",
+        { author: "main", kind: "ruling", body: "裁定二" },
+        { kind: "system", reason: "test" },
+      );
+      ledger.append(
+        "r",
+        { author: "main", kind: "active_rule", body: "规矩一" },
+        { kind: "system", reason: "test" },
+      );
+      ledger.append(
+        "r",
+        { author: "main", kind: "confirmed_preference", body: "偏好一" },
+        { kind: "system", reason: "test" },
+      );
       ledger.openViewport("r", "w-1"); // baseline=4
       ledger.ack("r", "w-1", 4);
-      ledger.supersede("r", 2, { author: "main", reason: "只解除裁定二" });
-      ledger.supersede("r", 4, { author: "main", reason: "偏好一作废——这个 kind 全解除" });
+      ledger.supersede(
+        "r",
+        2,
+        { author: "main", reason: "只解除裁定二" },
+        { kind: "system", reason: "test" },
+      );
+      ledger.supersede(
+        "r",
+        4,
+        { author: "main", reason: "偏好一作废——这个 kind 全解除" },
+        { kind: "system", reason: "test" },
+      );
       ledger.openViewport("r", "w-2"); // baseline=6
-      ledger.append("r", { author: "main", kind: "active_rule", body: "规矩二" });
+      ledger.append(
+        "r",
+        { author: "main", kind: "active_rule", body: "规矩二" },
+        { kind: "system", reason: "test" },
+      );
 
       // 在线取一次，落盘后新实例再取一次，深比较相等。
       const restored = new FactLedger({ dataDir });
@@ -558,7 +838,11 @@ describe("持久化", () => {
       const ledger = new FactLedger({ dataDir });
       ledger.createLedger("a");
       ledger.createLedger("b");
-      ledger.append("a", { author: "main", kind: "ruling", body: "A 的" });
+      ledger.append(
+        "a",
+        { author: "main", kind: "ruling", body: "A 的" },
+        { kind: "system", reason: "test" },
+      );
       const restored = new FactLedger({ dataDir });
       expect(restored.latestSeq("a")).toBe(1);
       expect(restored.latestSeq("b")).toBe(0);
@@ -798,12 +1082,20 @@ describe("持久化", () => {
     withTempDir((dataDir) => {
       const ledger = new FactLedger({ dataDir });
       ledger.createLedger("r");
-      ledger.append("r", { author: "main", kind: "ruling", body: "已落盘" });
+      ledger.append(
+        "r",
+        { author: "main", kind: "ruling", body: "已落盘" },
+        { kind: "system", reason: "test" },
+      );
       writeFileSync(join(dataDir, "r.facts.json.tmp"), "没写完的一次写入");
       const restored = new FactLedger({ dataDir });
       expect(restored.latestSeq("r")).toBe(1);
       // 下一次写入覆盖残留。
-      restored.append("r", { author: "main", kind: "ruling", body: "二" });
+      restored.append(
+        "r",
+        { author: "main", kind: "ruling", body: "二" },
+        { kind: "system", reason: "test" },
+      );
       expect(readFileSync(join(dataDir, "r.facts.json"), "utf8")).toContain("二");
     });
   });
@@ -812,7 +1104,11 @@ describe("持久化", () => {
     withTempDir((dataDir) => {
       const ledger = new FactLedger({ dataDir });
       ledger.createLedger("r");
-      ledger.append("r", { author: "main", kind: "ruling", body: "正文" });
+      ledger.append(
+        "r",
+        { author: "main", kind: "ruling", body: "正文" },
+        { kind: "system", reason: "test" },
+      );
       const restored = new FactLedger({ dataDir });
       const copy = restored.entries("r");
       (copy[0] as { body: string }).body = "涂改";
@@ -839,16 +1135,30 @@ describe("落盘失败不改内存（写路径先落盘后发布）", () => {
     withTempDir((dataDir) => {
       const ledger = new FactLedger({ dataDir });
       ledger.createLedger("r");
-      ledger.append("r", { author: "main", kind: "ruling", body: "一" });
+      ledger.append(
+        "r",
+        { author: "main", kind: "ruling", body: "一" },
+        { kind: "system", reason: "test" },
+      );
       whileReadonly(dataDir, () => {
-        expect(() => ledger.append("r", { author: "main", kind: "ruling", body: "二" })).toThrow();
+        expect(() =>
+          ledger.append(
+            "r",
+            { author: "main", kind: "ruling", body: "二" },
+            { kind: "system", reason: "test" },
+          ),
+        ).toThrow();
         expect(ledger.latestSeq("r")).toBe(1);
         expect(ledger.entries("r").map((e) => e.body)).toEqual(["一"]);
       });
       // 盘上也没多：新实例读到的和内存一致。
       expect(new FactLedger({ dataDir }).entries("r")).toHaveLength(1);
       // 恢复可写后追加成功，seq 连续——失败没有吃掉序号。
-      const entry = ledger.append("r", { author: "main", kind: "ruling", body: "二" });
+      const entry = ledger.append(
+        "r",
+        { author: "main", kind: "ruling", body: "二" },
+        { kind: "system", reason: "test" },
+      );
       expect(entry.seq).toBe(2);
     });
   });
@@ -857,9 +1167,20 @@ describe("落盘失败不改内存（写路径先落盘后发布）", () => {
     withTempDir((dataDir) => {
       const ledger = new FactLedger({ dataDir });
       ledger.createLedger("r");
-      ledger.append("r", { author: "main", kind: "ruling", body: "裁定" });
+      ledger.append(
+        "r",
+        { author: "main", kind: "ruling", body: "裁定" },
+        { kind: "system", reason: "test" },
+      );
       whileReadonly(dataDir, () => {
-        expect(() => ledger.supersede("r", 1, { author: "main", reason: "解除" })).toThrow();
+        expect(() =>
+          ledger.supersede(
+            "r",
+            1,
+            { author: "main", reason: "解除" },
+            { kind: "system", reason: "test" },
+          ),
+        ).toThrow();
         // 这是故障注入打过的洞：旧实现先 push 再落盘，失败后全史多一条
         // supersede 而 supersededSeqs 没更新，currentSet 与全史自相矛盾。
         // 现在必须是干净的「什么都没发生」。
@@ -867,7 +1188,12 @@ describe("落盘失败不改内存（写路径先落盘后发布）", () => {
         expect(ledger.currentSet("r").map((e) => e.body)).toEqual(["裁定"]);
       });
       // 恢复可写后同一次解除能正常完成。
-      ledger.supersede("r", 1, { author: "main", reason: "解除" });
+      ledger.supersede(
+        "r",
+        1,
+        { author: "main", reason: "解除" },
+        { kind: "system", reason: "test" },
+      );
       expect(ledger.currentSet("r")).toEqual([]);
     });
   });
@@ -876,7 +1202,11 @@ describe("落盘失败不改内存（写路径先落盘后发布）", () => {
     withTempDir((dataDir) => {
       const ledger = new FactLedger({ dataDir });
       ledger.createLedger("r");
-      ledger.append("r", { author: "main", kind: "ruling", body: "裁定" });
+      ledger.append(
+        "r",
+        { author: "main", kind: "ruling", body: "裁定" },
+        { kind: "system", reason: "test" },
+      );
       whileReadonly(dataDir, () => {
         expect(() => ledger.openViewport("r", "w-a")).toThrow();
         expect(() => ledger.gap("r", "w-a")).toThrow(ViewportNotFoundError);
@@ -890,7 +1220,11 @@ describe("落盘失败不改内存（写路径先落盘后发布）", () => {
       const ledger = new FactLedger({ dataDir });
       ledger.createLedger("r");
       ledger.openViewport("r", "w-a");
-      ledger.append("r", { author: "main", kind: "ruling", body: "裁定" });
+      ledger.append(
+        "r",
+        { author: "main", kind: "ruling", body: "裁定" },
+        { kind: "system", reason: "test" },
+      );
       whileReadonly(dataDir, () => {
         expect(() => ledger.ack("r", "w-a", 1)).toThrow();
         expect(ledger.ackedSeq("r", "w-a")).toBe(0);

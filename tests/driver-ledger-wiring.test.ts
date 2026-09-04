@@ -50,7 +50,11 @@ describe("F1 启动包与首窗 baseline 时序", () => {
     const pack = await driver.buildBootPack(residentId);
     expect(pack.currentFacts).toEqual([]);
 
-    ledger.append(residentId, { author: "main-thread", kind: "ruling", body: "占位裁定-包后" });
+    ledger.append(
+      residentId,
+      { author: "main-thread", kind: "ruling", body: "占位裁定-包后" },
+      { kind: "system", reason: "test" },
+    );
     await driver.say(residentId, "占位首句");
 
     expect(prompts[0]).toContain(
@@ -81,7 +85,11 @@ describe("F1 启动包与首窗 baseline 时序", () => {
     expect(ledger.has(residentId)).toBe(true);
     expect(ledger.latestSeq(residentId)).toBe(0);
 
-    ledger.append(residentId, { author: "main-thread", kind: "ruling", body: "占位裁定-包前" });
+    ledger.append(
+      residentId,
+      { author: "main-thread", kind: "ruling", body: "占位裁定-包前" },
+      { kind: "system", reason: "test" },
+    );
     const pack = await revived.buildBootPack(residentId);
     expect(pack.currentFacts?.map((entry) => entry.body)).toEqual(["占位裁定-包前"]);
 
@@ -101,11 +109,15 @@ describe("F1 启动包与首窗 baseline 时序", () => {
       },
     });
     const residentId = await driver.createResident("placeholder-f1c");
-    ledger.append(residentId, {
-      author: "main-thread",
-      kind: "ruling",
-      body: "占位裁定-say-first",
-    });
+    ledger.append(
+      residentId,
+      {
+        author: "main-thread",
+        kind: "ruling",
+        body: "占位裁定-say-first",
+      },
+      { kind: "system", reason: "test" },
+    );
 
     // 没开过包、没开过窗：say 懒开窗记 baseline=1 把缺口清零，但开窗不算
     // 交付——首轮开工注入必须把现行有效集交给模型，否则这条裁定永久失踪。
@@ -145,11 +157,15 @@ describe("F1 启动包与首窗 baseline 时序", () => {
     ledger.probeGap = realProbe;
     expect(events).toEqual([]);
 
-    ledger.append(residentId, {
-      author: "main-thread",
-      kind: "ruling",
-      body: "占位裁定-history-first",
-    });
+    ledger.append(
+      residentId,
+      {
+        author: "main-thread",
+        kind: "ruling",
+        body: "占位裁定-history-first",
+      },
+      { kind: "system", reason: "test" },
+    );
     const pack = await driver.buildBootPack(residentId);
     expect(pack.currentFacts?.map((entry) => entry.body)).toEqual(["占位裁定-history-first"]);
 
@@ -222,7 +238,11 @@ describe("F4 住户与账本生命周期原子性", () => {
     createDriver({ dataDir: residentsDir, factLedger: ledger1 });
     expect(ledger1.has(oldId)).toBe(true);
     expect(ledger1.latestSeq(oldId)).toBe(0);
-    ledger1.append(oldId, { author: "main-thread", kind: "ruling", body: "占位真账" });
+    ledger1.append(
+      oldId,
+      { author: "main-thread", kind: "ruling", body: "占位真账" },
+      { kind: "system", reason: "test" },
+    );
     ledger1.openViewport(oldId, "w_probe");
     ledger1.ack(oldId, "w_probe", 1);
 
@@ -293,7 +313,11 @@ describe("F4 住户与账本生命周期原子性", () => {
     const ledger = new FactLedger({ dataDir: factsDir });
     const driver = createDriver({ dataDir: residentsDir, factLedger: ledger });
     const residentId = await driver.createResident("placeholder-destroy-abort");
-    ledger.append(residentId, { author: "main-thread", kind: "ruling", body: "占位真账" });
+    ledger.append(
+      residentId,
+      { author: "main-thread", kind: "ruling", body: "占位真账" },
+      { kind: "system", reason: "test" },
+    );
 
     // facts.json 已删（prepare 成功）、住户快照删不动（第二步抛）→
     // abort 必须把账的文件写回去，两边都不许半删。
@@ -368,7 +392,11 @@ describe("F5 两个真实 MistDriver 共用 dataDir 与 FactLedger", () => {
     }
 
     // ack 各归各：A 窗 ack 一条 ruling，B 窗的确认位不动；反之亦然。
-    ledger.append(residentId, { author: "main-thread", kind: "ruling", body: "占位共享裁定" });
+    ledger.append(
+      residentId,
+      { author: "main-thread", kind: "ruling", body: "占位共享裁定" },
+      { kind: "system", reason: "test" },
+    );
     await driverA.say(residentId, "占位 A 窗第二句");
     expect(ledger.ackedSeq(residentId, windowA)).toBe(1);
     expect(ledger.ackedSeq(residentId, windowB)).toBe(0);
@@ -397,11 +425,15 @@ describe("初始对齐 exactly-once（冻结快照语义，四轮复核反例）
 
     // reviseNode 懒开新窗：baseline 记在此刻，初始快照也冻结在此刻（空）。
     await driver.reviseNode(residentId, assistant.id, "占位改口");
-    ledger.append(residentId, {
-      author: "main-thread",
-      kind: "ruling",
-      body: "占位裁定-revise-first",
-    });
+    ledger.append(
+      residentId,
+      {
+        author: "main-thread",
+        kind: "ruling",
+        body: "占位裁定-revise-first",
+      },
+      { kind: "system", reason: "test" },
+    );
     await driver.say(residentId, "占位新窗首句");
 
     const prompt = prompts[prompts.length - 1];
@@ -425,11 +457,15 @@ describe("初始对齐 exactly-once（冻结快照语义，四轮复核反例）
       },
     });
     const residentId = await driver.createResident("placeholder-supersede-timing");
-    ledger.append(residentId, {
-      author: "main-thread",
-      kind: "ruling",
-      body: "占位裁定-将被解除",
-    });
+    ledger.append(
+      residentId,
+      {
+        author: "main-thread",
+        kind: "ruling",
+        body: "占位裁定-将被解除",
+      },
+      { kind: "system", reason: "test" },
+    );
     // 第一扇窗先把 ruling 交付掉（初始对齐注入），拿到一个旧节点。
     await driver.say(residentId, "占位旧节点");
     const assistant = (await driver.history(residentId)).find((node) => node.role === "assistant");
@@ -439,7 +475,12 @@ describe("初始对齐 exactly-once（冻结快照语义，四轮复核反例）
     // 新窗在 ruling 还活着时冻结快照；随后 ruling 被解除——现取 currentSet
     // 已经空了，但冻结快照里它还是原来的样子。
     await driver.reviseNode(residentId, assistant.id, "占位改口");
-    ledger.supersede(residentId, 1, { author: "main-thread", reason: "占位解除理由" });
+    ledger.supersede(
+      residentId,
+      1,
+      { author: "main-thread", reason: "占位解除理由" },
+      { kind: "system", reason: "test" },
+    );
     expect(ledger.currentSet(residentId)).toEqual([]);
     await driver.say(residentId, "占位新窗首句");
 
@@ -459,7 +500,11 @@ describe("初始对齐 exactly-once（冻结快照语义，四轮复核反例）
     const ledger = new FactLedger();
     const driver = createDriver({ factLedger: ledger });
     const residentId = await driver.createResident("placeholder-bootpack-after-say");
-    ledger.append(residentId, { author: "main-thread", kind: "ruling", body: "占位裁定" });
+    ledger.append(
+      residentId,
+      { author: "main-thread", kind: "ruling", body: "占位裁定" },
+      { kind: "system", reason: "test" },
+    );
     await driver.say(residentId, "占位首句"); // 首轮注入即交付
 
     await expect(driver.buildBootPack(residentId)).rejects.toThrow(BootPackAlignmentError);
@@ -474,7 +519,11 @@ describe("初始对齐 exactly-once（冻结快照语义，四轮复核反例）
     const ledger = new FactLedger();
     const driver = createDriver({ factLedger: ledger });
     const residentId = await driver.createResident("placeholder-bootpack-twice");
-    ledger.append(residentId, { author: "main-thread", kind: "ruling", body: "占位裁定" });
+    ledger.append(
+      residentId,
+      { author: "main-thread", kind: "ruling", body: "占位裁定" },
+      { kind: "system", reason: "test" },
+    );
 
     const pack = await driver.buildBootPack(residentId);
     expect(pack.currentFacts).toHaveLength(1);
@@ -493,7 +542,11 @@ describe("ResidentStore 与 FactLedger 同目录共存（阻塞二）", () => {
     store1.commit(residentId, "占位承诺");
     ledger1.createLedger(residentId);
     ledger1.openViewport(residentId, "w_probe");
-    ledger1.append(residentId, { author: "main-thread", kind: "ruling", body: "占位裁定" });
+    ledger1.append(
+      residentId,
+      { author: "main-thread", kind: "ruling", body: "占位裁定" },
+      { kind: "system", reason: "test" },
+    );
     ledger1.ack(residentId, "w_probe", 1);
 
     // 重启形态：两个存储从同一目录各自恢复——修复前 ResidentStore 会把

@@ -126,12 +126,20 @@ export class WriteGateUnavailableError extends Error {
 }
 
 /**
- * 窗署名写入的发起方。不传 = 非窗来源（主线程／管理员落账），不受 C04
- * 闸——闸拦的是「落后的窗」，不是「不是窗的写方」。
+ * 裁定级写入的发起方——必填判别联合，不许省略、不许 null。
+ *
+ * 渡渡家内审 P1 + 上游 Laurie/Elio 定案：origin 可省略就是洞——落后窗
+ * 只要少传一个字段就被当 system 放行。所以豁免必须是写方显式签名声明的，
+ * 不是「缺省得到的」；类型层必填，绕过就是 review 看得见的越权，跟账侧
+ * 「seq 只能账发号」是同一个设计语言。
+ *
+ * - viewport 分支：账侧写前验 probeGap（unknown fail-closed）+ 落后拒收；
+ * - system 分支：可信宿主能力，带 reason 落痕，不凭调用者自报 kind 就绕闸；
+ *   本层至少钉死「省略即类型错误、reason 必填非空」。
  */
-export interface WriteOrigin {
-  viewportId: string;
-}
+export type WriteOrigin =
+  | { kind: "viewport"; viewportId: string }
+  | { kind: "system"; reason: string };
 
 /**
  * 缺口探针的返回形状（MV-C03 的落点）。
@@ -302,7 +310,7 @@ export class FactLedger {
   append(
     residentId: string,
     input: { author: string; kind: FactKind; body: string },
-    origin?: WriteOrigin,
+    origin: WriteOrigin,
   ): LedgerEntry {
     const ledger = this.#ledger(residentId);
     this.#assertOriginCurrent(residentId, origin);
@@ -328,7 +336,7 @@ export class FactLedger {
     residentId: string,
     targetSeq: number,
     input: { author: string; reason: string },
-    origin?: WriteOrigin,
+    origin: WriteOrigin,
   ): LedgerEntry {
     const ledger = this.#ledger(residentId);
     // C04 闸先于目标校验：未知悉最新裁定的窗连「目标存不存在」的答案
@@ -352,13 +360,22 @@ export class FactLedger {
   }
 
   /**
-   * C04（闸在非缺失方）：窗署名的裁定级写入，写前必过账侧探针——
-   * unknown 即 fail-closed（查不到 ≠ 没缺口），落后即拒收。闸站在
-   * 账的必经写路径上，不依赖窗自查；经 probeGap 走，注入的通道故障
-   * （MV-C03 装置）在这里同样生效。非窗来源（origin 缺省）不受此闸。
+   * C04（闸在非缺失方）：裁定级写入的必经账侧闸。origin 必填判别联合，
+   * 省略在类型层就是编译错误（渡渡家内审 P1：可省略即洞）。
+   *
+   * - viewport 来源：写前过 probeGap，unknown fail-closed（查不到 ≠ 没缺口），
+   *   落后（ackedSeq < latestSeq）拒收。经 probeGap 走使 MV-C03 装置的
+   *   通道故障对写路径同样生效。
+   * - system 来源：可信宿主豁免，reason 非空才放行（豁免必须显式署名，
+   *   不是缺省得到；空署名等于没署名）。
    */
-  #assertOriginCurrent(residentId: string, origin: WriteOrigin | undefined): void {
-    if (origin === undefined) return;
+  #assertOriginCurrent(residentId: string, origin: WriteOrigin): void {
+    if (origin.kind === "system") {
+      if (origin.reason.trim() === "") {
+        throw new Error("system-origin write requires a non-empty reason —— 豁免必须显式署名");
+      }
+      return;
+    }
     const probe = this.probeGap(residentId, origin.viewportId);
     if (probe.status === "unknown") {
       throw new WriteGateUnavailableError(residentId, origin.viewportId, probe.cause);
