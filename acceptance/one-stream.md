@@ -61,7 +61,7 @@
   只读流水，不能续聊或写回。`session.create` 的成功回执是工作区已存在，不是“创建了一条
   新聊天”。这四项由协议响应和 first-party read model 的结构化结果判定，不靠肉眼看 UI。
 
-- [x] **OS-04 有界投递不夹带局部 transcript** [集成]：progress、blocked、result 三类
+- [ ] **OS-04 有界投递不夹带局部 transcript** [集成]：progress、blocked、result 三类
   合法 envelope 各投一次，来源 viewport、发生时刻、工作把手、权威产物指针与效果状态
   可核，三条均进入 canonical stream。随后在同类 payload 中夹带局部 transcript、消息数组
   或未声明的上下文正文，必被拒绝且主流字节不变；无类型自由文本同样不得借投递接口入流。
