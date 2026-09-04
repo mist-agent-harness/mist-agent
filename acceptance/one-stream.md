@@ -111,6 +111,22 @@
   工作区均不得收到该回复。按最近事件、当前焦点、viewport 创建时间或模型推测偷偷分配，
   任一种都判红。
 
+  证据：`BlockedReplyRouter` 的候选集只来自 canonical stream 中仍需回答的 blocked event 与
+  SessionRegistry 当前活代；输入面只有 `replyToEventId`、`workRef` 或裸回复，没有 recent、
+  focus、createdAt、active tab 等猜测口。成功投递后，宿主把 resolved receipt 写回同一条
+  canonical stream；router、port 与 stream store 从磁盘重建后仍能拒绝重复回复，同一 blocker
+  的并发回复也在首次派发前串行化。若 workspace pair 已提交而 resolved receipt 尚未落盘，
+  blocker event 派生的稳定投递键会在 MessageTree 自己的不可变节点中找回同一 pair；重建
+  tree/service/router 后只补 resolved receipt，不再调用 responder 或追加第二对节点。即使同窗
+  已继续一轮、当前 head 位于该 pair 的后继链上，恢复也只复用旧 pair 并保持新 head，不会
+  回退会话；若 head 属于别的分叉则继续 fail closed。临时拔掉投递键或后继链识别时，对应
+  crash-gap 回归均精准转红。`MessageTreeWorkspaceReplyDelivery` 走真实
+  MessageTreeService 派发，并把签发的 generation receipt 带到 responder 返回后的同步
+  tree/head commit boundary；in-flight kill 后以同一 windowId 重开时，旧代回复响亮拒绝且
+  user/assistant 树与新代 head 都零写入。`tests/one-stream-reply-router.test.ts` 还同时建立两扇
+  blocked 窗：裸回复零投递并返回两个把手；显式 event/work 抵达第一窗；剩唯一候选后裸回复
+  抵达第二窗；陌生、冲突、失效把手与 responder 失败均不旁落另一窗。
+
 ## 变绿条件
 
 本页合入只代表判卷程序已写清，六盏默认保持未勾。实现 PR 必须给出相应的可重复测试，

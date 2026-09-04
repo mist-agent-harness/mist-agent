@@ -66,6 +66,23 @@ export type {
   WorkspaceHandle,
   WorkspaceLifecycleOptions,
 } from "./workspace-read-model.ts";
+export {
+  BlockedReplyRouter,
+  CanonicalBlockedReplyResolutionPort,
+  MessageTreeWorkspaceReplyDelivery,
+  ReplyRouteError,
+} from "./reply-router.ts";
+export type {
+  BlockedReplyResolutionPort,
+  CanonicalBlockedReplyResolutionOptions,
+  ReplyCandidate,
+  ReplyRouteErrorCode,
+  ReplyRouteRequest,
+  ReplyRouteResult,
+  WorkspaceReplyDeliveryPort,
+  WorkspaceReplyDeliveryReceipt,
+  WorkspaceReplyDeliveryRequest,
+} from "./reply-router.ts";
 export type {
   CanonicalEventSubmission,
   CanonicalStreamWriterOptions,

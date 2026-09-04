@@ -19,6 +19,7 @@
  * id 与时钟可注入，测试可完全确定性复现。
  */
 
+import { createHash } from "node:crypto";
 import type { HistoryNode } from "../../acceptance/driver.ts";
 import { MessageTreeError, nodeUnavailable } from "./errors.ts";
 
@@ -41,6 +42,18 @@ export interface MessageTreeStoreOptions {
 export interface AppendedPair {
   user: HistoryNode;
   assistant: HistoryNode;
+}
+
+function idempotentNodeId(residentId: string, idempotencyKey: string, role: "user" | "assistant") {
+  const digest = createHash("sha256")
+    .update("message-tree-pair/v1\0")
+    .update(residentId)
+    .update("\0")
+    .update(idempotencyKey)
+    .update("\0")
+    .update(role)
+    .digest("hex");
+  return `n_${digest}`;
 }
 
 export class MessageTreeStore {
@@ -88,6 +101,64 @@ export class MessageTreeStore {
     this.assertFreshIds(room, [user, assistant]);
     this.insert(room, user);
     this.insert(room, assistant);
+    return { user: { ...user }, assistant: { ...assistant } };
+  }
+
+  /**
+   * Idempotent host delivery for an operation that may be retried after the pair committed but its
+   * external receipt did not. The operation key deterministically names the two immutable nodes,
+   * so the receipt survives an export/import or store rebuild without a second mutable ledger.
+   * Existing complete pairs are replayed; partial or content-conflicting pairs fail loudly.
+   */
+  appendPairOnce(
+    residentId: string,
+    userContent: string,
+    assistantContent: string,
+    parentId: string | null,
+    idempotencyKey: string,
+  ): AppendedPair {
+    const previous = this.idempotentPair(residentId, idempotencyKey, userContent);
+    if (previous !== null) return previous;
+
+    const room = this.mustRoom(residentId);
+    const user = this.buildWithId(
+      idempotentNodeId(residentId, idempotencyKey, "user"),
+      parentId,
+      "user",
+      userContent,
+    );
+    const assistant = this.buildWithId(
+      idempotentNodeId(residentId, idempotencyKey, "assistant"),
+      user.id,
+      "assistant",
+      assistantContent,
+    );
+    this.assertFreshIds(room, [user, assistant]);
+    this.insert(room, user);
+    this.insert(room, assistant);
+    return { user: { ...user }, assistant: { ...assistant } };
+  }
+
+  /** Returns the immutable pair named by a host operation without invoking the responder again. */
+  idempotentPair(
+    residentId: string,
+    idempotencyKey: string,
+    userContent: string,
+  ): AppendedPair | null {
+    const room = this.mustRoom(residentId);
+    const user = room.nodes.get(idempotentNodeId(residentId, idempotencyKey, "user"));
+    const assistant = room.nodes.get(idempotentNodeId(residentId, idempotencyKey, "assistant"));
+    if (user === undefined && assistant === undefined) return null;
+    if (
+      user === undefined ||
+      assistant === undefined ||
+      user.role !== "user" ||
+      user.content !== userContent ||
+      assistant.role !== "assistant" ||
+      assistant.parentId !== user.id
+    ) {
+      throw new MessageTreeError("消息投递幂等键与既有节点冲突");
+    }
     return { user: { ...user }, assistant: { ...assistant } };
   }
 
@@ -245,8 +316,17 @@ export class MessageTreeStore {
   }
 
   private build(parentId: string | null, role: HistoryNode["role"], content: string): HistoryNode {
+    return this.buildWithId(this.newId(), parentId, role, content);
+  }
+
+  private buildWithId(
+    id: string,
+    parentId: string | null,
+    role: HistoryNode["role"],
+    content: string,
+  ): HistoryNode {
     return Object.freeze({
-      id: this.newId(),
+      id,
       parentId,
       role,
       content,
