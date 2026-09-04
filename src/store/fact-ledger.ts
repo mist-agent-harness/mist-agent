@@ -55,6 +55,8 @@ export interface LedgerEntry {
   readonly kind: LedgerEntryKind;
   readonly body: string;
   readonly supersedesSeq: number | null;
+  /** 发起方印痕（C04）：谁署名写下的这条——viewport 三元组或 system 豁免的 reason。追加时定死，同为不可变字段。 */
+  readonly origin: EntryOrigin;
 }
 
 /** 跨住户访问时抛这个，不返回空账——静默的空结果会把 bug 藏起来（同 ResidentStore 的房规）。 */
@@ -126,19 +128,49 @@ export class WriteGateUnavailableError extends Error {
 }
 
 /**
- * 裁定级写入的发起方——必填判别联合，不许省略、不许 null。
- *
- * 渡渡家内审 P1 + 上游 Laurie/Elio 定案：origin 可省略就是洞——落后窗
- * 只要少传一个字段就被当 system 放行。所以豁免必须是写方显式签名声明的，
- * 不是「缺省得到的」；类型层必填，绕过就是 review 看得见的越权，跟账侧
- * 「seq 只能账发号」是同一个设计语言。
- *
- * - viewport 分支：账侧写前验 probeGap（unknown fail-closed）+ 落后拒收；
- * - system 分支：可信宿主能力，带 reason 落痕，不凭调用者自报 kind 就绕闸；
- *   本层至少钉死「省略即类型错误、reason 必填非空」。
+ * C04 权威半格：写入三元组携带的 generation 与权威现查（generationOf）
+ * 不符——旧代的窗无权署名当代写入。换代意味着窗对世界的知悉从头论起
+ * （D8 猝死语义：新代靠交接信重新对齐，不续旧窗），旧代号写入与落后
+ * 序号写入是同一种病的两个切面。
  */
-export type WriteOrigin =
-  | { kind: "viewport"; viewportId: string }
+export class StaleGenerationError extends Error {
+  constructor(residentId: string, viewportId: string, claimed: number, current: number) {
+    super(
+      `viewport ${viewportId} of ${residentId} writes as generation ${claimed} but authority says ${current} —— 旧代的窗无权写裁定级条目`,
+    );
+    this.name = "StaleGenerationError";
+  }
+}
+
+/**
+ * 裁定级写入的发起方三元组——对外写口唯一的合法形状。
+ *
+ * 渡渡家内审两轮 + 上游 Laurie/Elio 定案的落点：豁免不能是「缺省得到的」
+ * （P1 前半：origin 可省略即洞），也不能是「自报得到的」（P1 后半：联合
+ * 字段人人可构造，落后窗自称 system 照样绕闸）。所以公开 append/supersede
+ * 的 origin 类型里根本没有 system 分支——system 豁免只经 FactLedger.create()
+ * 铸给组装层的 SystemLedgerWriter 能力对象，不持有能力的调用方在类型上
+ * 就没有豁免可谈，跟「seq 只能账发号」是同一个设计语言。
+ *
+ * 三元组 (residentId, viewportId, generation) 一个不许少（上游 Elio 口径；
+ * viewportId 即宿主发号的 windowId，w_ + ULID）：residentId 必须与写入
+ * 目标账一致（防张冠李戴），generation 由账侧向权威 generationOf 现查
+ * 比对——旧代号拒收，authority 未接线或查不到即 fail-closed。
+ */
+export type ViewportWriteOrigin = {
+  kind: "viewport";
+  residentId: string;
+  viewportId: string;
+  generation: number;
+};
+
+/**
+ * 落进账目的发起方印痕（LedgerEntry.origin）——与 author 并排永存
+ * （上游 Laurie 口径：system 豁免必须显式署名且归档可审计，reason 只做
+ * 写前校验不落痕等于没署名）。residentId 不重复落：条目本身就住在那本账里。
+ */
+export type EntryOrigin =
+  | { kind: "viewport"; viewportId: string; generation: number }
   | { kind: "system"; reason: string };
 
 /**
@@ -186,8 +218,35 @@ interface LedgerRecord {
   viewports: { viewportId: string; baselineSeq: number; ackedSeq: number }[];
 }
 
-const SCHEMA_VERSION = 1;
+/** v2：条目落痕 origin 字段（C04 权威半格）。v1 旧档显式失败等迁移，不猜。 */
+const SCHEMA_VERSION = 2;
 const FILE_SUFFIX = ".facts.json";
+
+/** SystemLedgerWriter 的铸造印——模块私有，外部拿不到，等于构造函数上了锁。 */
+const SYSTEM_WRITER_BRAND = Symbol("fact-ledger system writer");
+
+/** system 豁免每次写入的署名校验：空署名等于没署名。 */
+function assertSystemReason(reason: string): string {
+  if (typeof reason !== "string" || reason.trim() === "") {
+    throw new Error("system-origin write requires a non-empty reason —— 豁免必须显式署名");
+  }
+  return reason;
+}
+
+/** 条目副本（含 origin 深一层）：改返回值涂改不了账。 */
+function copyEntry(entry: LedgerEntry): LedgerEntry {
+  return { ...entry, origin: { ...entry.origin } };
+}
+
+export interface FactLedgerOptions {
+  dataDir?: string;
+  /**
+   * 窗代际的权威查询口（一般由宿主的 SessionRegistry 适配，同 TurnGate 的
+   * generationOf）。窗署名写入必过它验代际；未接线或查不到都 fail-closed——
+   * 验不了资格的写入不放行，这正是「闸在非缺失方」的账侧承诺。
+   */
+  generationOf?: (viewportId: string) => number | null;
+}
 
 export class FactLedger {
   readonly #ledgers = new Map<string, ResidentLedger>();
@@ -203,12 +262,42 @@ export class FactLedger {
   /** ts 只用于展示与追溯，不参与任何判断（铁律 2），单调化只为同毫秒条目排序稳定。 */
   #lastStamp = 0;
 
-  constructor(options: { dataDir?: string } = {}) {
+  /** 窗代际权威口；undefined = 未接线，窗署名写入一律 fail-closed。 */
+  readonly #generationOf: ((viewportId: string) => number | null) | undefined;
+
+  constructor(options: FactLedgerOptions = {}) {
     this.#dataDir = options.dataDir ?? null;
+    this.#generationOf = options.generationOf;
     if (this.#dataDir !== null) {
       mkdirSync(this.#dataDir, { recursive: true });
       this.#restore(this.#dataDir);
     }
+  }
+
+  /**
+   * 组装层入口：开一本账，同时铸出它的 system 写手。SystemLedgerWriter
+   * 只有这一个出生点（类不导出、构造带模块私有印），账实例上也没有任何
+   * 方法能再取到它——能力只在铸出那一刻交给调用方，由组装层决定给谁。
+   * 用普通 new 构造的账没有 system 写手，等于这本账上不存在豁免。
+   */
+  static create(options: FactLedgerOptions = {}): {
+    ledger: FactLedger;
+    systemWriter: SystemLedgerWriter;
+  } {
+    const ledger = new FactLedger(options);
+    const systemWriter = new SystemLedgerWriter(SYSTEM_WRITER_BRAND, {
+      append: (residentId, input, reason) =>
+        ledger.#appendFact(ledger.#ledger(residentId), input, {
+          kind: "system",
+          reason: assertSystemReason(reason),
+        }),
+      supersede: (residentId, targetSeq, input, reason) =>
+        ledger.#supersedeEntry(ledger.#ledger(residentId), targetSeq, input, {
+          kind: "system",
+          reason: assertSystemReason(reason),
+        }),
+    });
+    return { ledger, systemWriter };
   }
 
   /** 同一进程内单调递增的时间戳，避免同毫秒条目排序不稳定。 */
@@ -304,16 +393,30 @@ export class FactLedger {
   // --- 追加（账上唯一的写形状）---
 
   /**
-   * 落一条事实。seq 由账侧发号——调用方没有传 seq 的入口，外部想伪造
-   * 序号得先改这个类，那是 review 看得见的越权。
+   * 落一条事实（窗署名写口）。seq 由账侧发号——调用方没有传 seq 的入口，
+   * 外部想伪造序号得先改这个类，那是 review 看得见的越权。origin 只收
+   * viewport 三元组：system 豁免不在这个门上（见 ViewportWriteOrigin 头注）。
    */
   append(
     residentId: string,
     input: { author: string; kind: FactKind; body: string },
-    origin: WriteOrigin,
+    origin: ViewportWriteOrigin,
   ): LedgerEntry {
     const ledger = this.#ledger(residentId);
-    this.#assertOriginCurrent(residentId, origin);
+    this.#assertViewportOriginCurrent(residentId, origin);
+    return this.#appendFact(ledger, input, {
+      kind: "viewport",
+      viewportId: origin.viewportId,
+      generation: origin.generation,
+    });
+  }
+
+  /** append 的共用内里（窗口与 system 写手共用）：kind 校验 + 原子追加。 */
+  #appendFact(
+    ledger: ResidentLedger,
+    input: { author: string; kind: FactKind; body: string },
+    origin: EntryOrigin,
+  ): LedgerEntry {
     // 运行时校验给绕过类型系统的调用方：supersede 走 append 会造出没有
     // supersedesSeq 指针的解除条目，推导视图直接被毒化。
     if (!FACT_KINDS.includes(input.kind)) {
@@ -321,7 +424,7 @@ export class FactLedger {
         `append only accepts ${FACT_KINDS.join("/")}, got ${String(input.kind)} —— 解除走 supersede()`,
       );
     }
-    return this.#appendEntry(ledger, input.author, input.kind, input.body, null);
+    return this.#appendEntry(ledger, input.author, input.kind, input.body, null, origin);
   }
 
   /**
@@ -336,15 +439,29 @@ export class FactLedger {
     residentId: string,
     targetSeq: number,
     input: { author: string; reason: string },
-    origin: WriteOrigin,
+    origin: ViewportWriteOrigin,
   ): LedgerEntry {
     const ledger = this.#ledger(residentId);
     // C04 闸先于目标校验：未知悉最新裁定的窗连「目标存不存在」的答案
     // 都不该拿到——先验资格，再验参数。
-    this.#assertOriginCurrent(residentId, origin);
+    this.#assertViewportOriginCurrent(residentId, origin);
+    return this.#supersedeEntry(ledger, targetSeq, input, {
+      kind: "viewport",
+      viewportId: origin.viewportId,
+      generation: origin.generation,
+    });
+  }
+
+  /** supersede 的共用内里（窗口与 system 写手共用）：目标校验 + 原子追加。 */
+  #supersedeEntry(
+    ledger: ResidentLedger,
+    targetSeq: number,
+    input: { author: string; reason: string },
+    origin: EntryOrigin,
+  ): LedgerEntry {
     const target = ledger.entries[targetSeq - 1];
     if (target === undefined || target.seq !== targetSeq) {
-      throw new LedgerEntryNotFoundError(residentId, targetSeq);
+      throw new LedgerEntryNotFoundError(ledger.residentId, targetSeq);
     }
     if (target.kind === "supersede") {
       throw new InvalidSupersedeError(
@@ -354,27 +471,61 @@ export class FactLedger {
     if (ledger.supersededSeqs.has(targetSeq)) {
       throw new InvalidSupersedeError(`entry seq ${targetSeq} is already superseded`);
     }
-    const entry = this.#appendEntry(ledger, input.author, "supersede", input.reason, targetSeq);
+    const entry = this.#appendEntry(
+      ledger,
+      input.author,
+      "supersede",
+      input.reason,
+      targetSeq,
+      origin,
+    );
     ledger.supersededSeqs.add(targetSeq);
     return entry;
   }
 
   /**
-   * C04（闸在非缺失方）：裁定级写入的必经账侧闸。origin 必填判别联合，
-   * 省略在类型层就是编译错误（渡渡家内审 P1：可省略即洞）。
-   *
-   * - viewport 来源：写前过 probeGap，unknown fail-closed（查不到 ≠ 没缺口），
-   *   落后（ackedSeq < latestSeq）拒收。经 probeGap 走使 MV-C03 装置的
-   *   通道故障对写路径同样生效。
-   * - system 来源：可信宿主豁免，reason 非空才放行（豁免必须显式署名，
-   *   不是缺省得到；空署名等于没署名）。
+   * C04（闸在非缺失方）：窗署名裁定级写入的必经账侧闸。四道检查按
+   * 资格从内到外排：形状（运行时半格——JS 调用方自报 {kind:"system"}
+   * 在这里响亮拒绝，类型面则根本没有那个分支）→ residentId 一致 →
+   * 代际权威现查（未接线/查不到 fail-closed，旧代号拒收）→ 缺口
+   * （unknown fail-closed，落后拒收）。经 probeGap 走使 MV-C03 装置的
+   * 通道故障对写路径同样生效。
    */
-  #assertOriginCurrent(residentId: string, origin: WriteOrigin): void {
-    if (origin.kind === "system") {
-      if (origin.reason.trim() === "") {
-        throw new Error("system-origin write requires a non-empty reason —— 豁免必须显式署名");
-      }
-      return;
+  #assertViewportOriginCurrent(residentId: string, origin: ViewportWriteOrigin): void {
+    if (
+      typeof origin !== "object" ||
+      origin === null ||
+      origin.kind !== "viewport" ||
+      typeof origin.residentId !== "string" ||
+      typeof origin.viewportId !== "string" ||
+      !Number.isInteger(origin.generation)
+    ) {
+      throw new Error(
+        'write origin must be a viewport triplet {kind:"viewport", residentId, viewportId, generation} —— system 豁免只经 FactLedger.create() 铸出的 SystemLedgerWriter，不凭调用方自报',
+      );
+    }
+    if (origin.residentId !== residentId) {
+      throw new Error(
+        `origin.residentId (${origin.residentId}) 与写入目标账 (${residentId}) 不一致 —— 三元组不许张冠李戴`,
+      );
+    }
+    if (this.#generationOf === undefined) {
+      throw new WriteGateUnavailableError(
+        residentId,
+        origin.viewportId,
+        "generationOf 权威未接线——验不了代际的窗署名写入 fail-closed",
+      );
+    }
+    const current = this.#generationOf(origin.viewportId);
+    if (current === null) {
+      throw new WriteGateUnavailableError(
+        residentId,
+        origin.viewportId,
+        `generation 权威查不到窗 ${origin.viewportId}——验不了资格即 fail-closed`,
+      );
+    }
+    if (current !== origin.generation) {
+      throw new StaleGenerationError(residentId, origin.viewportId, origin.generation, current);
     }
     const probe = this.probeGap(residentId, origin.viewportId);
     if (probe.status === "unknown") {
@@ -391,6 +542,7 @@ export class FactLedger {
     kind: LedgerEntryKind,
     body: string,
     supersedesSeq: number | null,
+    origin: EntryOrigin,
   ): LedgerEntry {
     const entry: LedgerEntry = Object.freeze({
       seq: ledger.entries.length + 1,
@@ -399,6 +551,7 @@ export class FactLedger {
       kind,
       body,
       supersedesSeq,
+      origin: Object.freeze({ ...origin }),
     });
     // 候选快照先落盘，成功才发布进内存：落盘失败时调用方收到错误，
     // 而账一个字节没变——不存在「内存改了、盘上没改」的中间态。
@@ -410,7 +563,7 @@ export class FactLedger {
     // 冻结石彻 append-only 的最后一步：即使有人拿到账内引用（持久化恢复
     // 之外的路径都返回副本），运行时也拒绝任何涂改。
     ledger.entries.push(entry);
-    return { ...entry };
+    return copyEntry(entry);
   }
 
   // --- 推导视图与追溯 ---
@@ -425,7 +578,7 @@ export class FactLedger {
    * 返回副本——改返回值涂改不了账。
    */
   entries(residentId: string): LedgerEntry[] {
-    return this.#ledger(residentId).entries.map((entry) => ({ ...entry }));
+    return this.#ledger(residentId).entries.map(copyEntry);
   }
 
   /**
@@ -446,7 +599,7 @@ export class FactLedger {
     const ledger = this.#ledger(residentId);
     return ledger.entries
       .filter((entry) => entry.kind !== "supersede" && !ledger.supersededSeqs.has(entry.seq))
-      .map((entry) => ({ ...entry }));
+      .map(copyEntry);
   }
 
   // --- 窗级确认位（viewport 一词从 glossary，图纸上说的「窗」）---
@@ -496,7 +649,7 @@ export class FactLedger {
   pendingInitial(residentId: string, viewportId: string): LedgerEntry[] | null {
     const row = this.#viewportRow(this.#ledger(residentId), viewportId);
     const pending = row.pendingInitial;
-    return pending === null ? null : pending.map((entry) => ({ ...entry }));
+    return pending === null ? null : pending.map(copyEntry);
   }
 
   /**
@@ -538,9 +691,7 @@ export class FactLedger {
   gapEntries(residentId: string, viewportId: string): LedgerEntry[] {
     const ledger = this.#ledger(residentId);
     const row = this.#viewportRow(ledger, viewportId);
-    return ledger.entries
-      .filter((entry) => entry.seq > row.ackedSeq)
-      .map((entry) => ({ ...entry }));
+    return ledger.entries.filter((entry) => entry.seq > row.ackedSeq).map(copyEntry);
   }
 
   /**
@@ -589,7 +740,7 @@ export class FactLedger {
     return {
       schemaVersion: SCHEMA_VERSION,
       residentId,
-      entries: entries.map((entry) => ({ ...entry })),
+      entries: entries.map(copyEntry),
       viewports: [...viewports.entries()].map(([viewportId, row]) => ({
         viewportId,
         baselineSeq: row.baselineSeq,
@@ -660,7 +811,9 @@ export class FactLedger {
       this.#restoreViewports(record);
       this.#ledgers.set(record.residentId, {
         residentId: record.residentId,
-        entries: record.entries.map((entry) => Object.freeze({ ...entry })),
+        entries: record.entries.map((entry) =>
+          Object.freeze({ ...entry, origin: Object.freeze({ ...entry.origin }) }),
+        ),
         supersededSeqs: new Set(
           record.entries.flatMap((entry) =>
             entry.kind === "supersede" && entry.supersedesSeq !== null ? [entry.supersedesSeq] : [],
@@ -721,7 +874,11 @@ export class FactLedger {
         throw bad(`第 ${i + 1} 条不是对象`);
       }
       const e = entry as Record<string, unknown>;
-      exactKeys(e, ["seq", "ts", "author", "kind", "body", "supersedesSeq"], `第 ${i + 1} 条`);
+      exactKeys(
+        e,
+        ["seq", "ts", "author", "kind", "body", "supersedesSeq", "origin"],
+        `第 ${i + 1} 条`,
+      );
       if (!Number.isInteger(e.seq)) throw bad(`第 ${i + 1} 条的 seq 不是整数`);
       if (typeof e.ts !== "string") throw bad(`第 ${i + 1} 条的 ts 不是字符串`);
       if (typeof e.author !== "string") throw bad(`第 ${i + 1} 条的 author 不是字符串`);
@@ -729,6 +886,29 @@ export class FactLedger {
       if (typeof e.body !== "string") throw bad(`第 ${i + 1} 条的 body 不是字符串`);
       if (e.supersedesSeq !== null && !Number.isInteger(e.supersedesSeq)) {
         throw bad(`第 ${i + 1} 条的 supersedesSeq 既不是 null 也不是整数`);
+      }
+      // origin 印痕（C04）：审计字段坏了同样是坏档——落痕缺失或形状不对的
+      // 条目无法回答「谁署名写的」，不许静默凑合。
+      const origin = e.origin;
+      if (typeof origin !== "object" || origin === null || Array.isArray(origin)) {
+        throw bad(`第 ${i + 1} 条的 origin 不是对象`);
+      }
+      const o = origin as Record<string, unknown>;
+      if (o.kind === "viewport") {
+        exactKeys(o, ["kind", "viewportId", "generation"], `第 ${i + 1} 条的 origin`);
+        if (typeof o.viewportId !== "string") {
+          throw bad(`第 ${i + 1} 条 origin 的 viewportId 不是字符串`);
+        }
+        if (!Number.isInteger(o.generation)) {
+          throw bad(`第 ${i + 1} 条 origin 的 generation 不是整数`);
+        }
+      } else if (o.kind === "system") {
+        exactKeys(o, ["kind", "reason"], `第 ${i + 1} 条的 origin`);
+        if (typeof o.reason !== "string" || o.reason.trim() === "") {
+          throw bad(`第 ${i + 1} 条 origin 的 system reason 不是非空字符串——空署名等于没署名`);
+        }
+      } else {
+        throw bad(`第 ${i + 1} 条 origin 带着未知 kind=${String(o.kind)}`);
       }
     }
     if (!Array.isArray(record.viewports)) throw bad("viewports 不是数组");
@@ -821,3 +1001,59 @@ export class FactLedger {
     }
   }
 }
+
+/** SystemLedgerWriter 内里的特权写口——由 FactLedger.create() 在铸造时闭包交付。 */
+interface SystemRawWriter {
+  append(
+    residentId: string,
+    input: { author: string; kind: FactKind; body: string },
+    reason: string,
+  ): LedgerEntry;
+  supersede(
+    residentId: string,
+    targetSeq: number,
+    input: { author: string; reason: string },
+    reason: string,
+  ): LedgerEntry;
+}
+
+/**
+ * system 豁免的能力对象（上游 Elio 口径：豁免是可信宿主能力，不是任意
+ * 调用方自报的 kind=system）。类只导出类型不导出值，构造函数再验模块私有
+ * 铸造印——模块之外既 new 不出来也仿不出来；唯一出生点是 FactLedger.create()，
+ * 由组装层决定这份能力交到谁手里。
+ *
+ * 每次写入仍必须给出非空 reason（豁免必须显式署名），reason 与 author 并排
+ * 落进不可变账目（LedgerEntry.origin），归档查询可审计。
+ */
+class SystemLedgerWriter {
+  readonly #raw: SystemRawWriter;
+
+  constructor(brand: symbol, raw: SystemRawWriter) {
+    if (brand !== SYSTEM_WRITER_BRAND) {
+      throw new Error("SystemLedgerWriter 只能由 FactLedger.create() 铸出——能力不可伪造");
+    }
+    this.#raw = raw;
+  }
+
+  /** 以 system 身份落一条事实；reason = 这次豁免的署名，落痕进条目。 */
+  append(
+    residentId: string,
+    input: { author: string; kind: FactKind; body: string },
+    reason: string,
+  ): LedgerEntry {
+    return this.#raw.append(residentId, input, reason);
+  }
+
+  /** 以 system 身份解除一条事实；originReason 与条目 body 里的解除理由是两回事——前者答「凭什么豁免」，后者答「为什么解除」。 */
+  supersede(
+    residentId: string,
+    targetSeq: number,
+    input: { author: string; reason: string },
+    originReason: string,
+  ): LedgerEntry {
+    return this.#raw.supersede(residentId, targetSeq, input, originReason);
+  }
+}
+
+export type { SystemLedgerWriter };

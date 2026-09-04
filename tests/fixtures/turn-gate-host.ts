@@ -22,12 +22,23 @@ import {
   type TurnGateEvent,
   ViewportTurnGate,
 } from "../../src/session/turn-gate.ts";
-import { type FactKind, FactLedger, type GapProbe } from "../../src/store/fact-ledger.ts";
+import {
+  type FactKind,
+  FactLedger,
+  type FactLedgerOptions,
+  type GapProbe,
+} from "../../src/store/fact-ledger.ts";
 
 const dataDir = process.env.MIST_TURN_GATE_DATADIR;
 // 给了 dataDir 就是「落盘宿主」形态：ResidentStore 与 FactLedger 同目录共存
 // （各自认领各自的后缀），供父进程 SIGKILL 后原目录拉起，验猝死不续接。
-const ledger = dataDir === undefined ? new FactLedger() : new FactLedger({ dataDir });
+// 账的代际权威接 B 窗注册表（A 窗走 driver 不直写账）；systemWriter 是
+// 组装层（本 fixture 的主线程）持有的能力——只在这里铸出，B 窗命令拿不到。
+const ledgerOptions: FactLedgerOptions = {
+  ...(dataDir === undefined ? {} : { dataDir }),
+  generationOf: (viewportId) => sessionsB.get(viewportId)?.generation ?? null,
+};
+const { ledger, systemWriter } = FactLedger.create(ledgerOptions);
 const events: TurnGateEvent[] = [];
 const logger: TurnEventLogger = {
   log: (event) => {
@@ -141,6 +152,13 @@ function windowBOf(residentId: string): string {
   return windowId;
 }
 
+/** B 窗署名三元组用的代际——从注册表现取（装置模拟的是「守规矩地报出自己的真实代际」的窗）。 */
+function generationBOf(viewportId: string): number {
+  const generation = sessionsB.get(viewportId)?.generation;
+  if (generation === undefined) throw new Error(`no B session for ${viewportId}`);
+  return generation;
+}
+
 async function execute(command: HostCommand): Promise<unknown> {
   switch (command.op) {
     case "createResident": {
@@ -169,21 +187,23 @@ async function execute(command: HostCommand): Promise<unknown> {
       await driver.killSession(requireString(command.residentId, "residentId"));
       return null;
     case "appendRuling":
-      // 主线程/管理员落账：显式 system 来源，不受 C04 落后窗闸（豁免必须自报）。
-      return ledger.append(
+      // 主线程/管理员落账：走组装层持有的 system 能力写手——豁免凭能力
+      // 不凭自报，reason 落痕进条目（C04 权威半格）。
+      return systemWriter.append(
         requireString(command.residentId, "residentId"),
         {
           author: requireString(command.author, "author"),
           kind: command.kind ?? "ruling",
           body: requireString(command.body, "body"),
         },
-        { kind: "system", reason: "main-thread ledger write" },
+        "main-thread ledger write",
       );
     // C04：B 窗署名的裁定级写入——同一个 append 入口，只多一个发起方。
     // 窗「自查与否」在这条路径上不存在：装置故意不做任何前置检查，
     // 拦不拦全看账侧。
     case "appendRulingFromB": {
       const residentId = requireString(command.residentId, "residentId");
+      const viewportId = windowBOf(residentId);
       return ledger.append(
         residentId,
         {
@@ -191,22 +211,23 @@ async function execute(command: HostCommand): Promise<unknown> {
           kind: command.kind ?? "ruling",
           body: requireString(command.body, "body"),
         },
-        { kind: "viewport", viewportId: windowBOf(residentId) },
+        { kind: "viewport", residentId, viewportId, generation: generationBOf(viewportId) },
       );
     }
     case "supersede":
-      // 主线程解除：显式 system 来源。
-      return ledger.supersede(
+      // 主线程解除：同样走 system 能力写手。
+      return systemWriter.supersede(
         requireString(command.residentId, "residentId"),
         command.targetSeq ?? -1,
         {
           author: requireString(command.author, "author"),
           reason: requireString(command.reason, "reason"),
         },
-        { kind: "system", reason: "main-thread supersede" },
+        "main-thread supersede",
       );
     case "supersedeFromB": {
       const residentId = requireString(command.residentId, "residentId");
+      const viewportId = windowBOf(residentId);
       return ledger.supersede(
         residentId,
         command.targetSeq ?? -1,
@@ -214,7 +235,7 @@ async function execute(command: HostCommand): Promise<unknown> {
           author: requireString(command.author, "author"),
           reason: requireString(command.reason, "reason"),
         },
-        { kind: "viewport", viewportId: windowBOf(residentId) },
+        { kind: "viewport", residentId, viewportId, generation: generationBOf(viewportId) },
       );
     }
     case "entries":

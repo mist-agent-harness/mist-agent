@@ -37,7 +37,7 @@ function setup(options: { reply?: AssistantReply } = {}) {
   });
   store.createRoom(RESIDENT);
   const sessions = new SessionRegistry<null>();
-  const ledger = new FactLedger();
+  const { ledger, systemWriter: system } = FactLedger.create();
   ledger.createLedger(RESIDENT);
   const logger = new CollectingLogger();
   const gate = new ViewportTurnGate(ledger, {
@@ -63,7 +63,7 @@ function setup(options: { reply?: AssistantReply } = {}) {
   );
   const window = sessions.open(RESIDENT, { context: null });
   ledger.openViewport(RESIDENT, window.windowId);
-  return { store, sessions, ledger, logger, gate, service, prompts, window };
+  return { store, sessions, ledger, system, logger, gate, service, prompts, window };
 }
 
 describe("ViewportTurnGate 经 MessageTreeService.say", () => {
@@ -91,17 +91,9 @@ describe("ViewportTurnGate 经 MessageTreeService.say", () => {
   });
 
   it("有缺口：注入格式档位标注齐全，落树 user 仍是原文，落树后 ack 到 latestSeq", async () => {
-    const { service, ledger, prompts, logger, window } = setup();
-    ledger.append(
-      RESIDENT,
-      { author: "main-thread", kind: "ruling", body: "裁定甲" },
-      { kind: "system", reason: "test" },
-    );
-    ledger.append(
-      RESIDENT,
-      { author: "main-thread", kind: "active_rule", body: "规矩乙" },
-      { kind: "system", reason: "test" },
-    );
+    const { service, ledger, system, prompts, logger, window } = setup();
+    system.append(RESIDENT, { author: "main-thread", kind: "ruling", body: "裁定甲" }, "test");
+    system.append(RESIDENT, { author: "main-thread", kind: "active_rule", body: "规矩乙" }, "test");
 
     await service.say(RESIDENT, "住户原话", window.windowId);
 
@@ -137,18 +129,14 @@ describe("ViewportTurnGate 经 MessageTreeService.say", () => {
 
   it("assistantReply 失败：不 ack 不落树，下轮原样重拉后正常 ack（MV-C05）", async () => {
     const prompts: string[] = [];
-    const { service, ledger, window } = setup({
+    const { service, ledger, system, window } = setup({
       reply: (_residentId, message) => {
         prompts.push(message);
         if (prompts.length === 1) throw new Error("model down");
         return "复原后的回应";
       },
     });
-    ledger.append(
-      RESIDENT,
-      { author: "main-thread", kind: "ruling", body: "裁定甲" },
-      { kind: "system", reason: "test" },
-    );
+    system.append(RESIDENT, { author: "main-thread", kind: "ruling", body: "裁定甲" }, "test");
 
     await expect(service.say(RESIDENT, "第一句", window.windowId)).rejects.toThrow("model down");
     expect(ledger.ackedSeq(RESIDENT, window.windowId)).toBe(0);
@@ -191,13 +179,9 @@ describe("ViewportTurnGate 经 MessageTreeService.say", () => {
   });
 
   it("reviseNode 不过闸：有缺口时改口既不拉取也不 ack（改口不是开工）", async () => {
-    const { service, ledger, logger, window } = setup();
+    const { service, ledger, system, logger, window } = setup();
     const reply = await service.say(RESIDENT, "初稿", window.windowId);
-    ledger.append(
-      RESIDENT,
-      { author: "main-thread", kind: "ruling", body: "裁定甲" },
-      { kind: "system", reason: "test" },
-    );
+    system.append(RESIDENT, { author: "main-thread", kind: "ruling", body: "裁定甲" }, "test");
     const eventsBefore = logger.events.length;
 
     await service.reviseNode(RESIDENT, reply.id, "改口", window.windowId);
@@ -221,12 +205,8 @@ describe("ViewportTurnGate.noteOrdinaryAction（MV-C03 普通半）", () => {
   });
 
   it("查账正常：什么都不记，什么都不做", () => {
-    const { gate, ledger, window, logger } = setup();
-    ledger.append(
-      RESIDENT,
-      { author: "main-thread", kind: "ruling", body: "裁定甲" },
-      { kind: "system", reason: "test" },
-    );
+    const { gate, ledger, system, window, logger } = setup();
+    system.append(RESIDENT, { author: "main-thread", kind: "ruling", body: "裁定甲" }, "test");
 
     expect(() => gate.noteOrdinaryAction(RESIDENT, window.windowId)).not.toThrow();
 
@@ -247,12 +227,8 @@ describe("ViewportTurnGate.noteOrdinaryAction（MV-C03 普通半）", () => {
 
 describe("回执幂等", () => {
   it("同一轮 commit 重发不炸也不退（MV-C05：回执重发是传播机制的常态）", () => {
-    const { gate, ledger, window } = setup();
-    ledger.append(
-      RESIDENT,
-      { author: "main-thread", kind: "ruling", body: "裁定甲" },
-      { kind: "system", reason: "test" },
-    );
+    const { gate, ledger, system, window } = setup();
+    system.append(RESIDENT, { author: "main-thread", kind: "ruling", body: "裁定甲" }, "test");
 
     const pass = gate.beforeTurn(RESIDENT, window.windowId);
     pass.commit();
@@ -314,7 +290,7 @@ describe("ack 落盘失败（MV-C05：回执未达不能否认本轮已交付）
     store.createRoom(RESIDENT);
     const sessions = new SessionRegistry<null>();
     // 真 FactLedger + 真 dataDir：注入的是磁盘写失败，不是 mocked 的账。
-    const ledger = new FactLedger({ dataDir: dir });
+    const { ledger, systemWriter: system } = FactLedger.create({ dataDir: dir });
     ledger.createLedger(RESIDENT);
     const logger = new CollectingLogger();
     const gate = new ViewportTurnGate(ledger, {
@@ -338,11 +314,7 @@ describe("ack 落盘失败（MV-C05：回执未达不能否认本轮已交付）
     );
     const window = sessions.open(RESIDENT, { context: null });
     ledger.openViewport(RESIDENT, window.windowId);
-    ledger.append(
-      RESIDENT,
-      { author: "main-thread", kind: "ruling", body: "裁定甲" },
-      { kind: "system", reason: "test" },
-    );
+    system.append(RESIDENT, { author: "main-thread", kind: "ruling", body: "裁定甲" }, "test");
 
     // chmod 0555 让 ack 的落盘必败（同 tests/fact-ledger.test.ts 的装置）。
     let reply: HistoryNode | undefined;
