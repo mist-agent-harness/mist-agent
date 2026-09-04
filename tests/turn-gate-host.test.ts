@@ -372,6 +372,111 @@ describe("turn-gate real host subprocess", () => {
     expect(await callHost<LedgerEntry[]>(child, { op: "currentSet", residentId })).toEqual([]);
   });
 
+  it("MV-C04 闸在非缺失方：落后窗直写裁定级条目被账侧拒收，账上一个字节不多；追平后放行", async () => {
+    const child = startHost();
+    await waitForReady(child);
+    const { residentId } = await callHost<{ residentId: string }>(child, {
+      op: "createResident",
+      name: "placeholder-c04",
+    });
+    // B 窗开在空账上（baseline=0），随后主线程落一条裁定——B 落后一条，
+    // 且这条路径上没有任何窗自查：拦不拦全看账侧写路径。
+    const { windowId: windowB } = await callHost<{ windowId: string }>(child, {
+      op: "openWindowB",
+      residentId,
+    });
+    await callHost(child, {
+      op: "appendRuling",
+      residentId,
+      author: "main-thread",
+      kind: "ruling",
+      body: "placeholder ruling unseen by B",
+    });
+
+    // 落后窗写新裁定：拒收，且账上没有多出条目。
+    await expect(
+      callHost(child, {
+        op: "appendRulingFromB",
+        residentId,
+        author: "placeholder-resident",
+        kind: "ruling",
+        body: "placeholder stale write",
+      }),
+    ).rejects.toThrow(/StaleViewportError/);
+    // 落后窗解除它没见过的那条裁定：同样拒收。
+    await expect(
+      callHost(child, {
+        op: "supersedeFromB",
+        residentId,
+        targetSeq: 1,
+        author: "placeholder-resident",
+        reason: "placeholder stale supersede",
+      }),
+    ).rejects.toThrow(/StaleViewportError/);
+    expect(await callHost<LedgerEntry[]>(child, { op: "entries", residentId })).toHaveLength(1);
+
+    // B 过一轮开工闸追平缺口后，同一扇窗的写入放行——闸拦的是「落后」，
+    // 不是「窗」。
+    await callHost(child, { op: "sayOnB", residentId, message: "placeholder align turn" });
+    expect(await callHost<number>(child, { op: "ackedSeq", residentId, windowId: windowB })).toBe(
+      1,
+    );
+    const written = await callHost<LedgerEntry>(child, {
+      op: "appendRulingFromB",
+      residentId,
+      author: "placeholder-resident",
+      kind: "ruling",
+      body: "placeholder synced write",
+    });
+    expect(written).toMatchObject({ seq: 2, kind: "ruling" });
+  });
+
+  it("MV-C04 unknown 半格：查账失败时窗署名写入 fail-closed；非窗来源写入不受此闸", async () => {
+    const child = startHost();
+    await waitForReady(child);
+    const { residentId } = await callHost<{ residentId: string }>(child, {
+      op: "createResident",
+      name: "placeholder-c04-unknown",
+    });
+    await callHost(child, { op: "openWindowB", residentId });
+    await callHost(child, { op: "failProbe", on: true });
+
+    // 查不到 ≠ 没缺口：窗署名的裁定级写入 fail-closed。
+    await expect(
+      callHost(child, {
+        op: "appendRulingFromB",
+        residentId,
+        author: "placeholder-resident",
+        kind: "ruling",
+        body: "placeholder write under unknown",
+      }),
+    ).rejects.toThrow(/WriteGateUnavailableError/);
+    expect(await callHost<LedgerEntry[]>(child, { op: "entries", residentId })).toHaveLength(0);
+
+    // 非窗来源（主线程落账）不经 C04 闸——闸拦的是「落后的窗」，
+    // 不是「不是窗的写方」。
+    const mainWrite = await callHost<LedgerEntry>(child, {
+      op: "appendRuling",
+      residentId,
+      author: "main-thread",
+      kind: "ruling",
+      body: "placeholder main-thread write during outage",
+    });
+    expect(mainWrite).toMatchObject({ seq: 1, kind: "ruling" });
+
+    // 注入撤销后，追平的窗恢复写入——fail-closed 不是永久熔断。
+    await callHost(child, { op: "failProbe", on: false });
+    await callHost(child, { op: "sayOnB", residentId, message: "placeholder recovery turn" });
+    const recovered = await callHost<LedgerEntry>(child, {
+      op: "appendRulingFromB",
+      residentId,
+      author: "placeholder-resident",
+      kind: "ruling",
+      body: "placeholder recovered write",
+    });
+    expect(recovered).toMatchObject({ seq: 2, kind: "ruling" });
+  });
+
   it("宿主猝死不续接旧窗（PR #98 拍板）：同 dataDir 拉起新宿主，人与账原样恢复，新窗重新初始对齐", async () => {
     const dir = mkdtempSync(join(tmpdir(), "mist-gate-crash-"));
     directories.push(dir);

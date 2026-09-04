@@ -98,6 +98,42 @@ export class AckError extends Error {
 }
 
 /**
+ * C04（闸在非缺失方）：窗署名的裁定级写入，发起窗落后于账
+ * （ackedSeq < latestSeq）时的拒收。拦截站在账侧写路径上——窗自查
+ * 不是闸，忘了自查的窗和故意不自查的窗在这里长一个样。
+ */
+export class StaleViewportError extends Error {
+  constructor(residentId: string, viewportId: string, ackedSeq: number, latestSeq: number) {
+    super(
+      `viewport ${viewportId} of ${residentId} is stale (acked ${ackedSeq} < latest ${latestSeq}) —— 未知悉最新裁定的窗无权写裁定级条目，先过开工闸拉平缺口`,
+    );
+    this.name = "StaleViewportError";
+  }
+}
+
+/**
+ * C04 的 unknown 半格：窗署名写入时查账失败（GapProbe unknown）即
+ * fail-closed——「查不到」不许被当成「没缺口」放行（与 MV-C03 同一条
+ * 纪律：unknown 和零是两个值）。
+ */
+export class WriteGateUnavailableError extends Error {
+  constructor(residentId: string, viewportId: string, cause: string) {
+    super(
+      `ledger probe unknown for viewport ${viewportId} of ${residentId}（${cause}）—— 裁定级写入 fail-closed`,
+    );
+    this.name = "WriteGateUnavailableError";
+  }
+}
+
+/**
+ * 窗署名写入的发起方。不传 = 非窗来源（主线程／管理员落账），不受 C04
+ * 闸——闸拦的是「落后的窗」，不是「不是窗的写方」。
+ */
+export interface WriteOrigin {
+  viewportId: string;
+}
+
+/**
  * 缺口探针的返回形状（MV-C03 的落点）。
  *
  * 「查不到」（unknown）与「查到是零」（ok 且 latestSeq=ackedSeq=0）是两个
@@ -263,8 +299,15 @@ export class FactLedger {
    * 落一条事实。seq 由账侧发号——调用方没有传 seq 的入口，外部想伪造
    * 序号得先改这个类，那是 review 看得见的越权。
    */
-  append(residentId: string, input: { author: string; kind: FactKind; body: string }): LedgerEntry {
+  append(
+    residentId: string,
+    input: { author: string; kind: FactKind; body: string },
+    origin?: WriteOrigin,
+  ): LedgerEntry {
     const ledger = this.#ledger(residentId);
+    // C04 红灯占位：origin 已收、闸未落（拦截随绿灯 commit 落地）。
+    // 红灯测试必须在这个头上失败——落后窗的写入此刻仍被放行。
+    void origin;
     // 运行时校验给绕过类型系统的调用方：supersede 走 append 会造出没有
     // supersedesSeq 指针的解除条目，推导视图直接被毒化。
     if (!FACT_KINDS.includes(input.kind)) {
@@ -287,8 +330,11 @@ export class FactLedger {
     residentId: string,
     targetSeq: number,
     input: { author: string; reason: string },
+    origin?: WriteOrigin,
   ): LedgerEntry {
     const ledger = this.#ledger(residentId);
+    // C04 红灯占位：同 append——origin 已收、闸未落。
+    void origin;
     const target = ledger.entries[targetSeq - 1];
     if (target === undefined || target.seq !== targetSeq) {
       throw new LedgerEntryNotFoundError(residentId, targetSeq);

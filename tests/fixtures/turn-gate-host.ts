@@ -99,7 +99,9 @@ type HostCommand = {
     | "recall"
     | "killSession"
     | "appendRuling"
+    | "appendRulingFromB"
     | "supersede"
+    | "supersedeFromB"
     | "entries"
     | "currentSet"
     | "openWindowB"
@@ -172,6 +174,21 @@ async function execute(command: HostCommand): Promise<unknown> {
         kind: command.kind ?? "ruling",
         body: requireString(command.body, "body"),
       });
+    // C04：B 窗署名的裁定级写入——同一个 append 入口，只多一个发起方。
+    // 窗「自查与否」在这条路径上不存在：装置故意不做任何前置检查，
+    // 拦不拦全看账侧。
+    case "appendRulingFromB": {
+      const residentId = requireString(command.residentId, "residentId");
+      return ledger.append(
+        residentId,
+        {
+          author: requireString(command.author, "author"),
+          kind: command.kind ?? "ruling",
+          body: requireString(command.body, "body"),
+        },
+        { viewportId: windowBOf(residentId) },
+      );
+    }
     case "supersede":
       return ledger.supersede(
         requireString(command.residentId, "residentId"),
@@ -181,6 +198,18 @@ async function execute(command: HostCommand): Promise<unknown> {
           reason: requireString(command.reason, "reason"),
         },
       );
+    case "supersedeFromB": {
+      const residentId = requireString(command.residentId, "residentId");
+      return ledger.supersede(
+        residentId,
+        command.targetSeq ?? -1,
+        {
+          author: requireString(command.author, "author"),
+          reason: requireString(command.reason, "reason"),
+        },
+        { viewportId: windowBOf(residentId) },
+      );
+    }
     case "entries":
       return ledger.entries(requireString(command.residentId, "residentId"));
     case "currentSet":
