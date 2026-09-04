@@ -67,6 +67,13 @@
   或未声明的上下文正文，必被拒绝且主流字节不变；无类型自由文本同样不得借投递接口入流。
   来源字段只提供 provenance，不自动赋予 authority。
 
+  证据：`BoundedWorkEventPort` 是 viewport 面唯一的三类投递口；来源窗只能提交固定
+  envelope，authority source 由宿主组装时注入，不由窗自报。`tests/one-stream-host.test.ts`
+  启动真实子进程，逐类投递 progress / blocked / result，并核对三条进入同一本 durable
+  canonical stream；随后分别夹带 transcript、messages、context、伪造 authority source，
+  以及直接提交无类型字符串，五种输入均被拒且 snapshot 字节不变。临时移除 envelope
+  exact-key 闸时，专项稳定转红（非法 transcript 成为第 4 条事件）。
+
 - [ ] **OS-05 宿主失败必须外显且明确未生效** [集成]：模拟一次由宿主执行的生命周期
   动作失败（至少覆盖换气失败）。canonical stream 必须收到宿主签发的 typed user-visible
   event，明确动作未生效；受影响 viewport 是 subject，不是 reporter。若宿主会自动重试，

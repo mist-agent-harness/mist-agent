@@ -1,4 +1,5 @@
 import {
+  BoundedWorkEventPort,
   type CanonicalEventDraft,
   CanonicalStreamProjection,
   CanonicalStreamStore,
@@ -20,6 +21,9 @@ const writer = new CanonicalStreamWriter(store, {
     }
   },
 });
+const workEvents = new BoundedWorkEventPort(writer, {
+  authoritySource: { kind: "host", id: "mist-host" },
+});
 
 type Command = {
   requestId?: string;
@@ -28,6 +32,7 @@ type Command = {
   clientId?: string;
   idempotencyKey?: string;
   draft?: CanonicalEventDraft;
+  workEvent?: unknown;
   afterSeq?: number;
 };
 
@@ -63,6 +68,8 @@ async function handle(command: Command): Promise<unknown> {
         idempotencyKey: required(command.idempotencyKey, "idempotencyKey"),
         draft: command.draft,
       });
+    case "submitWorkEvent":
+      return workEvents.submit(command.workEvent);
     case "events":
       return store.eventsAfter(required(command.residentId, "residentId"), command.afterSeq ?? 0);
     case "openProjection": {

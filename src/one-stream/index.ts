@@ -10,6 +10,12 @@ export {
   stableJson,
   verifyCanonicalEvent,
 } from "./event-contract.ts";
+export { BoundedWorkEventError, BoundedWorkEventPort } from "./bounded-work-events.ts";
+export type {
+  BoundedWorkEventPortOptions,
+  BoundedWorkEventSubmission,
+  WorkEventPurpose,
+} from "./bounded-work-events.ts";
 export type {
   ActorKind,
   CanonicalEvent,
