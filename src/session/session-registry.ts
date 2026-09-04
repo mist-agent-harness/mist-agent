@@ -26,6 +26,7 @@ const ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 export const WINDOW_ARCHIVED = "WINDOW_ARCHIVED" as const;
 export const WINDOW_REOPEN_INVALID = "WINDOW_REOPEN_INVALID" as const;
+export const WINDOW_ARCHIVE_RECOVERY_INVALID = "WINDOW_ARCHIVE_RECOVERY_INVALID" as const;
 
 export class WindowArchivedError extends Error {
   readonly code = WINDOW_ARCHIVED;
@@ -40,6 +41,14 @@ export class WindowReopenError extends Error {
   constructor(windowId: string, reason: string) {
     super(`${WINDOW_REOPEN_INVALID}: ${windowId}: ${reason}`);
     this.name = "WindowReopenError";
+  }
+}
+
+export class WindowArchiveRecoveryError extends Error {
+  readonly code = WINDOW_ARCHIVE_RECOVERY_INVALID;
+  constructor(windowId: string, reason: string) {
+    super(`${WINDOW_ARCHIVE_RECOVERY_INVALID}: ${windowId}: ${reason}`);
+    this.name = "WindowArchiveRecoveryError";
   }
 }
 
@@ -211,6 +220,12 @@ export class SessionRegistry<TContext> {
           `window generation is not increasing at line ${index + 1}: ${window.windowId}`,
         );
       }
+      if (record.type === "window_opened") {
+        // Runtime open() removes the prior archived generation before this generation becomes
+        // active. Journal replay must project the same state: after a later open, an older
+        // archive is historical evidence, not the current archived state of this windowId.
+        this.#archived.delete(window.windowId);
+      }
       if (record.type === "window_archived") {
         const previousArchiveGeneration = this.#archived.get(window.windowId)?.generation ?? 0;
         if (
@@ -300,30 +315,37 @@ export class SessionRegistry<TContext> {
     return time + this.#ulidRandom.map((digit) => ULID_ALPHABET.charAt(digit)).join("");
   }
 
-  #requireArchivedForReopen(residentId: string, scopeId: string, windowId: string): ArchivedWindow {
+  #requireArchivedForReopen(residentId: string, scopeId: string, windowId: string): void {
+    if (this.#active.has(windowId)) {
+      throw new WindowReopenError(windowId, "target is still active");
+    }
     const archived = this.#archived.get(windowId);
-    if (archived === undefined) {
-      throw new WindowReopenError(windowId, "target is not an archived window");
+    const identity = this.#windowIdentity.get(windowId);
+    const knownResidentId = archived?.residentId ?? identity?.residentId;
+    const knownScopeId = archived?.scopeId ?? identity?.scopeId;
+    if (knownResidentId === undefined || this.#lastGeneration.get(windowId) === undefined) {
+      throw new WindowReopenError(windowId, "target is not a known stopped window");
     }
-    if (archived.residentId !== residentId) {
+    if (knownResidentId !== residentId) {
       throw new WindowReopenError(
         windowId,
-        `resident mismatch: archived=${archived.residentId}, requested=${residentId}`,
+        `resident mismatch: known=${knownResidentId}, requested=${residentId}`,
       );
     }
-    if (archived.scopeId !== scopeId) {
+    if (knownScopeId !== scopeId) {
       throw new WindowReopenError(
         windowId,
-        `scope mismatch: archived=${archived.scopeId}, requested=${scopeId}`,
+        `scope mismatch: known=${knownScopeId}, requested=${scopeId}`,
       );
     }
-    return archived;
   }
 
   /**
    * 开一扇窗。同一 residentId 连开两次得到两扇不同的窗，各自 generation=1，
    * 两窗皆活；旧语义「重复 open 原地换代」不再存在（MV-A01）。
-   * 给 windowId 时是按同一身份重开一扇已归档的窗，起新一代（#66 B5）。
+   * 给 windowId 时是按同一身份重开一扇已停止的窗，起新一代（#66 B5）。同一进程的
+   * 活窗不能重开；宿主重启后，journal 中只有 opened 但没有 archived 的最新代也视为已停止，
+   * 继续发下一代而不复活旧 active context。
    */
   open(residentId: string, options: OpenOptions<TContext>): ActiveWindow<TContext> {
     const scopeId = options.scopeId ?? PRIVATE_SCOPE;
@@ -441,6 +463,65 @@ export class SessionRegistry<TContext> {
     this.#active.delete(windowId);
     this.#archived.set(windowId, archived);
     return cloneArchivedWindow(archived);
+  }
+
+  /**
+   * Finish a host-owned close operation after restart. The caller must supply the exact durable
+   * snapshot recorded before the active window disappeared; this method cannot invent or resume
+   * an active context. It only restores the archived evidence record for the latest issued
+   * generation of an already-known window identity.
+   */
+  recoverArchived(window: ArchivedWindow): ArchivedWindow {
+    if (
+      window.archived !== true ||
+      typeof window.residentId !== "string" ||
+      window.residentId.length === 0 ||
+      typeof window.windowId !== "string" ||
+      window.windowId.length === 0 ||
+      typeof window.scopeId !== "string" ||
+      window.scopeId.length === 0 ||
+      !Number.isSafeInteger(window.generation) ||
+      window.generation < 1
+    ) {
+      throw new WindowArchiveRecoveryError(window.windowId, "archive snapshot is invalid");
+    }
+    const existing = this.#archived.get(window.windowId);
+    if (existing !== undefined) {
+      if (
+        existing.residentId !== window.residentId ||
+        existing.scopeId !== window.scopeId ||
+        existing.generation !== window.generation ||
+        existing.headId !== window.headId ||
+        window.archived !== true
+      ) {
+        throw new WindowArchiveRecoveryError(window.windowId, "archive snapshot mismatch");
+      }
+      return cloneArchivedWindow(existing);
+    }
+    if (this.#active.has(window.windowId)) {
+      throw new WindowArchiveRecoveryError(window.windowId, "window is still active");
+    }
+    const identity = this.#windowIdentity.get(window.windowId);
+    if (
+      identity === undefined ||
+      identity.residentId !== window.residentId ||
+      identity.scopeId !== window.scopeId
+    ) {
+      throw new WindowArchiveRecoveryError(window.windowId, "window identity mismatch");
+    }
+    if (this.#lastGeneration.get(window.windowId) !== window.generation) {
+      throw new WindowArchiveRecoveryError(window.windowId, "generation is not the latest issued");
+    }
+    if (
+      window.headId !== null &&
+      (typeof window.headId !== "string" || window.headId.length === 0)
+    ) {
+      throw new WindowArchiveRecoveryError(window.windowId, "headId is invalid");
+    }
+    const recovered = cloneArchivedWindow({ ...window, archived: true });
+    this.#appendArchive(recovered);
+    this.#archived.set(recovered.windowId, recovered);
+    return cloneArchivedWindow(recovered);
   }
 
   /** 杀掉一位住户的全部活窗（MV-A03 后半）。 */
