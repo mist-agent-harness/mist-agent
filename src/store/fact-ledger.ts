@@ -305,9 +305,7 @@ export class FactLedger {
     origin?: WriteOrigin,
   ): LedgerEntry {
     const ledger = this.#ledger(residentId);
-    // C04 红灯占位：origin 已收、闸未落（拦截随绿灯 commit 落地）。
-    // 红灯测试必须在这个头上失败——落后窗的写入此刻仍被放行。
-    void origin;
+    this.#assertOriginCurrent(residentId, origin);
     // 运行时校验给绕过类型系统的调用方：supersede 走 append 会造出没有
     // supersedesSeq 指针的解除条目，推导视图直接被毒化。
     if (!FACT_KINDS.includes(input.kind)) {
@@ -333,8 +331,9 @@ export class FactLedger {
     origin?: WriteOrigin,
   ): LedgerEntry {
     const ledger = this.#ledger(residentId);
-    // C04 红灯占位：同 append——origin 已收、闸未落。
-    void origin;
+    // C04 闸先于目标校验：未知悉最新裁定的窗连「目标存不存在」的答案
+    // 都不该拿到——先验资格，再验参数。
+    this.#assertOriginCurrent(residentId, origin);
     const target = ledger.entries[targetSeq - 1];
     if (target === undefined || target.seq !== targetSeq) {
       throw new LedgerEntryNotFoundError(residentId, targetSeq);
@@ -350,6 +349,23 @@ export class FactLedger {
     const entry = this.#appendEntry(ledger, input.author, "supersede", input.reason, targetSeq);
     ledger.supersededSeqs.add(targetSeq);
     return entry;
+  }
+
+  /**
+   * C04（闸在非缺失方）：窗署名的裁定级写入，写前必过账侧探针——
+   * unknown 即 fail-closed（查不到 ≠ 没缺口），落后即拒收。闸站在
+   * 账的必经写路径上，不依赖窗自查；经 probeGap 走，注入的通道故障
+   * （MV-C03 装置）在这里同样生效。非窗来源（origin 缺省）不受此闸。
+   */
+  #assertOriginCurrent(residentId: string, origin: WriteOrigin | undefined): void {
+    if (origin === undefined) return;
+    const probe = this.probeGap(residentId, origin.viewportId);
+    if (probe.status === "unknown") {
+      throw new WriteGateUnavailableError(residentId, origin.viewportId, probe.cause);
+    }
+    if (probe.ackedSeq < probe.latestSeq) {
+      throw new StaleViewportError(residentId, origin.viewportId, probe.ackedSeq, probe.latestSeq);
+    }
   }
 
   #appendEntry(
