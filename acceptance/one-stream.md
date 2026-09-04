@@ -36,11 +36,20 @@
   效果语义必须逐项等价，只有明确声明的投影层展示元数据可排除。保留相同 id/顺序却改了
   payload 仍判红。任一 viewport 的局部 transcript 都不得成为第二个权威源。
 
+  证据：`tests/one-stream-host.test.ts` 通过真实子进程宿主交换 A/B 到达顺序，并核对 desktop、
+  mobile、offline 三个投影的完整事件、顺序与 payload hash；`tests/one-stream-core.test.ts`
+  保留同一 id/seq 后篡改 payload，投影校验会 fail-closed。
+
 - [ ] **OS-02 猝死重放至多入流一次，回执不冒充生效** [集成]：对同一投递分别在
   “生成后、主流写入前”和“主流写入后、回执前”杀死宿主，再恢复并重试。最终 canonical
   stream 中该投递恰有一条；同一幂等把手换内容重试必须拒绝。未取得真实入流回执时
   不得标为 delivered；仅 delivered 不得标为 committed-effective，也不得推进对应权威
   head。日志里的 attempted / started 不能充当任何一档成功回执。
+
+  证据：`tests/one-stream-host.test.ts` 在 generated-before-write 与
+  durable-write-before-receipt 两个 checkpoint 杀死宿主后恢复重试，最终都恰一条；换内容
+  重试被拒且 snapshot 字节不变，delivery receipt 也不产生 effect/head。
+  `tests/one-stream-core.test.ts` 另证同进程双 writer 被拒、坏 snapshot 恢复 fail-closed。
 
 - [ ] **OS-03 归档流水只进证据面，不长成第二条聊天史** [协议/客户端]：活工作区可从
   first-party workspace navigator 进入；关闭后其活动入口消失，canonical stream 留下
