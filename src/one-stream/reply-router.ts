@@ -1,7 +1,8 @@
 import type { MessageTreeService } from "../message-tree/service.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
-import type { CanonicalEvent, EventViewport } from "./event-contract.ts";
+import type { CanonicalEvent, EventActor, EventViewport } from "./event-contract.ts";
 import type { CanonicalStreamReadPort } from "./store.ts";
+import type { CanonicalStreamWriter } from "./writer.ts";
 
 export interface ReplyRouteRequest {
   readonly residentId: string;
@@ -29,6 +30,20 @@ export interface WorkspaceReplyDeliveryReceipt extends ReplyCandidate {
 
 export interface WorkspaceReplyDeliveryPort {
   deliver(request: WorkspaceReplyDeliveryRequest): Promise<WorkspaceReplyDeliveryReceipt>;
+}
+
+export interface BlockedReplyResolutionPort {
+  resolvedEventIds(residentId: string): ReadonlySet<string>;
+  resolveAfterDelivery(
+    candidate: WorkspaceReplyDeliveryRequest,
+    deliver: () => Promise<WorkspaceReplyDeliveryReceipt>,
+  ): Promise<WorkspaceReplyDeliveryReceipt>;
+}
+
+export interface CanonicalBlockedReplyResolutionOptions {
+  /** Host-owned authority; callers replying to a blocker cannot self-appoint it. */
+  readonly authoritySource: EventActor;
+  readonly now?: () => string;
 }
 
 export type ReplyRouteResult =
@@ -59,6 +74,120 @@ export class ReplyRouteError extends Error {
     super(`${code}: ${message}`);
     this.name = "ReplyRouteError";
     this.code = code;
+  }
+}
+
+const resolutionQueues = new WeakMap<CanonicalStreamReadPort, Map<string, Promise<void>>>();
+
+function resolutionTarget(event: CanonicalEvent): string | null {
+  if (
+    event.purpose !== "result" ||
+    event.effect.state !== "committed-effective" ||
+    event.authoritySource.kind !== "host" ||
+    event.origin.reporter.kind !== "host" ||
+    event.payload.kind !== "blocked-reply-resolved" ||
+    typeof event.payload.replyToEventId !== "string" ||
+    event.payload.replyToEventId.length === 0
+  ) {
+    return null;
+  }
+  return event.payload.replyToEventId;
+}
+
+/**
+ * Writes the resolved receipt into the same canonical stream that supplied the blocker. The
+ * per-stream queue covers concurrent router instances in one host process; rebuilding a router or
+ * the port derives state from the durable event instead of process memory.
+ */
+export class CanonicalBlockedReplyResolutionPort implements BlockedReplyResolutionPort {
+  readonly #stream: CanonicalStreamReadPort;
+  readonly #writer: CanonicalStreamWriter;
+  readonly #authoritySource: EventActor;
+  readonly #now: () => string;
+
+  constructor(
+    stream: CanonicalStreamReadPort,
+    writer: CanonicalStreamWriter,
+    options: CanonicalBlockedReplyResolutionOptions,
+  ) {
+    this.#stream = stream;
+    this.#writer = writer;
+    this.#authoritySource = Object.freeze(structuredClone(options.authoritySource));
+    this.#now = options.now ?? (() => new Date().toISOString());
+  }
+
+  resolvedEventIds(residentId: string): ReadonlySet<string> {
+    return new Set(
+      this.#stream
+        .eventsAfter(residentId, 0)
+        .map(resolutionTarget)
+        .filter((eventId): eventId is string => eventId !== null),
+    );
+  }
+
+  resolveAfterDelivery(
+    candidate: WorkspaceReplyDeliveryRequest,
+    deliver: () => Promise<WorkspaceReplyDeliveryReceipt>,
+  ): Promise<WorkspaceReplyDeliveryReceipt> {
+    const key = `${candidate.residentId}\u0000${candidate.eventId}`;
+    return this.#enqueue(key, async () => {
+      if (this.resolvedEventIds(candidate.residentId).has(candidate.eventId)) {
+        throw new ReplyRouteError(
+          "REPLY_TARGET_RESOLVED",
+          "blocked event already received a reply",
+        );
+      }
+      const receipt = await deliver();
+      await this.#writer.submit({
+        residentId: candidate.residentId,
+        idempotencyKey: `blocked-reply-resolved:${candidate.eventId}`,
+        draft: {
+          purpose: "result",
+          occurredAt: this.#now(),
+          workRef: candidate.workRef,
+          authoritySource: this.#authoritySource,
+          origin: {
+            reporter: this.#authoritySource,
+            subject: { kind: "work", id: candidate.workRef },
+            viewport: structuredClone(candidate.viewport),
+          },
+          effect: {
+            state: "committed-effective",
+            requiresUserAction: false,
+            retry: "none",
+          },
+          artifactRef: `message-tree-node:${receipt.assistantNodeId}`,
+          payload: {
+            kind: "blocked-reply-resolved",
+            replyToEventId: candidate.eventId,
+            assistantNodeId: receipt.assistantNodeId,
+          },
+        },
+      });
+      return receipt;
+    });
+  }
+
+  #enqueue<T>(key: string, operation: () => Promise<T>): Promise<T> {
+    let queues = resolutionQueues.get(this.#stream);
+    if (queues === undefined) {
+      queues = new Map();
+      resolutionQueues.set(this.#stream, queues);
+    }
+    const previous = queues.get(key) ?? Promise.resolve();
+    let release = (): void => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const marker = previous.then(
+      () => gate,
+      () => gate,
+    );
+    queues.set(key, marker);
+    return previous.then(operation, operation).finally(() => {
+      release();
+      if (queues?.get(key) === marker) queues.delete(key);
+    });
   }
 }
 
@@ -121,11 +250,15 @@ export class MessageTreeWorkspaceReplyDelivery implements WorkspaceReplyDelivery
   }
 
   async deliver(request: WorkspaceReplyDeliveryRequest): Promise<WorkspaceReplyDeliveryReceipt> {
-    const live = this.#sessions.get(request.viewport.windowId);
+    let dispatch: ReturnType<SessionRegistry<unknown>["issueDispatch"]>;
+    try {
+      dispatch = this.#sessions.issueDispatch(request.viewport.windowId);
+    } catch {
+      throw new ReplyRouteError("REPLY_TARGET_STALE", "workspace changed before dispatch");
+    }
     if (
-      live === undefined ||
-      live.residentId !== request.residentId ||
-      live.generation !== request.viewport.generation
+      dispatch.residentId !== request.residentId ||
+      dispatch.generation !== request.viewport.generation
     ) {
       throw new ReplyRouteError("REPLY_TARGET_STALE", "workspace changed before dispatch");
     }
@@ -133,6 +266,20 @@ export class MessageTreeWorkspaceReplyDelivery implements WorkspaceReplyDelivery
       request.residentId,
       request.text,
       request.viewport.windowId,
+      {
+        commitBoundary: {
+          commit: (mutation) => {
+            if (!this.#sessions.belongsToActiveWindow(dispatch)) {
+              throw new ReplyRouteError(
+                "REPLY_TARGET_STALE",
+                "workspace changed while the reply was in flight",
+              );
+            }
+            // No await occurs between this generation check and the synchronous tree/head commit.
+            return mutation();
+          },
+        },
+      },
     );
     return Object.freeze({
       phase: "workspace-committed",
@@ -153,48 +300,52 @@ export class BlockedReplyRouter {
   readonly #stream: CanonicalStreamReadPort;
   readonly #sessions: SessionRegistry<unknown>;
   readonly #delivery: WorkspaceReplyDeliveryPort;
-  readonly #resolved = new Set<string>();
+  readonly #resolutions: BlockedReplyResolutionPort;
 
   constructor(
     stream: CanonicalStreamReadPort,
     sessions: SessionRegistry<unknown>,
     delivery: WorkspaceReplyDeliveryPort,
+    resolutions: BlockedReplyResolutionPort,
   ) {
     this.#stream = stream;
     this.#sessions = sessions;
     this.#delivery = delivery;
+    this.#resolutions = resolutions;
   }
 
   async route(value: unknown): Promise<ReplyRouteResult> {
     const request = parseRequest(value);
     const events = this.#stream.eventsAfter(request.residentId, 0);
     const all = events.map(candidate).filter((item): item is ReplyCandidate => item !== null);
-    const unresolved = all.filter(
-      (item) => !this.#resolved.has(this.#resolutionKey(request.residentId, item.eventId)),
-    );
+    const resolved = this.#resolutions.resolvedEventIds(request.residentId);
+    const unresolved = all.filter((item) => !resolved.has(item.eventId));
     const live = unresolved.filter((item) => this.#isLive(request.residentId, item));
     const selected = this.#select(request, all, unresolved, live);
     if (selected.status !== "selected") return selected.result;
 
-    const receipt = await this.#delivery.deliver({
+    const deliveryRequest = {
       ...selected.candidate,
       residentId: request.residentId,
       text: request.text,
+    } satisfies WorkspaceReplyDeliveryRequest;
+    const receipt = await this.#resolutions.resolveAfterDelivery(deliveryRequest, async () => {
+      const delivered = await this.#delivery.deliver(deliveryRequest);
+      if (
+        delivered.phase !== "workspace-committed" ||
+        delivered.residentId !== request.residentId ||
+        delivered.eventId !== selected.candidate.eventId ||
+        delivered.workRef !== selected.candidate.workRef ||
+        delivered.viewport.windowId !== selected.candidate.viewport.windowId ||
+        delivered.viewport.generation !== selected.candidate.viewport.generation
+      ) {
+        throw new ReplyRouteError(
+          "REPLY_RECEIPT_MISMATCH",
+          "delivery receipt changed route identity",
+        );
+      }
+      return delivered;
     });
-    if (
-      receipt.phase !== "workspace-committed" ||
-      receipt.residentId !== request.residentId ||
-      receipt.eventId !== selected.candidate.eventId ||
-      receipt.workRef !== selected.candidate.workRef ||
-      receipt.viewport.windowId !== selected.candidate.viewport.windowId ||
-      receipt.viewport.generation !== selected.candidate.viewport.generation
-    ) {
-      throw new ReplyRouteError(
-        "REPLY_RECEIPT_MISMATCH",
-        "delivery receipt changed route identity",
-      );
-    }
-    this.#resolved.add(this.#resolutionKey(request.residentId, selected.candidate.eventId));
     return { status: "routed", receipt };
   }
 
@@ -271,9 +422,5 @@ export class BlockedReplyRouter {
       window.residentId === residentId &&
       window.generation === item.viewport.generation
     );
-  }
-
-  #resolutionKey(residentId: string, eventId: string): string {
-    return `${residentId}\u0000${eventId}`;
   }
 }

@@ -55,6 +55,20 @@ export interface MessageTreeServiceOptions {
   turnGate?: TurnGate;
 }
 
+/**
+ * Optional final-commit boundary for callers whose authority can change while the responder is
+ * running. The boundary is entered after the awaited reply and wraps the synchronous tree append
+ * plus head advance, so a caller can revalidate a generation without leaving another await-sized
+ * race before the mutation.
+ */
+export interface MessageCommitBoundary {
+  commit<T>(mutation: () => T): T;
+}
+
+export interface MessageTreeSayOptions {
+  readonly commitBoundary?: MessageCommitBoundary;
+}
+
 const echoReply: AssistantReply = (_residentId, message) => message;
 
 /**
@@ -80,7 +94,12 @@ export class MessageTreeService {
   }
 
   /** 原子落 user + assistant；两节点都存在以后才允许推进会话 head。 */
-  async say(residentId: string, message: string, windowId: string): Promise<HistoryNode> {
+  async say(
+    residentId: string,
+    message: string,
+    windowId: string,
+    options: MessageTreeSayOptions = {},
+  ): Promise<HistoryNode> {
     // Store 的公开 API 刻意很窄；复用只读历史同时验证房间与会话 head，
     // 避免 stale/cross-room head 在最终落树失败前已经调用 responder，白花模型成本
     // 或触发外部副作用。appendPair 仍会在写入边界重验 parentId，不依赖这层代签。
@@ -98,12 +117,15 @@ export class MessageTreeService {
         ? [...pass.contextPrefix, message].join("\n\n")
         : message;
     const assistantContent = await this.#assistantReply(residentId, prompt);
-    const pair = this.#store.appendPair(residentId, message, assistantContent, parentId);
-    this.#sessionHeads.setHead(windowId, pair.assistant.id);
-    // 回执只在落树 + head 推进都成功之后发出：先 ack 后落树会让「已确认」
-    // 覆盖「没送到」，回执丢失归传播机制的前提是先证明这轮真的开工了（MV-C05）。
-    pass?.commit();
-    return pair.assistant;
+    const commit = (): HistoryNode => {
+      const pair = this.#store.appendPair(residentId, message, assistantContent, parentId);
+      this.#sessionHeads.setHead(windowId, pair.assistant.id);
+      // 回执只在落树 + head 推进都成功之后发出：先 ack 后落树会让「已确认」
+      // 覆盖「没送到」，回执丢失归传播机制的前提是先证明这轮真的开工了（MV-C05）。
+      pass?.commit();
+      return pair.assistant;
+    };
+    return options.commitBoundary?.commit(commit) ?? commit();
   }
 
   async history(residentId: string): Promise<HistoryNode[]> {

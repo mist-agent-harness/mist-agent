@@ -113,11 +113,14 @@
 
   证据：`BlockedReplyRouter` 的候选集只来自 canonical stream 中仍需回答的 blocked event 与
   SessionRegistry 当前活代；输入面只有 `replyToEventId`、`workRef` 或裸回复，没有 recent、
-  focus、createdAt、active tab 等猜测口。`MessageTreeWorkspaceReplyDelivery` 走真实
-  MessageTreeService 派发，只有 user/assistant 两节点落树并推进目标 head 后才返回
-  workspace-committed receipt，失败不标 resolved。`tests/one-stream-reply-router.test.ts` 同时
-  建两扇 blocked 窗：裸回复零投递并返回两个把手；显式 event/work 抵达第一窗；剩唯一候选后
-  裸回复抵达第二窗；陌生、冲突、失效把手与 responder 失败均不旁落另一窗。
+  focus、createdAt、active tab 等猜测口。成功投递后，宿主把 resolved receipt 写回同一条
+  canonical stream；router、port 与 stream store 从磁盘重建后仍能拒绝重复回复，同一 blocker
+  的并发回复也在首次派发前串行化。`MessageTreeWorkspaceReplyDelivery` 走真实
+  MessageTreeService 派发，并把签发的 generation receipt 带到 responder 返回后的同步
+  tree/head commit boundary；in-flight kill 后以同一 windowId 重开时，旧代回复响亮拒绝且
+  user/assistant 树与新代 head 都零写入。`tests/one-stream-reply-router.test.ts` 还同时建立两扇
+  blocked 窗：裸回复零投递并返回两个把手；显式 event/work 抵达第一窗；剩唯一候选后裸回复
+  抵达第二窗；陌生、冲突、失效把手与 responder 失败均不旁落另一窗。
 
 ## 变绿条件
 

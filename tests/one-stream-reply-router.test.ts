@@ -1,8 +1,12 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { MessageTreeService, MessageTreeStore } from "../src/message-tree/index.ts";
 import {
   BlockedReplyRouter,
   BoundedWorkEventPort,
+  CanonicalBlockedReplyResolutionPort,
   CanonicalStreamStore,
   CanonicalStreamWriter,
   MessageTreeWorkspaceReplyDelivery,
@@ -10,8 +14,15 @@ import {
 } from "../src/one-stream/index.ts";
 import { SessionRegistry } from "../src/session/session-registry.ts";
 
-async function assembly() {
-  const stream = new CanonicalStreamStore();
+async function assembly(
+  options: {
+    assistantReply?: (residentId: string, message: string) => string | Promise<string>;
+    dataDir?: string;
+  } = {},
+) {
+  const stream = new CanonicalStreamStore(
+    options.dataDir === undefined ? {} : { dataDir: options.dataDir },
+  );
   stream.createStream("resident-a");
   const writer = new CanonicalStreamWriter(stream);
   const sessions = new SessionRegistry<null>();
@@ -26,10 +37,12 @@ async function assembly() {
       setHead: (windowId, headId) => sessions.setHead(windowId, headId),
     },
     {
-      assistantReply: (_residentId, message) => {
-        if (message === "dispatch-fails") throw new Error("responder unavailable");
-        return `reply:${message}`;
-      },
+      assistantReply:
+        options.assistantReply ??
+        ((_residentId, message) => {
+          if (message === "dispatch-fails") throw new Error("responder unavailable");
+          return `reply:${message}`;
+        }),
     },
   );
   const workEvents = new BoundedWorkEventPort(writer, {
@@ -55,12 +68,25 @@ async function assembly() {
       }),
     );
   }
-  const router = new BlockedReplyRouter(
+  const delivery = new MessageTreeWorkspaceReplyDelivery(service, sessions);
+  const resolutions = new CanonicalBlockedReplyResolutionPort(stream, writer, {
+    authoritySource: { kind: "host", id: "mist-host" },
+    now: () => "2026-09-04T08:01:00.000Z",
+  });
+  const router = new BlockedReplyRouter(stream, sessions, delivery, resolutions);
+  return {
     stream,
+    writer,
     sessions,
-    new MessageTreeWorkspaceReplyDelivery(service, sessions),
-  );
-  return { stream, writer, sessions, tree, first, second, blocked, router };
+    tree,
+    service,
+    delivery,
+    resolutions,
+    first,
+    second,
+    blocked,
+    router,
+  };
 }
 
 describe("OS-06 canonical blocked reply routing", () => {
@@ -158,6 +184,126 @@ describe("OS-06 canonical blocked reply routing", () => {
         replyToEventId: blocked[1]?.eventId,
       }),
     ).rejects.toBeInstanceOf(ReplyRouteError);
+    await writer.close();
+  });
+
+  it("derives resolved blockers from the durable stream after router and port rebuild", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "mist-reply-resolution-"));
+    try {
+      const { writer, sessions, tree, delivery, blocked, router } = await assembly({ dataDir });
+      await router.route({
+        residentId: "resident-a",
+        text: "answer-once",
+        replyToEventId: blocked[0]?.eventId,
+      });
+      const afterFirst = JSON.stringify(tree.history("resident-a"));
+      await writer.close();
+
+      const restoredStream = new CanonicalStreamStore({ dataDir });
+      const restoredWriter = new CanonicalStreamWriter(restoredStream);
+      const rebuilt = new BlockedReplyRouter(
+        restoredStream,
+        sessions,
+        delivery,
+        new CanonicalBlockedReplyResolutionPort(restoredStream, restoredWriter, {
+          authoritySource: { kind: "host", id: "mist-host" },
+        }),
+      );
+
+      await expect(
+        rebuilt.route({
+          residentId: "resident-a",
+          text: "must-not-repeat",
+          replyToEventId: blocked[0]?.eventId,
+        }),
+      ).rejects.toMatchObject({ code: "REPLY_TARGET_RESOLVED" });
+      expect(JSON.stringify(tree.history("resident-a"))).toBe(afterFirst);
+      expect(
+        restoredStream
+          .eventsAfter("resident-a", 0)
+          .filter((event) => event.payload.kind === "blocked-reply-resolved"),
+      ).toHaveLength(1);
+      await restoredWriter.close();
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes concurrent replies to one blocker before either can dispatch twice", async () => {
+    let releaseReply = (): void => undefined;
+    let markStarted = (): void => undefined;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const replyReleased = new Promise<void>((resolve) => {
+      releaseReply = resolve;
+    });
+    const { stream, writer, tree, blocked, router } = await assembly({
+      assistantReply: async (_residentId, message) => {
+        markStarted();
+        await replyReleased;
+        return `reply:${message}`;
+      },
+    });
+
+    const first = router.route({
+      residentId: "resident-a",
+      text: "first",
+      replyToEventId: blocked[0]?.eventId,
+    });
+    await started;
+    const second = router.route({
+      residentId: "resident-a",
+      text: "second",
+      replyToEventId: blocked[0]?.eventId,
+    });
+    releaseReply();
+
+    await expect(first).resolves.toMatchObject({ status: "routed" });
+    await expect(second).rejects.toMatchObject({ code: "REPLY_TARGET_RESOLVED" });
+    expect(tree.history("resident-a")).toHaveLength(2);
+    expect(
+      stream
+        .eventsAfter("resident-a", 0)
+        .filter((event) => event.payload.kind === "blocked-reply-resolved"),
+    ).toHaveLength(1);
+    await writer.close();
+  });
+
+  it("rechecks generation at the synchronous tree/head commit boundary", async () => {
+    let releaseReply = (): void => undefined;
+    let markStarted = (): void => undefined;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const replyReleased = new Promise<void>((resolve) => {
+      releaseReply = resolve;
+    });
+    const { writer, sessions, tree, first, blocked, router } = await assembly({
+      assistantReply: async (_residentId, message) => {
+        markStarted();
+        await replyReleased;
+        return `reply:${message}`;
+      },
+    });
+
+    const inFlight = router.route({
+      residentId: "resident-a",
+      text: "old-generation",
+      replyToEventId: blocked[0]?.eventId,
+    });
+    await started;
+    sessions.kill(first.windowId);
+    const reopened = sessions.open("resident-a", {
+      windowId: first.windowId,
+      context: null,
+    });
+    expect(reopened.generation).toBe(first.generation + 1);
+    releaseReply();
+
+    await expect(inFlight).rejects.toMatchObject({ code: "REPLY_TARGET_STALE" });
+    expect(tree.history("resident-a")).toEqual([]);
+    expect(sessions.getHead(first.windowId)).toBeNull();
     await writer.close();
   });
 });
