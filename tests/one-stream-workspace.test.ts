@@ -265,6 +265,88 @@ describe("OS-03 workspace and evidence capability split", () => {
     }
   });
 
+  it("reconciles the latest generation after an archived window was reopened and the host died", async () => {
+    const root = mkdtempSync(join(tmpdir(), "mist-workspace-multigen-recovery-"));
+    const dataDir = join(root, "stream");
+    const archivePath = join(root, "sessions", "archive.jsonl");
+    let crash = false;
+    try {
+      const first = assembly({
+        dataDir,
+        archivePath,
+        checkpoint: (name) => {
+          if (crash && name === "closure-delivered") throw new Error("simulated host death");
+        },
+      });
+      const generationOne = first.lifecycle.create("resident-a", {
+        context: null,
+        scopeId: "project",
+      });
+      const firstClose = await first.lifecycle.close({
+        residentId: "resident-a",
+        windowId: generationOne.handle.windowId,
+        generation: generationOne.handle.generation,
+        workRef: "work-generation-one",
+        artifactRef: "evidence:generation-one",
+        idempotencyKey: "close-generation-one",
+        occurredAt: "2026-09-04T08:03:10.000Z",
+        summary: "close generation one",
+      });
+      const archivedGenerationOne = first.sessions.getArchived(generationOne.handle.windowId);
+      expect(archivedGenerationOne).toBeDefined();
+      const generationTwo = first.sessions.open("resident-a", {
+        windowId: generationOne.handle.windowId,
+        scopeId: "project",
+        headId: archivedGenerationOne?.headId ?? null,
+        context: null,
+      });
+      expect(generationTwo.generation).toBe(2);
+
+      crash = true;
+      await expect(
+        first.lifecycle.close({
+          residentId: "resident-a",
+          windowId: generationTwo.windowId,
+          generation: generationTwo.generation,
+          workRef: "work-generation-two",
+          artifactRef: "evidence:generation-two",
+          idempotencyKey: "close-generation-two",
+          occurredAt: "2026-09-04T08:03:20.000Z",
+          summary: "recover generation two after restart",
+        }),
+      ).rejects.toThrow("simulated host death");
+      await first.writer.close();
+
+      const restoredStore = new CanonicalStreamStore({ dataDir });
+      const restoredWriter = new CanonicalStreamWriter(restoredStore);
+      const restoredSessions = new SessionRegistry<null>({ archivePath });
+      expect(restoredSessions.getArchived(generationTwo.windowId)).toBeUndefined();
+      const restoredLifecycle = new WorkspaceLifecycleOwner(
+        restoredWriter,
+        restoredStore,
+        restoredSessions,
+        { authoritySource: { kind: "host", id: "mist-host" } },
+      );
+
+      const recovered = await restoredLifecycle.reconcile("resident-a");
+      expect(recovered).toHaveLength(1);
+      expect(recovered[0]?.requested.eventId).not.toBe(firstClose.requested.eventId);
+      expect(restoredSessions.getArchived(generationTwo.windowId)).toMatchObject({
+        residentId: "resident-a",
+        windowId: generationTwo.windowId,
+        generation: 2,
+        scopeId: "project",
+      });
+      expect(
+        restoredStore.eventsAfter("resident-a", 0).filter((event) => event.purpose === "result"),
+      ).toHaveLength(2);
+      expect(await restoredLifecycle.reconcile("resident-a")).toEqual([]);
+      await restoredWriter.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("keeps first-party create from reopening or appending to an archived workspace", async () => {
     const { writer, sessions, lifecycle } = assembly();
     const opened = lifecycle.create("resident-a", { context: null });

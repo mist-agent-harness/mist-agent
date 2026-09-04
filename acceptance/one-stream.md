@@ -72,7 +72,9 @@
   closure，viewport 自签的事件对也不能解锁历史。获授权的 reader 只能拿 canonical result
   eventId 调只读 `MessageTreeViewportHistory`；无权主体、closure intent 或裸 windowId 都不能成为
   读取入口。`tests/one-stream-workspace.test.ts` 用真实 file store、SessionRegistry、MessageTree
-  分支与 canonical writer 验证两扇活窗、两处 crash recovery 以及上述三支反例。
+  分支与 canonical writer 验证两扇活窗、两处 crash recovery 以及上述三支反例；另走完
+  generation 1 关闭、同窗合法重开 generation 2、closure-delivered 后宿主死亡、全量重建并
+  reconcile 的链路，证明 journal replay 不会拿旧代 archive 冒充当前代。
 
 - [ ] **OS-04 有界投递不夹带局部 transcript** [集成]：progress、blocked、result 三类
   合法 envelope 各投一次，来源 viewport、发生时刻、工作把手、权威产物指针与效果状态
