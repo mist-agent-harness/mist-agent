@@ -308,6 +308,86 @@ describe("OS-06 canonical blocked reply routing", () => {
     }
   });
 
+  it("recovers the resolved receipt after later turns advanced beyond the committed pair", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "mist-reply-crash-gap-later-turn-"));
+    let closeWriter = async (): Promise<void> => undefined;
+    let blockerResponderCalls = 0;
+    try {
+      const built = await assembly({
+        dataDir,
+        assistantReply: async (_residentId, message) => {
+          if (message === "answer-before-later-turn") {
+            blockerResponderCalls += 1;
+            await closeWriter();
+          }
+          return `reply:${message}`;
+        },
+      });
+      closeWriter = () => built.writer.close();
+
+      await expect(
+        built.router.route({
+          residentId: "resident-a",
+          text: "answer-before-later-turn",
+          replyToEventId: built.blocked[0]?.eventId,
+        }),
+      ).rejects.toThrow("canonical stream writer is closed");
+      expect(blockerResponderCalls).toBe(1);
+      expect(built.tree.history("resident-a")).toHaveLength(2);
+
+      closeWriter = async () => undefined;
+      const later = await built.service.say("resident-a", "later-turn", built.first.windowId);
+      expect(built.sessions.getHead(built.first.windowId)).toBe(later.id);
+      expect(built.tree.history("resident-a")).toHaveLength(4);
+
+      const restoredStream = new CanonicalStreamStore({ dataDir });
+      const restoredWriter = new CanonicalStreamWriter(restoredStream);
+      const restoredTree = new MessageTreeStore();
+      restoredTree.createRoom("resident-a");
+      restoredTree.importTree("resident-a", built.tree.exportTree("resident-a"));
+      const restoredService = new MessageTreeService(
+        restoredTree,
+        {
+          getHead: (windowId) => built.sessions.getHead(windowId),
+          setHead: (windowId, headId) => built.sessions.setHead(windowId, headId),
+        },
+        {
+          assistantReply: () => {
+            blockerResponderCalls += 1;
+            throw new Error("committed blocker delivery must not invoke responder again");
+          },
+        },
+      );
+      const rebuilt = new BlockedReplyRouter(
+        restoredStream,
+        built.sessions,
+        new MessageTreeWorkspaceReplyDelivery(restoredService, built.sessions),
+        new CanonicalBlockedReplyResolutionPort(restoredStream, restoredWriter, {
+          authoritySource: { kind: "host", id: "mist-host" },
+        }),
+      );
+
+      await expect(
+        rebuilt.route({
+          residentId: "resident-a",
+          text: "answer-before-later-turn",
+          replyToEventId: built.blocked[0]?.eventId,
+        }),
+      ).resolves.toMatchObject({ status: "routed" });
+      expect(blockerResponderCalls).toBe(1);
+      expect(restoredTree.history("resident-a")).toHaveLength(4);
+      expect(built.sessions.getHead(built.first.windowId)).toBe(later.id);
+      expect(
+        restoredStream
+          .eventsAfter("resident-a", 0)
+          .filter((event) => event.payload.kind === "blocked-reply-resolved"),
+      ).toHaveLength(1);
+      await restoredWriter.close();
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it("serializes concurrent replies to one blocker before either can dispatch twice", async () => {
     let releaseReply = (): void => undefined;
     let markStarted = (): void => undefined;

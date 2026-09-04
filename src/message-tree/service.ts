@@ -115,11 +115,28 @@ export class MessageTreeService {
         ? null
         : this.#store.idempotentPair(residentId, options.idempotencyKey, message);
     if (replay !== null) {
-      if (parentId !== replay.user.parentId && parentId !== replay.assistant.id) {
+      const nodesById = new Map(roomHistory.map((node) => [node.id, node]));
+      let cursor = parentId;
+      let replayPrecedesCurrentHead = false;
+      while (cursor !== null) {
+        if (cursor === replay.assistant.id) {
+          replayPrecedesCurrentHead = true;
+          break;
+        }
+        cursor = nodesById.get(cursor)?.parentId ?? null;
+      }
+      if (
+        parentId !== replay.user.parentId &&
+        parentId !== replay.assistant.id &&
+        !replayPrecedesCurrentHead
+      ) {
         throw nodeUnavailable();
       }
       const commitReplay = (): HistoryNode => {
-        if (parentId !== replay.assistant.id) {
+        // If later turns already descend from this committed pair, the pair itself is the durable
+        // receipt. Reuse it without rewinding the live head; only the immediate post-crash shape
+        // (head still at the pair's former parent) needs its missing head advance repaired.
+        if (parentId === replay.user.parentId) {
           this.#sessionHeads.setHead(windowId, replay.assistant.id);
         }
         return replay.assistant;
