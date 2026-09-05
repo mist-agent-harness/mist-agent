@@ -1,4 +1,4 @@
-import type { MessageTreeService } from "../message-tree/service.ts";
+import { DispatchResultDroppedError, type MessageTreeService } from "../message-tree/service.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 import type { CanonicalEvent, EventActor, EventViewport } from "./event-contract.ts";
 import type { CanonicalStreamReadPort } from "./store.ts";
@@ -250,38 +250,50 @@ export class MessageTreeWorkspaceReplyDelivery implements WorkspaceReplyDelivery
   }
 
   async deliver(request: WorkspaceReplyDeliveryRequest): Promise<WorkspaceReplyDeliveryReceipt> {
-    let dispatch: ReturnType<SessionRegistry<unknown>["issueDispatch"]>;
-    try {
-      dispatch = this.#sessions.issueDispatch(request.viewport.windowId);
-    } catch {
-      throw new ReplyRouteError("REPLY_TARGET_STALE", "workspace changed before dispatch");
-    }
-    if (
-      dispatch.residentId !== request.residentId ||
-      dispatch.generation !== request.viewport.generation
-    ) {
-      throw new ReplyRouteError("REPLY_TARGET_STALE", "workspace changed before dispatch");
-    }
-    const assistant = await this.#service.say(
-      request.residentId,
-      request.text,
-      request.viewport.windowId,
-      {
+    const assertCurrentTarget = (): void => {
+      const window = this.#sessions.get(request.viewport.windowId);
+      if (
+        window === undefined ||
+        window.residentId !== request.residentId ||
+        window.generation !== request.viewport.generation
+      ) {
+        throw new ReplyRouteError("REPLY_TARGET_STALE", "workspace changed before delivery");
+      }
+    };
+    // Reject stale requests before say reads the head, including durable replays. Minting a
+    // dispatch receipt belongs to the service's fresh responder path, never to this preflight.
+    assertCurrentTarget();
+    let dispatched = false;
+    const assistant = await this.#service
+      .say(request.residentId, request.text, request.viewport.windowId, {
         idempotencyKey: `blocked-reply-delivery:${request.eventId}`,
+        dispatch: {
+          issueDispatch: (windowId) => {
+            assertCurrentTarget();
+            const receipt = this.#sessions.issueDispatch(windowId);
+            dispatched = true;
+            return receipt;
+          },
+          belongsToActiveWindow: (receipt) => this.#sessions.belongsToActiveWindow(receipt),
+        },
         commitBoundary: {
           commit: (mutation) => {
-            if (!this.#sessions.belongsToActiveWindow(dispatch)) {
-              throw new ReplyRouteError(
-                "REPLY_TARGET_STALE",
-                "workspace changed while the reply was in flight",
-              );
-            }
-            // No await occurs between this generation check and the synchronous tree/head commit.
+            // Fresh results are guarded and logged inside mutation by the service. A replay
+            // has no dispatch receipt, so validate its target here before repairing the head.
+            if (!dispatched) assertCurrentTarget();
             return mutation();
           },
         },
-      },
-    );
+      })
+      .catch((error: unknown) => {
+        if (error instanceof DispatchResultDroppedError) {
+          throw new ReplyRouteError(
+            "REPLY_TARGET_STALE",
+            "workspace changed while the reply was in flight",
+          );
+        }
+        throw error;
+      });
     return Object.freeze({
       phase: "workspace-committed",
       residentId: request.residentId,

@@ -1,8 +1,12 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
-import { MessageTreeService, MessageTreeStore } from "../src/message-tree/index.ts";
+import { describe, expect, it, vi } from "vitest";
+import {
+  type DispatchEvent,
+  MessageTreeService,
+  MessageTreeStore,
+} from "../src/message-tree/index.ts";
 import {
   BlockedReplyRouter,
   BoundedWorkEventPort,
@@ -30,6 +34,7 @@ async function assembly(
   const second = sessions.open("resident-a", { context: null });
   const tree = new MessageTreeStore();
   tree.createRoom("resident-a");
+  const dispatchEvents: DispatchEvent[] = [];
   const service = new MessageTreeService(
     tree,
     {
@@ -37,6 +42,8 @@ async function assembly(
       setHead: (windowId, headId) => sessions.setHead(windowId, headId),
     },
     {
+      dispatch: sessions,
+      dispatchEventLogger: { log: (event) => dispatchEvents.push(event) },
       assistantReply:
         options.assistantReply ??
         ((_residentId, message) => {
@@ -86,10 +93,69 @@ async function assembly(
     second,
     blocked,
     router,
+    dispatchEvents,
   };
 }
 
 describe("OS-06 canonical blocked reply routing", () => {
+  it("issues one receipt for a responder call and none for a committed replay", async () => {
+    const assistantReply = vi.fn((_residentId: string, message: string) => `reply:${message}`);
+    const { writer, sessions, first, blocked, delivery, tree, dispatchEvents } = await assembly({
+      assistantReply,
+    });
+    const issueDispatch = vi.spyOn(sessions, "issueDispatch");
+    const request = {
+      residentId: "resident-a",
+      text: "answer-once",
+      eventId: blocked[0]?.eventId ?? "missing-blocker",
+      workRef: "work-1",
+      viewport: { windowId: first.windowId, generation: first.generation },
+    };
+    const committed = await delivery.deliver(request);
+    expect(issueDispatch).toHaveBeenCalledTimes(1);
+    expect(dispatchEvents.map((event) => event.event)).toEqual(["dispatch", "receipt"]);
+    for (const event of dispatchEvents) {
+      expect(event).toMatchObject(issueDispatch.mock.results[0]?.value);
+    }
+
+    await expect(delivery.deliver(request)).resolves.toEqual(committed);
+    expect(issueDispatch).toHaveBeenCalledTimes(1);
+    expect(assistantReply).toHaveBeenCalledTimes(1);
+    expect(dispatchEvents).toHaveLength(2);
+    expect(tree.history("resident-a")).toHaveLength(2);
+
+    sessions.kill(first.windowId);
+    sessions.open("resident-a", { windowId: first.windowId, context: null });
+    await expect(delivery.deliver(request)).rejects.toMatchObject({ code: "REPLY_TARGET_STALE" });
+    expect(issueDispatch).toHaveBeenCalledTimes(1);
+    expect(sessions.getHead(first.windowId)).toBeNull();
+    expect(tree.history("resident-a")).toHaveLength(2);
+    await writer.close();
+  });
+
+  it("rejects an archived delivery before issuing a receipt or calling the responder", async () => {
+    const assistantReply = vi.fn(() => "must not run");
+    const { writer, sessions, first, delivery, tree, dispatchEvents } = await assembly({
+      assistantReply,
+    });
+    const issueDispatch = vi.spyOn(sessions, "issueDispatch");
+    sessions.kill(first.windowId);
+    await expect(
+      delivery.deliver({
+        residentId: "resident-a",
+        text: "stale",
+        eventId: "archived-blocker",
+        workRef: "work-1",
+        viewport: { windowId: first.windowId, generation: first.generation },
+      }),
+    ).rejects.toMatchObject({ code: "REPLY_TARGET_STALE" });
+    expect(issueDispatch).not.toHaveBeenCalled();
+    expect(assistantReply).not.toHaveBeenCalled();
+    expect(dispatchEvents).toEqual([]);
+    expect(tree.history("resident-a")).toEqual([]);
+    await writer.close();
+  });
+
   it("routes explicit handles exactly, allows one naked target, and never guesses among two", async () => {
     const { writer, sessions, tree, first, second, blocked, router } = await assembly();
     const before = JSON.stringify(tree.history("resident-a"));
@@ -438,7 +504,7 @@ describe("OS-06 canonical blocked reply routing", () => {
     const replyReleased = new Promise<void>((resolve) => {
       releaseReply = resolve;
     });
-    const { writer, sessions, tree, first, blocked, router } = await assembly({
+    const { writer, sessions, tree, first, blocked, router, dispatchEvents } = await assembly({
       assistantReply: async (_residentId, message) => {
         markStarted();
         await replyReleased;
@@ -446,6 +512,7 @@ describe("OS-06 canonical blocked reply routing", () => {
       },
     });
 
+    const issueDispatch = vi.spyOn(sessions, "issueDispatch");
     const inFlight = router.route({
       residentId: "resident-a",
       text: "old-generation",
@@ -461,6 +528,11 @@ describe("OS-06 canonical blocked reply routing", () => {
     releaseReply();
 
     await expect(inFlight).rejects.toMatchObject({ code: "REPLY_TARGET_STALE" });
+    expect(issueDispatch).toHaveBeenCalledTimes(1);
+    expect(dispatchEvents.map((event) => event.event)).toEqual(["dispatch", "dropped"]);
+    for (const event of dispatchEvents) {
+      expect(event).toMatchObject(issueDispatch.mock.results[0]?.value);
+    }
     expect(tree.history("resident-a")).toEqual([]);
     expect(sessions.getHead(first.windowId)).toBeNull();
     await writer.close();
