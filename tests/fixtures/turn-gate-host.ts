@@ -22,12 +22,26 @@ import {
   type TurnGateEvent,
   ViewportTurnGate,
 } from "../../src/session/turn-gate.ts";
-import { type FactKind, FactLedger, type GapProbe } from "../../src/store/fact-ledger.ts";
+import { type FactKind, FactLedger, type FactLedgerOptions } from "../../src/store/fact-ledger.ts";
 
 const dataDir = process.env.MIST_TURN_GATE_DATADIR;
 // 给了 dataDir 就是「落盘宿主」形态：ResidentStore 与 FactLedger 同目录共存
 // （各自认领各自的后缀），供父进程 SIGKILL 后原目录拉起，验猝死不续接。
-const ledger = dataDir === undefined ? new FactLedger() : new FactLedger({ dataDir });
+// 账的代际权威接 B 窗注册表（A 窗走 driver 不直写账）；systemWriter 是
+// 组装层（本 fixture 的主线程）持有的能力——只在这里铸出，B 窗命令拿不到。
+// MV-C03 故障注入走显式 gapProbeFault 口：只造 unknown、造不出假零也造不出
+// 假新鲜；此前 monkey-patch 公开 probeGap 的写法已被上游 review 定为可误用
+// 先例（实例属性遮蔽会连安全判据一起换），不再使用。
+let probeFails = false;
+const ledgerOptions: FactLedgerOptions = {
+  ...(dataDir === undefined ? {} : { dataDir }),
+  viewportAuthority: (viewportId) => {
+    const live = sessionsB.get(viewportId);
+    return live === undefined ? null : { residentId: live.residentId, generation: live.generation };
+  },
+  gapProbeFault: () => (probeFails ? { status: "unknown", cause: "注入的查账失败" } : null),
+};
+const { ledger, systemWriter } = FactLedger.create(ledgerOptions);
 const events: TurnGateEvent[] = [];
 const logger: TurnEventLogger = {
   log: (event) => {
@@ -83,12 +97,7 @@ const serviceB = new MessageTreeService(
   },
 );
 
-// MV-C03 故障注入：查账必返 unknown。「查不到」与「查到是零」在 GapProbe
-// 类型上是两个值，注入只造 unknown，造不出假零。
-let probeFails = false;
-const realProbeGap = ledger.probeGap.bind(ledger);
-ledger.probeGap = (residentId, windowId): GapProbe =>
-  probeFails ? { status: "unknown", cause: "注入的查账失败" } : realProbeGap(residentId, windowId);
+// （MV-C03 故障注入已上移进 ledgerOptions.gapProbeFault——见构造处注释。）
 
 type HostCommand = {
   requestId: string;
@@ -99,7 +108,9 @@ type HostCommand = {
     | "recall"
     | "killSession"
     | "appendRuling"
+    | "appendRulingFromB"
     | "supersede"
+    | "supersedeFromB"
     | "entries"
     | "currentSet"
     | "openWindowB"
@@ -139,6 +150,13 @@ function windowBOf(residentId: string): string {
   return windowId;
 }
 
+/** B 窗署名三元组用的代际——从注册表现取（装置模拟的是「守规矩地报出自己的真实代际」的窗）。 */
+function generationBOf(viewportId: string): number {
+  const generation = sessionsB.get(viewportId)?.generation;
+  if (generation === undefined) throw new Error(`no B session for ${viewportId}`);
+  return generation;
+}
+
 async function execute(command: HostCommand): Promise<unknown> {
   switch (command.op) {
     case "createResident": {
@@ -167,20 +185,57 @@ async function execute(command: HostCommand): Promise<unknown> {
       await driver.killSession(requireString(command.residentId, "residentId"));
       return null;
     case "appendRuling":
-      return ledger.append(requireString(command.residentId, "residentId"), {
-        author: requireString(command.author, "author"),
-        kind: command.kind ?? "ruling",
-        body: requireString(command.body, "body"),
-      });
+      // 主线程/管理员落账：走组装层持有的 system 能力写手——豁免凭能力
+      // 不凭自报，reason 落痕进条目（C04 权威半格）。
+      return systemWriter.append(
+        requireString(command.residentId, "residentId"),
+        {
+          author: requireString(command.author, "author"),
+          kind: command.kind ?? "ruling",
+          body: requireString(command.body, "body"),
+        },
+        "main-thread ledger write",
+      );
+    // C04：B 窗署名的裁定级写入——同一个 append 入口，只多一个发起方。
+    // 窗「自查与否」在这条路径上不存在：装置故意不做任何前置检查，
+    // 拦不拦全看账侧。
+    case "appendRulingFromB": {
+      const residentId = requireString(command.residentId, "residentId");
+      const viewportId = windowBOf(residentId);
+      return ledger.append(
+        residentId,
+        {
+          author: requireString(command.author, "author"),
+          kind: command.kind ?? "ruling",
+          body: requireString(command.body, "body"),
+        },
+        { kind: "viewport", residentId, viewportId, generation: generationBOf(viewportId) },
+      );
+    }
     case "supersede":
-      return ledger.supersede(
+      // 主线程解除：同样走 system 能力写手。
+      return systemWriter.supersede(
         requireString(command.residentId, "residentId"),
         command.targetSeq ?? -1,
         {
           author: requireString(command.author, "author"),
           reason: requireString(command.reason, "reason"),
         },
+        "main-thread supersede",
       );
+    case "supersedeFromB": {
+      const residentId = requireString(command.residentId, "residentId");
+      const viewportId = windowBOf(residentId);
+      return ledger.supersede(
+        residentId,
+        command.targetSeq ?? -1,
+        {
+          author: requireString(command.author, "author"),
+          reason: requireString(command.reason, "reason"),
+        },
+        { kind: "viewport", residentId, viewportId, generation: generationBOf(viewportId) },
+      );
+    }
     case "entries":
       return ledger.entries(requireString(command.residentId, "residentId"));
     case "currentSet":
