@@ -16,9 +16,11 @@ import { describe, expect, it } from "vitest";
 import {
   AckError,
   FactLedger,
+  ForeignViewportError,
   InvalidSupersedeError,
   LedgerEntryNotFoundError,
   LedgerNotFoundError,
+  StaleViewportError,
   ViewportNotFoundError,
   WriteGateUnavailableError,
 } from "../src/store/fact-ledger.ts";
@@ -455,23 +457,23 @@ describe("查账失败按缺处理（MV-C03 账侧）", () => {
 });
 
 describe("C04 权威半格：豁免是能力不是自报（渡渡家内审二轮 + 上游 Laurie/Elio）", () => {
-  /** 带代际权威的账：gens 就是这些测试里的 SessionRegistry 替身。 */
+  /** 带身份权威的账：owners 就是这些测试里的 SessionRegistry 替身（归属与代际同源同查）。 */
   function gatedLedger() {
-    const gens = new Map<string, number>();
+    const owners = new Map<string, { residentId: string; generation: number }>();
     const created = FactLedger.create({
-      generationOf: (viewportId) => gens.get(viewportId) ?? null,
+      viewportAuthority: (viewportId) => owners.get(viewportId) ?? null,
     });
-    return { ...created, gens };
+    return { ...created, owners };
   }
 
   it('落后窗伪报 system 必红：强喂 {kind:"system"} 进公开写口被拒，账上零多写', () => {
     // 复刻二轮复审的绕闸路径：B 窗 ackedSeq=0 落后于 latestSeq=1，
     // 换掉省略 origin 的招数，改自报 system——类型层本已没有这个分支，
     // 这里模拟 JS 调用方硬塞，必须在运行时半格响亮拒绝。
-    const { ledger, systemWriter: system, gens } = gatedLedger();
+    const { ledger, systemWriter: system, owners } = gatedLedger();
     ledger.createLedger("r");
     ledger.openViewport("r", "w-b");
-    gens.set("w-b", 1);
+    owners.set("w-b", { residentId: "r", generation: 1 });
     system.append("r", { author: "main", kind: "ruling", body: "既有裁定" }, "seed");
     expect(ledger.probeGap("r", "w-b")).toEqual({ status: "ok", latestSeq: 1, ackedSeq: 0 });
     expect(() =>
@@ -495,10 +497,10 @@ describe("C04 权威半格：豁免是能力不是自报（渡渡家内审二轮
   });
 
   it("旧 generation 必红：权威说当代是 2，拿 1 来写被拒，账上零多写", () => {
-    const { ledger, gens } = gatedLedger();
+    const { ledger, owners } = gatedLedger();
     ledger.createLedger("r");
     ledger.openViewport("r", "w-b");
-    gens.set("w-b", 2);
+    owners.set("w-b", { residentId: "r", generation: 2 });
     expect(() =>
       ledger.append(
         "r",
@@ -510,7 +512,7 @@ describe("C04 权威半格：豁免是能力不是自报（渡渡家内审二轮
   });
 
   it("generation 权威未接线或查不到：fail-closed，不放行", () => {
-    // 未接线：普通 new 出来的账没有 generationOf——验不了资格就不放行。
+    // 未接线：普通 new 出来的账没有 viewportAuthority——验不了资格就不放行。
     const { ledger: bare } = FactLedger.create();
     bare.createLedger("r");
     bare.openViewport("r", "w-b");
@@ -523,10 +525,10 @@ describe("C04 权威半格：豁免是能力不是自报（渡渡家内审二轮
     ).toThrow(WriteGateUnavailableError);
     expect(bare.latestSeq("r")).toBe(0);
     // 接了线但权威查不到这扇窗：同样 fail-closed。
-    const { ledger, gens } = gatedLedger();
+    const { ledger, owners } = gatedLedger();
     ledger.createLedger("r");
     ledger.openViewport("r", "w-b");
-    expect(gens.has("w-b")).toBe(false);
+    expect(owners.has("w-b")).toBe(false);
     expect(() =>
       ledger.append(
         "r",
@@ -538,11 +540,11 @@ describe("C04 权威半格：豁免是能力不是自报（渡渡家内审二轮
   });
 
   it("三元组 residentId 与目标账不一致：拒收（不许张冠李戴）", () => {
-    const { ledger, gens } = gatedLedger();
+    const { ledger, owners } = gatedLedger();
     ledger.createLedger("r");
     ledger.createLedger("other");
     ledger.openViewport("r", "w-b");
-    gens.set("w-b", 1);
+    owners.set("w-b", { residentId: "r", generation: 1 });
     expect(() =>
       ledger.append(
         "r",
@@ -574,10 +576,10 @@ describe("C04 权威半格：豁免是能力不是自报（渡渡家内审二轮
   });
 
   it("守规窗写入成功，三元组印痕落进条目", () => {
-    const { ledger, gens } = gatedLedger();
+    const { ledger, owners } = gatedLedger();
     ledger.createLedger("r");
     ledger.openViewport("r", "w-b");
-    gens.set("w-b", 3);
+    owners.set("w-b", { residentId: "r", generation: 3 });
     const entry = ledger.append(
       "r",
       { author: "b-window", kind: "ruling", body: "守规矩的裁定" },
@@ -589,6 +591,165 @@ describe("C04 权威半格：豁免是能力不是自报（渡渡家内审二轮
       viewportId: "w-b",
       generation: 3,
     });
+  });
+
+  it("闸先于目标校验：落后窗 supersede 不存在的 seq，答案是 Stale 不是 NotFound（阿问 review 钉的性质）", () => {
+    // 未知悉最新裁定的窗连「目标存不存在」的答案都不该拿到——把闸挪到
+    // 目标校验之后，这条测试会精准转红（LedgerEntryNotFoundError 抛出）。
+    const { ledger, systemWriter: system, owners } = gatedLedger();
+    ledger.createLedger("r");
+    ledger.openViewport("r", "w-b");
+    owners.set("w-b", { residentId: "r", generation: 1 });
+    system.append("r", { author: "main", kind: "ruling", body: "让 w-b 落后的裁定" }, "seed");
+    expect(() =>
+      ledger.supersede(
+        "r",
+        999,
+        { author: "b-window", reason: "落后窗探路" },
+        {
+          kind: "viewport",
+          residentId: "r",
+          viewportId: "w-b",
+          generation: 1,
+        },
+      ),
+    ).toThrow(StaleViewportError);
+    expect(ledger.latestSeq("r")).toBe(1);
+  });
+
+  it("归属半格：别家的真活窗被误挂进目标账 ack row，也不得署名写入（界 review 的复现反例）", () => {
+    // 复刻界的复现链：w-bee 是住户 bee 的真窗（权威在案、代际现值），
+    // 误接线把它 openViewport 进了 a 的账——resident 自比与代际全过，
+    // 只有权威归属能拦住这笔写入。
+    const { ledger, owners } = gatedLedger();
+    ledger.createLedger("a");
+    ledger.createLedger("bee");
+    owners.set("w-bee", { residentId: "bee", generation: 1 });
+    ledger.openViewport("a", "w-bee"); // 误接线：别家的窗挂进了 a 的确认位
+    expect(() =>
+      ledger.append(
+        "a",
+        { author: "bee-window", kind: "ruling", body: "跨户写入" },
+        {
+          kind: "viewport",
+          residentId: "a",
+          viewportId: "w-bee",
+          generation: 1,
+        },
+      ),
+    ).toThrow(ForeignViewportError);
+    expect(ledger.latestSeq("a")).toBe(0);
+    // 回自己家写照常放行：权威归属对上即走。
+    ledger.openViewport("bee", "w-bee");
+    const entry = ledger.append(
+      "bee",
+      { author: "bee-window", kind: "ruling", body: "在自家写" },
+      {
+        kind: "viewport",
+        residentId: "bee",
+        viewportId: "w-bee",
+        generation: 1,
+      },
+    );
+    expect(entry.seq).toBe(1);
+  });
+
+  it("写者自 ack：同一扇窗连续两笔合法裁定级写入都放行，确认位随写推进（界 review 定的语义）", () => {
+    const { ledger, owners } = gatedLedger();
+    ledger.createLedger("r");
+    ledger.openViewport("r", "w-b");
+    owners.set("w-b", { residentId: "r", generation: 1 });
+    const origin = { kind: "viewport", residentId: "r", viewportId: "w-b", generation: 1 } as const;
+    const first = ledger.append("r", { author: "b", kind: "ruling", body: "第一笔" }, origin);
+    expect(ledger.ackedSeq("r", "w-b")).toBe(first.seq); // 写者天然知悉自己的条目
+    // 不补任何手工 ack，第二笔照常放行——写入与确认位推进同一次持久化完成。
+    const second = ledger.supersede("r", first.seq, { author: "b", reason: "改主意" }, origin);
+    expect(second.seq).toBe(2);
+    expect(ledger.ackedSeq("r", "w-b")).toBe(2);
+    // 别家窗的确认位不动：他们的知悉仍走缺口通道。
+    ledger.openViewport("r", "w-c");
+    owners.set("w-c", { residentId: "r", generation: 1 });
+    const third = ledger.append("r", { author: "b", kind: "ruling", body: "第三笔" }, origin);
+    expect(ledger.ackedSeq("r", "w-b")).toBe(third.seq);
+    expect(ledger.ackedSeq("r", "w-c")).toBe(2); // w-c 开窗 baseline=2，之后没动
+  });
+
+  it("写者自 ack 落盘同笔：重启恢复后确认位就是写后的值", () => {
+    withTempDir((dataDir) => {
+      const owners = new Map([["w-b", { residentId: "r", generation: 1 }]]);
+      const authority = (viewportId: string) => owners.get(viewportId) ?? null;
+      const { ledger } = FactLedger.create({ dataDir, viewportAuthority: authority });
+      ledger.createLedger("r");
+      ledger.openViewport("r", "w-b");
+      ledger.append(
+        "r",
+        { author: "b", kind: "ruling", body: "落盘的一笔" },
+        {
+          kind: "viewport",
+          residentId: "r",
+          viewportId: "w-b",
+          generation: 1,
+        },
+      );
+      const restored = new FactLedger({ dataDir, viewportAuthority: authority });
+      expect(restored.ackedSeq("r", "w-b")).toBe(1);
+    });
+  });
+
+  it("覆盖公开 probeGap 改变不了写资格：安全判据走内部探针（界 review 定的边界）", () => {
+    const { ledger, systemWriter: system, owners } = gatedLedger();
+    ledger.createLedger("r");
+    ledger.openViewport("r", "w-b");
+    owners.set("w-b", { residentId: "r", generation: 1 });
+    system.append("r", { author: "main", kind: "ruling", body: "让 w-b 落后" }, "seed");
+    // monkey-patch 公开探针谎报新鲜——查询门面被换，闸不为所动。
+    (ledger as { probeGap: unknown }).probeGap = () => ({
+      status: "ok",
+      latestSeq: 0,
+      ackedSeq: 0,
+    });
+    expect(() =>
+      ledger.append(
+        "r",
+        { author: "b-window", kind: "ruling", body: "想借假探针绕闸" },
+        {
+          kind: "viewport",
+          residentId: "r",
+          viewportId: "w-b",
+          generation: 1,
+        },
+      ),
+    ).toThrow(StaleViewportError);
+    expect(ledger.latestSeq("r")).toBe(1);
+  });
+
+  it("gapProbeFault 显式注入口：只造 unknown、写路径 fail-closed；类型上注不出假新鲜", () => {
+    let inject = false;
+    const owners = new Map([["w-b", { residentId: "r", generation: 1 }]]);
+    const { ledger } = FactLedger.create({
+      viewportAuthority: (viewportId) => owners.get(viewportId) ?? null,
+      gapProbeFault: () => (inject ? { status: "unknown", cause: "注入的查账失败" } : null),
+    });
+    ledger.createLedger("r");
+    ledger.openViewport("r", "w-b");
+    const origin = { kind: "viewport", residentId: "r", viewportId: "w-b", generation: 1 } as const;
+    ledger.append("r", { author: "b", kind: "ruling", body: "注入前照常" }, origin);
+    inject = true;
+    expect(() =>
+      ledger.append("r", { author: "b", kind: "ruling", body: "注入中必拒" }, origin),
+    ).toThrow(WriteGateUnavailableError);
+    expect(ledger.probeGap("r", "w-b").status).toBe("unknown"); // 查询门面同源可见
+    inject = false;
+    ledger.append("r", { author: "b", kind: "ruling", body: "注入撤销后恢复" }, origin);
+    expect(ledger.latestSeq("r")).toBe(2); // 注入中那笔被拒，账上只有前后两笔
+  });
+
+  it("SystemLedgerWriter 铸造印：拿原型构造函数配假印也铸不出写手（阿问 review 的纵深防御探针）", () => {
+    const { systemWriter } = FactLedger.create();
+    const proto = Object.getPrototypeOf(systemWriter) as {
+      constructor: new (...args: unknown[]) => unknown;
+    };
+    expect(() => new proto.constructor(Symbol("fake"), {})).toThrow(/铸出/);
   });
 });
 
@@ -823,6 +984,44 @@ describe("持久化", () => {
       );
       expect(() => new FactLedger({ dataDir })).toThrow(/未知 kind/);
     });
+  });
+
+  it("origin 印痕坏档显式失败：未知 kind / 空 system reason / generation 非整数（界 review 的 P3 回归）", () => {
+    // 把 #validateSnapshot 的 origin 深层校验拆掉后，这三份坏档会被静默
+    // 恢复进内存、经 entries() 外泄、再次落盘——此前无测试钉住（变异实证）。
+    const badOrigins: { name: string; origin: unknown; message: RegExp }[] = [
+      { name: "martian", origin: { kind: "martian" }, message: /未知 kind/ },
+      { name: "empty-reason", origin: { kind: "system", reason: "  " }, message: /空署名/ },
+      {
+        name: "bad-generation",
+        origin: { kind: "viewport", viewportId: "w-b", generation: "one" },
+        message: /generation 不是整数/,
+      },
+    ];
+    for (const bad of badOrigins) {
+      withTempDir((dataDir) => {
+        writeFileSync(
+          join(dataDir, "r.facts.json"),
+          JSON.stringify({
+            schemaVersion: 2,
+            residentId: "r",
+            entries: [
+              {
+                seq: 1,
+                ts: "2026-08-20T00:00:00.000Z",
+                author: "m",
+                kind: "ruling",
+                body: bad.name,
+                supersedesSeq: null,
+                origin: bad.origin,
+              },
+            ],
+            viewports: [],
+          }),
+        );
+        expect(() => new FactLedger({ dataDir }), bad.name).toThrow(bad.message);
+      });
+    }
   });
 
   it("supersede 指向另一条 supersede 的坏档显式失败", () => {

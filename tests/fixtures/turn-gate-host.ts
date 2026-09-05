@@ -22,21 +22,24 @@ import {
   type TurnGateEvent,
   ViewportTurnGate,
 } from "../../src/session/turn-gate.ts";
-import {
-  type FactKind,
-  FactLedger,
-  type FactLedgerOptions,
-  type GapProbe,
-} from "../../src/store/fact-ledger.ts";
+import { type FactKind, FactLedger, type FactLedgerOptions } from "../../src/store/fact-ledger.ts";
 
 const dataDir = process.env.MIST_TURN_GATE_DATADIR;
 // 给了 dataDir 就是「落盘宿主」形态：ResidentStore 与 FactLedger 同目录共存
 // （各自认领各自的后缀），供父进程 SIGKILL 后原目录拉起，验猝死不续接。
 // 账的代际权威接 B 窗注册表（A 窗走 driver 不直写账）；systemWriter 是
 // 组装层（本 fixture 的主线程）持有的能力——只在这里铸出，B 窗命令拿不到。
+// MV-C03 故障注入走显式 gapProbeFault 口：只造 unknown、造不出假零也造不出
+// 假新鲜；此前 monkey-patch 公开 probeGap 的写法已被上游 review 定为可误用
+// 先例（实例属性遮蔽会连安全判据一起换），不再使用。
+let probeFails = false;
 const ledgerOptions: FactLedgerOptions = {
   ...(dataDir === undefined ? {} : { dataDir }),
-  generationOf: (viewportId) => sessionsB.get(viewportId)?.generation ?? null,
+  viewportAuthority: (viewportId) => {
+    const live = sessionsB.get(viewportId);
+    return live === undefined ? null : { residentId: live.residentId, generation: live.generation };
+  },
+  gapProbeFault: () => (probeFails ? { status: "unknown", cause: "注入的查账失败" } : null),
 };
 const { ledger, systemWriter } = FactLedger.create(ledgerOptions);
 const events: TurnGateEvent[] = [];
@@ -94,12 +97,7 @@ const serviceB = new MessageTreeService(
   },
 );
 
-// MV-C03 故障注入：查账必返 unknown。「查不到」与「查到是零」在 GapProbe
-// 类型上是两个值，注入只造 unknown，造不出假零。
-let probeFails = false;
-const realProbeGap = ledger.probeGap.bind(ledger);
-ledger.probeGap = (residentId, windowId): GapProbe =>
-  probeFails ? { status: "unknown", cause: "注入的查账失败" } : realProbeGap(residentId, windowId);
+// （MV-C03 故障注入已上移进 ledgerOptions.gapProbeFault——见构造处注释。）
 
 type HostCommand = {
   requestId: string;
