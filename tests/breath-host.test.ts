@@ -321,6 +321,79 @@ describe("换气阈值硬闸与手动入口（real host subprocess）", () => {
   });
 });
 
+describe("MV-D09 换气失败外显（real host subprocess）", () => {
+  it("撞线先外显预告，换气失败外显；失败后的下一次阈值穿越重新预告", async () => {
+    const child = startHost();
+    await waitForReady(child);
+    const residentId = "resident-d09";
+    const { windowId } = await callHost<Opened>(child, { op: "open", residentId });
+    await callHost(child, { op: "configureThreshold", windowId, tokens: 10 });
+
+    // 这一回合完整跑完并把用量顶过线；下一回合才在边界触发预告与硬闸。
+    await callHost<Said>(child, {
+      op: "say",
+      windowId,
+      message: "第一句话，长度足够把本代用量顶过线",
+    });
+    await expect(
+      callHost(child, { op: "say", windowId, message: "第一次阈值穿越" }),
+    ).rejects.toThrow(/BREATH_THRESHOLD_REACHED/);
+
+    const firstCrossing = await callHost<Notice[]>(child, { op: "notices" });
+    expect(firstCrossing.filter((notice) => notice.kind === "announced")).toEqual([
+      expect.objectContaining({ windowId, generation: 1 }),
+    ]);
+
+    // 在真实子进程的时间线写口注入失败：失败必须走对人可见通知，窗仍在原代。
+    await callHost(child, { op: "failNextAppend" });
+    await expect(
+      callHost(child, {
+        op: "breathe",
+        windowId,
+        draft: draft("D09 失败外显", "时间线写入失败"),
+      }),
+    ).rejects.toThrow(/BREATH_CYCLE_FAILED\[append\]/);
+
+    const afterFailure = await callHost<Notice[]>(child, { op: "notices" });
+    expect(afterFailure.at(-1)).toMatchObject({
+      kind: "failed",
+      windowId,
+      generation: 1,
+      stage: "append",
+      windowRecovered: true,
+    });
+
+    // 与 OS-05 接缝：真实阈值路径的失败也必须耐久进入唯一主流，不能只留本地 notice。
+    const failures = await callHost<CanonicalEvent[]>(child, {
+      op: "canonicalEvents",
+      residentId,
+    });
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({
+      residentId,
+      purpose: "lifecycle",
+      authoritySource: { kind: "host", id: "mist-host" },
+      effect: { state: "failed-not-effective", requiresUserAction: false, retry: "automatic" },
+      payload: { kind: "host-lifecycle-failed", action: "breath", stage: "append" },
+    });
+
+    // 失败必须清掉“本周期已预告”：用量仍过线，下一次穿越要再次送到人眼前。
+    await expect(
+      callHost(child, { op: "say", windowId, message: "失败后的第二次阈值穿越" }),
+    ).rejects.toThrow(/BREATH_THRESHOLD_REACHED/);
+    const secondCrossing = await callHost<Notice[]>(child, { op: "notices" });
+    expect(secondCrossing.filter((notice) => notice.kind === "announced")).toEqual([
+      expect.objectContaining({ windowId, generation: 1 }),
+      expect.objectContaining({ windowId, generation: 1 }),
+    ]);
+
+    // 两次被硬闸拦下的输入都没有落树；日志事件不能冒充上述人可见通知。
+    expect(await callHost<HistoryNode[]>(child, { op: "history", residentId })).toHaveLength(2);
+    const events = await callHost<GateEvent[]>(child, { op: "events" });
+    expect(events.filter((event) => event.event === "threshold_reached")).toHaveLength(2);
+  });
+});
+
 describe("OS-05 宿主换气失败进入 canonical stream", () => {
   it("真实换气失败由宿主签发、明确未生效，并在下一次阈值穿越重新预告", async () => {
     const child = startHost();
