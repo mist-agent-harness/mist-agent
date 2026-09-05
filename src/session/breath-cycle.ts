@@ -19,12 +19,14 @@
  *
  * 2. **信先落定，再换代**（图纸 §4.1 的 sealed 在新代之前）。顺序反过来的话，
  *    新代已经醒了而信还没落盘，一旦落盘失败，这一代就是**没有交接的换代**——
- *    而那正是交接信要防的全部内容。所以 `appendLetter` 抛错时换代不发生。
+ *    而那正是交接信要防的全部内容。所以 `appendLetter` 抛错或拒绝时换代不发生。
  *
  * 3. **失败必须有人看见**（MV-D09）。换气失败时住户是被换的那个，
  *    ta 没有视角看见自己没被换。所以失败走 `notify` 而不是只落日志字段；
- *    并且**失败会清掉本周期的预告记号**，下一次阈值穿越重新发预告——
+ *    并且**实际换气失败会清掉本周期的预告记号**，下一次阈值穿越重新发预告——
  *    「本周期已发过」这种去重逻辑正好会把连续失败静默掉。
+ *    唯一例外是同窗换气尚在途时的重入：它会失败并通知，但首轮仍在进行，
+ *    所以不能替首轮清掉预告记号。
  *
  * 第三刀给这条路加了一道前置闸（MV-D07b）：封信之前的流水卫生检查分两档——
  * 中断产生的**合法残骸**（如末尾悬着一条没回应的 user 节点）降级为 debris
@@ -203,9 +205,9 @@ export interface BreathCycleOptions<TContext> {
   /**
    * 信落时间线（图纸 §4.2：「信落时间线，归档当前代际流水」）。
    * 不另建 letter store——第三条持久化路径没有依据（旦九 2026-08-21 裁定）。
-   * 抛错即换代不发生。
+   * 抛错或 Promise 拒绝即换代不发生；换代必须等耐久写回执。
    */
-  appendLetter: (letter: SealedLetter) => void;
+  appendLetter: (letter: SealedLetter) => unknown;
   /**
    * 把信塞进新代的启动上下文（MV-D04）。装配器保持住户级纯函数不碰信，
    * 注入责任放在换气流程——它才是唯一知道「这扇窗上一代是谁」的地方
@@ -236,6 +238,8 @@ export class BreathCycle<TContext> {
    * 用途只有一个：让「本周期已预告」的去重**不会跨过失败**（MV-D09 后半）。
    */
   readonly #announced = new Set<string>();
+  /** 正在换气的窗；异步落信期间不允许同一旧代再次进入。 */
+  readonly #inFlight = new Set<string>();
 
   constructor(options: BreathCycleOptions<TContext>) {
     this.#options = options;
@@ -270,7 +274,7 @@ export class BreathCycle<TContext> {
    * 成功返回新代的活窗与那封信；任何一步失败都抛 BreathCycleError，
    * 并且**先通知再抛**——调用方可能吞掉异常，但人得看见。
    */
-  breathe(windowId: string, draft: LetterDraft): BreathResult<TContext> {
+  async breathe(windowId: string, draft: LetterDraft): Promise<BreathResult<TContext>> {
     const { registry, appendLetter, injectLetter, notify, now } = this.#options;
 
     const current = registry.get(windowId);
@@ -282,95 +286,114 @@ export class BreathCycle<TContext> {
     }
 
     const fromGeneration = current.generation;
-
-    // ⓪ 流水卫生检查（MV-D07b），在封信之前。畸形结构硬拦：把会导致下游
-    // API 调用失败的流水封进归档，下一代继承的是一具必炸的尸体。合法残骸
-    // 只警告并记档（debris 通知），换气照常完成——残骸属于被归档的旧代，
-    // 不许楔死这扇窗此后所有的换气。
-    if (this.#options.flowOf !== undefined) {
-      const inspection = inspectFlowHygiene(this.#options.flowOf(current));
-      if (inspection.malformed.length > 0) {
-        const reason = `流水卫生检查硬拦：${inspection.malformed.join("；")}`;
-        this.#fail(windowId, fromGeneration, "hygiene", reason, true);
-        throw new BreathCycleError("hygiene", reason);
-      }
-      if (inspection.remnants.length > 0) {
-        notify({
-          kind: "debris",
-          windowId,
-          generation: fromGeneration,
-          remnants: inspection.remnants,
-        });
-      }
-    }
-
-    // ① 封信。校验不过就停在这里——窗一根汗毛没动。
-    let letter: SealedLetter;
-    try {
-      letter = sealLetter(draft, {
-        residentId: current.residentId,
-        windowId: current.windowId,
-        generation: fromGeneration,
-        now: now(),
-      });
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      this.#fail(windowId, fromGeneration, "seal", reason, true);
-      throw new BreathCycleError("seal", reason, { cause: error });
-    }
-
-    // ② 信先落定。落盘失败则换代不发生——宁可不换代，不可无信换代。
-    try {
-      appendLetter(letter);
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      this.#fail(windowId, fromGeneration, "append", reason, true);
-      throw new BreathCycleError("append", reason, { cause: error });
-    }
-
-    // ③ 换代。kill + open 锁在同一个同步区，中途不 await。
-    const archivedHeadId = current.headId;
-    const scopeId = current.scopeId;
-    const residentId = current.residentId;
-    // ④ 注入先算完，再动窗。参数在调用前求值——若把 injectLetter 写在
-    // open(...) 的参数位上，它一抛错就落在 kill 之后、open 之前：窗已归档、
-    // 新代没开，正好违反模块头的「失败且窗没动过」。（cursor 08-25 抓的）
-    let nextContext: TContext;
-    try {
-      nextContext = injectLetter(current.context, letter);
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      // 窗一个字没动：kill 还没执行，如实报 recovered=true。
-      this.#fail(windowId, fromGeneration, "inject", reason, true);
-      throw new BreathCycleError("inject", reason, { cause: error });
-    }
-    let reopened: ActiveWindow<TContext>;
-    try {
-      registry.kill(windowId);
-      reopened = registry.open(residentId, {
+    if (this.#inFlight.has(windowId)) {
+      const reason = `breath already in progress: ${windowId}`;
+      // 首次换气仍拥有本周期的预告位。重入失败要外显，但不能调用会清掉
+      // #announced 的 #fail，否则首次落信还在途时就提前释放了预告去重。
+      notify({
+        kind: "failed",
         windowId,
-        scopeId,
-        headId: archivedHeadId,
-        // 新代醒来时信全文已在上下文里，不需要任何工具调用。
-        context: nextContext,
+        generation: fromGeneration,
+        stage: "append",
+        reason,
+        windowRecovered: true,
       });
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      // 窗可能停在归档态。据实报告，不粉饰——需要人来捞的时候得说出口。
-      const recovered = registry.get(windowId) !== undefined;
-      this.#fail(windowId, fromGeneration, "swap", reason, recovered);
-      throw new BreathCycleError("swap", reason, { cause: error });
+      throw new BreathCycleError("append", reason);
     }
+    this.#inFlight.add(windowId);
 
-    this.#announced.delete(windowId);
-    notify({
-      kind: "completed",
-      windowId,
-      fromGeneration,
-      toGeneration: reopened.generation,
-      letterTitle: letter.title,
-    });
-    return { window: reopened, letter };
+    try {
+      // ⓪ 流水卫生检查（MV-D07b），在封信之前。畸形结构硬拦：把会导致下游
+      // API 调用失败的流水封进归档，下一代继承的是一具必炸的尸体。合法残骸
+      // 只警告并记档（debris 通知），换气照常完成——残骸属于被归档的旧代，
+      // 不许楔死这扇窗此后所有的换气。
+      if (this.#options.flowOf !== undefined) {
+        const inspection = inspectFlowHygiene(this.#options.flowOf(current));
+        if (inspection.malformed.length > 0) {
+          const reason = `流水卫生检查硬拦：${inspection.malformed.join("；")}`;
+          this.#fail(windowId, fromGeneration, "hygiene", reason, true);
+          throw new BreathCycleError("hygiene", reason);
+        }
+        if (inspection.remnants.length > 0) {
+          notify({
+            kind: "debris",
+            windowId,
+            generation: fromGeneration,
+            remnants: inspection.remnants,
+          });
+        }
+      }
+
+      // ① 封信。校验不过就停在这里——窗一根汗毛没动。
+      let letter: SealedLetter;
+      try {
+        letter = sealLetter(draft, {
+          residentId: current.residentId,
+          windowId: current.windowId,
+          generation: fromGeneration,
+          now: now(),
+        });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        this.#fail(windowId, fromGeneration, "seal", reason, true);
+        throw new BreathCycleError("seal", reason, { cause: error });
+      }
+
+      // ② 信先落定。落盘失败则换代不发生——宁可不换代，不可无信换代。
+      try {
+        await appendLetter(letter);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        this.#fail(windowId, fromGeneration, "append", reason, true);
+        throw new BreathCycleError("append", reason, { cause: error });
+      }
+
+      // ③ 换代。kill + open 锁在同一个同步区，中途不 await。
+      const archivedHeadId = current.headId;
+      const scopeId = current.scopeId;
+      const residentId = current.residentId;
+      // ④ 注入先算完，再动窗。参数在调用前求值——若把 injectLetter 写在
+      // open(...) 的参数位上，它一抛错就落在 kill 之后、open 之前：窗已归档、
+      // 新代没开，正好违反模块头的「失败且窗没动过」。（cursor 08-25 抓的）
+      let nextContext: TContext;
+      try {
+        nextContext = injectLetter(current.context, letter);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        // 窗一个字没动：kill 还没执行，如实报 recovered=true。
+        this.#fail(windowId, fromGeneration, "inject", reason, true);
+        throw new BreathCycleError("inject", reason, { cause: error });
+      }
+      let reopened: ActiveWindow<TContext>;
+      try {
+        registry.kill(windowId);
+        reopened = registry.open(residentId, {
+          windowId,
+          scopeId,
+          headId: archivedHeadId,
+          // 新代醒来时信全文已在上下文里，不需要任何工具调用。
+          context: nextContext,
+        });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        // 窗可能停在归档态。据实报告，不粉饰——需要人来捞的时候得说出口。
+        const recovered = registry.get(windowId) !== undefined;
+        this.#fail(windowId, fromGeneration, "swap", reason, recovered);
+        throw new BreathCycleError("swap", reason, { cause: error });
+      }
+
+      this.#announced.delete(windowId);
+      notify({
+        kind: "completed",
+        windowId,
+        fromGeneration,
+        toGeneration: reopened.generation,
+        letterTitle: letter.title,
+      });
+      return { window: reopened, letter };
+    } finally {
+      this.#inFlight.delete(windowId);
+    }
   }
 
   /**

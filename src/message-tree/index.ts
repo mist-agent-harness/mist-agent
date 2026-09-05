@@ -6,6 +6,8 @@ export {
 export { MessageTreeService } from "./service.ts";
 export type {
   AssistantReply,
+  MessageCommitBoundary,
+  MessageTreeSayOptions,
   MessageTreeServiceOptions,
   SessionHeadPort,
   TurnGate,

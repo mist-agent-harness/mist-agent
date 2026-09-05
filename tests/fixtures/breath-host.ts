@@ -22,13 +22,23 @@
  */
 
 import { MessageTreeService, MessageTreeStore } from "../../src/message-tree/index.ts";
+import {
+  CanonicalHandoverTimeline,
+  CanonicalStreamStore,
+  CanonicalStreamWriter,
+  HostLifecycleFailurePort,
+} from "../../src/one-stream/index.ts";
 import { BreathCycle, type BreathNotification } from "../../src/session/breath-cycle.ts";
 import {
   type LetterDraft,
   type SealedLetter,
   estimateTokens,
 } from "../../src/session/handover-letter.ts";
-import { type ActiveWindow, SessionRegistry } from "../../src/session/session-registry.ts";
+import {
+  type ActiveWindow,
+  type OpenOptions,
+  SessionRegistry,
+} from "../../src/session/session-registry.ts";
 import { type TurnGateEvent, ViewportTurnGate } from "../../src/session/turn-gate.ts";
 import { FactLedger } from "../../src/store/fact-ledger.ts";
 
@@ -37,14 +47,39 @@ interface Ctx {
   letter?: SealedLetter;
 }
 
-const registry = new SessionRegistry<Ctx>();
+class FixtureSessionRegistry extends SessionRegistry<Ctx> {
+  #failNextReopen = false;
+
+  failNextReopen(): void {
+    this.#failNextReopen = true;
+  }
+
+  override open(residentId: string, options: OpenOptions<Ctx>): ActiveWindow<Ctx> {
+    if (options.windowId !== undefined && this.#failNextReopen) {
+      this.#failNextReopen = false;
+      throw new Error("injected viewport reopen failure");
+    }
+    return super.open(residentId, options);
+  }
+}
+
+const registry = new FixtureSessionRegistry();
 const ledger = new FactLedger();
 const store = new MessageTreeStore();
 const events: TurnGateEvent[] = [];
 const notices: BreathNotification[] = [];
-const timeline: SealedLetter[] = [];
 const debrisLog: string[] = [];
-let appendFailure: string | null = null;
+const residentIds = new Set<string>();
+const canonicalDataDir = process.env.MIST_BREATH_DATA_DIR;
+if (canonicalDataDir === undefined) throw new Error("MIST_BREATH_DATA_DIR is required");
+const canonicalStore = new CanonicalStreamStore({ dataDir: canonicalDataDir });
+const canonicalWriter = new CanonicalStreamWriter(canonicalStore);
+const handoverTimeline = new CanonicalHandoverTimeline(canonicalWriter, canonicalStore, {
+  authoritySource: { kind: "host", id: "mist-host" },
+});
+const lifecycleFailures = new HostLifecycleFailurePort(canonicalWriter, {
+  authoritySource: { kind: "host", id: "mist-host" },
+});
 
 /** windowId → 本代流水的插入序起点。 */
 const boundaries = new Map<string, number>();
@@ -53,6 +88,8 @@ const rawDebris = new Map<string, unknown[]>();
 /** 已在账上开过确认位的 windowId——openViewport 对同一窗只能开一次。 */
 const viewportRows = new Set<string>();
 let remnantSeq = 0;
+let breathAttemptSeq = 0;
+let failNextAppend = false;
 
 function requireLive(windowId: string): ActiveWindow<Ctx> {
   const window = registry.get(windowId);
@@ -79,11 +116,12 @@ function usageOf(windowId: string): number | null {
 
 const cycle = new BreathCycle<Ctx>({
   registry,
-  appendLetter: (letter) => {
-    if (appendFailure !== null) {
-      throw new Error(appendFailure);
+  appendLetter: async (letter) => {
+    if (failNextAppend) {
+      failNextAppend = false;
+      throw new Error("injected timeline append failure");
     }
-    timeline.push(letter);
+    await handoverTimeline.append(letter);
   },
   injectLetter: (context, letter) => ({ ...context, letter }),
   notify: (event) => {
@@ -131,6 +169,7 @@ type HostCommand = {
     | "say"
     | "usage"
     | "configureThreshold"
+    | "announce"
     | "breathe"
     | "context"
     | "history"
@@ -139,18 +178,21 @@ type HostCommand = {
     | "reopen"
     | "injectRemnant"
     | "injectDebris"
-    | "setAppendFailure"
     | "quarantineDebris"
     | "notices"
     | "events"
     | "debrisLog"
     | "timeline"
+    | "recallLetter"
+    | "canonicalEvents"
+    | "failNextAppend"
+    | "failNextSwap"
     | "stop";
   residentId?: string;
   windowId?: string;
   message?: string;
   content?: string;
-  reason?: string;
+  title?: string;
   tokens?: number;
   draft?: LetterDraft;
   debris?: unknown[];
@@ -165,7 +207,9 @@ async function execute(command: HostCommand): Promise<unknown> {
   switch (command.op) {
     case "open": {
       const residentId = requireString(command.residentId, "residentId");
+      residentIds.add(residentId);
       ledger.createLedger(residentId);
+      if (!canonicalStore.has(residentId)) canonicalStore.createStream(residentId);
       store.createRoom(residentId);
       const window = registry.open(residentId, { context: { notes: [] } });
       ledger.openViewport(residentId, window.windowId);
@@ -190,10 +234,45 @@ async function execute(command: HostCommand): Promise<unknown> {
         command.tokens ?? Number.NaN,
       );
       return null;
+    case "announce":
+      return cycle.announce(requireString(command.windowId, "windowId"));
     case "breathe": {
       const windowId = requireString(command.windowId, "windowId");
       if (command.draft === undefined) throw new Error("missing draft");
-      const result = cycle.breathe(windowId, command.draft);
+      const before = requireLive(windowId);
+      breathAttemptSeq += 1;
+      const noticeStart = notices.length;
+      let result: Awaited<ReturnType<typeof cycle.breathe>>;
+      try {
+        result = await cycle.breathe(windowId, command.draft);
+      } catch (error) {
+        const failure = notices
+          .slice(noticeStart)
+          .findLast(
+            (notice): notice is Extract<BreathNotification, { kind: "failed" }> =>
+              notice.kind === "failed" &&
+              notice.windowId === windowId &&
+              notice.generation === before.generation,
+          );
+        if (failure === undefined) throw new Error("breath failed without a failure notice");
+        await lifecycleFailures.submit({
+          residentId: before.residentId,
+          idempotencyKey: `breath:${windowId}:${before.generation}:${breathAttemptSeq}`,
+          occurredAt: new Date().toISOString(),
+          action: "breath",
+          subject: { windowId, generation: before.generation },
+          stage: failure.stage,
+          reason: failure.reason,
+          windowRecovered: failure.windowRecovered,
+          handling: failure.windowRecovered
+            ? { kind: "automatic-retry" }
+            : {
+                kind: "user-action",
+                action: `Recover viewport ${windowId} before retrying breath`,
+              },
+        });
+        throw error;
+      }
       // 换代即边界：旧代流水（含残骸）出切片，不进新代的核算与检查。
       boundaries.set(windowId, store.history(result.window.residentId).length);
       return {
@@ -249,9 +328,6 @@ async function execute(command: HostCommand): Promise<unknown> {
     case "injectDebris":
       rawDebris.set(requireString(command.windowId, "windowId"), command.debris ?? []);
       return null;
-    case "setAppendFailure":
-      appendFailure = requireString(command.reason, "reason");
-      return null;
     case "quarantineDebris": {
       const windowId = requireString(command.windowId, "windowId");
       const debris = rawDebris.get(windowId) ?? [];
@@ -268,8 +344,25 @@ async function execute(command: HostCommand): Promise<unknown> {
     case "debrisLog":
       return debrisLog;
     case "timeline":
-      return timeline;
+      return [...residentIds]
+        .flatMap((residentId) => canonicalStore.eventsAfter(residentId, 0))
+        .filter((event) => event.payload.kind === "handover-letter")
+        .map((event) => event.payload.letter);
+    case "recallLetter":
+      return handoverTimeline.recall({
+        residentId: requireString(command.residentId, "residentId"),
+        title: requireString(command.title, "title"),
+      });
+    case "canonicalEvents":
+      return canonicalStore.events(requireString(command.residentId, "residentId"));
+    case "failNextAppend":
+      failNextAppend = true;
+      return null;
+    case "failNextSwap":
+      registry.failNextReopen();
+      return null;
     case "stop":
+      await canonicalWriter.close();
       return null;
   }
 }
