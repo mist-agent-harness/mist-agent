@@ -201,3 +201,10 @@ Phase 0 图纸见 [history-search-phase-0.md](design/history-search-phase-0.md)�
 可交给宿主 resolver 回源的身份把手，语义上绑定 source domain、权威记录身份、范围与
 版本/hash。它不是访问授权；每次解析重新过权限闸。索引的 path/line 是临时 locator，
 snippet/score 是找线索的材料，均不能单独充当证据。字段拼写随上游稳定接缝确定。
+
+**WindowNavigationIndex（跨窗导航索引）**
+可重建、非权威的只读投影，回答「哪一扇旧窗、哪一条原始记录可能相关」。真源仍是
+canonical stream / window history / handoff；命中只返回按 source domain 定义的
+source handle 与召回回执，不返回记忆结论。可删可重建；服务不可用只降级导航，
+不改变任何权威状态。Phase 0 图纸见
+[window-navigation-index-phase-0.md](design/window-navigation-index-phase-0.md)。
