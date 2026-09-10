@@ -48,8 +48,11 @@ async function loadDriver(): Promise<LoadedDriver | null> {
   const driverPath = DRIVER_SPECIFIER;
   const mod = await import(driverPath);
   if (typeof mod.createIsolationDriver !== "function") {
-    console.error("src/isolation-acceptance-driver.ts 存在但没有导出 createIsolationDriver()");
-    return null;
+    // 文件在盘上却没有工厂导出＝驱动坏了，不是还没开工。返回 null 会让它显示成
+    // 「缺驱动」并退 0，那是同一种假起点，只是坏在导出上而不是坏在依赖上。
+    throw new Error(
+      "src/isolation-acceptance-driver.ts 存在但没有导出 createIsolationDriver()——这是坏驱动，不是起点状态",
+    );
   }
   const stubbed = new Set<string>(Array.isArray(mod.STUBBED) ? mod.STUBBED : []);
   return { driver: mod.createIsolationDriver() as IsolationDriver, stubbed };
