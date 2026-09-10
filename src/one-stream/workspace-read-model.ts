@@ -403,6 +403,7 @@ export class WorkspaceLifecycleOwner<TContext> {
           operationId: request.idempotencyKey,
           phase: "requested",
           scopeId: snapshot.scopeId,
+          scopeGeneration: snapshot.scopeGeneration,
           summary: request.summary,
         },
       },
@@ -429,11 +430,21 @@ export class WorkspaceLifecycleOwner<TContext> {
     if (rawHeadId !== null && (typeof rawHeadId !== "string" || rawHeadId.length === 0)) {
       throw new WorkspaceCapabilityError("closure headId must be null or a non-empty string");
     }
+    const scopeGeneration =
+      closure.payload.scopeGeneration === undefined ? 1 : closure.payload.scopeGeneration;
+    if (
+      typeof scopeGeneration !== "number" ||
+      !Number.isSafeInteger(scopeGeneration) ||
+      scopeGeneration < 1
+    ) {
+      throw new WorkspaceCapabilityError("closure scopeGeneration must be a positive integer");
+    }
     return this.#sessions.recoverArchived({
       residentId: request.residentId,
       windowId: request.windowId,
       generation: request.generation,
       scopeId,
+      scopeGeneration,
       headId: rawHeadId,
       archived: true,
     });

@@ -144,12 +144,12 @@ describe("SessionRegistry：多窗语义", () => {
       const lines = readFileSync(archivePath, "utf8").trim().split("\n");
       expect(lines).toHaveLength(2);
       expect(JSON.parse(lines[0] ?? "null")).toMatchObject({
-        schemaVersion: 1,
+        schemaVersion: 2,
         type: "window_opened",
         window: { windowId: window.windowId, generation: 1 },
       });
       expect(JSON.parse(lines[1] ?? "null")).toMatchObject({
-        schemaVersion: 1,
+        schemaVersion: 2,
         type: "window_archived",
         window: { windowId: window.windowId, generation: 1, headId: "node-1" },
       });
@@ -256,6 +256,7 @@ describe("SessionRegistry：多窗语义", () => {
       residentId: "resident-a",
       windowId: opened.windowId,
       scopeId: "room-1",
+      scopeGeneration: 1,
       generation: 1,
       headId: "node-1",
       archived: true,
