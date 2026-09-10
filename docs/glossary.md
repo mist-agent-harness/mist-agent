@@ -201,3 +201,20 @@ Phase 0 图纸见 [history-search-phase-0.md](design/history-search-phase-0.md)�
 可交给宿主 resolver 回源的身份把手，语义上绑定 source domain、权威记录身份、范围与
 版本/hash。它不是访问授权；每次解析重新过权限闸。索引的 path/line 是临时 locator，
 snippet/score 是找线索的材料，均不能单独充当证据。字段拼写随上游稳定接缝确定。
+
+**隔离 session（有意隔离）**
+同一住户在一个 scope 内的局部工作现场，保留自己的上下文、工具状态与生命周期；
+不是新住户或第二条长期聊天线。v0 只交项目型 preset，文件隔离须由执行环境真实约束，
+不能仅凭绑定目录声称成立。图纸见 [intentional-isolation-v0.md](design/intentional-isolation-v0.md)。
+
+**scope 活化代际**
+稳定 scope 的一次开工身份；关闭后重开改变活化代际，不改变 scopeId。
+它与 viewport 换气代际分别校验，不能用关闭或重开一扇窗代替关闭或重开整个 scope。
+
+**携带包（有意隔离）**
+创建分支时显式选入的冻结截面，保留原事件身份与衍生来源；不复制授权、在途工具或锁。
+此后新增内容仍走跨界规则，不把携带当成持续同步。
+
+**关闭卡（closure card）**
+隔离 scope 关闭后的用户可见共享状态投影：完成状态、时间、产物引用、未收口项、副作用与回执。
+它不是给其他 scope 模型自动注入的叙事摘要，也不证明结果已进入长期记忆。
