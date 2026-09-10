@@ -36,8 +36,12 @@ async function loadDriver(): Promise<LoadedDriver | null> {
     }
     const stubbed = new Set<string>(Array.isArray(mod.STUBBED) ? mod.STUBBED : []);
     return { driver: mod.createIsolationDriver() as IsolationDriver, stubbed };
-  } catch {
-    return null;
+  } catch (err) {
+    // 只把「模块不存在」当起点状态。驱动存在但 import 即抛的话必须炸出来，
+    // 否则坏驱动会显示成「还没开工」——假起点和假绿一样是读数造假。同 acceptance/run.ts。
+    if (err instanceof Error && err.message.includes("Cannot find module")) return null;
+    if (err instanceof Error && "code" in err && err.code === "ERR_MODULE_NOT_FOUND") return null;
+    throw err;
   }
 }
 

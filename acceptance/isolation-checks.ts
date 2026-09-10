@@ -28,13 +28,17 @@ const c01: IsolationCheck = {
   async run(driver: IsolationDriver) {
     const r = await driver.createResident("c01");
     try {
+      const listed = "她说话偏好短句，不用破折号";
       await driver.addDefaultIn(r, {
-        content: "她说话偏好短句，不用破折号",
+        content: listed,
         origin: { kind: "verified", ref: "confirm:2026-09-02" },
       });
       const first = await driver.listDefaultIn(r);
       const guard = requireNonEmpty(first, "default-in 名单");
       if (!guard.ok) return fail(guard.detail);
+      if (!guard.items.some((x) => x.content === listed)) {
+        return fail("刚写入的条目不在名单里——名单非空但装的不是我写进去的东西");
+      }
 
       const second = await driver.listDefaultIn(r);
       if (!second.ok) return fail(`第二次列名单失败：${second.reason}`);
@@ -64,6 +68,19 @@ const c02: IsolationCheck = {
   async run(driver: IsolationDriver) {
     const r = await driver.createResident("c02");
     try {
+      // 正对照：合法写入必须先成功。否则「两次都被拒」可能只是 addDefaultIn 一律抛错。
+      const legit = "她的辣度：两档，湖南口味";
+      await driver.addDefaultIn(r, {
+        content: legit,
+        origin: { kind: "verified", ref: "confirm:2026-07-27" },
+      });
+      const control = await driver.listDefaultIn(r);
+      const controlGuard = requireNonEmpty(control, "合法写入后的 default-in 名单");
+      if (!controlGuard.ok) return fail(controlGuard.detail);
+      if (!controlGuard.items.some((x) => x.content === legit)) {
+        return fail("正对照失败：带 origin 的合法条目没能写进名单——无法据此断言拒绝是真拒绝");
+      }
+
       let rejectedUnknown = false;
       try {
         await driver.addDefaultIn(r, {
@@ -90,10 +107,15 @@ const c02: IsolationCheck = {
 
       const after = await driver.listDefaultIn(r);
       if (!after.ok) return fail(`列名单失败：${after.reason}`);
-      if (after.items.length !== 0) {
-        return fail(`两次被拒的写入之后名单里仍有 ${after.items.length} 条——拒绝没有真的拒绝`);
+      const contents = after.items.map((x) => x.content);
+      if (contents.length !== 1 || contents[0] !== legit) {
+        return fail(
+          `两次被拒的写入之后名单应当只剩正对照那一条，实际是 ${JSON.stringify(contents)}——拒绝没有真的拒绝`,
+        );
       }
-      return pass("unknown 与 ref 为空两种缺来源写入均被拒，名单未被污染");
+      return pass(
+        "合法写入成功（正对照成立），unknown 与 ref 为空两种缺来源写入均被拒，名单未被污染",
+      );
     } finally {
       await driver.destroyResident(r);
     }
@@ -110,6 +132,7 @@ const c03: IsolationCheck = {
     "addDefaultIn",
     "seedLegacyMemory",
     "assembleContext",
+    "listDefaultIn",
     "destroyResident",
   ],
   async run(driver: IsolationDriver) {
@@ -136,7 +159,14 @@ const c03: IsolationCheck = {
       if (guard.items.some((x) => x.includes(canary))) {
         return fail("缺 origin 的 legacy 记忆出现在了自动进入内容里");
       }
-      return pass("名单内条目已进（正对照成立），缺 origin 的 legacy canary 未进");
+
+      // 灯题是「不进自动进入内容」，名单是它的上游：canary 也不许混进名单本身。
+      const list = await driver.listDefaultIn(r);
+      if (!list.ok) return fail(`列名单失败：${list.reason}`);
+      if (list.items.some((x) => x.content.includes(canary))) {
+        return fail("缺 origin 的 legacy 记忆被收进了 default-in 名单");
+      }
+      return pass("名单内条目已进（正对照成立），legacy canary 既不在名单里也不在上下文里");
     } finally {
       await driver.destroyResident(r);
     }
@@ -189,7 +219,7 @@ const c05: IsolationCheck = {
 const d06: IsolationCheck = {
   id: "II-D06",
   title: "更正只追加勘误链：旧条目字节不变，新条目链回旧条目",
-  uses: ["createResident", "remember", "errata", "listMemories", "readEntry", "destroyResident"],
+  uses: ["createResident", "remember", "errata", "readEntry", "destroyResident"],
   async run(driver: IsolationDriver) {
     const r = await driver.createResident("d06");
     try {
@@ -256,7 +286,14 @@ const d07: IsolationCheck = {
 const d08: IsolationCheck = {
   id: "II-D08",
   title: "删除留疤：原值不可恢复，疤可见且不泄露被删内容",
-  uses: ["createResident", "remember", "hardDelete", "listMemories", "destroyResident"],
+  uses: [
+    "createResident",
+    "remember",
+    "hardDelete",
+    "listMemories",
+    "readEntry",
+    "destroyResident",
+  ],
   async run(driver: IsolationDriver) {
     const r = await driver.createResident("d08");
     try {
@@ -282,11 +319,20 @@ const d08: IsolationCheck = {
       if (survivor.tombstone === undefined) {
         return fail("条目还在但没有 tombstone——疤必须可见");
       }
-      const leaked = JSON.stringify(after.items).includes(secret);
-      if (leaked) {
-        return fail("疤或残留数据里仍能读到被删内容——原值必须不可恢复");
+      if (JSON.stringify(after.items).includes(secret)) {
+        return fail("列表路径的疤或残留数据里仍能读到被删内容——原值必须不可恢复");
       }
-      return pass("原值不可恢复，疤可见且不泄露被删内容");
+
+      // 「不可恢复」是对所有读口说的。只扫 listMemories 会漏掉 readEntry 这条路。
+      try {
+        const direct = await driver.readEntry(r, entryId);
+        if (JSON.stringify(direct).includes(secret)) {
+          return fail("readEntry 仍能读回被删内容——列表路径干净不等于原值不可恢复");
+        }
+      } catch {
+        // 直接读被删条目抛错也是合法实现：原值同样取不回来。
+      }
+      return pass("两条读口（listMemories / readEntry）均取不回原值，疤可见且不泄露被删内容");
     } finally {
       await driver.destroyResident(r);
     }
