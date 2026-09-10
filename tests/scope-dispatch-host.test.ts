@@ -181,4 +181,46 @@ describe("scope retirement through the real isolation host", () => {
     expect(JSON.stringify(history)).not.toContain("A old work");
     expect(JSON.stringify(history)).not.toContain("old result");
   });
+
+  it("rejects forged ids and a revoked in-flight result through the host, without touching B", async () => {
+    const child = startHost();
+    await waitForReady(child);
+    const a = await callHost<{ entryWindowId: string }>(child, { op: "create", name: "A" });
+    const b = await callHost<{ entryWindowId: string }>(child, { op: "create", name: "B" });
+    await callHost(child, { op: "hold" });
+    const pending = callHost(child, {
+      op: "say",
+      windowId: a.entryWindowId,
+      message: "revoked turn",
+    });
+    const dropped = expect(pending).rejects.toThrow(DISPATCH_RESULT_DROPPED);
+    const [receipt] = await callHost<DispatchEvent[]>(child, { op: "events" });
+    expect(receipt).toBeDefined();
+    expect(
+      await callHost(child, {
+        op: "belongs",
+        receipt: { ...receipt, dispatchId: "dispatch-forged" },
+      }),
+    ).toBe(false);
+    expect(await callHost(child, { op: "belongs", receipt })).toBe(true);
+    expect(await callHost(child, { op: "revoke", receipt })).toBe(true);
+    await callHost(child, { op: "say", windowId: b.entryWindowId, message: "B unaffected" });
+    await callHost(child, { op: "release" });
+    await dropped;
+    const events = await callHost<DispatchEvent[]>(child, { op: "events" });
+    expect(events.map((event) => event.event)).toEqual([
+      "dispatch",
+      "dispatch",
+      "receipt",
+      "dropped",
+    ]);
+    expect(events[3]).toMatchObject({ ...receipt, event: "dropped", detail: expect.any(String) });
+    // A terminal receipt cannot be consumed again or impersonate an outstanding dispatch.
+    expect(await callHost(child, { op: "consume", receipt: events[2] })).toBe(false);
+    expect(await callHost(child, { op: "consume", receipt })).toBe(false);
+    const history = await callHost<HistoryNode[]>(child, { op: "history" });
+    expect(history).toHaveLength(2);
+    expect(JSON.stringify(history)).not.toContain("revoked turn");
+    expect(JSON.stringify(history)).not.toContain("old result");
+  });
 });

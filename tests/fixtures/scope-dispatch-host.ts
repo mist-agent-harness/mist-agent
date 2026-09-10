@@ -1,7 +1,7 @@
 import { IntentionalIsolation } from "../../src/isolation/intentional-isolation.ts";
 import { MessageTreeService } from "../../src/message-tree/service.ts";
 import { MessageTreeStore } from "../../src/message-tree/store.ts";
-import { SessionRegistry } from "../../src/session/session-registry.ts";
+import { type DispatchReceipt, SessionRegistry } from "../../src/session/session-registry.ts";
 import { ResidentStore } from "../../src/store/resident-store.ts";
 
 const residents = new ResidentStore();
@@ -47,12 +47,16 @@ type Command = {
     | "activate"
     | "open"
     | "kill"
-    | "scopes";
+    | "scopes"
+    | "belongs"
+    | "consume"
+    | "revoke";
   name?: string;
   message?: string;
   windowId?: string;
   scopeId?: string;
   scopeGeneration?: number;
+  receipt?: DispatchReceipt;
 };
 
 async function execute(command: Command): Promise<unknown> {
@@ -65,6 +69,14 @@ async function execute(command: Command): Promise<unknown> {
       releaseReply("old result");
       releaseReply = undefined;
       return null;
+    }
+    case "belongs":
+    case "consume":
+    case "revoke": {
+      if (command.receipt === undefined) throw new Error("receipt required");
+      if (command.op === "belongs") return sessions.belongsToActiveWindow(command.receipt);
+      if (command.op === "consume") return sessions.consumeDispatch(command.receipt);
+      return sessions.revokeDispatch(command.receipt);
     }
     case "events":
       return structuredClone(events);

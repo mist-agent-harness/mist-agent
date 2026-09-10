@@ -48,6 +48,8 @@ export interface DispatchEventLogger {
 export interface DispatchLifecyclePort {
   issueDispatch(windowId: string): WindowDispatchReceipt;
   belongsToActiveWindow(receipt: WindowDispatchReceipt): boolean;
+  consumeDispatch(receipt: WindowDispatchReceipt): boolean;
+  revokeDispatch(receipt: WindowDispatchReceipt): boolean;
 }
 
 export const DISPATCH_RESULT_DROPPED = "DISPATCH_RESULT_DROPPED" as const;
@@ -124,12 +126,25 @@ export interface MessageTreeSayOptions {
 function hasDispatchLifecycle(
   port: SessionHeadPort,
 ): port is SessionHeadPort & DispatchLifecyclePort {
-  return (
+  const complete =
     "issueDispatch" in port &&
     typeof port.issueDispatch === "function" &&
     "belongsToActiveWindow" in port &&
-    typeof port.belongsToActiveWindow === "function"
-  );
+    typeof port.belongsToActiveWindow === "function" &&
+    "consumeDispatch" in port &&
+    typeof port.consumeDispatch === "function" &&
+    "revokeDispatch" in port &&
+    typeof port.revokeDispatch === "function";
+  if (
+    !complete &&
+    ("issueDispatch" in port ||
+      "belongsToActiveWindow" in port ||
+      "consumeDispatch" in port ||
+      "revokeDispatch" in port)
+  ) {
+    throw new Error("incomplete dispatch lifecycle port");
+  }
+  return complete;
 }
 
 const echoReply: AssistantReply = (_residentId, message) => message;
@@ -229,41 +244,51 @@ export class MessageTreeService {
     // but issuance and lifecycle logging stay here; committed replays bypass both.
     const dispatch = options.dispatch ?? this.#dispatch;
     const dispatchReceipt = dispatch?.issueDispatch(windowId);
-    if (dispatchReceipt !== undefined) {
-      this.#logDispatch("dispatch", dispatchReceipt, "responder 已开始处理本轮");
-    }
-    const assistantContent = await this.#assistantReply(residentId, prompt);
-    const commit = (): HistoryNode => {
-      // Check inside the final synchronous mutation, including any caller boundary. A stale
-      // result must be logged with its original dispatch ID before touching the tree or head.
-      if (
-        dispatchReceipt !== undefined &&
-        dispatch !== undefined &&
-        !dispatch.belongsToActiveWindow(dispatchReceipt)
-      ) {
-        this.#logDispatch("dropped", dispatchReceipt, "结果返回时原 scope 或窗代际已不再活跃");
-        throw new DispatchResultDroppedError(dispatchReceipt);
-      }
-      const pair =
-        options.idempotencyKey === undefined
-          ? this.#store.appendPair(residentId, message, assistantContent, parentId)
-          : this.#store.appendPairOnce(
-              residentId,
-              message,
-              assistantContent,
-              parentId,
-              options.idempotencyKey,
-            );
-      this.#sessionHeads.setHead(windowId, pair.assistant.id);
-      // 回执只在落树 + head 推进都成功之后发出：先 ack 后落树会让「已确认」
-      // 覆盖「没送到」，回执丢失归传播机制的前提是先证明这轮真的开工了（MV-C05）。
-      pass?.commit();
+    try {
       if (dispatchReceipt !== undefined) {
-        this.#logDispatch("receipt", dispatchReceipt, "回应已落树且窗 head 已推进");
+        this.#logDispatch("dispatch", dispatchReceipt, "responder 已开始处理本轮");
       }
-      return pair.assistant;
-    };
-    return options.commitBoundary?.commit(commit) ?? commit();
+      const assistantContent = await this.#assistantReply(residentId, prompt);
+      const commit = (): HistoryNode => {
+        // Check inside the final synchronous mutation, including any caller boundary. A stale
+        // result must be logged with its original dispatch ID before touching the tree or head.
+        if (
+          dispatchReceipt !== undefined &&
+          dispatch !== undefined &&
+          !dispatch.consumeDispatch(dispatchReceipt)
+        ) {
+          this.#logDispatch(
+            "dropped",
+            dispatchReceipt,
+            "回执未签发、已消费、已撤销，或原 scope/窗代际已失效",
+          );
+          throw new DispatchResultDroppedError(dispatchReceipt);
+        }
+        const pair =
+          options.idempotencyKey === undefined
+            ? this.#store.appendPair(residentId, message, assistantContent, parentId)
+            : this.#store.appendPairOnce(
+                residentId,
+                message,
+                assistantContent,
+                parentId,
+                options.idempotencyKey,
+              );
+        this.#sessionHeads.setHead(windowId, pair.assistant.id);
+        // 回执只在落树 + head 推进都成功之后发出：先 ack 后落树会让「已确认」
+        // 覆盖「没送到」，回执丢失归传播机制的前提是先证明这轮真的开工了（MV-C05）。
+        pass?.commit();
+        if (dispatchReceipt !== undefined) {
+          this.#logDispatch("receipt", dispatchReceipt, "回应已落树且窗 head 已推进");
+        }
+        return pair.assistant;
+      };
+      return options.commitBoundary?.commit(commit) ?? commit();
+    } finally {
+      // Failed responders/boundaries must not leave a still-consumable receipt behind.
+      // Successful consumption has already removed it, so this is then a no-op.
+      if (dispatchReceipt !== undefined) dispatch?.revokeDispatch(dispatchReceipt);
+    }
   }
 
   async history(residentId: string): Promise<HistoryNode[]> {

@@ -206,6 +206,8 @@ export class SessionRegistry<TContext> {
   readonly #scopes: ScopeRegistry;
   readonly #windowScopeGeneration = new Map<string, number>();
   #dispatchSeq = 0;
+  /** Only outstanding host-issued dispatches live here; event logging belongs to the host. */
+  readonly #pendingDispatches = new Map<string, DispatchReceipt>();
   /** 上一枚 ULID 的时间戳与随机段——同毫秒连开多窗时自增随机段保单调。 */
   #ulidTimestamp = 0;
   #ulidRandom: number[] = [];
@@ -433,7 +435,17 @@ export class SessionRegistry<TContext> {
   }
 
   retireScope(residentId: string, scopeId: string, scopeGeneration: number): ScopeActivation {
-    return this.#scopes.retire(residentId, scopeId, scopeGeneration);
+    const retired = this.#scopes.retire(residentId, scopeId, scopeGeneration);
+    for (const [id, receipt] of this.#pendingDispatches) {
+      if (
+        receipt.residentId === residentId &&
+        receipt.scopeId === scopeId &&
+        receipt.scopeGeneration === scopeGeneration
+      ) {
+        this.#pendingDispatches.delete(id);
+      }
+    }
+    return retired;
   }
 
   getScope(residentId: string, scopeId: string): ScopeActivation | undefined {
@@ -511,7 +523,7 @@ export class SessionRegistry<TContext> {
   issueDispatch(windowId: string): DispatchReceipt {
     const window = this.#requireLive(windowId);
     this.#dispatchSeq += 1;
-    return {
+    const receipt: DispatchReceipt = {
       residentId: window.residentId,
       scopeId: window.scopeId,
       scopeGeneration: window.scopeGeneration,
@@ -519,15 +531,44 @@ export class SessionRegistry<TContext> {
       generation: window.generation,
       dispatchId: `dispatch-${this.#dispatchSeq.toString(36).padStart(6, "0")}`,
     };
+    this.#pendingDispatches.set(receipt.dispatchId, receipt);
+    return { ...receipt };
+  }
+
+  #wasIssued(receipt: DispatchReceipt): boolean {
+    const issued = this.#pendingDispatches.get(receipt.dispatchId);
+    return (
+      issued !== undefined &&
+      issued.residentId === receipt.residentId &&
+      issued.scopeId === receipt.scopeId &&
+      issued.scopeGeneration === receipt.scopeGeneration &&
+      issued.windowId === receipt.windowId &&
+      issued.generation === receipt.generation
+    );
+  }
+
+  /** Consume synchronously before committing a response. This is not action authorization. */
+  consumeDispatch(receipt: DispatchReceipt): boolean {
+    if (!this.belongsToActiveWindow(receipt)) return false;
+    this.#pendingDispatches.delete(receipt.dispatchId);
+    return true;
+  }
+
+  /** Host cancellation also releases failed responder calls; it cannot cancel a different tuple. */
+  revokeDispatch(receipt: DispatchReceipt): boolean {
+    if (!this.#wasIssued(receipt)) return false;
+    this.#pendingDispatches.delete(receipt.dispatchId);
+    return true;
   }
 
   /**
-   * 回执同时校验住户、scope 激活代际与 viewport 代际，缺一不认。
+   * 回执须已由宿主签发且尚未消费；同时校验住户、scope 与 viewport 代际。
    * 两扇窗互相的迟到回执因此不会落到对方身上（MV-B01）。
    */
   belongsToActiveWindow(receipt: DispatchReceipt): boolean {
     const window = this.#active.get(receipt.windowId);
     return (
+      this.#wasIssued(receipt) &&
       window !== undefined &&
       window.residentId === receipt.residentId &&
       window.generation === receipt.generation &&
@@ -556,6 +597,9 @@ export class SessionRegistry<TContext> {
     // 先落耐久证据再改内存；追加失败时窗仍保持活态，不伪报已归档。
     this.#appendArchive(archived);
     this.#active.delete(windowId);
+    for (const [id, receipt] of this.#pendingDispatches) {
+      if (receipt.windowId === windowId) this.#pendingDispatches.delete(id);
+    }
     this.#archived.set(windowId, archived);
     return cloneArchivedWindow(archived);
   }
