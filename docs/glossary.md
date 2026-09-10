@@ -202,6 +202,26 @@ Phase 0 图纸见 [history-search-phase-0.md](design/history-search-phase-0.md)�
 版本/hash。它不是访问授权；每次解析重新过权限闸。索引的 path/line 是临时 locator，
 snippet/score 是找线索的材料，均不能单独充当证据。字段拼写随上游稳定接缝确定。
 
+**房间流水（room stream）**
+显式发往同一房间的原始事件总账，append-only，作者身份由宿主在写入时构造。
+它不收住户私有 transcript，也不是任一住户的记忆库或第二条个人生命线。按成员投递的是
+带来源的授权投影，听见不自动产生长期记忆。Phase 0 见
+[group-chat-phase-0.md](design/group-chat-phase-0.md)。
+
+**房间投递记录（room delivery record）**
+房间事件对某个成员的编排决定与投递证据，分别记录排队、未纳入、实际装入上下文及失败。
+它不改原始事件，也不证明住户已理解、回复或记入长期记忆；不同成员的状态不能压成一个
+房间级 `delivered`。它不是 canonical stream 已有 `DeliveryReceipt` 的别名。
+
+**房间回合（room round）**
+一次房间触发及其住户接力共享的编排单位。接力保留根触发身份和累计用量，不因换发送方、
+新消息 ID、重试或换代重新计数。与模型一次工具回合、viewport generation 分开；上限和
+发言策略来自有版本的房间配置，不由正文中的名字、内容变化或时间间隔推定。
+
+**房间载荷（room-facing payload）**
+发送方明确选择公开到指定房间的内容及结构化目标信息。未声明的输出默认私有；
+私有思考、工具日志和中间草稿不能因处于同一 transcript 而搭车发布。
+声明公开不等于取得房间权限，写入前仍须由宿主核验身份、成员资格和授权。
 **隔离 session（有意隔离）**
 同一住户在一个 scope 内的局部工作现场，保留自己的上下文、工具状态与生命周期；
 不是新住户或第二条长期聊天线。v0 只交项目型 preset，文件隔离须由执行环境真实约束，
