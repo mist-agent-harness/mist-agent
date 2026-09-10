@@ -151,8 +151,7 @@ function renderEnvelope(envelope: ScopePresenceEnvelope): string {
  * 投影给同住户的其他 viewport。
  *
  * scope 与 viewport 刻意分层：本类只签发 scopeId；SessionRegistry 继续只管
- * windowId/generation。B5 的 scopeGeneration 尚待 Q2，不能在这里偷借 window
- * generation 代替。
+ * windowId/generation，并用独立的 scopeGeneration 绑定活化归属；创建登记不是项目文件 P0 验收。
  */
 export class IntentionalIsolation<TContext> implements TurnGate {
   readonly #residents: ResidentDirectory;
@@ -187,7 +186,13 @@ export class IntentionalIsolation<TContext> implements TurnGate {
     options: CreateIsolationOptions<TContext>,
   ): IsolationSessionPresence {
     const origin = this.#sessions.get(originWindowId);
-    if (origin === undefined) {
+    const originScope =
+      origin === undefined ? undefined : this.#sessions.getScope(origin.residentId, origin.scopeId);
+    if (
+      origin === undefined ||
+      originScope?.status !== "active" ||
+      originScope.scopeGeneration !== origin.scopeGeneration
+    ) {
       throw new IsolationCreateError(
         ISOLATION_CREATE_INVALID,
         `origin window is not active: ${originWindowId}`,
@@ -204,8 +209,11 @@ export class IntentionalIsolation<TContext> implements TurnGate {
       throw new IsolationCreateError(ISOLATION_CREATE_INVALID, "name must not be empty");
     }
     const scopeId = this.#scopeIdFactory();
-    if (scopeId.length === 0) {
-      throw new IsolationCreateError(ISOLATION_CREATE_FAILED, "scope id factory returned empty id");
+    if (scopeId.length === 0 || this.#sessions.getScope(origin.residentId, scopeId) !== undefined) {
+      throw new IsolationCreateError(
+        ISOLATION_CREATE_FAILED,
+        "scope id factory returned an empty or existing id",
+      );
     }
 
     let window: ActiveWindow<TContext> | undefined;
@@ -229,6 +237,10 @@ export class IntentionalIsolation<TContext> implements TurnGate {
       this.#presence.create(presence);
       return clonePresence(presence);
     } catch (error) {
+      // The newly allocated identity must not remain dispatchable after creation failed.
+      const activation = this.#sessions.getScope(origin.residentId, scopeId);
+      if (activation?.status === "active")
+        this.#sessions.retireScope(origin.residentId, scopeId, activation.scopeGeneration);
       if (window !== undefined) this.#sessions.kill(window.windowId);
       if (error instanceof IsolationCreateError) throw error;
       throw new IsolationCreateError(

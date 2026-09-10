@@ -25,6 +25,8 @@ export type AssistantReply = (residentId: string, message: string) => string | P
  */
 export interface WindowDispatchReceipt {
   residentId: string;
+  scopeId: string;
+  scopeGeneration: number;
   windowId: string;
   generation: number;
   dispatchId: string;
@@ -95,7 +97,7 @@ export interface MessageTreeServiceOptions {
   assistantReply?: AssistantReply;
   /** 不接闸时行为与接闸前完全一致——既有路径一个字不变。 */
   turnGate?: TurnGate;
-  /** 不接派发端口时保留旧的直调 responder 行为，供纯消息树嵌入方使用。 */
+  /** 默认使用 sessionHeads 自带的派发口；纯 head-only 嵌入方仍可显式提供。 */
   dispatch?: DispatchLifecyclePort;
   /** 派发事件日志口；不提供时只执行回执过滤，不产生日志。 */
   dispatchEventLogger?: DispatchEventLogger;
@@ -117,6 +119,17 @@ export interface MessageTreeSayOptions {
   readonly dispatch?: DispatchLifecyclePort;
   /** Host-owned operation identity for crash-safe retry after tree commit but before outer receipt. */
   readonly idempotencyKey?: string;
+}
+
+function hasDispatchLifecycle(
+  port: SessionHeadPort,
+): port is SessionHeadPort & DispatchLifecyclePort {
+  return (
+    "issueDispatch" in port &&
+    typeof port.issueDispatch === "function" &&
+    "belongsToActiveWindow" in port &&
+    typeof port.belongsToActiveWindow === "function"
+  );
 }
 
 const echoReply: AssistantReply = (_residentId, message) => message;
@@ -143,7 +156,8 @@ export class MessageTreeService {
     this.#sessionHeads = sessionHeads;
     this.#assistantReply = options.assistantReply ?? echoReply;
     this.#turnGate = options.turnGate;
-    this.#dispatch = options.dispatch;
+    this.#dispatch =
+      options.dispatch ?? (hasDispatchLifecycle(sessionHeads) ? sessionHeads : undefined);
     this.#dispatchEventLogger = options.dispatchEventLogger;
   }
 
@@ -227,7 +241,7 @@ export class MessageTreeService {
         dispatch !== undefined &&
         !dispatch.belongsToActiveWindow(dispatchReceipt)
       ) {
-        this.#logDispatch("dropped", dispatchReceipt, "结果返回时原窗代际已不再活跃");
+        this.#logDispatch("dropped", dispatchReceipt, "结果返回时原 scope 或窗代际已不再活跃");
         throw new DispatchResultDroppedError(dispatchReceipt);
       }
       const pair =

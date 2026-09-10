@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { type ScopeActivation, ScopeInactiveError, ScopeRegistry } from "./scope-registry.ts";
 
 /**
  * 活窗（viewport）的临时状态。
@@ -12,7 +13,7 @@ import { dirname } from "node:path";
  * - 同一住户可以同时有多扇活窗，`open` 永远开新窗，不再「原地换代」。
  * - 代际归窗，不归住户；住户级不存在「当前代际」。
  * - `kill(windowId)` 幂等归档，归档后只读；`killResident` 才杀全部活窗。
- * - 派发回执带完整三元组 `(residentId, windowId, generation)`。
+ * - 派发回执同时绑定 scopeId/scopeGeneration 与 windowId/generation。
  */
 
 /** 缺省 scope 是私聊，任何路径都不得默认「全局」。 */
@@ -56,6 +57,7 @@ export interface ActiveWindow<TContext> {
   residentId: string;
   windowId: string;
   scopeId: string;
+  scopeGeneration: number;
   /**
    * 这扇窗的代际号。同窗 kill 后按同一 windowId 重开才换代；
    * 旧代际的迟到结果不能被当成当前窗的一部分。
@@ -71,6 +73,7 @@ export interface ArchivedWindow {
   residentId: string;
   windowId: string;
   scopeId: string;
+  scopeGeneration: number;
   generation: number;
   headId: string | null;
   archived: true;
@@ -82,6 +85,8 @@ function cloneArchivedWindow(window: ArchivedWindow): ArchivedWindow {
 
 export interface DispatchReceipt {
   residentId: string;
+  scopeId: string;
+  scopeGeneration: number;
   windowId: string;
   generation: number;
   dispatchId: string;
@@ -102,18 +107,23 @@ export interface SessionRegistryOptions {
    * 不给路径时保持纯内存，供无持久化需求的嵌入方与单测使用。
    */
   archivePath?: string;
+  // Durable scope authority lives beside this path as `${archivePath}.scopes`.
+  // Both journals are single-writer and must be backed up/restored together.
 }
 
 interface ArchivedWindowRecord {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   type: "window_archived";
   window: ArchivedWindow;
 }
 
 interface WindowOpenedRecord {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   type: "window_opened";
-  window: Pick<ActiveWindow<unknown>, "residentId" | "windowId" | "scopeId" | "generation">;
+  window: Pick<
+    ActiveWindow<unknown>,
+    "residentId" | "windowId" | "scopeId" | "scopeGeneration" | "generation"
+  >;
 }
 
 type WindowJournalRecord = ArchivedWindowRecord | WindowOpenedRecord;
@@ -134,7 +144,7 @@ function parseWindowJournalRecord(line: string, lineNumber: number): WindowJourn
     window?: Partial<ArchivedWindow>;
   };
   if (
-    record.schemaVersion !== 1 ||
+    (record.schemaVersion !== 1 && record.schemaVersion !== 2) ||
     (record.type !== "window_archived" && record.type !== "window_opened")
   ) {
     throw new Error(`unsupported window archive record at line ${lineNumber}`);
@@ -149,6 +159,10 @@ function parseWindowJournalRecord(line: string, lineNumber: number): WindowJourn
     window.windowId.length === 0 ||
     typeof window.scopeId !== "string" ||
     window.scopeId.length === 0 ||
+    (record.schemaVersion === 2 &&
+      (typeof window.scopeGeneration !== "number" ||
+        !Number.isSafeInteger(window.scopeGeneration) ||
+        window.scopeGeneration < 1)) ||
     typeof window.generation !== "number" ||
     !Number.isInteger(window.generation) ||
     window.generation < 1 ||
@@ -162,16 +176,17 @@ function parseWindowJournalRecord(line: string, lineNumber: number): WindowJourn
     windowId: window.windowId as string,
     scopeId: window.scopeId as string,
     generation: window.generation as number,
+    scopeGeneration: record.schemaVersion === 1 ? 1 : (window.scopeGeneration as number),
   };
   if (record.type === "window_opened") {
     return {
-      schemaVersion: 1,
+      schemaVersion: record.schemaVersion,
       type: "window_opened",
       window: common,
     };
   }
   return {
-    schemaVersion: 1,
+    schemaVersion: record.schemaVersion,
     type: "window_archived",
     window: {
       ...common,
@@ -188,6 +203,8 @@ export class SessionRegistry<TContext> {
   /** 代际归窗：windowId -> 上一次用过的代际号。 */
   readonly #lastGeneration = new Map<string, number>();
   readonly #archivePath: string | undefined;
+  readonly #scopes: ScopeRegistry;
+  readonly #windowScopeGeneration = new Map<string, number>();
   #dispatchSeq = 0;
   /** 上一枚 ULID 的时间戳与随机段——同毫秒连开多窗时自增随机段保单调。 */
   #ulidTimestamp = 0;
@@ -195,14 +212,41 @@ export class SessionRegistry<TContext> {
 
   constructor(options: SessionRegistryOptions = {}) {
     this.#archivePath = options.archivePath;
+    this.#scopes = new ScopeRegistry(
+      this.#archivePath === undefined ? {} : { journalPath: `${this.#archivePath}.scopes` },
+    );
     if (this.#archivePath === undefined) return;
     mkdirSync(dirname(this.#archivePath), { recursive: true });
     if (!existsSync(this.#archivePath)) return;
-    const lines = readFileSync(this.#archivePath, "utf8").split("\n");
-    for (const [index, line] of lines.entries()) {
-      if (line.trim().length === 0) continue;
-      const record = parseWindowJournalRecord(line, index + 1);
+    const records = readFileSync(this.#archivePath, "utf8")
+      .split("\n")
+      .flatMap((line, index) =>
+        line.trim().length === 0 ? [] : [parseWindowJournalRecord(line, index + 1)],
+      );
+    // Check new-format evidence before legacy migration can create any missing activations.
+    for (const record of records) {
       const window = record.window;
+      const scope = this.#scopes.get(window.residentId, window.scopeId);
+      if (
+        record.schemaVersion === 2 &&
+        (scope === undefined || scope.scopeGeneration < window.scopeGeneration)
+      ) {
+        throw new Error("missing scope activation history");
+      }
+    }
+    for (const [index, record] of records.entries()) {
+      const window = record.window;
+      const previousScopeGeneration = this.#windowScopeGeneration.get(window.windowId);
+      if (
+        previousScopeGeneration !== undefined &&
+        (window.scopeGeneration < previousScopeGeneration ||
+          (record.type === "window_archived" &&
+            window.generation === this.#lastGeneration.get(window.windowId) &&
+            window.scopeGeneration !== previousScopeGeneration))
+      ) {
+        throw new Error(`window scope activation changed at line ${index + 1}`);
+      }
+      this.#windowScopeGeneration.set(window.windowId, window.scopeGeneration);
       const identity = this.#windowIdentity.get(window.windowId);
       if (
         identity !== undefined &&
@@ -240,17 +284,24 @@ export class SessionRegistry<TContext> {
       }
       this.#lastGeneration.set(window.windowId, Math.max(previousGeneration, window.generation));
     }
+    for (const record of records) {
+      const { residentId, scopeId } = record.window;
+      if (record.schemaVersion === 1 && this.#scopes.get(residentId, scopeId) === undefined) {
+        this.#scopes.activate(residentId, scopeId);
+      }
+    }
   }
 
   #appendOpened(window: ActiveWindow<TContext>): void {
     if (this.#archivePath === undefined) return;
     const record: WindowOpenedRecord = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       type: "window_opened",
       window: {
         residentId: window.residentId,
         windowId: window.windowId,
         scopeId: window.scopeId,
+        scopeGeneration: window.scopeGeneration,
         generation: window.generation,
       },
     };
@@ -260,7 +311,7 @@ export class SessionRegistry<TContext> {
   #appendArchive(archived: ArchivedWindow): void {
     if (this.#archivePath === undefined) return;
     const record: ArchivedWindowRecord = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       type: "window_archived",
       window: archived,
     };
@@ -353,26 +404,58 @@ export class SessionRegistry<TContext> {
     if (options.windowId !== undefined) {
       this.#requireArchivedForReopen(residentId, scopeId, windowId);
     }
+    const activation =
+      this.#scopes.get(residentId, scopeId) ?? this.#scopes.activate(residentId, scopeId);
+    if (activation.status !== "active") throw new ScopeInactiveError(residentId, scopeId);
     const generation = (this.#lastGeneration.get(windowId) ?? 0) + 1;
     const window: ActiveWindow<TContext> = {
       residentId,
       windowId,
       scopeId,
+      scopeGeneration: activation.scopeGeneration,
       generation,
       headId: options.headId ?? null,
       context: options.context,
     };
     // 代际一经发出就先落盘；否则活窗在未归档时停机，重启后会重复发出同一代际。
     this.#appendOpened(window);
+    this.#windowScopeGeneration.set(windowId, activation.scopeGeneration);
     this.#lastGeneration.set(windowId, generation);
     this.#windowIdentity.set(windowId, { residentId, scopeId });
     this.#archived.delete(windowId);
     this.#active.set(windowId, window);
-    return window;
+    return { ...window };
+  }
+
+  /** Activation is a host operation, not project readiness or full close (#165/#166). */
+  activateScope(residentId: string, scopeId: string): ScopeActivation {
+    return this.#scopes.activate(residentId, scopeId);
+  }
+
+  retireScope(residentId: string, scopeId: string, scopeGeneration: number): ScopeActivation {
+    return this.#scopes.retire(residentId, scopeId, scopeGeneration);
+  }
+
+  getScope(residentId: string, scopeId: string): ScopeActivation | undefined {
+    return this.#scopes.get(residentId, scopeId);
+  }
+
+  activeScopesOf(residentId: string): ScopeActivation[] {
+    return this.#scopes.activeScopesOf(residentId);
+  }
+
+  #scopeMatches(window: ActiveWindow<TContext>): boolean {
+    const scope = this.#scopes.get(window.residentId, window.scopeId);
+    return (
+      scope?.status === "active" &&
+      scope.scopeGeneration === window.scopeGeneration &&
+      this.#windowScopeGeneration.get(window.windowId) === window.scopeGeneration
+    );
   }
 
   get(windowId: string): ActiveWindow<TContext> | undefined {
-    return this.#active.get(windowId);
+    const window = this.#active.get(windowId);
+    return window === undefined ? undefined : { ...window };
   }
 
   getArchived(windowId: string): ArchivedWindow | undefined {
@@ -394,7 +477,9 @@ export class SessionRegistry<TContext> {
 
   /** 一位住户此刻的全部活窗。多开合法，所以这里返回的是列表而不是一格。 */
   windowsOf(residentId: string): ActiveWindow<TContext>[] {
-    return [...this.#active.values()].filter((window) => window.residentId === residentId);
+    return [...this.#active.values()]
+      .filter((window) => window.residentId === residentId)
+      .map((window) => ({ ...window }));
   }
 
   /** 一位住户的全部归档窗。线协议列窗时与 windowsOf 合并，不复活任何窗。 */
@@ -410,7 +495,11 @@ export class SessionRegistry<TContext> {
 
   #requireLive(windowId: string): ActiveWindow<TContext> {
     const window = this.#active.get(windowId);
-    if (window !== undefined) return window;
+    if (window !== undefined) {
+      if (!this.#scopeMatches(window))
+        throw new ScopeInactiveError(window.residentId, window.scopeId);
+      return window;
+    }
     if (this.#archived.has(windowId)) throw new WindowArchivedError(windowId);
     throw new Error(`no active window ${windowId}`);
   }
@@ -424,6 +513,8 @@ export class SessionRegistry<TContext> {
     this.#dispatchSeq += 1;
     return {
       residentId: window.residentId,
+      scopeId: window.scopeId,
+      scopeGeneration: window.scopeGeneration,
       windowId: window.windowId,
       generation: window.generation,
       dispatchId: `dispatch-${this.#dispatchSeq.toString(36).padStart(6, "0")}`,
@@ -431,7 +522,7 @@ export class SessionRegistry<TContext> {
   }
 
   /**
-   * 回执归属按完整三元组判定：住户对得上、窗对得上、代际对得上，缺一不认。
+   * 回执同时校验住户、scope 激活代际与 viewport 代际，缺一不认。
    * 两扇窗互相的迟到回执因此不会落到对方身上（MV-B01）。
    */
   belongsToActiveWindow(receipt: DispatchReceipt): boolean {
@@ -439,7 +530,10 @@ export class SessionRegistry<TContext> {
     return (
       window !== undefined &&
       window.residentId === receipt.residentId &&
-      window.generation === receipt.generation
+      window.generation === receipt.generation &&
+      window.scopeId === receipt.scopeId &&
+      window.scopeGeneration === receipt.scopeGeneration &&
+      this.#scopeMatches(window)
     );
   }
 
@@ -454,6 +548,7 @@ export class SessionRegistry<TContext> {
       residentId: window.residentId,
       windowId: window.windowId,
       scopeId: window.scopeId,
+      scopeGeneration: window.scopeGeneration,
       generation: window.generation,
       headId: window.headId,
       archived: true,
@@ -480,6 +575,8 @@ export class SessionRegistry<TContext> {
       window.windowId.length === 0 ||
       typeof window.scopeId !== "string" ||
       window.scopeId.length === 0 ||
+      !Number.isSafeInteger(window.scopeGeneration) ||
+      window.scopeGeneration < 1 ||
       !Number.isSafeInteger(window.generation) ||
       window.generation < 1
     ) {
@@ -490,6 +587,7 @@ export class SessionRegistry<TContext> {
       if (
         existing.residentId !== window.residentId ||
         existing.scopeId !== window.scopeId ||
+        existing.scopeGeneration !== window.scopeGeneration ||
         existing.generation !== window.generation ||
         existing.headId !== window.headId ||
         window.archived !== true
@@ -509,7 +607,10 @@ export class SessionRegistry<TContext> {
     ) {
       throw new WindowArchiveRecoveryError(window.windowId, "window identity mismatch");
     }
-    if (this.#lastGeneration.get(window.windowId) !== window.generation) {
+    if (
+      this.#windowScopeGeneration.get(window.windowId) !== window.scopeGeneration ||
+      this.#lastGeneration.get(window.windowId) !== window.generation
+    ) {
       throw new WindowArchiveRecoveryError(window.windowId, "generation is not the latest issued");
     }
     if (
