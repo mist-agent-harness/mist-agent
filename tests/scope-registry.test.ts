@@ -119,6 +119,10 @@ describe("scope activation authority", () => {
     const scopes = new ScopeRegistry();
     expect(() => scopes.activate("", "a")).toThrow();
     expect(() => scopes.activate("r", "")).toThrow();
+    for (const identity of [null, undefined, 1, {}, []]) {
+      expect(() => scopes.activate(identity as never, "a")).toThrow();
+      expect(() => scopes.activate("r", identity as never)).toThrow();
+    }
     scopes.activate("r", "a");
     for (const generation of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
       expect(() => scopes.retire("r", "a", generation)).toThrow();

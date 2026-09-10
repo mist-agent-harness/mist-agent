@@ -61,7 +61,14 @@ export class ScopeRegistry {
   }
 
   #key(residentId: string, scopeId: string): string {
-    if (!residentId || !scopeId) throw new Error("scope requires residentId and scopeId");
+    if (
+      typeof residentId !== "string" ||
+      residentId.length === 0 ||
+      typeof scopeId !== "string" ||
+      scopeId.length === 0
+    ) {
+      throw new Error("scope requires residentId and scopeId");
+    }
     return JSON.stringify([residentId, scopeId]);
   }
 

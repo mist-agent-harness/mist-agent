@@ -430,7 +430,8 @@ export class WorkspaceLifecycleOwner<TContext> {
     if (rawHeadId !== null && (typeof rawHeadId !== "string" || rawHeadId.length === 0)) {
       throw new WorkspaceCapabilityError("closure headId must be null or a non-empty string");
     }
-    const scopeGeneration = closure.payload.scopeGeneration ?? 1;
+    const scopeGeneration =
+      closure.payload.scopeGeneration === undefined ? 1 : closure.payload.scopeGeneration;
     if (
       typeof scopeGeneration !== "number" ||
       !Number.isSafeInteger(scopeGeneration) ||
