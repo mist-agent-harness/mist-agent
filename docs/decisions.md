@@ -16,7 +16,8 @@
 ## 进行中
 
 - **H1 能力契约工作稿**（#2/#8/#11）：2026-09-09 主笔改写。多 viewport 验收 28 条
-  已勾齐，但独立复验尚未落章；one-stream 六灯实现已合 main，2026-09-10 主笔授权勾
+  已勾齐，但独立复验尚未落章（#148 的逐条施工证据见
+  [多 viewport 复验附注](../acceptance/multi-viewport.md#2026-09-10-逐条复验附注148)，不代替指定验收席署名）；one-stream 六灯实现已合 main，2026-09-10 主笔授权勾
   （见 [acceptance/one-stream.md](../acceptance/one-stream.md)），独立复验同样尚未落章；
   window-history 判卷仍红——地基还在动，
   现在「定稿」等于给推翻自己留账。改为两步：**先出 v0 工作稿**（从 driver、账、

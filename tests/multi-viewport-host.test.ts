@@ -156,10 +156,23 @@ describe("multi-viewport real host subprocess", () => {
     await callHost(child, { op: "setHead", windowId: w2.windowId, headId: "node-w2" });
     const r1 = await callHost<Receipt>(child, { op: "issueDispatch", windowId: w1.windowId });
     const r2 = await callHost<Receipt>(child, { op: "issueDispatch", windowId: w2.windowId });
+    // 两窗同代的回执各自有效；不能只验 kill 后的单个阴性分支。
+    expect(await callHost(child, { op: "belongs", receipt: r1 })).toBe(true);
+    expect(await callHost(child, { op: "belongs", receipt: r2 })).toBe(true);
 
     const firstArchive = await callHost(child, { op: "kill", windowId: w1.windowId });
     const secondArchive = await callHost(child, { op: "kill", windowId: w1.windowId });
     expect(secondArchive).toEqual(firstArchive);
+    // MV-A03 的拒写半格也必须穿过真实子进程，而不只靠 registry 单测。
+    await expect(
+      callHost(child, { op: "setHead", windowId: w1.windowId, headId: "forbidden-write" }),
+    ).rejects.toThrow("WINDOW_ARCHIVED");
+    await expect(callHost(child, { op: "issueDispatch", windowId: w1.windowId })).rejects.toThrow(
+      "WINDOW_ARCHIVED",
+    );
+    expect(await callHost(child, { op: "getArchived", windowId: w1.windowId })).toEqual(
+      firstArchive,
+    );
     expect(await callHost(child, { op: "belongs", receipt: r1 })).toBe(false);
     expect(await callHost(child, { op: "belongs", receipt: r2 })).toBe(true);
     expect(await callHost<WindowRecord>(child, { op: "get", windowId: w2.windowId })).toMatchObject(
@@ -193,10 +206,23 @@ describe("multi-viewport real host subprocess", () => {
     });
     expect(reopened.generation).toBe(2);
     expect(await callHost(restarted, { op: "belongs", receipt: r1 })).toBe(false);
+    const otherWindow = await callHost<WindowRecord>(restarted, {
+      op: "open",
+      residentId: "resident-a",
+      scopeId: "room-1",
+      windowId: w2.windowId,
+    });
+    const otherReceipt = await callHost<Receipt>(restarted, {
+      op: "issueDispatch",
+      windowId: otherWindow.windowId,
+    });
+    expect(await callHost(restarted, { op: "belongs", receipt: r2 })).toBe(false);
+    expect(await callHost(restarted, { op: "belongs", receipt: otherReceipt })).toBe(true);
     const generation2Receipt = await callHost<Receipt>(restarted, {
       op: "issueDispatch",
       windowId: w1.windowId,
     });
+    expect(await callHost(restarted, { op: "belongs", receipt: generation2Receipt })).toBe(true);
     await stopHost(restarted);
 
     // 活窗在未归档时正常停机；第三个进程必须从发号水位继续到 generation 3，

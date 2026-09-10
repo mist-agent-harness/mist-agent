@@ -51,12 +51,19 @@ const logger: TurnEventLogger = {
 
 // --- A 窗通道：生产 MistDriver，say 的注入文本经捕获型 reply 留给父进程断言 ---
 let lastDriverPrompt: string | null = null;
+let holdDriverReply = false;
+let releaseDriverReply: (() => void) | null = null;
 const driver = createDriver({
   ...(dataDir === undefined ? {} : { dataDir }),
   factLedger: ledger,
   turnEventLogger: logger,
-  reply: (_residentId, message) => {
+  reply: async (_residentId, message) => {
     lastDriverPrompt = message;
+    if (holdDriverReply) {
+      await new Promise<void>((resolve) => {
+        releaseDriverReply = resolve;
+      });
+    }
     return "司机窗哑回应";
   },
 });
@@ -123,6 +130,9 @@ type HostCommand = {
     | "logEvents"
     | "failProbe"
     | "dropCommit"
+    | "holdDriverReply"
+    | "driverReplyPending"
+    | "releaseDriverReply"
     | "stop";
   residentId?: string;
   windowId?: string;
@@ -286,6 +296,16 @@ async function execute(command: HostCommand): Promise<unknown> {
       return null;
     case "dropCommit":
       commitDropped = command.on === true;
+      return null;
+    case "holdDriverReply":
+      holdDriverReply = true;
+      return null;
+    case "driverReplyPending":
+      return releaseDriverReply !== null;
+    case "releaseDriverReply":
+      holdDriverReply = false;
+      releaseDriverReply?.();
+      releaseDriverReply = null;
       return null;
     case "stop":
       return null;

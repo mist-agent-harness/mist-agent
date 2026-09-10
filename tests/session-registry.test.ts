@@ -27,7 +27,8 @@ describe("SessionRegistry：多窗语义", () => {
   it("MV-A04 缺省 scope 落私聊，不落全局", () => {
     const sessions = new SessionRegistry<null>();
 
-    expect(sessions.open("resident-a", { context: null }).scopeId).toBe(PRIVATE_SCOPE);
+    // 不拿实现导出的常量造期望：常量错成 global 时，测试也必须转红。
+    expect(sessions.open("resident-a", { context: null }).scopeId).toBe("private");
     expect(sessions.open("resident-a", { scopeId: "room-1", context: null }).scopeId).toBe(
       "room-1",
     );

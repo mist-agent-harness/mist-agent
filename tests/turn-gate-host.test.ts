@@ -199,34 +199,47 @@ describe("turn-gate real host subprocess", () => {
     // A 窗先开工（driver 懒开窗路径）。MV-C02 的正确性来源只有拉：
     // 本实现不存在推送通道（无可模拟、无可丢弃），B 窗能看到的每一条裁定
     // 都只能是开工闸拉来的。
-    await callHost(child, { op: "sayOn", residentId, message: "placeholder A turn" });
-    const { windowId: windowB, baseline } = await callHost<{ windowId: string; baseline: number }>(
-      child,
-      { op: "openWindowB", residentId },
-    );
-    expect(baseline).toBe(0);
-
-    await callHost(child, {
-      op: "appendRuling",
+    await callHost(child, { op: "holdDriverReply" });
+    const pendingA = callHost<SayResult>(child, {
+      op: "sayOn",
       residentId,
-      author: "main-thread",
-      kind: "ruling",
-      body: "placeholder cross-window ruling",
+      message: "placeholder A turn",
     });
+    // A 的 responder 被固定在途：裁定确实落在 A 开工中，而不是 A 已结束之后。
+    try {
+      expect(await callHost(child, { op: "driverReplyPending" })).toBe(true);
+      const { windowId: windowB, baseline } = await callHost<{
+        windowId: string;
+        baseline: number;
+      }>(child, { op: "openWindowB", residentId });
+      expect(baseline).toBe(0);
 
-    const saidB = await callHost<SayResult>(child, {
-      op: "sayOnB",
-      residentId,
-      message: "placeholder B turn",
-    });
-    expect(saidB.prompt).toContain(
-      "[权威事实账缺口 | kind=ruling | seq=1 | author=main-thread] placeholder cross-window ruling",
-    );
-    // B 窗的 user 节点仍只落原话。
-    expect(saidB.node.role).toBe("assistant");
-    expect(await callHost<number>(child, { op: "ackedSeq", residentId, windowId: windowB })).toBe(
-      1,
-    );
+      await callHost(child, {
+        op: "appendRuling",
+        residentId,
+        author: "main-thread",
+        kind: "ruling",
+        body: "placeholder cross-window ruling",
+      });
+
+      const saidB = await callHost<SayResult>(child, {
+        op: "sayOnB",
+        residentId,
+        message: "placeholder B turn",
+      });
+      expect(saidB.prompt).toContain(
+        "[权威事实账缺口 | kind=ruling | seq=1 | author=main-thread] placeholder cross-window ruling",
+      );
+      // B 窗的 user 节点仍只落原话。
+      expect(saidB.node.role).toBe("assistant");
+      expect(await callHost<number>(child, { op: "ackedSeq", residentId, windowId: windowB })).toBe(
+        1,
+      );
+      expect(await callHost(child, { op: "driverReplyPending" })).toBe(true);
+    } finally {
+      await callHost(child, { op: "releaseDriverReply" });
+      await pendingA;
+    }
   });
 
   it("MV-C03 查账失败按缺处理：say fail-closed，history 放行且日志记「缺口未知」", async () => {

@@ -1,6 +1,6 @@
 # 会话 API（session API）· 给 external 前端的接入说明
 
-状态：v0.3（refs #58 第 3 条、#82）。会话模型与线协议三端点已经按 D7 多活窗对齐；`SessionRegistry` 的窗口语义在 §1，`session.list / session.create / session.history` 的窗口映射唯一以 §1.1 为准。HTTP/WS 信封、鉴权与下行流的真源是本仓 `webui/docs/research/mist-wire-contract.md`；frontend 插件当前仍固定使用 mock，真实 handler 的交付通道延期至插件协议 v0.1，不在本页冒充已经接通。
+状态：v0.4（refs #58 第 3 条、#82、#121；#148 复验订正）。会话模型与线协议三端点已经按 D7 多活窗对齐；`SessionRegistry` 的窗口语义在 §1，`session.list / session.create / session.history` 的窗口映射唯一以 §1.1 为准。HTTP/WS 信封、鉴权与下行流的真源是本仓 `webui/docs/research/mist-wire-contract.md`。#121 已交付真实 handler 的宿主服务通道：官方 frontend 插件从 `context.services` 获取 `mist.session-handler@^1.0.0`，缺服务在 prepare 前被拒，不再固定创建 mock。通道可用不代表生产 history port、浏览器交互或完整 P1 产品面已验收。
 
 ## 0. 一句话
 
@@ -35,9 +35,9 @@ mist 不替前端保管任何东西。线协议里的一个 session 对应一扇
 - `session.create`：调用 `open(residentId, scopeId)`；`residentId` 来自 handler 绑定，`scopeId` 可省略并落私聊。返回宿主签发的 `sessionId=windowId` 与 generation；客户端预分配 sessionId 被拒绝。共享 schema 中没有明确窗模型映射的 `workspaceId / cwd / agentPreset` 也在 Mist adapter 边界显式返回 `bad-request`，不静默猜测。
 - `session.history`：以 `sessionId=windowId` 读取该窗的只读流水；活窗和归档窗走同一读口，读取不得复活或改写窗。具体流水字节由只读 history port 提供，窗口注册表只负责身份、代际与归档状态。
 
-这三个端点属于 control/evidence 能力面，“协议可接线”不自动等于 “P1-conformant”。P1-conformant 用户面只有一条 canonical user-visible stream：可以进入仍有行动意义的活工作区，但不把 `session.list` 渲染成永久聊天列表，也不把归档窗的 `session.history` 变成第二本权威 transcript；关闭后主流只留 typed closure/result 与权威证据指针（方向未定，待 #84 收口）。
+这三个端点属于 control/evidence 能力面，“协议可接线”不自动等于 “P1-conformant”。P1-conformant 用户面只有一条 canonical user-visible stream：可以进入仍有行动意义的活工作区，但不把 `session.list` 渲染成永久聊天列表，也不把归档窗的 `session.history` 变成第二本权威 transcript；关闭后主流只留 typed closure/result 与权威证据指针。#139 已交付 first-party read model 与只读证据能力面，行为及授权边界见 [OS-03](../../acceptance/one-stream.md)；不再标成“方向未定”。
 
-**代价**：列表需要同时读活窗与归档窗；history 必须由窗流水的权威存储提供只读端口，不能拿 `residentId` 级整棵消息树冒充某一窗的流水。真实 handler 如何交到 frontend 插件仍待协议 v0.1，本次映射不改变 mock 默认边界。
+**代价**：列表需要同时读活窗与归档窗；history 必须由窗流水的权威存储提供只读端口，不能拿 `residentId` 级整棵消息树冒充某一窗的流水。宿主须显式注册所声明版本的 session handler 服务，并随插件事务撤销服务句柄。`mist-plugin-host-composition.spec.ts` 使用真实事务宿主、官方插件、HTTP 和 SessionRegistry，但 history 是 fixture；它证明交付通道，不替生产窗流水持久化判卷（#120）。
 
 ## 2. 线协议（端点 / 鉴权 / 信封）
 
