@@ -108,6 +108,84 @@ afterEach(async () => {
 });
 
 describe("scope retirement through the real isolation host", () => {
+  it("uses the real ledger gate: forged ack is rejected, revoked A stays stale, B confirms its own delivered range", async () => {
+    const child = startHost();
+    await waitForReady(child);
+    const a = await callHost<{ scopeId: string; entryWindowId: string }>(child, {
+      op: "create",
+      name: "A",
+    });
+    const b = await callHost<{ scopeId: string; entryWindowId: string }>(child, {
+      op: "create",
+      name: "B",
+    });
+    await callHost(child, { ledgerOp: "seed", message: "first authoritative rule" });
+    await expect(
+      callHost(child, { ledgerOp: "rawAck", windowId: a.entryWindowId }),
+    ).rejects.toThrow("authenticated ledger");
+    await callHost(child, { op: "hold" });
+    const pending = callHost(child, {
+      op: "say",
+      windowId: a.entryWindowId,
+      message: "A in flight",
+    });
+    const dropped = expect(pending).rejects.toThrow(DISPATCH_RESULT_DROPPED);
+    const events = await callHost<DispatchEvent[]>(child, { op: "events" });
+    const receipt = events[0];
+    expect(receipt).toMatchObject({ event: "dispatch", scopeId: a.scopeId });
+    await callHost(child, { op: "revoke", receipt });
+    await callHost(child, { ledgerOp: "seed", message: "later authoritative rule" });
+    await callHost(child, { op: "say", windowId: b.entryWindowId, message: "B continues" });
+    await callHost(child, { op: "release" });
+    await dropped;
+    expect(await callHost(child, { ledgerOp: "probe", windowId: a.entryWindowId })).toEqual({
+      status: "ok",
+      latestSeq: 2,
+      ackedSeq: 0,
+    });
+    expect(await callHost(child, { ledgerOp: "probe", windowId: b.entryWindowId })).toEqual({
+      status: "ok",
+      latestSeq: 2,
+      ackedSeq: 2,
+    });
+    const prompts = await callHost<string[]>(child, { op: "prompts" });
+    expect(prompts[0]).toContain("first authoritative rule");
+    expect(prompts[0]).not.toContain("later authoritative rule");
+    expect(prompts[1]).toContain("first authoritative rule");
+    expect(prompts[1]).toContain("later authoritative rule");
+    const confirmations = await callHost<
+      Array<{ event: string; scopeId: string; dispatchId: string }>
+    >(child, { ledgerOp: "gateEvents" });
+    expect(confirmations.filter((event) => event.event === "gate_ack")).toEqual([
+      expect.objectContaining({ scopeId: b.scopeId, dispatchId: expect.any(String) }),
+    ]);
+    expect(await callHost<HistoryNode[]>(child, { op: "history" })).toHaveLength(2);
+  });
+
+  it("unknown lookup fails before responder execution and stays distinguishable from an empty successful lookup", async () => {
+    const child = startHost();
+    await waitForReady(child);
+    const a = await callHost<{ entryWindowId: string }>(child, { op: "create", name: "A" });
+    expect(await callHost(child, { ledgerOp: "probe", windowId: a.entryWindowId })).toEqual({
+      status: "ok",
+      latestSeq: 0,
+      ackedSeq: 0,
+    });
+    await callHost(child, { ledgerOp: "fail", fail: true });
+    expect(await callHost(child, { ledgerOp: "probe", windowId: a.entryWindowId })).toEqual({
+      status: "unknown",
+      cause: "injected unavailable ledger",
+    });
+    await expect(
+      callHost(child, { op: "say", windowId: a.entryWindowId, message: "must not run" }),
+    ).rejects.toThrow("GateUnavailableError");
+    expect(await callHost(child, { op: "prompts" })).toEqual([]);
+    expect(await callHost(child, { op: "history" })).toEqual([]);
+    await callHost(child, { ledgerOp: "fail", fail: false });
+    await callHost(child, { op: "say", windowId: a.entryWindowId, message: "positive control" });
+    expect(await callHost<HistoryNode[]>(child, { op: "history" })).toHaveLength(2);
+  });
+
   it("drops the original activation result, keeps B working, and never revives A's old viewport", async () => {
     const child = startHost();
     await waitForReady(child);

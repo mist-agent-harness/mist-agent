@@ -276,6 +276,7 @@ export class MessageTreeWorkspaceReplyDelivery implements WorkspaceReplyDelivery
           },
           belongsToActiveWindow: (receipt) => this.#sessions.belongsToActiveWindow(receipt),
           consumeDispatch: (receipt) => this.#sessions.consumeDispatch(receipt),
+          settleDispatch: (receipt) => this.#sessions.settleDispatch(receipt),
           revokeDispatch: (receipt) => this.#sessions.revokeDispatch(receipt),
         },
         commitBoundary: {

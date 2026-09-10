@@ -43,6 +43,8 @@ import {
   writeSync,
 } from "node:fs";
 import { join } from "node:path";
+import type { DispatchSettlement } from "../session/dispatch-authority.ts";
+import type { DispatchReceipt } from "../session/session-registry.ts";
 
 /** 能落账的三种事实。supersede 不是事实，是对事实的解除，只能走 supersede() 追加。 */
 export type FactKind = "ruling" | "active_rule" | "confirmed_preference";
@@ -193,7 +195,68 @@ export type ViewportWriteOrigin = {
  */
 export type EntryOrigin =
   | { kind: "viewport"; viewportId: string; generation: number }
-  | { kind: "system"; reason: string };
+  | { kind: "system"; reason: string }
+  | {
+      kind: "authenticated_viewport";
+      sourceKind: "human" | "resident";
+      senderId: string;
+      residentId: string;
+      scopeId: string;
+      scopeGeneration: number;
+      viewportId: string;
+      generation: number;
+      dispatchId: string;
+    }
+  | { kind: "authenticated_system"; senderId: string; reason: string };
+
+export interface LedgerDispatchAuthority {
+  belongsToActiveWindow(receipt: DispatchReceipt): boolean;
+  isDispatchSettlement(settlement: object, receipt: DispatchReceipt): boolean;
+  isCurrentDispatchIdentity(identity: Omit<DispatchReceipt, "dispatchId">): boolean;
+}
+
+export interface LedgerDelivery {
+  readonly initial: LedgerEntry[];
+  readonly entries: LedgerEntry[];
+  readonly latestSeq: number;
+  readonly ackedSeq: number;
+  commit(settlement: DispatchSettlement): void;
+}
+
+export interface AuthenticatedFactWriter {
+  append(input: { kind: FactKind; body: string }): LedgerEntry;
+  supersede(targetSeq: number, input: { reason: string }): LedgerEntry;
+}
+
+/** Kept by trusted host assembly. The identity argument must come from authenticated ingress. */
+export interface AuthenticatedLedgerHost {
+  registerViewport(identity: Omit<DispatchReceipt, "dispatchId">): number;
+  forDispatch(
+    identity: { kind: "human" | "resident"; senderId: string },
+    receipt: DispatchReceipt,
+  ): AuthenticatedFactWriter;
+  prepareDelivery(receipt: DispatchReceipt): LedgerDelivery;
+  system(senderId: string): {
+    append(
+      residentId: string,
+      input: { kind: FactKind; body: string },
+      reason: string,
+    ): LedgerEntry;
+    supersede(
+      residentId: string,
+      targetSeq: number,
+      input: { reason: string },
+      originReason: string,
+    ): LedgerEntry;
+  };
+}
+
+export class LedgerAuthenticationError extends Error {
+  constructor(message: string) {
+    super(`authenticated ledger: ${message}`);
+    this.name = "LedgerAuthenticationError";
+  }
+}
 
 /**
  * 缺口探针的返回形状（MV-C03 的落点）。
@@ -209,6 +272,7 @@ export type GapProbe =
 
 /** 一扇窗的确认位。它是游标不是账目：只前进、可落盘，不属于 append-only 约束。 */
 interface ViewportAckRow {
+  identity?: Omit<DispatchReceipt, "dispatchId">;
   /** 开窗那一刻的 latestSeq；新窗 ackedSeq 从 baseline 起算，不背全史（MV-A05）。 */
   baselineSeq: number;
   ackedSeq: number;
@@ -235,9 +299,15 @@ interface ResidentLedger {
  */
 interface LedgerRecord {
   schemaVersion: number;
+  accessMode?: "authenticated";
   residentId: string;
   entries: LedgerEntry[];
-  viewports: { viewportId: string; baselineSeq: number; ackedSeq: number }[];
+  viewports: {
+    viewportId: string;
+    baselineSeq: number;
+    ackedSeq: number;
+    identity?: Omit<DispatchReceipt, "dispatchId"> | null;
+  }[];
 }
 
 /** v2：条目落痕 origin 字段（C04 权威半格）。v1 旧档显式失败等迁移，不猜。 */
@@ -291,6 +361,7 @@ export interface FactLedgerOptions {
 
 export class FactLedger {
   readonly #ledgers = new Map<string, ResidentLedger>();
+  #authenticated = false;
 
   /**
    * 落盘目录；null = 纯内存（判卷和单元测试的默认形态，不产生任何文件）。
@@ -333,18 +404,255 @@ export class FactLedger {
   } {
     const ledger = new FactLedger(options);
     const systemWriter = new SystemLedgerWriter(SYSTEM_WRITER_BRAND, {
-      append: (residentId, input, reason) =>
-        ledger.#appendFact(ledger.#ledger(residentId), input, {
+      append: (residentId, input, reason) => {
+        ledger.#assertLegacyWrite();
+        return ledger.#appendFact(ledger.#ledger(residentId), input, {
           kind: "system",
           reason: assertSystemReason(reason),
-        }),
-      supersede: (residentId, targetSeq, input, reason) =>
-        ledger.#supersedeEntry(ledger.#ledger(residentId), targetSeq, input, {
+        });
+      },
+      supersede: (residentId, targetSeq, input, reason) => {
+        ledger.#assertLegacyWrite();
+        return ledger.#supersedeEntry(ledger.#ledger(residentId), targetSeq, input, {
           kind: "system",
           reason: assertSystemReason(reason),
-        }),
+        });
+      },
     });
     return { ledger, systemWriter };
+  }
+
+  /**
+   * Scoped host assembly: public legacy write/ack methods are permanently disabled on this
+   * instance and its persisted books. Only bound writers and host delivery continuations mutate
+   * authority. This does not authenticate a network sender; ingress must do that before binding.
+   */
+  static createAuthenticated(
+    options: FactLedgerOptions & { dispatchAuthority: LedgerDispatchAuthority },
+  ): {
+    ledger: FactLedger;
+    host: AuthenticatedLedgerHost;
+  } {
+    const authority = options.dispatchAuthority;
+    if (
+      authority == null ||
+      typeof authority.belongsToActiveWindow !== "function" ||
+      typeof authority.isDispatchSettlement !== "function" ||
+      typeof authority.isCurrentDispatchIdentity !== "function"
+    ) {
+      throw new LedgerAuthenticationError("complete host dispatch authority is required");
+    }
+    const ledger = new FactLedger(options);
+    ledger.#authenticated = true;
+    for (const book of ledger.#ledgers.values()) {
+      ledger.#persistSnapshot(ledger.#snapshotOf(book.residentId, book.entries, book.viewports));
+    }
+    const registered = new WeakSet<ViewportAckRow>();
+    const sameIdentity = (
+      a: Omit<DispatchReceipt, "dispatchId"> | undefined,
+      b: Omit<DispatchReceipt, "dispatchId">,
+    ): boolean =>
+      a !== undefined &&
+      a.residentId === b.residentId &&
+      a.scopeId === b.scopeId &&
+      a.scopeGeneration === b.scopeGeneration &&
+      a.windowId === b.windowId &&
+      a.generation === b.generation;
+    const assertPending = (receipt: DispatchReceipt): void => {
+      if (!authority.belongsToActiveWindow(receipt))
+        throw new LedgerAuthenticationError(
+          "dispatch is not pending in its original scope and viewport",
+        );
+      const row = ledger.#viewportRow(ledger.#ledger(receipt.residentId), receipt.windowId);
+      if (!registered.has(row) || !sameIdentity(row.identity, receipt))
+        throw new LedgerAuthenticationError(
+          "viewport alignment belongs to another activation; register the current viewport first",
+        );
+    };
+    const assertFresh = (receipt: DispatchReceipt): void => {
+      assertPending(receipt);
+      const probe = ledger.#probeGap(receipt.residentId, receipt.windowId);
+      if (probe.status === "unknown")
+        throw new WriteGateUnavailableError(receipt.residentId, receipt.windowId, probe.cause);
+      if (probe.ackedSeq < probe.latestSeq)
+        throw new StaleViewportError(
+          receipt.residentId,
+          receipt.windowId,
+          probe.ackedSeq,
+          probe.latestSeq,
+        );
+    };
+    const identityString = (value: string): string => {
+      if (typeof value !== "string" || value.trim() === "")
+        throw new LedgerAuthenticationError("sender identity must be nonempty");
+      return value;
+    };
+    const host = Object.freeze<AuthenticatedLedgerHost>({
+      registerViewport(input) {
+        const identity = Object.freeze({
+          residentId: input.residentId,
+          scopeId: input.scopeId,
+          scopeGeneration: input.scopeGeneration,
+          windowId: input.windowId,
+          generation: input.generation,
+        });
+        if (!authority.isCurrentDispatchIdentity(identity))
+          throw new LedgerAuthenticationError("viewport registration is not current");
+        const book = ledger.#ledger(identity.residentId);
+        const previous = book.viewports.get(identity.windowId);
+        if (
+          previous !== undefined &&
+          registered.has(previous) &&
+          sameIdentity(previous.identity, identity)
+        )
+          return previous.baselineSeq;
+        const baselineSeq = book.entries.length;
+        const row: ViewportAckRow = {
+          identity,
+          baselineSeq,
+          ackedSeq: baselineSeq,
+          pendingInitial: book.entries
+            .filter((entry) => entry.kind !== "supersede" && !book.supersededSeqs.has(entry.seq))
+            .map(copyEntry),
+        };
+        const candidate = new Map(book.viewports);
+        candidate.set(identity.windowId, row);
+        ledger.#persistSnapshot(ledger.#snapshotOf(identity.residentId, book.entries, candidate));
+        book.viewports.set(identity.windowId, row);
+        registered.add(row);
+        return baselineSeq;
+      },
+      forDispatch(identity, inputReceipt) {
+        const receipt = Object.freeze({ ...inputReceipt });
+        const senderId = identityString(identity.senderId);
+        const sourceKind = identity.kind;
+        if (sourceKind !== "human" && sourceKind !== "resident")
+          throw new LedgerAuthenticationError("unsupported ingress identity kind");
+        if (sourceKind === "resident" && senderId !== receipt.residentId)
+          throw new LedgerAuthenticationError("resident author does not own dispatch");
+        assertPending(receipt);
+        const boundBook = ledger.#ledger(receipt.residentId);
+        const boundRow = ledger.#viewportRow(boundBook, receipt.windowId);
+        const assertBound = (): void => {
+          assertFresh(receipt);
+          if (
+            ledger.#ledger(receipt.residentId) !== boundBook ||
+            ledger.#viewportRow(boundBook, receipt.windowId) !== boundRow
+          )
+            throw new LedgerAuthenticationError("writer's ledger alignment was replaced");
+        };
+        const origin: EntryOrigin = Object.freeze({
+          kind: "authenticated_viewport",
+          sourceKind,
+          senderId,
+          residentId: receipt.residentId,
+          scopeId: receipt.scopeId,
+          scopeGeneration: receipt.scopeGeneration,
+          viewportId: receipt.windowId,
+          generation: receipt.generation,
+          dispatchId: receipt.dispatchId,
+        });
+        return Object.freeze<AuthenticatedFactWriter>({
+          append(input) {
+            const payload = { author: senderId, kind: input.kind, body: input.body };
+            assertBound();
+            return ledger.#appendFact(
+              ledger.#ledger(receipt.residentId),
+              payload,
+              origin,
+              receipt.windowId,
+            );
+          },
+          supersede(targetSeq, input) {
+            const payload = { author: senderId, reason: input.reason };
+            assertBound();
+            return ledger.#supersedeEntry(
+              ledger.#ledger(receipt.residentId),
+              targetSeq,
+              payload,
+              origin,
+              receipt.windowId,
+            );
+          },
+        });
+      },
+      prepareDelivery(inputReceipt) {
+        const receipt = Object.freeze({ ...inputReceipt });
+        assertPending(receipt);
+        const probe = ledger.#probeGap(receipt.residentId, receipt.windowId);
+        if (probe.status === "unknown")
+          throw new WriteGateUnavailableError(receipt.residentId, receipt.windowId, probe.cause);
+        const book = ledger.#ledger(receipt.residentId);
+        const row = ledger.#viewportRow(book, receipt.windowId);
+        const pending = row.pendingInitial;
+        const entries = book.entries
+          .filter((entry) => entry.seq > probe.ackedSeq && entry.seq <= probe.latestSeq)
+          .map(copyEntry);
+        if (entries.length !== probe.latestSeq - probe.ackedSeq)
+          throw new LedgerAuthenticationError("delivery has an incomplete ledger range");
+        let confirmed = false;
+        return Object.freeze<LedgerDelivery>({
+          initial: pending === null ? [] : pending.map(copyEntry),
+          entries,
+          latestSeq: probe.latestSeq,
+          ackedSeq: probe.ackedSeq,
+          commit(settlement) {
+            if (
+              typeof settlement !== "object" ||
+              settlement === null ||
+              !authority.isDispatchSettlement(settlement, receipt)
+            )
+              throw new LedgerAuthenticationError(
+                "delivery requires its own current host settlement",
+              );
+            if (
+              ledger.#ledger(receipt.residentId) !== book ||
+              ledger.#viewportRow(book, receipt.windowId) !== row
+            )
+              throw new LedgerAuthenticationError("delivery's ledger alignment was replaced");
+            if (confirmed) return;
+            // An out-of-order genuine delivery cannot regress a newer confirmed position.
+            ledger.#ack(
+              receipt.residentId,
+              receipt.windowId,
+              Math.max(probe.latestSeq, row.ackedSeq),
+            );
+            if (row.pendingInitial === pending) row.pendingInitial = null;
+            confirmed = true;
+          },
+        });
+      },
+      system(identity) {
+        const senderId = identityString(identity);
+        return Object.freeze<ReturnType<AuthenticatedLedgerHost["system"]>>({
+          append(residentId, input, reason) {
+            return ledger.#appendFact(
+              ledger.#ledger(residentId),
+              { author: senderId, kind: input.kind, body: input.body },
+              { kind: "authenticated_system", senderId, reason: assertSystemReason(reason) },
+            );
+          },
+          supersede(residentId, targetSeq, input, originReason) {
+            return ledger.#supersedeEntry(
+              ledger.#ledger(residentId),
+              targetSeq,
+              { author: senderId, reason: input.reason },
+              { kind: "authenticated_system", senderId, reason: assertSystemReason(originReason) },
+            );
+          },
+        });
+      },
+    });
+    return { ledger, host };
+  }
+
+  #assertLegacyWrite(): void {
+    if (this.#authenticated)
+      throw new LedgerAuthenticationError("use a host-bound writer or delivery confirmation");
+  }
+
+  get requiresAuthenticatedSources(): boolean {
+    return this.#authenticated;
   }
 
   /** 同一进程内单调递增的时间戳，避免同毫秒条目排序不稳定。 */
@@ -454,6 +762,7 @@ export class FactLedger {
     input: { author: string; kind: FactKind; body: string },
     origin: ViewportWriteOrigin,
   ): LedgerEntry {
+    this.#assertLegacyWrite();
     const ledger = this.#ledger(residentId);
     this.#assertViewportOriginCurrent(residentId, origin);
     return this.#appendFact(
@@ -507,6 +816,7 @@ export class FactLedger {
     input: { author: string; reason: string },
     origin: ViewportWriteOrigin,
   ): LedgerEntry {
+    this.#assertLegacyWrite();
     const ledger = this.#ledger(residentId);
     // C04 闸先于目标校验：未知悉最新裁定的窗连「目标存不存在」的答案
     // 都不该拿到——先验资格，再验参数。
@@ -631,6 +941,9 @@ export class FactLedger {
     origin: EntryOrigin,
     selfAckViewportId: string | null = null,
   ): LedgerEntry {
+    if (typeof author !== "string" || author.trim() === "" || typeof body !== "string") {
+      throw new Error("ledger author must be nonempty and body must be a string");
+    }
     const entry: LedgerEntry = Object.freeze({
       seq: ledger.entries.length + 1,
       ts: this.#nextStamp(),
@@ -719,6 +1032,7 @@ export class FactLedger {
    * viewportId 对账是不透明字符串；它的发号（w_ + ULID）是宿主的事，不在这里校验。
    */
   openViewport(residentId: string, viewportId: string): number {
+    this.#assertLegacyWrite();
     const ledger = this.#ledger(residentId);
     if (ledger.viewports.has(viewportId)) {
       throw new Error(`ack row already exists for viewport ${viewportId} in ${residentId}`);
@@ -757,6 +1071,7 @@ export class FactLedger {
    * 与 destroy 系 API 同一容忍口径。
    */
   clearPendingInitial(residentId: string, viewportId: string): void {
+    this.#assertLegacyWrite();
     const ledger = this.#ledgers.get(residentId);
     const row = ledger?.viewports.get(viewportId);
     if (row === undefined) return;
@@ -811,6 +1126,11 @@ export class FactLedger {
    * 不算窗的。
    */
   ack(residentId: string, viewportId: string, seq: number): void {
+    this.#assertLegacyWrite();
+    this.#ack(residentId, viewportId, seq);
+  }
+
+  #ack(residentId: string, viewportId: string, seq: number): void {
     const ledger = this.#ledger(residentId);
     const row = this.#viewportRow(ledger, viewportId);
     if (!Number.isInteger(seq) || seq < 0) {
@@ -848,13 +1168,17 @@ export class FactLedger {
     viewports: ReadonlyMap<string, ViewportAckRow>,
   ): LedgerRecord {
     return {
-      schemaVersion: SCHEMA_VERSION,
+      schemaVersion: this.#authenticated ? 3 : SCHEMA_VERSION,
+      ...(this.#authenticated ? { accessMode: "authenticated" as const } : {}),
       residentId,
       entries: entries.map(copyEntry),
       viewports: [...viewports.entries()].map(([viewportId, row]) => ({
         viewportId,
         baselineSeq: row.baselineSeq,
         ackedSeq: row.ackedSeq,
+        ...(this.#authenticated
+          ? { identity: row.identity === undefined ? null : { ...row.identity } }
+          : {}),
       })),
     };
   }
@@ -909,11 +1233,12 @@ export class FactLedger {
       if (!file.endsWith(FILE_SUFFIX)) continue;
       const parsed: unknown = JSON.parse(readFileSync(join(dataDir, file), "utf8"));
       const record = this.#validateSnapshot(parsed, file);
-      if (record.schemaVersion !== SCHEMA_VERSION) {
+      if (record.schemaVersion !== SCHEMA_VERSION && record.schemaVersion !== 3) {
         throw new Error(
           `快照 ${file} 的 schema_version=${record.schemaVersion}，本进程只认 ${SCHEMA_VERSION}——显式失败等人来迁移，不静默跳过`,
         );
       }
+      if (record.schemaVersion === 3) this.#authenticated = true;
       if (`${record.residentId}${FILE_SUFFIX}` !== file) {
         throw new Error(`快照 ${file} 内容声称自己是 ${record.residentId}，文件名与身份对不上`);
       }
@@ -935,6 +1260,7 @@ export class FactLedger {
             {
               baselineSeq: row.baselineSeq,
               ackedSeq: row.ackedSeq,
+              ...(row.identity == null ? {} : { identity: Object.freeze({ ...row.identity }) }),
               // 初始快照不落盘，恢复出的窗行一律无 pending：确认位落盘是历史
               // 轨迹，不承担初始交付（2026-08-20 主笔在 PR #98 拍板——旧
               // active 窗不续接；新窗开窗时按当时 currentSet 重新冻结一份，
@@ -974,7 +1300,15 @@ export class FactLedger {
       throw bad("根不是对象");
     }
     const record = value as Record<string, unknown>;
-    exactKeys(record, ["schemaVersion", "residentId", "entries", "viewports"], "根");
+    exactKeys(
+      record,
+      record.schemaVersion === 3
+        ? ["schemaVersion", "accessMode", "residentId", "entries", "viewports"]
+        : ["schemaVersion", "residentId", "entries", "viewports"],
+      "根",
+    );
+    if (record.schemaVersion === 3 && record.accessMode !== "authenticated")
+      throw bad("authenticated accessMode missing or invalid");
     if (typeof record.schemaVersion !== "number") throw bad("schemaVersion 不是数字");
     if (typeof record.residentId !== "string") throw bad("residentId 不是字符串");
     if (!Array.isArray(record.entries)) throw bad("entries 不是数组");
@@ -1017,6 +1351,48 @@ export class FactLedger {
         if (typeof o.reason !== "string" || o.reason.trim() === "") {
           throw bad(`第 ${i + 1} 条 origin 的 system reason 不是非空字符串——空署名等于没署名`);
         }
+      } else if (record.schemaVersion === 3 && o.kind === "authenticated_viewport") {
+        exactKeys(
+          o,
+          [
+            "kind",
+            "sourceKind",
+            "senderId",
+            "residentId",
+            "scopeId",
+            "scopeGeneration",
+            "viewportId",
+            "generation",
+            "dispatchId",
+          ],
+          `第 ${i + 1} 条 origin`,
+        );
+        if (o.sourceKind !== "human" && o.sourceKind !== "resident")
+          throw bad("invalid authenticated source kind");
+        for (const key of ["senderId", "residentId", "scopeId", "viewportId", "dispatchId"]) {
+          if (typeof o[key] !== "string" || (o[key] as string).trim() === "")
+            throw bad(`invalid authenticated ${key}`);
+        }
+        if (
+          o.senderId !== e.author ||
+          o.residentId !== record.residentId ||
+          (o.sourceKind === "resident" && o.senderId !== record.residentId)
+        )
+          throw bad("authenticated author or resident mismatch");
+        for (const key of ["scopeGeneration", "generation"]) {
+          if (!Number.isSafeInteger(o[key]) || (o[key] as number) < 1)
+            throw bad(`invalid authenticated ${key}`);
+        }
+      } else if (record.schemaVersion === 3 && o.kind === "authenticated_system") {
+        exactKeys(o, ["kind", "senderId", "reason"], `第 ${i + 1} 条 origin`);
+        if (
+          typeof o.senderId !== "string" ||
+          o.senderId.trim() === "" ||
+          o.senderId !== e.author ||
+          typeof o.reason !== "string" ||
+          o.reason.trim() === ""
+        )
+          throw bad("invalid authenticated system origin");
       } else {
         throw bad(`第 ${i + 1} 条 origin 带着未知 kind=${String(o.kind)}`);
       }
@@ -1027,7 +1403,34 @@ export class FactLedger {
         throw bad("确认位行不是对象");
       }
       const r = row as Record<string, unknown>;
-      exactKeys(r, ["viewportId", "baselineSeq", "ackedSeq"], "确认位行");
+      exactKeys(
+        r,
+        record.schemaVersion === 3
+          ? ["viewportId", "baselineSeq", "ackedSeq", "identity"]
+          : ["viewportId", "baselineSeq", "ackedSeq"],
+        "确认位行",
+      );
+      if (record.schemaVersion === 3 && r.identity !== null) {
+        const identity = r.identity;
+        if (typeof identity !== "object" || identity === null || Array.isArray(identity))
+          throw bad("invalid authenticated viewport identity");
+        const binding = identity as Record<string, unknown>;
+        exactKeys(
+          binding,
+          ["residentId", "scopeId", "scopeGeneration", "windowId", "generation"],
+          "viewport identity",
+        );
+        for (const key of ["residentId", "scopeId", "windowId"]) {
+          if (typeof binding[key] !== "string" || (binding[key] as string).trim() === "")
+            throw bad(`invalid viewport ${key}`);
+        }
+        if (binding.residentId !== record.residentId || binding.windowId !== r.viewportId)
+          throw bad("viewport identity ownership mismatch");
+        for (const key of ["scopeGeneration", "generation"]) {
+          if (!Number.isSafeInteger(binding[key]) || (binding[key] as number) < 1)
+            throw bad(`invalid viewport ${key}`);
+        }
+      }
       if (typeof r.viewportId !== "string") throw bad("确认位的 viewportId 不是字符串");
       if (!Number.isInteger(r.baselineSeq) || !Number.isInteger(r.ackedSeq)) {
         throw bad("确认位的 baselineSeq/ackedSeq 不是整数");

@@ -208,6 +208,7 @@ export class SessionRegistry<TContext> {
   #dispatchSeq = 0;
   /** Only outstanding host-issued dispatches live here; event logging belongs to the host. */
   readonly #pendingDispatches = new Map<string, DispatchReceipt>();
+  readonly #settlements = new WeakMap<object, DispatchReceipt>();
   /** 上一枚 ULID 的时间戳与随机段——同毫秒连开多窗时自增随机段保单调。 */
   #ulidTimestamp = 0;
   #ulidRandom: number[] = [];
@@ -554,6 +555,34 @@ export class SessionRegistry<TContext> {
     return true;
   }
 
+  /** Host-only proof of one successful consumption; never pass this object to a responder. */
+  settleDispatch(
+    receipt: DispatchReceipt,
+  ): import("./dispatch-authority.ts").DispatchSettlement | null {
+    if (!this.consumeDispatch(receipt)) return null;
+    const settlement = Object.freeze({ kind: "dispatch_settlement" as const });
+    this.#settlements.set(settlement, { ...receipt });
+    return settlement;
+  }
+
+  isDispatchSettlement(settlement: object, receipt: DispatchReceipt): boolean {
+    const original = this.#settlements.get(settlement);
+    return (
+      original !== undefined &&
+      original.dispatchId === receipt.dispatchId &&
+      original.residentId === receipt.residentId &&
+      original.scopeId === receipt.scopeId &&
+      original.scopeGeneration === receipt.scopeGeneration &&
+      original.windowId === receipt.windowId &&
+      original.generation === receipt.generation &&
+      this.#matchesActiveIdentity(receipt)
+    );
+  }
+
+  isCurrentDispatchIdentity(identity: Omit<DispatchReceipt, "dispatchId">): boolean {
+    return this.#matchesActiveIdentity(identity);
+  }
+
   /** Host cancellation also releases failed responder calls; it cannot cancel a different tuple. */
   revokeDispatch(receipt: DispatchReceipt): boolean {
     if (!this.#wasIssued(receipt)) return false;
@@ -566,9 +595,12 @@ export class SessionRegistry<TContext> {
    * 两扇窗互相的迟到回执因此不会落到对方身上（MV-B01）。
    */
   belongsToActiveWindow(receipt: DispatchReceipt): boolean {
+    return this.#wasIssued(receipt) && this.#matchesActiveIdentity(receipt);
+  }
+
+  #matchesActiveIdentity(receipt: Omit<DispatchReceipt, "dispatchId">): boolean {
     const window = this.#active.get(receipt.windowId);
     return (
-      this.#wasIssued(receipt) &&
       window !== undefined &&
       window.residentId === receipt.residentId &&
       window.generation === receipt.generation &&

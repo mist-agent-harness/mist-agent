@@ -2,19 +2,35 @@ import { IntentionalIsolation } from "../../src/isolation/intentional-isolation.
 import { MessageTreeService } from "../../src/message-tree/service.ts";
 import { MessageTreeStore } from "../../src/message-tree/store.ts";
 import { type DispatchReceipt, SessionRegistry } from "../../src/session/session-registry.ts";
+import { type TurnGateEvent, ViewportTurnGate } from "../../src/session/turn-gate.ts";
+import { FactLedger } from "../../src/store/fact-ledger.ts";
 import { ResidentStore } from "../../src/store/resident-store.ts";
 
 const residents = new ResidentStore();
 const residentId = residents.createResident("host-resident");
 const sessions = new SessionRegistry<null>();
 const origin = sessions.open(residentId, { scopeId: "private", context: null });
+let probeFails = false;
+const { ledger, host: ledgerHost } = FactLedger.createAuthenticated({
+  dispatchAuthority: sessions,
+  gapProbeFault: () =>
+    probeFails ? { status: "unknown", cause: "injected unavailable ledger" } : null,
+});
+ledger.createLedger(residentId);
+ledgerHost.registerViewport(origin);
+const gateEvents: TurnGateEvent[] = [];
+const ledgerGate = new ViewportTurnGate(ledger, {
+  authenticatedHost: ledgerHost,
+  generationOf: (windowId) => sessions.get(windowId)?.generation ?? null,
+  logger: { log: (event) => gateEvents.push(event) },
+});
 const tree = new MessageTreeStore();
 tree.createRoom(residentId);
 const prompts: string[] = [];
 const events: import("../../src/message-tree/service.ts").DispatchEvent[] = [];
 let releaseReply: ((reply: string) => void) | undefined;
 let hold = false;
-const isolation = new IntentionalIsolation(residents, sessions);
+const isolation = new IntentionalIsolation(residents, sessions, { ledgerGate });
 let isolatedWindowId: string | undefined;
 const messages = new MessageTreeService(tree, sessions, {
   turnGate: isolation,
@@ -51,6 +67,8 @@ type Command = {
     | "belongs"
     | "consume"
     | "revoke";
+  ledgerOp?: "seed" | "probe" | "fail" | "entries" | "rawAck" | "gateEvents";
+  fail?: boolean;
   name?: string;
   message?: string;
   windowId?: string;
@@ -60,6 +78,33 @@ type Command = {
 };
 
 async function execute(command: Command): Promise<unknown> {
+  if (command.ledgerOp !== undefined) {
+    switch (command.ledgerOp) {
+      case "seed":
+        return ledgerHost
+          .system("fixture-authority")
+          .append(
+            residentId,
+            { kind: "ruling", body: command.message ?? "rule" },
+            "controlled host seed",
+          );
+      case "probe":
+        return ledger.probeGap(residentId, command.windowId ?? origin.windowId);
+      case "fail":
+        probeFails = command.fail ?? false;
+        return null;
+      case "entries":
+        return ledger.entries(residentId);
+      case "gateEvents":
+        return structuredClone(gateEvents);
+      case "rawAck":
+        return ledger.ack(
+          residentId,
+          command.windowId ?? origin.windowId,
+          ledger.latestSeq(residentId),
+        );
+    }
+  }
   switch (command.op) {
     case "hold":
       hold = true;
@@ -86,12 +131,15 @@ async function execute(command: Command): Promise<unknown> {
       return sessions.retireScope(residentId, command.scopeId ?? "", command.scopeGeneration ?? 0);
     case "activate":
       return sessions.activateScope(residentId, command.scopeId ?? "");
-    case "open":
-      return sessions.open(residentId, {
+    case "open": {
+      const opened = sessions.open(residentId, {
         context: null,
         scopeId: command.scopeId ?? "",
         ...(command.windowId ? { windowId: command.windowId } : {}),
       });
+      ledgerHost.registerViewport(opened);
+      return opened;
+    }
     case "kill":
       return sessions.kill(command.windowId ?? "");
     case "create": {
@@ -100,6 +148,9 @@ async function execute(command: Command): Promise<unknown> {
         context: null,
       });
       isolatedWindowId = created.entryWindowId;
+      const opened = sessions.get(created.entryWindowId);
+      if (opened === undefined) throw new Error("created viewport missing");
+      ledgerHost.registerViewport(opened);
       return created;
     }
     case "sharedState":

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { TurnGate, TurnPass } from "../message-tree/service.ts";
+import type { TurnGate, TurnPass, WindowDispatchReceipt } from "../message-tree/service.ts";
 import type { ActiveWindow, SessionRegistry } from "../session/session-registry.ts";
 
 export const ISOLATION_CREATE_INVALID = "ISOLATION_CREATE_INVALID" as const;
@@ -120,6 +120,7 @@ export interface CreateIsolationOptions<TContext> {
 }
 
 export interface IntentionalIsolationOptions {
+  ledgerGate?: TurnGate;
   presenceStore?: IsolationPresenceStore;
   scopeIdFactory?: () => string;
   now?: () => string;
@@ -154,6 +155,10 @@ function renderEnvelope(envelope: ScopePresenceEnvelope): string {
  * windowId/generation，并用独立的 scopeGeneration 绑定活化归属；创建登记不是项目文件 P0 验收。
  */
 export class IntentionalIsolation<TContext> implements TurnGate {
+  readonly #ledgerGate: TurnGate | undefined;
+  get requiresDispatchSettlement(): boolean {
+    return this.#ledgerGate?.requiresDispatchSettlement ?? false;
+  }
   readonly #residents: ResidentDirectory;
   readonly #sessions: SessionRegistry<TContext>;
   readonly #presence: IsolationPresenceStore;
@@ -168,6 +173,7 @@ export class IntentionalIsolation<TContext> implements TurnGate {
     options: IntentionalIsolationOptions = {},
   ) {
     this.#residents = residents;
+    this.#ledgerGate = options.ledgerGate;
     this.#sessions = sessions;
     this.#presence = options.presenceStore ?? new InMemoryIsolationPresenceStore();
     this.#scopeIdFactory = options.scopeIdFactory ?? (() => `scope_${randomUUID()}`);
@@ -265,7 +271,7 @@ export class IntentionalIsolation<TContext> implements TurnGate {
    * 模型侧的异步存在信封：只在下一次 dispatch 开始时读取，当前正在生成的回合
    * 不会被中断。commit 只确认本次实际送进模型的最高序号；途中新增事件留给下轮。
    */
-  beforeTurn(residentId: string, windowId: string): TurnPass {
+  beforeTurn(residentId: string, windowId: string, receipt?: WindowDispatchReceipt): TurnPass {
     const window = this.#sessions.get(windowId);
     if (window === undefined || window.residentId !== residentId) {
       throw new IsolationCreateError(
@@ -273,6 +279,7 @@ export class IntentionalIsolation<TContext> implements TurnGate {
         `window is not active for resident: ${residentId}/${windowId}`,
       );
     }
+    const ledgerPass = this.#ledgerGate?.beforeTurn(residentId, windowId, receipt);
     const acked = this.#ackedSeq.get(windowId) ?? 0;
     // 创建出来的隔离 session 不需要收到一封“你自己刚被创建”的通知；B3 的
     // 模型信封只发给同住户的其他 session。同 scope 的其他 viewport 也共享
@@ -282,8 +289,9 @@ export class IntentionalIsolation<TContext> implements TurnGate {
       .filter((event) => event.scope.scopeId !== window.scopeId);
     const deliveredThrough = pending.at(-1)?.seq ?? acked;
     return {
-      contextPrefix: pending.map(renderEnvelope),
-      commit: () => {
+      contextPrefix: [...(ledgerPass?.contextPrefix ?? []), ...pending.map(renderEnvelope)],
+      commit: (settlement) => {
+        ledgerPass?.commit(settlement);
         const current = this.#ackedSeq.get(windowId) ?? 0;
         if (deliveredThrough > current) this.#ackedSeq.set(windowId, deliveredThrough);
       },
