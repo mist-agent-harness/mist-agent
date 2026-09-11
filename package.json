@@ -14,7 +14,9 @@
     "lint:fix": "biome check --write .",
     "test": "vitest run",
     "acceptance": "tsx acceptance/run.ts",
-    "acceptance:strict": "tsx acceptance/run.ts --strict"
+    "acceptance:strict": "tsx acceptance/run.ts --strict",
+    "acceptance:isolation": "tsx acceptance/isolation-run.ts",
+    "acceptance:isolation:strict": "tsx acceptance/isolation-run.ts --strict"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
