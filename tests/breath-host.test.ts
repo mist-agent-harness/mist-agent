@@ -703,6 +703,7 @@ describe("猝死与流水残骸（real host subprocess）", () => {
 });
 
 type Receipt = { residentId: string; windowId: string; generation: number; dispatchId: string };
+type IngressReceipt = { status: string; dispatch?: Receipt };
 type Live = {
   residentId: string;
   windowId: string;
@@ -791,7 +792,23 @@ describe("MV-D10 换气不改窗身份（real host subprocess）", () => {
     const child = startHost();
     await waitForReady(child);
     const { windowId } = await callHost<Opened>(child, { op: "open", residentId: "resident-d10c" });
-    // 外部绑定：调用方拿到 windowId 当句柄，换气前配了阈值、开过回合。
+    const external = { pluginId: "fixture.external", channelId: "resident-d10c-dm" };
+    await callHost(child, {
+      op: "bindExternal",
+      residentId: "resident-d10c",
+      scopeId: "private",
+      ...external,
+    });
+    const firstIngress = await callHost<IngressReceipt>(child, {
+      op: "ingestExternal",
+      externalMessageId: "external-1",
+      body: "第一代外部消息",
+      ...external,
+    });
+    expect(firstIngress).toMatchObject({
+      status: "dispatched",
+      dispatch: { windowId, generation: 1 },
+    });
     await callHost(child, { op: "configureThreshold", windowId, tokens: 10_000 });
     await callHost<Said>(child, { op: "say", windowId, message: "第一代的话" });
 
@@ -805,6 +822,17 @@ describe("MV-D10 换气不改窗身份（real host subprocess）", () => {
       expect(breathed.windowId).toBe(windowId);
       expect(breathed.generation).toBe(generation + 1);
       generation = breathed.generation;
+
+      const ingress = await callHost<IngressReceipt>(child, {
+        op: "ingestExternal",
+        externalMessageId: `external-${generation}`,
+        body: `第 ${generation} 代外部消息`,
+        ...external,
+      });
+      expect(ingress).toMatchObject({
+        status: "dispatched",
+        dispatch: { windowId, generation },
+      });
 
       // 换气后阈值重新可配（新代尚无回合过闸），仍用同一个 windowId 句柄（MV-D02 的换代口径）。
       await callHost(child, { op: "configureThreshold", windowId, tokens: 10_000 });
@@ -834,5 +862,15 @@ describe("MV-D10 换气不改窗身份（real host subprocess）", () => {
     // 全程只有一扇窗：归档簿里查不到它，活窗簿里它是第 4 代。
     expect(await callHost<unknown>(child, { op: "archived", windowId })).toBeNull();
     expect((await callHost<Live>(child, { op: "live", windowId }))?.generation).toBe(4);
+    const externalFacts = await callHost<Array<{ externalMessageId: string }>>(child, {
+      op: "externalFacts",
+      windowId,
+    });
+    expect(externalFacts.map((fact) => fact.externalMessageId)).toEqual([
+      "external-1",
+      "external-2",
+      "external-3",
+      "external-4",
+    ]);
   });
 });

@@ -16,7 +16,8 @@
     "acceptance": "tsx acceptance/run.ts",
     "acceptance:strict": "tsx acceptance/run.ts --strict",
     "acceptance:isolation": "tsx acceptance/isolation-run.ts",
-    "acceptance:isolation:strict": "tsx acceptance/isolation-run.ts --strict"
+    "acceptance:isolation:strict": "tsx acceptance/isolation-run.ts --strict",
+    "acceptance:external-channel": "test -x ./node_modules/.bin/tsx && tsx acceptance/external-channel-run.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",

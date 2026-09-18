@@ -214,6 +214,9 @@ describe("OS-03 workspace and evidence capability split", () => {
           if (name === "closure-delivered") throw new Error("simulated host death");
         },
       });
+      first.sessions.activateScope("resident-a", "project");
+      first.sessions.retireScope("resident-a", "project", 1);
+      first.sessions.activateScope("resident-a", "project");
       const opened = first.lifecycle.create("resident-a", { context: null, scopeId: "project" });
       const reply = await first.service.say(
         "resident-a",
@@ -252,6 +255,7 @@ describe("OS-03 workspace and evidence capability split", () => {
         residentId: "resident-a",
         generation: opened.handle.generation,
         scopeId: "project",
+        scopeGeneration: 2,
         headId: reply.id,
       });
       expect(restoredStore.eventsAfter("resident-a", 0).map((event) => event.purpose)).toEqual([

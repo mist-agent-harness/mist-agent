@@ -88,6 +88,20 @@ describe("IntentionalIsolation B1", () => {
     expect(sessions.windowsOf(residentId)).toHaveLength(1);
   });
 
+  it("拒绝从已停用的来源创建，也不因生成器碰撞停用现有 scope", () => {
+    const { residentId, sessions, origin, isolation } = fixture();
+    const created = isolation.create(origin.windowId, { name: "first", context: null });
+    expect(() => isolation.create(origin.windowId, { name: "collision", context: null })).toThrow(
+      "existing id",
+    );
+    expect(sessions.getScope(residentId, created.scopeId)?.status).toBe("active");
+    expect(sessions.issueDispatch(created.entryWindowId).scopeGeneration).toBe(1);
+    sessions.retireScope(residentId, origin.scopeId, origin.scopeGeneration);
+    expect(() =>
+      isolation.create(origin.windowId, { name: "stale origin", context: null }),
+    ).toThrow("origin window is not active");
+  });
+
   it("住户级登记失败时不返回假成功，新窗被归档且共享投影为空", () => {
     const underlying = new InMemoryIsolationPresenceStore();
     const failing: IsolationPresenceStore = {
@@ -110,6 +124,7 @@ describe("IntentionalIsolation B1", () => {
     expect(String(error)).toContain("ISOLATION_CREATE_FAILED");
     expect(isolation.sharedState(residentId)).toEqual([]);
     expect(sessions.windowsOf(residentId)).toEqual([origin]);
+    expect(sessions.getScope(residentId, "scope_project")?.status).toBe("inactive");
   });
 });
 

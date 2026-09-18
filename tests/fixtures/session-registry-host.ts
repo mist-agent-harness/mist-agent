@@ -21,6 +21,8 @@ type HostCommand = {
   headId?: string | null;
   receipt?: {
     residentId: string;
+    scopeId: string;
+    scopeGeneration: number;
     windowId: string;
     generation: number;
     dispatchId: string;

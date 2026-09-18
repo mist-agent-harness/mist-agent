@@ -24,8 +24,8 @@
  * 无权给自己续命）。
  */
 
-import type { TurnGate, TurnPass } from "../message-tree/service.ts";
-import type { FactLedger, LedgerEntry } from "../store/fact-ledger.ts";
+import type { TurnGate, TurnPass, WindowDispatchReceipt } from "../message-tree/service.ts";
+import type { AuthenticatedLedgerHost, FactLedger, LedgerEntry } from "../store/fact-ledger.ts";
 import { type BreathTrigger, thresholdBreath } from "./breath-trigger.ts";
 
 /**
@@ -101,6 +101,9 @@ export interface TurnGateEvent {
   residentId: string;
   windowId: string;
   generation: number | null;
+  scopeId?: string;
+  scopeGeneration?: number;
+  dispatchId?: string;
   /** 人读摘要，如 "pulled 3 entries (seq 5..7)" / "缺口未知" / "回执未达"。 */
   detail: string;
 }
@@ -128,6 +131,8 @@ export interface BreathThresholdOptions {
 }
 
 export interface ViewportTurnGateOptions {
+  /** Trusted assembly only; a protected ledger never falls back to caller-supplied ack values. */
+  authenticatedHost?: AuthenticatedLedgerHost;
   /** 默认 no-op：不接日志的嵌入方不该被迫造一个哑 logger。 */
   logger?: TurnEventLogger;
   /** 窗代际查询口，一般由宿主的 SessionRegistry 适配；不给则事件里 generation 恒为 null。 */
@@ -162,6 +167,8 @@ function formatInitialEntry(entry: LedgerEntry): string {
 }
 
 export class ViewportTurnGate implements TurnGate {
+  readonly requiresDispatchSettlement: boolean;
+  readonly #authenticatedHost: AuthenticatedLedgerHost | undefined;
   readonly #ledger: FactLedger;
   readonly #logger: TurnEventLogger;
   readonly #generationOf: ((windowId: string) => number | null) | undefined;
@@ -172,18 +179,36 @@ export class ViewportTurnGate implements TurnGate {
   readonly #turnStarted = new Map<string, number>();
 
   constructor(ledger: FactLedger, options: ViewportTurnGateOptions = {}) {
+    if (ledger.requiresAuthenticatedSources && options.authenticatedHost === undefined) {
+      throw new Error("authenticated ledger requires its host delivery port");
+    }
     this.#ledger = ledger;
+    this.#authenticatedHost = options.authenticatedHost;
+    this.requiresDispatchSettlement = options.authenticatedHost !== undefined;
     this.#logger = options.logger ?? noopLogger;
     this.#generationOf = options.generationOf;
     this.#breath = options.breath;
   }
 
-  #log(event: TurnGateEvent["event"], residentId: string, windowId: string, detail: string): void {
+  #log(
+    event: TurnGateEvent["event"],
+    residentId: string,
+    windowId: string,
+    detail: string,
+    receipt?: WindowDispatchReceipt,
+  ): void {
     this.#logger.log({
       event,
       residentId,
       windowId,
-      generation: this.#generationOf?.(windowId) ?? null,
+      generation: receipt?.generation ?? this.#generationOf?.(windowId) ?? null,
+      ...(receipt === undefined
+        ? {}
+        : {
+            scopeId: receipt.scopeId,
+            scopeGeneration: receipt.scopeGeneration,
+            dispatchId: receipt.dispatchId,
+          }),
       detail,
     });
   }
@@ -219,7 +244,11 @@ export class ViewportTurnGate implements TurnGate {
     }
   }
 
-  beforeTurn(residentId: string, windowId: string): TurnPass {
+  beforeTurn(
+    residentId: string,
+    windowId: string,
+    dispatchReceipt?: WindowDispatchReceipt,
+  ): TurnPass {
     // 阈值硬闸（MV-D01）在查账之前：到线的窗连缺口都不该再拉——这一轮
     // 根本不许开始。容差由检查点的位置保证：撞线的那轮（含其工具调用）
     // 已经跑完，这里拦的是下一轮。
@@ -236,6 +265,9 @@ export class ViewportTurnGate implements TurnGate {
         this.#breath?.announce(windowId);
         throw new BreathThresholdError(windowId, usage, threshold);
       }
+    }
+    if (this.#authenticatedHost !== undefined) {
+      return this.#authenticatedPass(residentId, windowId, dispatchReceipt);
     }
     const probe = this.#ledger.probeGap(residentId, windowId);
     if (probe.status === "unknown") {
@@ -306,6 +338,66 @@ export class ViewportTurnGate implements TurnGate {
         // 先 ack 再确认交付：回执到了才认「这轮交付完成」。
         this.#ledger.clearPendingInitial(residentId, windowId);
         this.#log("gate_ack", residentId, windowId, `acked seq=${probe.latestSeq}`);
+      },
+    };
+  }
+
+  #authenticatedPass(
+    residentId: string,
+    windowId: string,
+    inputReceipt?: WindowDispatchReceipt,
+  ): TurnPass {
+    if (
+      inputReceipt === undefined ||
+      inputReceipt.residentId !== residentId ||
+      inputReceipt.windowId !== windowId
+    ) {
+      throw new GateUnavailableError(
+        residentId,
+        windowId,
+        "authenticated dispatch identity is missing or mismatched",
+      );
+    }
+    const receipt = Object.freeze({ ...inputReceipt });
+    const host = this.#authenticatedHost;
+    if (host === undefined)
+      throw new GateUnavailableError(residentId, windowId, "authenticated host missing");
+    let delivery: ReturnType<AuthenticatedLedgerHost["prepareDelivery"]>;
+    try {
+      delivery = host.prepareDelivery(receipt);
+    } catch (error) {
+      const cause = error instanceof Error ? error.message : String(error);
+      this.#log("gate_unknown", residentId, windowId, cause, receipt);
+      throw new GateUnavailableError(residentId, windowId, cause);
+    }
+    this.#markTurnStarted(windowId);
+    this.#log(
+      delivery.latestSeq === delivery.ackedSeq ? "gate_clear" : "gate_gap_pulled",
+      residentId,
+      windowId,
+      `authenticated delivery through seq=${delivery.latestSeq}`,
+      receipt,
+    );
+    return {
+      contextPrefix: [
+        ...delivery.initial.map(formatInitialEntry),
+        ...delivery.entries.map(formatGapEntry),
+      ],
+      commit: (settlement) => {
+        try {
+          if (settlement === undefined) throw new Error("host settlement missing");
+          delivery.commit(settlement);
+        } catch (error) {
+          this.#log(
+            "ack_failed",
+            residentId,
+            windowId,
+            error instanceof Error ? error.message : String(error),
+            receipt,
+          );
+          return;
+        }
+        this.#log("gate_ack", residentId, windowId, `acked seq=${delivery.latestSeq}`, receipt);
       },
     };
   }

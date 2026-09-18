@@ -21,6 +21,11 @@
  * 测试数据全为虚构占位（AGENTS.md：住户内容不进仓库）。
  */
 
+import {
+  ExternalChannelBindingStore,
+  ExternalChannelHost,
+  ExternalInboundStore,
+} from "../../src/external-channel/index.ts";
 import { MessageTreeService, MessageTreeStore } from "../../src/message-tree/index.ts";
 import {
   CanonicalHandoverTimeline,
@@ -73,6 +78,20 @@ const debrisLog: string[] = [];
 const residentIds = new Set<string>();
 const canonicalDataDir = process.env.MIST_BREATH_DATA_DIR;
 if (canonicalDataDir === undefined) throw new Error("MIST_BREATH_DATA_DIR is required");
+const externalBindings = new ExternalChannelBindingStore({
+  journalPath: `${canonicalDataDir}/external-bindings.jsonl`,
+});
+const externalInbox = new ExternalInboundStore({
+  journalPath: `${canonicalDataDir}/external-inbound.jsonl`,
+  maxQueuedItems: 4,
+  maxAgeMs: 60_000,
+});
+const externalChannel = new ExternalChannelHost({
+  sessions: registry,
+  bindings: externalBindings,
+  inbox: externalInbox,
+});
+externalChannel.activate();
 const canonicalStore = new CanonicalStreamStore({ dataDir: canonicalDataDir });
 const canonicalWriter = new CanonicalStreamWriter(canonicalStore);
 const handoverTimeline = new CanonicalHandoverTimeline(canonicalWriter, canonicalStore, {
@@ -191,6 +210,9 @@ type HostCommand = {
     | "live"
     | "issueDispatch"
     | "belongsToActiveWindow"
+    | "bindExternal"
+    | "ingestExternal"
+    | "externalFacts"
     | "stop";
   residentId?: string;
   windowId?: string;
@@ -201,6 +223,11 @@ type HostCommand = {
   draft?: LetterDraft;
   debris?: unknown[];
   receipt?: DispatchReceipt;
+  scopeId?: string;
+  pluginId?: string;
+  channelId?: string;
+  externalMessageId?: string;
+  body?: string;
 };
 
 function requireString(value: string | undefined, field: string): string {
@@ -384,6 +411,24 @@ async function execute(command: HostCommand): Promise<unknown> {
     case "belongsToActiveWindow":
       if (command.receipt === undefined) throw new Error("missing receipt");
       return registry.belongsToActiveWindow(command.receipt);
+    case "bindExternal":
+      return externalBindings.bind({
+        residentId: requireString(command.residentId, "residentId"),
+        scopeId: requireString(command.scopeId, "scopeId"),
+        address: {
+          pluginId: requireString(command.pluginId, "pluginId"),
+          channelId: requireString(command.channelId, "channelId"),
+        },
+      });
+    case "ingestExternal":
+      return externalChannel.ingest({
+        pluginId: requireString(command.pluginId, "pluginId"),
+        channelId: requireString(command.channelId, "channelId"),
+        externalMessageId: requireString(command.externalMessageId, "externalMessageId"),
+        body: requireString(command.body, "body"),
+      });
+    case "externalFacts":
+      return externalChannel.factsForWindow(requireString(command.windowId, "windowId"));
     case "stop":
       await canonicalWriter.close();
       return null;

@@ -210,7 +210,9 @@ M 编号的文件、原行、替换行、工作目录、实际仓库测试命令
 - **MV-C02**：仓内无 push 通道，「丢全部推送」是 vacuous 成立；引入推送通道后必须重验。
 - **MV-D04**：计量口契约，不是端到端产品行为。
 - **MV-D07**：子进程内模拟窗死亡，不是 SIGKILL。
-- **MV-D10**：外部绑定是 fixture Map。
+- **MV-D10**：#172 已把原先的窗句柄夹具替换为耐久的 `(residentId, scopeId)` 真绑定；
+  `tests/breath-host.test.ts` 现在跨三次真实换气逐次从外部地址重新解析当前 generation。
+  这里仍不包含 Telegram 等具体 transport 联调。
 - **MV-E01**：history 仍是 fixture，不替 #120 判卷。
 - M18 / M24 / M28 三次是装配变异，不冒充实现内部闸门。
 - 以上任何一条都不得因落章被改写成已完成的生产能力。
