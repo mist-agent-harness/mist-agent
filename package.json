@@ -17,7 +17,9 @@
     "acceptance:strict": "tsx acceptance/run.ts --strict",
     "acceptance:isolation": "tsx acceptance/isolation-run.ts",
     "acceptance:isolation:strict": "tsx acceptance/isolation-run.ts --strict",
-    "acceptance:external-channel": "test -x ./node_modules/.bin/tsx && tsx acceptance/external-channel-run.ts"
+    "acceptance:external-channel": "test -x ./node_modules/.bin/tsx && tsx acceptance/external-channel-run.ts",
+    "acceptance:resident-continuity": "tsx acceptance/resident-continuity-run.ts",
+    "acceptance:resident-continuity:strict": "tsx acceptance/resident-continuity-run.ts --strict"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
