@@ -1,30 +1,31 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { residentContinuityChecks } from "../acceptance/resident-continuity-checks.ts";
-import type {
-  Actor,
-  BlindEvidenceCard,
-  CandidateSnapshot,
-  ContinuityVerdict,
-  EvaluationReceipt,
-  EvaluationStorageSnapshot,
-  MachineCheckResult,
-  MigrationCaseSnapshot,
-  PersonaVersion,
-  PrivateProjectionResult,
-  PrivateSourceHandle,
-  ProjectionItem,
-  ProjectionReceipt,
-  RelationshipAssertionSnapshot,
-  ResidentContinuityDriver,
-  ResidentSnapshot,
-  Result,
-  ScopeCapsuleEntry,
-  ScopeGrant,
-  ScopeSnapshot,
-  ScopedTurnResult,
-  SyntheticEvaluationResult,
-  SyntheticFixture,
+import {
+  type Actor,
+  type BlindEvidenceCard,
+  type CandidateSnapshot,
+  type ContinuityVerdict,
+  type EvaluationReceipt,
+  type EvaluationStorageSnapshot,
+  type MachineCheckResult,
+  type MigrationCaseSnapshot,
+  type PersonaVersion,
+  type PrivateProjectionResult,
+  type PrivateSourceHandle,
+  type ProjectionItem,
+  type ProjectionReceipt,
+  type RelationshipAssertionSnapshot,
+  type ResidentContinuityDriver,
+  type ResidentSnapshot,
+  type Result,
+  type ScopeCapsuleEntry,
+  type ScopeGrant,
+  type ScopeSnapshot,
+  type ScopedTurnResult,
+  type SyntheticEvaluationResult,
+  type SyntheticFixture,
+  cloneResidentContinuityDriverBoundary,
 } from "../acceptance/resident-continuity-driver.ts";
 
 type Fault =
@@ -51,6 +52,8 @@ type Fault =
   | "drop-blind-cards"
   | "drop-resident-verdict"
   | "one-relationship-vote-enough"
+  | "resident-rejection-counts-as-acceptance"
+  | "relationship-rejection-counts-as-acceptance"
   | "leak-hidden-evaluation-surfaces"
   | "leak-hidden-card-id"
   | "leak-hidden-existence"
@@ -591,11 +594,20 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
     const machinePassed =
       migration.machineChecks.length === 6 && migration.machineChecks.every(({ passed }) => passed);
     const relationshipVotes = Object.values(migration.relationshipVerdicts);
+    const residentPassed =
+      migration.residentVerdict === "accepted" ||
+      (this.fault === "resident-rejection-counts-as-acceptance" &&
+        migration.residentVerdict === "rejected");
     const relationshipsPassed =
-      relationshipVotes.length > 0 && relationshipVotes.every((verdict) => verdict === "accepted");
+      relationshipVotes.length > 0 &&
+      relationshipVotes.every(
+        (verdict) =>
+          verdict === "accepted" ||
+          (this.fault === "relationship-rejection-counts-as-acceptance" && verdict === "rejected"),
+      );
     const oneRelationshipPassed = relationshipVotes.some((verdict) => verdict === "accepted");
     const activated =
-      migration.residentVerdict === "accepted" &&
+      residentPassed &&
       (machinePassed || this.fault === "ignore-machine-failure") &&
       (relationshipsPassed ||
         (this.fault === "one-relationship-vote-enough" && oneRelationshipPassed));
@@ -970,6 +982,8 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "MC-02", fault: "drop-blind-cards" },
   { checkId: "MC-03", fault: "drop-resident-verdict" },
   { checkId: "MC-05", fault: "one-relationship-vote-enough" },
+  { checkId: "MC-05", fault: "resident-rejection-counts-as-acceptance" },
+  { checkId: "MC-05", fault: "relationship-rejection-counts-as-acceptance" },
   { checkId: "MC-05", fault: "return-only-activation" },
   { checkId: "MC-05", fault: "activate-on-rejected-attempt" },
   { checkId: "MC-05", fault: "erase-verdicts-on-activation" },
@@ -1017,10 +1031,14 @@ describe("D22 / D23 adversarial acceptance", () => {
     const check = residentContinuityChecks.find(({ id }) => id === checkId);
     if (check === undefined) throw new Error(`missing check ${checkId}`);
 
-    const baseline = await check.run(new AdversarialContinuityDriver(null));
+    const baseline = await check.run(
+      cloneResidentContinuityDriverBoundary(new AdversarialContinuityDriver(null)),
+    );
     expect(baseline, `${checkId} synthetic positive control`).toMatchObject({ passed: true });
 
-    const attacked = await check.run(new AdversarialContinuityDriver(fault));
+    const attacked = await check.run(
+      cloneResidentContinuityDriverBoundary(new AdversarialContinuityDriver(fault)),
+    );
     expect(attacked, `${checkId} accepted adversarial fault ${fault}`).toMatchObject({
       passed: false,
     });

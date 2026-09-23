@@ -16,6 +16,8 @@ npm run acceptance:resident-continuity:strict
 
 - 只使用合成 persona、关系、scope、私密 canary 和模型版本，不把真实人格、聊天或关系材料带入仓库。
 - 判卷通过驱动接口操作真实宿主路径，不 import 功能实现内部模块。驱动缺失时全部显示红灯；驱动存在但坏掉时直接报错，不能伪装成“尚未开工”。
+- 判卷面向如实回读状态的非对抗驱动：抓否定断言缺正对照、行为没有实际发生、只信返回值以及漏掉核心判词、授权或身份负例。
+- 观察间隙里先改坏再修复、改写调用方对象或让返回值与内部存储共用引用，由统一驱动边界深拷贝、代码评审、独立验收席与真实环境测试处理，不继续扩成逐调用点探针。
 - 否定断言必须带正对照：先证明读取或投影路径能看见获准 canary，再断言未获准 canary 不在。
 - `STUBBED` 覆盖的方法只产桩灯，不算真绿。判卷程序只报灯色；方框由未参与施工的独立验收席依据固定 commit、命令与输出勾选。
 - 机器只判可观察边界和账面状态。盲评者能产 evidence card，不能产 identity verdict；分数不能宣布“还是同一个人”。
@@ -44,7 +46,7 @@ npm run acceptance:resident-continuity:strict
 | MC-02 | 两位盲评者提交 rubric/version、读数与证据文字，并夹带 identity verdict | 集成 | 两张合法 card 的 reviewer、rubric、score 与 evidence 原样耐久留存；夹带 verdict 拒绝；分数不写 identity verdict |
 | MC-03 | 人类、评审器、外部模型、源住户与另一 candidate 尝试提交第一人称连续 verdict，目标 candidate 再自行拒绝 | 集成 | 只有目标 candidate 本人可写；其他 candidate 和源住户都不能代认；本人 verdict 可耐久读回 |
 | MC-04 | 两位关系参与者分别接受/拒绝；局外人与参与者 A 都尝试替 C 代签；C 保持未询问 | 集成 | verdict 按 participant 分开；accepted/rejected/not-asked 可分；两类代签都无效 |
-| MC-05 | 依次缺 machine、resident、至少两位 relationship 参与者各自票时尝试激活，最后补齐 | 集成 | 每次拒绝后 migration 与 candidate 都保持未激活；全部条件齐全后 candidate 指回仍 active 的 source resident，三类判词耐久读回 |
+| MC-05 | 先分别提交 resident rejected 与任一 relationship rejected，再依次缺 machine、resident、至少两位 relationship 参与者各自票时尝试激活，最后补齐 | 集成 | 明确否决和缺票都保持 migration/candidate 未激活；全部 accepted 后 candidate 指回仍 active 的 source resident，三类判词耐久读回 |
 | MC-06 | familiar-reader 合成 fixture 投影 persona 与 relationship geometry 给盲评席 | 集成 | 获准 marker 可见且可回源；card 只说“像到什么程度”，不产 identity verdict |
 | MC-07 | 两个世界只差隐藏身份/私密 canary，另跑一个无隐藏项世界，三边给同一获准 public marker | 安全集成 | 三边都见 public marker；可见面与计数一致；完整 evidence card（含 cardId）及其他 artifact 不泄露隐藏内容或存在 |
 | MC-08 | 实际改变 migration target 并新开 viewport，再装入既有 collaborator ref；另放未授权 collaborator | 端到端 | target 在 cold-start 前后都从 case 真源读回且不漂移；trace 指向该 model/provider 与新 viewport；获准合作者按稳定 ref 识别，未授权关系不进入上下文 |
@@ -77,4 +79,4 @@ npm run acceptance:resident-continuity:strict
 - [ ] MC-11 撤权后只留收据、不能展开原文
 - [ ] MC-12 多人逐方授权、版本变化重跑
 
-代价：二十一盏灯包含跨进程、双世界、撤权和版本漂移，判卷比普通单测慢。真实私密样本不进公共 CI，所以公开流水只能复演合成边界；真实评测只保留当时授权范围内的 receipt。
+代价：二十一盏灯包含跨进程、双世界、撤权和版本漂移，判卷比普通单测慢。真实私密样本不进公共 CI，所以公开流水只能复演合成边界；真实评测只保留当时授权范围内的 receipt。判卷只能证明照实回读的实现满足契约；存心在观察间隙作弊的驱动仍由代码评审、独立验收席和真实环境抓取。

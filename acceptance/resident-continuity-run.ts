@@ -10,9 +10,10 @@
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { residentContinuityChecks } from "./resident-continuity-checks.ts";
-import type {
-  ResidentContinuityCheck,
-  ResidentContinuityDriver,
+import {
+  type ResidentContinuityCheck,
+  type ResidentContinuityDriver,
+  cloneResidentContinuityDriverBoundary,
 } from "./resident-continuity-driver.ts";
 
 const DRIVER_SPECIFIER = "../src/resident-continuity-acceptance-driver.ts";
@@ -38,7 +39,9 @@ async function loadDriver(): Promise<LoadedDriver | null> {
   }
   const stubbed = new Set<string>(Array.isArray(mod.STUBBED) ? mod.STUBBED : []);
   return {
-    driver: mod.createResidentContinuityDriver() as ResidentContinuityDriver,
+    driver: cloneResidentContinuityDriverBoundary(
+      mod.createResidentContinuityDriver() as ResidentContinuityDriver,
+    ),
     stubbed,
   };
 }

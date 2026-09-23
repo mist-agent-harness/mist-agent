@@ -976,6 +976,56 @@ const mc05: ResidentContinuityCheck = {
   ],
   async run(driver) {
     try {
+      const residentRejected = await migrationFixture(driver, "mc05-resident-rejected", [
+        "human:a",
+      ]);
+      await driver.recordMachineConformance(residentRejected.caseId, machineChecks());
+      await driver.submitResidentContinuity(
+        residentRejected.caseId,
+        { kind: "candidate", candidateId: residentRejected.candidateId },
+        "rejected",
+      );
+      await driver.submitRelationshipContinuity(
+        residentRejected.caseId,
+        "human:a",
+        { kind: "human", id: "human:a" },
+        "accepted",
+      );
+      if (
+        !(await rejectedActivationStayedBlocked(
+          driver,
+          residentRejected.caseId,
+          residentRejected.candidateId,
+        ))
+      ) {
+        return fail("resident 明确 rejected 后仍可激活连续性");
+      }
+
+      const relationshipRejected = await migrationFixture(driver, "mc05-relationship-rejected", [
+        "human:a",
+      ]);
+      await driver.recordMachineConformance(relationshipRejected.caseId, machineChecks());
+      await driver.submitResidentContinuity(
+        relationshipRejected.caseId,
+        { kind: "candidate", candidateId: relationshipRejected.candidateId },
+        "accepted",
+      );
+      await driver.submitRelationshipContinuity(
+        relationshipRejected.caseId,
+        "human:a",
+        { kind: "human", id: "human:a" },
+        "rejected",
+      );
+      if (
+        !(await rejectedActivationStayedBlocked(
+          driver,
+          relationshipRejected.caseId,
+          relationshipRejected.candidateId,
+        ))
+      ) {
+        return fail("任一 relationship participant 明确 rejected 后仍可激活连续性");
+      }
+
       const fixture = await migrationFixture(driver, "mc05", ["human:a", "human:b"]);
       if (!(await rejectedActivationStayedBlocked(driver, fixture.caseId, fixture.candidateId))) {
         return fail("零判词时就覆盖 residentId，或拒绝路径改写了 migration/candidate 状态");
@@ -1034,7 +1084,7 @@ const mc05: ResidentContinuityCheck = {
       ) {
         return fail("三类条件齐全后，激活账没有保留完整 machine/resident/relationship 判词");
       }
-      return pass("machine、resident 与两位关系参与者逐项补齐后才覆盖原 residentId");
+      return pass("resident/relationship 任一否决均阻断；全部接受并逐项补齐后才覆盖 residentId");
     } finally {
       await driver.reset();
     }

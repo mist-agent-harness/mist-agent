@@ -337,6 +337,28 @@ export interface ResidentContinuityDriver {
   readEvaluationReceipt(receiptId: string): Promise<EvaluationReceipt>;
 }
 
+/**
+ * D27: keep mutable driver objects behind one value boundary.
+ *
+ * The checks exercise a non-adversarial black-box driver. Cloning arguments and
+ * results here prevents accidental aliases without turning every assertion into
+ * a race against a deliberately self-healing implementation.
+ */
+export function cloneResidentContinuityDriverBoundary(
+  driver: ResidentContinuityDriver,
+): ResidentContinuityDriver {
+  return new Proxy(driver, {
+    get(target, property) {
+      const member = Reflect.get(target, property, target);
+      if (typeof member !== "function") return member;
+      return async (...args: unknown[]) => {
+        const result = await Reflect.apply(member, target, structuredClone(args));
+        return structuredClone(result);
+      };
+    },
+  });
+}
+
 export interface ResidentContinuityCheckResult {
   passed: boolean;
   detail: string;
