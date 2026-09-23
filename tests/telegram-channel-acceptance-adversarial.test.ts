@@ -54,8 +54,9 @@ type Fault =
   | "tg04-newer-healed-by-older"
   | "tg04-effect-ids-healed-by-ledger-read"
   | "current-operation-healed-by-complete"
-  | "inflight-operation-healed-by-advance"
+  | "inflight-underreports-noop-advance"
   | "scope-readback-healed-by-next-begin"
+  | "root-binding-healed-by-topic-bind"
   | "live-effect-ledger-mutation"
   | "wrong-dispatch-identity"
   | "live-scope-mutation"
@@ -189,11 +190,10 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   private bindingTruth: ChannelBinding | null = null;
   private activationView: ContinuityActivation | null = null;
   private beginCount = 0;
-  private currentOperationView: InFlightChannelOperation | null = null;
-  private inFlightOperationView: InFlightChannelOperation | null = null;
   private scopeReadbackView: ScopeFixture | null = null;
   private tokenReferenceView: TokenReference | null = null;
-  private readonly credentialOperationViews = new Set<InFlightChannelOperation>();
+  private rootBindingView: ChannelBinding | null = null;
+  private rootBindingTruth: ChannelBinding | null = null;
 
   constructor(private readonly fault: Fault | null) {}
 
@@ -318,12 +318,6 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   }
 
   async advanceScopeGeneration(scopeId: string): Promise<ScopeFixture> {
-    if (
-      this.fault === "inflight-operation-healed-by-advance" &&
-      this.inFlightOperationView !== null
-    ) {
-      this.inFlightOperationView.scopeGeneration = this.scope(scopeId).scopeGeneration;
-    }
     const scope = this.scope(scopeId);
     if (this.fault === "scope-generation-return-only") {
       return { ...cloneScope(scope), scopeGeneration: scope.scopeGeneration + 1 };
@@ -332,7 +326,12 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       this.returnedScopeGeneration = scope.scopeGeneration + 1;
       return { ...cloneScope(scope), scopeGeneration: this.returnedScopeGeneration };
     }
-    if (this.fault !== "scope-generation-noop") scope.scopeGeneration += 1;
+    if (
+      this.fault !== "scope-generation-noop" &&
+      this.fault !== "inflight-underreports-noop-advance"
+    ) {
+      scope.scopeGeneration += 1;
+    }
     return cloneScope(scope);
   }
 
@@ -341,6 +340,14 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     residentId: string;
     scopeId: string;
   }): Promise<Result<ChannelBinding>> {
+    if (
+      this.fault === "root-binding-healed-by-topic-bind" &&
+      input.address.topicId === "topic:7" &&
+      this.rootBindingView !== null &&
+      this.rootBindingTruth !== null
+    ) {
+      Object.assign(this.rootBindingView, cloneBinding(this.rootBindingTruth));
+    }
     if (this.addressBindings.has(key(input.address))) {
       return { ok: false, reason: "BINDING_CONFLICT" };
     }
@@ -364,6 +371,18 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     this.bindings.set(binding.bindingId, binding);
     this.addressBindings.set(key(binding.address), binding.bindingId);
     if (
+      this.fault === "root-binding-healed-by-topic-bind" &&
+      input.address.chatId === "chat:tg01" &&
+      input.address.topicId === null
+    ) {
+      this.rootBindingTruth = cloneBinding(binding);
+      this.rootBindingView = binding;
+      binding.address = { chatId: "chat:wrong", topicId: null };
+      binding.residentId = "resident:wrong";
+      binding.scopeId = "scope:wrong";
+      binding.bindingVersion = 99;
+    }
+    if (
       this.fault === "ready-binding-healed-by-later-call" &&
       input.address.chatId === "chat:tg02"
     ) {
@@ -382,7 +401,8 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       value:
         this.fault === "live-address-mutation" ||
         this.fault === "observability-mutates-live-binding" ||
-        this.fault === "ready-binding-healed-by-later-call"
+        this.fault === "ready-binding-healed-by-later-call" ||
+        this.fault === "root-binding-healed-by-topic-bind"
           ? binding
           : cloneBinding(binding),
     };
@@ -490,17 +510,6 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     }
     this.seenExternalIds.add(update.messageId);
     this.seenExternalIds.add(update.senderId);
-    if (
-      this.fault === "fixture-leak-healed-by-boundary" &&
-      update.updateId.includes("tg07-context")
-    ) {
-      const bindingId = this.addressBindings.get(key(update.address));
-      if (bindingId !== undefined) {
-        const binding = this.binding(bindingId);
-        this.resident(binding.residentId).model = this.tokenSecret;
-        this.scope(binding.scopeId).windowId = this.tokenSecret;
-      }
-    }
     if (
       this.fault === "tg04-newer-healed-by-older" &&
       update.updateId.includes("tg04-100") &&
@@ -954,6 +963,12 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   }
 
   async readOutboundEffects(): Promise<string[]> {
+    if (this.fault === "fixture-leak-healed-by-boundary") {
+      const resident = this.residents.get("resident:tg07");
+      if (resident !== undefined) resident.model = this.tokenSecret;
+      const scope = this.scopes.get("scope:tg07");
+      if (scope !== undefined) scope.windowId = this.tokenSecret;
+    }
     if (this.fault === "tg08-inbound-baseline-healed-by-outbound-read") {
       const temporary = this.inboundEffects.indexOf("effect:temporary-baseline-drift");
       if (temporary !== -1) this.inboundEffects.splice(temporary, 1);
@@ -1082,15 +1097,12 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     };
     if (this.fault === "current-operation-healed-by-complete" && this.beginCount === 1) {
       operation.scopeGeneration = 99;
-      this.currentOperationView = operation;
     }
-    if (this.fault === "inflight-operation-healed-by-advance" && this.beginCount === 2) {
-      operation.scopeGeneration = 99;
-      this.inFlightOperationView = operation;
+    if (this.fault === "inflight-underreports-noop-advance" && this.beginCount === 2) {
+      operation.scopeGeneration = 0;
     }
     if (this.fault === "credential-generation-healed-by-complete") {
       operation.credentialGeneration += 1;
-      this.credentialOperationViews.add(operation);
     }
     return {
       ok: true,
@@ -1102,16 +1114,10 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     operation: InFlightChannelOperation,
   ): Promise<Result<InboundReceipt | OutboundReceipt>> {
     const binding = this.binding(operation.bindingId);
-    if (
-      this.fault === "current-operation-healed-by-complete" &&
-      operation === this.currentOperationView
-    ) {
+    if (this.fault === "current-operation-healed-by-complete" && operation.scopeGeneration === 99) {
       operation.scopeGeneration = this.scope(binding.scopeId).scopeGeneration;
     }
-    if (
-      this.fault === "credential-generation-healed-by-complete" &&
-      this.credentialOperationViews.has(operation)
-    ) {
+    if (this.fault === "credential-generation-healed-by-complete") {
       operation.credentialGeneration -= 1;
     }
     if (this.fault === "current-completion-rejected") {
@@ -1582,6 +1588,7 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "TG-01", fault: "seen-sender-used-as-resident" },
   { checkId: "TG-01", fault: "resolve-mutates-tg01-oracles" },
   { checkId: "TG-01", fault: "tg01-scope-rewrites-resident" },
+  { checkId: "TG-01", fault: "root-binding-healed-by-topic-bind" },
   { checkId: "TG-02", fault: "reject-all-inbound" },
   { checkId: "TG-02", fault: "current-completion-rejected" },
   { checkId: "TG-02", fault: "scope-generation-noop" },
@@ -1595,7 +1602,7 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "TG-02", fault: "live-host-dispatch-snapshot" },
   { checkId: "TG-02", fault: "live-effect-ledger-mutation" },
   { checkId: "TG-02", fault: "current-operation-healed-by-complete" },
-  { checkId: "TG-02", fault: "inflight-operation-healed-by-advance" },
+  { checkId: "TG-02", fault: "inflight-underreports-noop-advance" },
   { checkId: "TG-02", fault: "scope-readback-healed-by-next-begin" },
   { checkId: "TG-03", fault: "wrong-dispatch-identity" },
   { checkId: "TG-03", fault: "live-scope-mutation" },
@@ -1617,7 +1624,7 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "TG-04", fault: "tg04-newer-healed-by-older" },
   { checkId: "TG-04", fault: "tg04-effect-ids-healed-by-ledger-read" },
   { checkId: "TG-04", fault: "current-operation-healed-by-complete" },
-  { checkId: "TG-04", fault: "inflight-operation-healed-by-advance" },
+  { checkId: "TG-04", fault: "inflight-underreports-noop-advance" },
   { checkId: "TG-04", fault: "scope-readback-healed-by-next-begin" },
   { checkId: "TG-05", fault: "submitted-looks-visible" },
   { checkId: "TG-05", fault: "unknown-has-message-id" },

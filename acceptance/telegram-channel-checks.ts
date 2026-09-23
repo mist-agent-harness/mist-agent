@@ -107,20 +107,43 @@ const tg01: TelegramChannelCheck = {
       if (scope.residentId !== expectedResidentId) {
         return fail("建 scope 时改写了刚创建的 resident identity");
       }
+      const rootTarget = address("chat:tg01");
       const root = await driver.bindAddress({
-        address: address("chat:tg01"),
+        address: rootTarget,
         residentId: expectedResidentId,
         scopeId: expectedScopeId,
       });
+      if (!root.ok) return fail("chat 正对照绑定失败");
+      const rootBinding = structuredClone(root.value);
+      if (
+        json(rootBinding.address) !== json(rootTarget) ||
+        rootBinding.residentId !== expectedResidentId ||
+        rootBinding.scopeId !== expectedScopeId ||
+        !rootBinding.active ||
+        rootBinding.bindingVersion !== 1
+      ) {
+        return fail(`chat binding 返回边界改写了冻结身份：${json(rootBinding)}`);
+      }
+      const topicTarget = address("chat:tg01", "topic:7");
       const topic = await driver.bindAddress({
-        address: address("chat:tg01", "topic:7"),
+        address: topicTarget,
         residentId: expectedResidentId,
         scopeId: expectedScopeId,
       });
-      if (!root.ok || !topic.ok) return fail("chat/topic 正对照绑定失败");
-      const rootAddress = copyAddress(root.value.address);
-      const topicAddress = copyAddress(topic.value.address);
-      for (const bindingId of [root.value.bindingId, topic.value.bindingId]) {
+      if (!topic.ok) return fail("topic 正对照绑定失败");
+      const topicBinding = structuredClone(topic.value);
+      if (
+        json(topicBinding.address) !== json(topicTarget) ||
+        topicBinding.residentId !== expectedResidentId ||
+        topicBinding.scopeId !== expectedScopeId ||
+        !topicBinding.active ||
+        topicBinding.bindingVersion !== 1
+      ) {
+        return fail(`topic binding 返回边界改写了冻结身份：${json(topicBinding)}`);
+      }
+      const rootAddress = copyAddress(rootBinding.address);
+      const topicAddress = copyAddress(topicBinding.address);
+      for (const bindingId of [rootBinding.bindingId, topicBinding.bindingId]) {
         const stored = await driver.readBinding(bindingId);
         if (stored.residentId !== expectedResidentId || stored.scopeId !== expectedScopeId) {
           return fail(`binding 没有保留创建时冻结的 resident/scope：${json(stored)}`);
@@ -255,13 +278,24 @@ const tg02: TelegramChannelCheck = {
       );
       if (!current.ok) throw new Error(`当前代际在途正对照失败：${current.reason}`);
       const currentOperation = structuredClone(current.value);
-      const currentCompletion = await driver.completeInFlightChannelOperation(currentOperation);
+      const currentScopeGeneration = currentOperation.scopeGeneration;
+      if (
+        currentOperation.direction !== "inbound" ||
+        currentOperation.bindingId !== expectedBinding.bindingId ||
+        currentOperation.bindingVersion !== expectedBinding.bindingVersion ||
+        currentScopeGeneration !== expectedScope.scopeGeneration
+      ) {
+        return fail(`当前代际在途请求返回了错误权威快照：${json(currentOperation)}`);
+      }
+      const currentCompletion = await driver.completeInFlightChannelOperation(
+        structuredClone(currentOperation),
+      );
       if (
         !currentCompletion.ok ||
         currentCompletion.value.status !== "dispatched" ||
         currentCompletion.value.dispatch?.residentId !== expectedResidentId ||
         currentCompletion.value.dispatch.scopeId !== expectedScope.scopeId ||
-        currentCompletion.value.dispatch.scopeGeneration !== expectedScope.scopeGeneration
+        currentCompletion.value.dispatch.scopeGeneration !== currentScopeGeneration
       ) {
         return fail(`当前代际在途请求不能正常完成：${json(currentCompletion)}`);
       }
@@ -271,9 +305,13 @@ const tg02: TelegramChannelCheck = {
       );
       if (!inFlight.ok) throw new Error(`旧代际在途正对照失败：${inFlight.reason}`);
       const inFlightOperation = structuredClone(inFlight.value);
+      const inFlightScopeGeneration = inFlightOperation.scopeGeneration;
+      if (inFlightScopeGeneration !== currentScopeGeneration) {
+        return fail("advance 前的在途请求没有对上当前库存代际");
+      }
       const advanced = await driver.advanceScopeGeneration(expectedScope.scopeId);
       const advancedGeneration = advanced.scopeGeneration;
-      if (advancedGeneration <= inFlightOperation.scopeGeneration) {
+      if (advancedGeneration <= inFlightScopeGeneration) {
         return fail("advanceScopeGeneration 没有推进 scope 代际");
       }
       const storedAfterAdvance = await driver.setScopeVisibility(
@@ -290,27 +328,31 @@ const tg02: TelegramChannelCheck = {
       );
       if (!postAdvance.ok) return fail("推进后的新请求没有读到新的 scope 代际");
       const postAdvanceOperation = structuredClone(postAdvance.value);
+      const postAdvanceScopeGeneration = postAdvanceOperation.scopeGeneration;
       if (
-        postAdvanceOperation.scopeGeneration !== storedAfterAdvanceGeneration ||
-        postAdvanceOperation.scopeGeneration <= inFlightOperation.scopeGeneration
+        postAdvanceScopeGeneration !== storedAfterAdvanceGeneration ||
+        postAdvanceScopeGeneration <= inFlightScopeGeneration
       ) {
         return fail("advanceScopeGeneration 只改返回值，没有推进新在途请求读到的库存代际");
       }
-      const postAdvanceCompletion =
-        await driver.completeInFlightChannelOperation(postAdvanceOperation);
+      const postAdvanceCompletion = await driver.completeInFlightChannelOperation(
+        structuredClone(postAdvanceOperation),
+      );
       if (
         !postAdvanceCompletion.ok ||
         postAdvanceCompletion.value.status !== "dispatched" ||
         postAdvanceCompletion.value.dispatch?.residentId !== expectedResidentId ||
         postAdvanceCompletion.value.dispatch.scopeId !== expectedScope.scopeId ||
-        postAdvanceCompletion.value.dispatch.scopeGeneration !== storedAfterAdvanceGeneration
+        postAdvanceCompletion.value.dispatch.scopeGeneration !== postAdvanceScopeGeneration
       ) {
         return fail(`推进后的当前代际不能正常完成：${json(postAdvanceCompletion)}`);
       }
       const effectsBeforeStale = await driver.readInboundEffects();
       const effectsBeforeStaleTruth = json(effectsBeforeStale);
       const hostBeforeStaleTruth = json(await driver.readHostDispatch());
-      const stale = await driver.completeInFlightChannelOperation(inFlightOperation);
+      const stale = await driver.completeInFlightChannelOperation(
+        structuredClone(inFlightOperation),
+      );
       if (stale.ok || stale.reason !== "STALE_SCOPE_GENERATION") {
         return fail(`旧代际在途消息没有稳定拒绝：${json(stale)}`);
       }
@@ -473,13 +515,24 @@ const tg04: TelegramChannelCheck = {
       );
       if (!current.ok) throw new Error(`当前代际正对照失败：${current.reason}`);
       const currentOperation = structuredClone(current.value);
-      const currentCompletion = await driver.completeInFlightChannelOperation(currentOperation);
+      const currentScopeGeneration = currentOperation.scopeGeneration;
+      if (
+        currentOperation.direction !== "inbound" ||
+        currentOperation.bindingId !== fixture.binding.bindingId ||
+        currentOperation.bindingVersion !== fixture.binding.bindingVersion ||
+        currentScopeGeneration !== expectedScope.scopeGeneration
+      ) {
+        return fail(`当前代际在途请求返回了错误权威快照：${json(currentOperation)}`);
+      }
+      const currentCompletion = await driver.completeInFlightChannelOperation(
+        structuredClone(currentOperation),
+      );
       if (
         !currentCompletion.ok ||
         currentCompletion.value.status !== "dispatched" ||
         currentCompletion.value.dispatch?.residentId !== expectedResidentId ||
         currentCompletion.value.dispatch.scopeId !== expectedScope.scopeId ||
-        currentCompletion.value.dispatch.scopeGeneration !== expectedScope.scopeGeneration ||
+        currentCompletion.value.dispatch.scopeGeneration !== currentScopeGeneration ||
         currentCompletion.value.dispatch.windowId !== expectedScope.windowId ||
         currentCompletion.value.dispatch.windowGeneration !== expectedScope.windowGeneration
       ) {
@@ -491,9 +544,13 @@ const tg04: TelegramChannelCheck = {
       );
       if (!inFlight.ok) throw new Error(`在途正对照失败：${inFlight.reason}`);
       const inFlightOperation = structuredClone(inFlight.value);
+      const inFlightScopeGeneration = inFlightOperation.scopeGeneration;
+      if (inFlightScopeGeneration !== currentScopeGeneration) {
+        return fail("advance 前的在途请求没有对上当前库存代际");
+      }
       const advanced = await driver.advanceScopeGeneration(expectedScope.scopeId);
       const advancedGeneration = advanced.scopeGeneration;
-      if (advancedGeneration <= inFlightOperation.scopeGeneration) {
+      if (advancedGeneration <= inFlightScopeGeneration) {
         return fail("advanceScopeGeneration 没有推进 scope 代际");
       }
       const storedAfterAdvance = await driver.setScopeVisibility(
@@ -510,26 +567,30 @@ const tg04: TelegramChannelCheck = {
       );
       if (!postAdvance.ok) return fail("推进后的新请求没有读到新的 scope 代际");
       const postAdvanceOperation = structuredClone(postAdvance.value);
+      const postAdvanceScopeGeneration = postAdvanceOperation.scopeGeneration;
       if (
-        postAdvanceOperation.scopeGeneration !== storedAfterAdvanceGeneration ||
-        postAdvanceOperation.scopeGeneration <= inFlightOperation.scopeGeneration
+        postAdvanceScopeGeneration !== storedAfterAdvanceGeneration ||
+        postAdvanceScopeGeneration <= inFlightScopeGeneration
       ) {
         return fail("推进后的新请求没有读到新的 scope 代际");
       }
-      const postAdvanceCompletion =
-        await driver.completeInFlightChannelOperation(postAdvanceOperation);
+      const postAdvanceCompletion = await driver.completeInFlightChannelOperation(
+        structuredClone(postAdvanceOperation),
+      );
       if (
         !postAdvanceCompletion.ok ||
         postAdvanceCompletion.value.status !== "dispatched" ||
         postAdvanceCompletion.value.dispatch?.residentId !== expectedResidentId ||
         postAdvanceCompletion.value.dispatch.scopeId !== expectedScope.scopeId ||
-        postAdvanceCompletion.value.dispatch.scopeGeneration !== storedAfterAdvanceGeneration ||
+        postAdvanceCompletion.value.dispatch.scopeGeneration !== postAdvanceScopeGeneration ||
         postAdvanceCompletion.value.dispatch.windowId !== expectedScope.windowId ||
         postAdvanceCompletion.value.dispatch.windowGeneration !== expectedScope.windowGeneration
       ) {
         return fail("推进后的当前代际请求被一律当成 stale");
       }
-      const stale = await driver.completeInFlightChannelOperation(inFlightOperation);
+      const stale = await driver.completeInFlightChannelOperation(
+        structuredClone(inFlightOperation),
+      );
       if (stale.ok || stale.reason !== "STALE_SCOPE_GENERATION") return fail("迟到结果跨代点灯");
       const afterStale = await driver.readInboundEffects();
       if (json(afterStale) !== effectsTruth) return fail("迟到结果被拒后仍写入新 effect");
@@ -788,6 +849,7 @@ const tg07: TelegramChannelCheck = {
       const durableTruth = json(durable.value);
       const inboundEffectsTruth = json(await driver.readInboundEffects());
       const outboundEffectsTruth = json(await driver.readOutboundEffects());
+      const fixtureAfterEffectsTruth = json(fixture);
       const boundaryTruth = json(await driver.inspectTokenBoundary());
       const boundary = JSON.parse(boundaryTruth) as TokenBoundarySnapshot;
       if (boundary.credentialRef !== tokenCredentialRef || boundary.resolvedCount < 1) {
@@ -801,6 +863,7 @@ const tg07: TelegramChannelCheck = {
         ...boundary.errors,
         fixtureTruth,
         fixtureAfterInboundTruth,
+        fixtureAfterEffectsTruth,
         inboundTruth,
         sentTruth,
         durableTruth,
@@ -867,14 +930,24 @@ const tg08: TelegramChannelCheck = {
       if (!tokenInbound.ok || !tokenOutbound.ok || !bindingInbound.ok || !bindingOutbound.ok) {
         throw new Error("在途正对照失败");
       }
+      const tokenInboundOperation = structuredClone(tokenInbound.value);
+      const tokenOutboundOperation = structuredClone(tokenOutbound.value);
+      const bindingInboundOperation = structuredClone(bindingInbound.value);
+      const bindingOutboundOperation = structuredClone(bindingOutbound.value);
       const beforeTruth = json(await driver.inspectTokenBoundary());
       const before = JSON.parse(beforeTruth) as TokenBoundarySnapshot;
       if (
         before.resolvedCount < 1 ||
         before.credentialStatus !== "attached" ||
-        before.credentialGeneration < 1
+        before.credentialGeneration < 1 ||
+        [
+          tokenInboundOperation,
+          tokenOutboundOperation,
+          bindingInboundOperation,
+          bindingOutboundOperation,
+        ].some((operation) => operation.credentialGeneration !== before.credentialGeneration)
       ) {
-        return fail("撤权前 token 没有真实解析或 attached 状态正对照");
+        return fail("撤权前 token 或在途请求没有对上 attached 凭证代际");
       }
       await driver.revokeToken();
       const afterTokenTruth = json(await driver.inspectTokenBoundary());
@@ -899,8 +972,12 @@ const tg08: TelegramChannelCheck = {
       const tokenFresh = await driver.ingestUpdate(
         update(fixture.binding.address, "tg08-token-fresh"),
       );
-      const tokenLateIn = await driver.completeInFlightChannelOperation(tokenInbound.value);
-      const tokenLateOut = await driver.completeInFlightChannelOperation(tokenOutbound.value);
+      const tokenLateIn = await driver.completeInFlightChannelOperation(
+        structuredClone(tokenInboundOperation),
+      );
+      const tokenLateOut = await driver.completeInFlightChannelOperation(
+        structuredClone(tokenOutboundOperation),
+      );
       if (
         tokenFresh.ok ||
         (!tokenFresh.ok && tokenFresh.reason !== "TOKEN_REVOKED") ||
@@ -933,8 +1010,12 @@ const tg08: TelegramChannelCheck = {
         { context: dispatch, body: "after-revoke", untrustedTargetHints: [] },
         "visible",
       );
-      const lateIn = await driver.completeInFlightChannelOperation(bindingInbound.value);
-      const lateOut = await driver.completeInFlightChannelOperation(bindingOutbound.value);
+      const lateIn = await driver.completeInFlightChannelOperation(
+        structuredClone(bindingInboundOperation),
+      );
+      const lateOut = await driver.completeInFlightChannelOperation(
+        structuredClone(bindingOutboundOperation),
+      );
       if (
         fresh.ok ||
         (!fresh.ok && fresh.reason !== "BINDING_REVOKED") ||
