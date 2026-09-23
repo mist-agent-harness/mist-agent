@@ -53,6 +53,9 @@ type Fault =
   | "tg04-first-healed-by-duplicate"
   | "tg04-newer-healed-by-older"
   | "tg04-effect-ids-healed-by-ledger-read"
+  | "current-operation-healed-by-complete"
+  | "inflight-operation-healed-by-advance"
+  | "scope-readback-healed-by-next-begin"
   | "live-effect-ledger-mutation"
   | "wrong-dispatch-identity"
   | "live-scope-mutation"
@@ -75,6 +78,8 @@ type Fault =
   | "tg07-durable-leak-healed-by-effect-read"
   | "tg07-inbound-effects-leak-healed-by-boundary"
   | "tg07-outbound-effects-leak-healed-by-boundary"
+  | "token-ref-healed-by-boundary"
+  | "fixture-leak-healed-by-boundary"
   | "token-resolves-after-revoke"
   | "hidden-token-resolve-log"
   | "token-leaks-early-snapshot"
@@ -85,6 +90,7 @@ type Fault =
   | "middle-token-count-drift"
   | "unstable-revoke-reason"
   | "tg08-inbound-baseline-healed-by-outbound-read"
+  | "credential-generation-healed-by-complete"
   | "send-fails-observability-fresh"
   | "observability-mutates-live-binding"
   | "observability-drifts-when-unavailable"
@@ -182,6 +188,12 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   private bindingView: ChannelBinding | null = null;
   private bindingTruth: ChannelBinding | null = null;
   private activationView: ContinuityActivation | null = null;
+  private beginCount = 0;
+  private currentOperationView: InFlightChannelOperation | null = null;
+  private inFlightOperationView: InFlightChannelOperation | null = null;
+  private scopeReadbackView: ScopeFixture | null = null;
+  private tokenReferenceView: TokenReference | null = null;
+  private readonly credentialOperationViews = new Set<InFlightChannelOperation>();
 
   constructor(private readonly fault: Fault | null) {}
 
@@ -220,7 +232,8 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       this.fault === "gd04-scope-create-swaps-residents" ||
       this.fault === "gd04-last-scope-swaps-residents" ||
       this.fault === "gd04-later-resident-mutates-first" ||
-      this.fault === "gd01-scope-mutates-models"
+      this.fault === "gd01-scope-mutates-models" ||
+      this.fault === "fixture-leak-healed-by-boundary"
       ? resident
       : cloneResident(resident);
   }
@@ -287,7 +300,8 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       this.fault === "bind-renames-ready-oracles" ||
       this.fault === "group-create-mutates-member-oracles" ||
       this.fault === "gd01-second-scope-mutates-first" ||
-      this.fault === "gd04-later-scope-mutates-first"
+      this.fault === "gd04-later-scope-mutates-first" ||
+      this.fault === "fixture-leak-healed-by-boundary"
       ? scope
       : cloneScope(scope);
   }
@@ -295,10 +309,21 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   async setScopeVisibility(scopeId: string, visible: boolean): Promise<ScopeFixture> {
     const scope = this.scope(scopeId);
     scope.visible = visible;
-    return cloneScope(scope);
+    const returned = cloneScope(scope);
+    if (this.fault === "scope-readback-healed-by-next-begin") {
+      this.scopeReadbackView = returned;
+      return returned;
+    }
+    return returned;
   }
 
   async advanceScopeGeneration(scopeId: string): Promise<ScopeFixture> {
+    if (
+      this.fault === "inflight-operation-healed-by-advance" &&
+      this.inFlightOperationView !== null
+    ) {
+      this.inFlightOperationView.scopeGeneration = this.scope(scopeId).scopeGeneration;
+    }
     const scope = this.scope(scopeId);
     if (this.fault === "scope-generation-return-only") {
       return { ...cloneScope(scope), scopeGeneration: scope.scopeGeneration + 1 };
@@ -465,6 +490,17 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     }
     this.seenExternalIds.add(update.messageId);
     this.seenExternalIds.add(update.senderId);
+    if (
+      this.fault === "fixture-leak-healed-by-boundary" &&
+      update.updateId.includes("tg07-context")
+    ) {
+      const bindingId = this.addressBindings.get(key(update.address));
+      if (bindingId !== undefined) {
+        const binding = this.binding(bindingId);
+        this.resident(binding.residentId).model = this.tokenSecret;
+        this.scope(binding.scopeId).windowId = this.tokenSecret;
+      }
+    }
     if (
       this.fault === "tg04-newer-healed-by-older" &&
       update.updateId.includes("tg04-100") &&
@@ -939,7 +975,9 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   async createTokenReference(secretCanary: string): Promise<TokenReference> {
     this.tokenSecret = secretCanary;
     this.tokenRef = "credential:opaque-telegram";
-    return { credentialRef: this.tokenRef };
+    const reference = { credentialRef: this.tokenRef };
+    if (this.fault === "token-ref-healed-by-boundary") this.tokenReferenceView = reference;
+    return reference;
   }
 
   async attachToken(credentialRef: string): Promise<void> {
@@ -948,6 +986,15 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   }
 
   async inspectTokenBoundary(): Promise<TokenBoundarySnapshot> {
+    if (this.fault === "token-ref-healed-by-boundary" && this.tokenReferenceView !== null) {
+      this.tokenReferenceView.credentialRef = "credential:foreign-not-attached";
+    }
+    if (this.fault === "fixture-leak-healed-by-boundary") {
+      const resident = this.residents.get("resident:tg07");
+      if (resident !== undefined) resident.model = "model:tg07";
+      const scope = this.scopes.get("scope:tg07");
+      if (scope !== undefined) scope.windowId = "window:tg07";
+    }
     if (this.fault === "tg07-inbound-effects-leak-healed-by-boundary") {
       const secret = this.inboundEffects.indexOf(this.tokenSecret);
       if (secret !== -1) this.inboundEffects.splice(secret, 1);
@@ -958,7 +1005,10 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     }
     this.boundaryInspectCount += 1;
     const snapshot: TokenBoundarySnapshot = {
-      credentialRef: this.tokenRef,
+      credentialRef:
+        this.fault === "token-ref-healed-by-boundary"
+          ? "credential:foreign-not-attached"
+          : this.tokenRef,
       credentialStatus:
         this.fault === "final-token-boundary-rewinds" && this.boundaryInspectCount === 4
           ? "attached"
@@ -1013,19 +1063,38 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     bindingId: string,
   ): Promise<Result<InFlightChannelOperation>> {
     const binding = this.binding(bindingId);
+    this.beginCount += 1;
+    const scope = this.scope(binding.scopeId);
+    if (this.fault === "scope-readback-healed-by-next-begin" && this.beginCount === 3) {
+      scope.scopeGeneration = 99;
+      if (this.scopeReadbackView !== null) this.scopeReadbackView.scopeGeneration = 99;
+    }
+    const operation: InFlightChannelOperation = {
+      operationId: `operation:${direction}`,
+      direction,
+      bindingId,
+      bindingVersion: binding.bindingVersion,
+      scopeGeneration:
+        this.fault === "coupled-generation-return-only" && this.returnedScopeGeneration !== null
+          ? this.returnedScopeGeneration
+          : scope.scopeGeneration,
+      credentialGeneration: this.credentialGeneration,
+    };
+    if (this.fault === "current-operation-healed-by-complete" && this.beginCount === 1) {
+      operation.scopeGeneration = 99;
+      this.currentOperationView = operation;
+    }
+    if (this.fault === "inflight-operation-healed-by-advance" && this.beginCount === 2) {
+      operation.scopeGeneration = 99;
+      this.inFlightOperationView = operation;
+    }
+    if (this.fault === "credential-generation-healed-by-complete") {
+      operation.credentialGeneration += 1;
+      this.credentialOperationViews.add(operation);
+    }
     return {
       ok: true,
-      value: {
-        operationId: `operation:${direction}`,
-        direction,
-        bindingId,
-        bindingVersion: binding.bindingVersion,
-        scopeGeneration:
-          this.fault === "coupled-generation-return-only" && this.returnedScopeGeneration !== null
-            ? this.returnedScopeGeneration
-            : this.scope(binding.scopeId).scopeGeneration,
-        credentialGeneration: this.credentialGeneration,
-      },
+      value: operation,
     };
   }
 
@@ -1033,6 +1102,18 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     operation: InFlightChannelOperation,
   ): Promise<Result<InboundReceipt | OutboundReceipt>> {
     const binding = this.binding(operation.bindingId);
+    if (
+      this.fault === "current-operation-healed-by-complete" &&
+      operation === this.currentOperationView
+    ) {
+      operation.scopeGeneration = this.scope(binding.scopeId).scopeGeneration;
+    }
+    if (
+      this.fault === "credential-generation-healed-by-complete" &&
+      this.credentialOperationViews.has(operation)
+    ) {
+      operation.credentialGeneration -= 1;
+    }
     if (this.fault === "current-completion-rejected") {
       return { ok: false, reason: "STALE_SCOPE_GENERATION" };
     }
@@ -1513,6 +1594,9 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "TG-02", fault: "ready-binding-healed-by-later-call" },
   { checkId: "TG-02", fault: "live-host-dispatch-snapshot" },
   { checkId: "TG-02", fault: "live-effect-ledger-mutation" },
+  { checkId: "TG-02", fault: "current-operation-healed-by-complete" },
+  { checkId: "TG-02", fault: "inflight-operation-healed-by-advance" },
+  { checkId: "TG-02", fault: "scope-readback-healed-by-next-begin" },
   { checkId: "TG-03", fault: "wrong-dispatch-identity" },
   { checkId: "TG-03", fault: "live-scope-mutation" },
   { checkId: "TG-03", fault: "bind-mutates-tg03-oracles" },
@@ -1532,6 +1616,9 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "TG-04", fault: "tg04-first-healed-by-duplicate" },
   { checkId: "TG-04", fault: "tg04-newer-healed-by-older" },
   { checkId: "TG-04", fault: "tg04-effect-ids-healed-by-ledger-read" },
+  { checkId: "TG-04", fault: "current-operation-healed-by-complete" },
+  { checkId: "TG-04", fault: "inflight-operation-healed-by-advance" },
+  { checkId: "TG-04", fault: "scope-readback-healed-by-next-begin" },
   { checkId: "TG-05", fault: "submitted-looks-visible" },
   { checkId: "TG-05", fault: "unknown-has-message-id" },
   { checkId: "TG-05", fault: "durable-status-promoted" },
@@ -1551,6 +1638,8 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "TG-07", fault: "tg07-durable-leak-healed-by-effect-read" },
   { checkId: "TG-07", fault: "tg07-inbound-effects-leak-healed-by-boundary" },
   { checkId: "TG-07", fault: "tg07-outbound-effects-leak-healed-by-boundary" },
+  { checkId: "TG-07", fault: "token-ref-healed-by-boundary" },
+  { checkId: "TG-07", fault: "fixture-leak-healed-by-boundary" },
   { checkId: "TG-08", fault: "token-resolves-after-revoke" },
   { checkId: "TG-08", fault: "hidden-token-resolve-log" },
   { checkId: "TG-08", fault: "token-leaks-early-snapshot" },
@@ -1564,6 +1653,7 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "TG-08", fault: "final-token-boundary-rewinds" },
   { checkId: "TG-08", fault: "live-effect-ledger-mutation" },
   { checkId: "TG-08", fault: "tg08-inbound-baseline-healed-by-outbound-read" },
+  { checkId: "TG-08", fault: "credential-generation-healed-by-complete" },
   { checkId: "TG-09", fault: "send-fails-observability-fresh" },
   { checkId: "TG-09", fault: "unavailable-send-still-visible" },
   { checkId: "TG-09", fault: "unavailable-durable-visible" },
