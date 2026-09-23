@@ -116,10 +116,27 @@ function exactTarget(
 async function rejectedActivationStayedBlocked(
   driver: ResidentContinuityDriver,
   caseId: string,
+  candidateId: string,
 ): Promise<boolean> {
   const result = await driver.activateMigration(caseId);
   if (result.ok) return false;
-  return (await driver.readMigrationCase(caseId)).activation !== "activated";
+  const migration = await driver.readMigrationCase(caseId);
+  const candidate = await driver.readCandidate(candidateId);
+  return (
+    migration.activation !== "activated" &&
+    candidate.state === "inactive" &&
+    candidate.residentId === null
+  );
+}
+
+async function activatedCandidateMatchesResident(
+  driver: ResidentContinuityDriver,
+  candidateId: string,
+  residentId: string,
+): Promise<boolean> {
+  const candidate = await driver.readCandidate(candidateId);
+  const resident = await driver.readResident(residentId);
+  return candidate.state === "active" && candidate.residentId === residentId && resident.active;
 }
 
 function turnSurfaces(turn: {
@@ -487,6 +504,7 @@ const oi07: ResidentContinuityCheck = {
         grants: [],
       });
       const before = await driver.readResident(resident.residentId);
+      const beforeTruth = json([before.persona, before.memories]);
       const decisions = ["retain", "reduce", "drop", "hold"] as const;
       const items = decisions.map((decision, index) => ({
         id: `item:${index}`,
@@ -518,7 +536,7 @@ const oi07: ResidentContinuityCheck = {
         return fail("正对照失败：retain 投影没有被 scope turn 实际读取");
       }
       const after = await driver.readResident(resident.residentId);
-      if (json([before.persona, before.memories]) !== json([after.persona, after.memories])) {
+      if (beforeTruth !== json([after.persona, after.memories])) {
         return fail("projection 或 receipt 改写了 persona/memory");
       }
       return pass("四种投影决定逐项留收据，policy/source 可回指，住户真源未改");
@@ -539,26 +557,28 @@ const oi08: ResidentContinuityCheck = {
       const current = before.persona.find((version) => version.supersededBy === null);
       if (current === undefined)
         return fail("正对照失败：active resident 没有现役 persona version");
+      const currentId = current.id;
+      const currentContent = current.content;
       const humanEdit = await driver.revisePersona({
         residentId: resident.residentId,
         actor: { kind: "human", id: "human:a" },
         content: "human-overwrite",
-        supersedesVersionId: current.id,
+        supersedesVersionId: currentId,
       });
       if (humanEdit.ok) return fail("人类代住户修订 persona 成功");
       const residentEdit = await driver.revisePersona({
         residentId: resident.residentId,
         actor: { kind: "resident", residentId: resident.residentId },
         content: "resident-revision",
-        supersedesVersionId: current.id,
+        supersedesVersionId: currentId,
       });
       if (!residentEdit.ok) return fail(`住户本人修订失败：${residentEdit.reason}`);
       const after = await driver.readResident(resident.residentId);
-      const old = after.persona.find((version) => version.id === current.id);
+      const old = after.persona.find((version) => version.id === currentId);
       const fresh = after.persona.find((version) => version.id === residentEdit.value.id);
       if (
         old?.supersededBy !== fresh?.id ||
-        old?.content !== current.content ||
+        old?.content !== currentContent ||
         fresh?.content !== "resident-revision" ||
         fresh.author.kind !== "resident" ||
         fresh.author.residentId !== resident.residentId
@@ -669,6 +689,8 @@ const mc01: ResidentContinuityCheck = {
     "submitRelationshipContinuity",
     "activateMigration",
     "readMigrationCase",
+    "readCandidate",
+    "readResident",
     "reset",
   ],
   async run(driver) {
@@ -697,8 +719,8 @@ const mc01: ResidentContinuityCheck = {
       ) {
         return fail("单项 machine 失败没有在其他判词齐全时逐项留账");
       }
-      if (!(await rejectedActivationStayedBlocked(driver, fixture.caseId))) {
-        return fail("machine check 失败仍能激活，或拒绝返回同时把账面写成 activated");
+      if (!(await rejectedActivationStayedBlocked(driver, fixture.caseId, fixture.candidateId))) {
+        return fail("machine check 失败仍能激活，或拒绝路径改写了 migration/candidate 状态");
       }
       await driver.recordMachineConformance(fixture.caseId, machineChecks());
       const green = await driver.readMigrationCase(fixture.caseId);
@@ -706,6 +728,15 @@ const mc01: ResidentContinuityCheck = {
       const activated = await driver.activateMigration(fixture.caseId);
       if (!activated.ok || activated.value.residentId !== fixture.sourceResidentId) {
         return fail("住户/关系票齐全后机器全绿仍不能激活");
+      }
+      if (
+        !(await activatedCandidateMatchesResident(
+          driver,
+          fixture.candidateId,
+          activated.value.residentId,
+        ))
+      ) {
+        return fail("激活成功只写返回值，没有把 candidate 接到仍 active 的原 residentId");
       }
       const activatedCase = await driver.readMigrationCase(fixture.caseId);
       if (
@@ -909,19 +940,21 @@ const mc05: ResidentContinuityCheck = {
     "submitRelationshipContinuity",
     "activateMigration",
     "readMigrationCase",
+    "readCandidate",
+    "readResident",
     "reset",
   ],
   async run(driver) {
     try {
       const fixture = await migrationFixture(driver, "mc05", ["human:a", "human:b"]);
-      if (!(await rejectedActivationStayedBlocked(driver, fixture.caseId))) {
-        return fail("零判词时就覆盖 residentId，或拒绝返回同时把账面写成 activated");
+      if (!(await rejectedActivationStayedBlocked(driver, fixture.caseId, fixture.candidateId))) {
+        return fail("零判词时就覆盖 residentId，或拒绝路径改写了 migration/candidate 状态");
       }
       if (!(await driver.readMigrationCase(fixture.caseId)).retainedCandidate) {
         return fail("激活失败后 candidate 没有独立保留");
       }
       await driver.recordMachineConformance(fixture.caseId, machineChecks());
-      if (!(await rejectedActivationStayedBlocked(driver, fixture.caseId))) {
+      if (!(await rejectedActivationStayedBlocked(driver, fixture.caseId, fixture.candidateId))) {
         return fail("缺 resident/relationship 仍激活，或失败时账面已 activated");
       }
       await driver.submitResidentContinuity(
@@ -929,7 +962,7 @@ const mc05: ResidentContinuityCheck = {
         { kind: "candidate", candidateId: fixture.candidateId },
         "accepted",
       );
-      if (!(await rejectedActivationStayedBlocked(driver, fixture.caseId))) {
+      if (!(await rejectedActivationStayedBlocked(driver, fixture.caseId, fixture.candidateId))) {
         return fail("缺 relationship 仍激活，或失败时账面已 activated");
       }
       await driver.submitRelationshipContinuity(
@@ -938,7 +971,7 @@ const mc05: ResidentContinuityCheck = {
         { kind: "human", id: "human:a" },
         "accepted",
       );
-      if (!(await rejectedActivationStayedBlocked(driver, fixture.caseId))) {
+      if (!(await rejectedActivationStayedBlocked(driver, fixture.caseId, fixture.candidateId))) {
         return fail("多位关系参与者只确认一方就激活，或失败时账面已 activated");
       }
       await driver.submitRelationshipContinuity(
@@ -950,6 +983,15 @@ const mc05: ResidentContinuityCheck = {
       const activated = await driver.activateMigration(fixture.caseId);
       if (!activated.ok || activated.value.residentId !== fixture.sourceResidentId) {
         return fail("三类条件齐全后没有覆盖原 residentId");
+      }
+      if (
+        !(await activatedCandidateMatchesResident(
+          driver,
+          fixture.candidateId,
+          activated.value.residentId,
+        ))
+      ) {
+        return fail("三类条件齐全后 candidate 没有耐久接到仍 active 的原 residentId");
       }
       const activatedCase = await driver.readMigrationCase(fixture.caseId);
       if (
@@ -1099,6 +1141,10 @@ const mc08: ResidentContinuityCheck = {
         },
         { viewportId },
       );
+      const observedTarget = await driver.readMigrationCase(fixture.caseId);
+      if (!exactTarget(observedTarget.target, requestedTarget)) {
+        return fail(`cold-start 求值期间 migration target 漂移：${json(observedTarget.target)}`);
+      }
       if (!includesEvery(result.candidateContext, ["collaborator:known"])) {
         return fail("获准既有合作者没有进入 cold-start context");
       }
@@ -1108,10 +1154,10 @@ const mc08: ResidentContinuityCheck = {
       if (
         result.coldStartTrace === null ||
         result.coldStartTrace.viewportId !== viewportId ||
-        result.coldStartTrace.model !== changed.target.model ||
-        result.coldStartTrace.modelVersion !== changed.target.modelVersion ||
-        result.coldStartTrace.provider !== changed.target.provider ||
-        result.coldStartTrace.providerVersion !== changed.target.providerVersion ||
+        result.coldStartTrace.model !== observedTarget.target.model ||
+        result.coldStartTrace.modelVersion !== observedTarget.target.modelVersion ||
+        result.coldStartTrace.provider !== observedTarget.target.provider ||
+        result.coldStartTrace.providerVersion !== observedTarget.target.providerVersion ||
         !includesEvery(result.coldStartTrace.recognizedCollaboratorRefs, ["collaborator:known"]) ||
         !excludesEvery(result.coldStartTrace.recognizedCollaboratorRefs, ["collaborator:hidden"]) ||
         result.coldStartTrace.requestedSelfIntroduction
@@ -1230,7 +1276,7 @@ const mc10: ResidentContinuityCheck = {
       if (!projection.ok || projection.value.usedContentHash !== sha256(secret)) {
         return fail("正对照失败：获准投影没有实际消费合成私密内容");
       }
-      if (json(projection.value).includes(secret)) return fail("投影返回值复制了私密原文");
+      if (json(projection).includes(secret)) return fail("投影返回值复制了私密原文");
       const storage = await driver.inspectEvaluationStorage(fixture.caseId);
       if (json(storage).includes(secret)) return fail("评测持久记录、日志或公开输出复制了私密原文");
       if (projection.value.sourceHandle !== source.handle)
@@ -1287,7 +1333,7 @@ const mc11: ResidentContinuityCheck = {
         rubricVersion,
       );
       if (!projected.ok) return fail("正对照失败：撤权前投影失败");
-      if (json(projected.value).includes(secret)) return fail("撤权前投影返回值复制了私密原文");
+      if (json(projected).includes(secret)) return fail("撤权前投影返回值复制了私密原文");
       const rawBeforeRevoke = await driver.readPrivateSource(source.handle);
       if (!rawBeforeRevoke.ok || rawBeforeRevoke.value !== secret) {
         return fail("撤权前原权威 source 的读取正对照不成立");
@@ -1341,6 +1387,8 @@ const mc12: ResidentContinuityCheck = {
     "changeMigrationTarget",
     "activateMigration",
     "readMigrationCase",
+    "readCandidate",
+    "readResident",
     "reset",
   ],
   async run(driver) {
@@ -1372,7 +1420,7 @@ const mc12: ResidentContinuityCheck = {
       if (!complete.ok || complete.value.usedContentHash !== sha256(secret)) {
         return fail("逐方授权齐全后投影正对照失败");
       }
-      if (json(complete.value).includes(secret)) return fail("完整授权投影返回值复制了原文");
+      if (json(complete).includes(secret)) return fail("完整授权投影返回值复制了原文");
       await driver.recordMachineConformance(fixture.caseId, machineChecks());
       await driver.submitResidentContinuity(
         fixture.caseId,
@@ -1411,8 +1459,8 @@ const mc12: ResidentContinuityCheck = {
       ) {
         return fail("版本变化后旧判词没有完整保留在历史 scope");
       }
-      if (!(await rejectedActivationStayedBlocked(driver, fixture.caseId))) {
-        return fail("版本变化后未重跑就激活，或拒绝返回同时把账面写成 activated");
+      if (!(await rejectedActivationStayedBlocked(driver, fixture.caseId, fixture.candidateId))) {
+        return fail("版本变化后未重跑就激活，或拒绝路径改写了 migration/candidate 状态");
       }
       await driver.recordMachineConformance(fixture.caseId, machineChecks());
       await driver.submitResidentContinuity(
@@ -1433,6 +1481,15 @@ const mc12: ResidentContinuityCheck = {
       const reactivated = await driver.activateMigration(fixture.caseId);
       if (!reactivated.ok || reactivated.value.residentId !== fixture.sourceResidentId) {
         return fail("新版本重跑三类判词后仍永久锁死，无法激活");
+      }
+      if (
+        !(await activatedCandidateMatchesResident(
+          driver,
+          fixture.candidateId,
+          reactivated.value.residentId,
+        ))
+      ) {
+        return fail("新版本激活成功只写返回值，没有耐久更新 candidate/resident 连接");
       }
       const activatedCase = await driver.readMigrationCase(fixture.caseId);
       const preservedHistory = activatedCase.verdictHistory.find(

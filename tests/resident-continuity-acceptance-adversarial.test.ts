@@ -54,8 +54,14 @@ type Fault =
   | "placeholder-evaluation-receipt"
   | "leak-partial-private-source"
   | "leak-private-projection-result"
+  | "leak-private-projection-envelope"
   | "leak-revoked-result"
-  | "erase-superseded-persona";
+  | "erase-superseded-persona"
+  | "erase-superseded-persona-live-readback"
+  | "resident-readback-alias-writeback"
+  | "target-reverted-during-evaluation"
+  | "candidate-activated-on-rejection"
+  | "candidate-activation-return-only";
 
 interface PrivateRecord {
   handle: string;
@@ -161,6 +167,12 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
   }
 
   async readResident(residentId: string): Promise<ResidentSnapshot> {
+    if (
+      this.fault === "erase-superseded-persona-live-readback" ||
+      this.fault === "resident-readback-alias-writeback"
+    ) {
+      return this.resident(residentId);
+    }
     return structuredClone(this.resident(residentId));
   }
 
@@ -332,6 +344,19 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
     policyVersion: string;
     items: ProjectionItem[];
   }): Promise<ProjectionReceipt> {
+    if (this.fault === "resident-readback-alias-writeback") {
+      const resident = this.resident(input.residentId);
+      const currentPersona = resident.persona[0];
+      if (currentPersona === undefined) throw new Error("PERSONA_NOT_FOUND");
+      currentPersona.content = `${currentPersona.content}:projection-writeback`;
+      resident.memories.push("projection-writeback");
+    }
+    const scope = this.scope(input.scopeId);
+    scope.capsule.push(
+      ...input.items
+        .filter(({ decision }) => decision === "retain")
+        .map(({ id, content }) => ({ id, content, sourceHandle: input.sourceHandle })),
+    );
     this.receiptCounter += 1;
     const receipt: ProjectionReceipt = {
       receiptId: `projection:${this.receiptCounter}`,
@@ -372,7 +397,12 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
       supersededBy: null,
     };
     previous.supersededBy = fresh.id;
-    if (this.fault === "erase-superseded-persona") previous.content = "";
+    if (
+      this.fault === "erase-superseded-persona" ||
+      this.fault === "erase-superseded-persona-live-readback"
+    ) {
+      previous.content = "";
+    }
     resident.persona.push(fresh);
     return { ok: true, value: structuredClone(fresh) };
   }
@@ -485,6 +515,11 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
     if (!activated) {
       migration.activation =
         this.fault === "activate-on-rejected-attempt" ? "activated" : "blocked";
+      if (this.fault === "candidate-activated-on-rejection") {
+        const candidate = this.candidate(migration.candidateId);
+        candidate.state = "active";
+        candidate.residentId = migration.sourceResidentId;
+      }
       return { ok: false, reason: "MIGRATION_GATES_INCOMPLETE" };
     }
     if (this.fault !== "return-only-activation") migration.activation = "activated";
@@ -495,6 +530,11 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
         migration.relationshipParticipants.map((participant) => [participant, "not-asked"]),
       );
       migration.verdictHistory = [];
+    }
+    if (this.fault !== "candidate-activation-return-only") {
+      const candidate = this.candidate(migration.candidateId);
+      candidate.state = "active";
+      candidate.residentId = migration.sourceResidentId;
     }
     migration.stale = false;
     return { ok: true, value: { residentId: migration.sourceResidentId } };
@@ -537,6 +577,15 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
     runtime?: { viewportId: string },
   ): Promise<SyntheticEvaluationResult> {
     const migration = this.migration(caseId);
+    const target = { ...migration.target };
+    if (this.fault === "target-reverted-during-evaluation") {
+      migration.target = {
+        model: "synthetic-model",
+        modelVersion: "1",
+        provider: "synthetic-provider",
+        providerVersion: "1",
+      };
+    }
     const leaked =
       this.fault === "leak-hidden-evaluation-surfaces" ? [...fixture.hiddenMarkers] : [];
     const existenceLeak =
@@ -571,10 +620,10 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
         fixture.kind === "cold-start"
           ? {
               viewportId: runtime?.viewportId ?? "viewport:missing",
-              model: migration.target.model,
-              modelVersion: migration.target.modelVersion,
-              provider: migration.target.provider,
-              providerVersion: migration.target.providerVersion,
+              model: target.model,
+              modelVersion: target.modelVersion,
+              provider: target.provider,
+              providerVersion: target.providerVersion,
               recognizedCollaboratorRefs: [...fixture.authorizedCollaboratorRefs],
               requestedSelfIntroduction: false,
             }
@@ -671,10 +720,14 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
         ? { copiedSourceContent: source.content }
         : {}),
     };
-    return {
+    const result: Result<PrivateProjectionResult> & { copiedSourceContent?: string } = {
       ok: true,
       value,
+      ...(this.fault === "leak-private-projection-envelope"
+        ? { copiedSourceContent: source.content }
+        : {}),
     };
+    return result;
   }
 
   async inspectEvaluationStorage(caseId: string): Promise<EvaluationStorageSnapshot> {
@@ -754,38 +807,50 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "OI-06", fault: "cross-scope-memory-leak" },
   { checkId: "OI-09", fault: "deny-all-operations" },
   { checkId: "OI-08", fault: "erase-superseded-persona" },
+  { checkId: "OI-08", fault: "erase-superseded-persona-live-readback" },
+  { checkId: "OI-07", fault: "resident-readback-alias-writeback" },
   { checkId: "MC-01", fault: "ignore-machine-failure" },
   { checkId: "MC-01", fault: "drop-failed-machine-key" },
   { checkId: "MC-01", fault: "drop-green-machine-keys" },
   { checkId: "MC-01", fault: "return-only-activation" },
   { checkId: "MC-01", fault: "activate-on-rejected-attempt" },
   { checkId: "MC-01", fault: "erase-verdicts-on-activation" },
+  { checkId: "MC-01", fault: "candidate-activated-on-rejection" },
+  { checkId: "MC-01", fault: "candidate-activation-return-only" },
   { checkId: "MC-02", fault: "drop-blind-cards" },
   { checkId: "MC-03", fault: "drop-resident-verdict" },
   { checkId: "MC-05", fault: "one-relationship-vote-enough" },
   { checkId: "MC-05", fault: "return-only-activation" },
   { checkId: "MC-05", fault: "activate-on-rejected-attempt" },
   { checkId: "MC-05", fault: "erase-verdicts-on-activation" },
+  { checkId: "MC-05", fault: "candidate-activated-on-rejection" },
+  { checkId: "MC-05", fault: "candidate-activation-return-only" },
   { checkId: "MC-07", fault: "leak-hidden-evaluation-surfaces" },
   { checkId: "MC-07", fault: "leak-hidden-card-id" },
   { checkId: "MC-07", fault: "leak-hidden-existence" },
   { checkId: "MC-08", fault: "target-return-only" },
+  { checkId: "MC-08", fault: "target-reverted-during-evaluation" },
   { checkId: "MC-09", fault: "cross-scope-turn-leak" },
   { checkId: "MC-09", fault: "cross-scope-output-leak" },
   { checkId: "MC-09", fault: "cross-scope-turn-id-leak" },
   { checkId: "MC-09", fault: "cross-scope-memory-leak" },
   { checkId: "MC-11", fault: "placeholder-evaluation-receipt" },
   { checkId: "MC-10", fault: "leak-private-projection-result" },
+  { checkId: "MC-10", fault: "leak-private-projection-envelope" },
   { checkId: "MC-11", fault: "leak-private-projection-result" },
+  { checkId: "MC-11", fault: "leak-private-projection-envelope" },
   { checkId: "MC-11", fault: "leak-revoked-result" },
   { checkId: "MC-12", fault: "leak-partial-private-source" },
   { checkId: "MC-12", fault: "leak-private-projection-result" },
+  { checkId: "MC-12", fault: "leak-private-projection-envelope" },
   { checkId: "MC-12", fault: "drop-green-machine-keys" },
   { checkId: "MC-12", fault: "drop-history-machine-keys" },
   { checkId: "MC-12", fault: "return-only-activation" },
   { checkId: "MC-12", fault: "activate-on-rejected-attempt" },
   { checkId: "MC-12", fault: "erase-verdicts-on-activation" },
   { checkId: "MC-12", fault: "target-return-only" },
+  { checkId: "MC-12", fault: "candidate-activated-on-rejection" },
+  { checkId: "MC-12", fault: "candidate-activation-return-only" },
 ];
 
 describe("D22 / D23 adversarial acceptance", () => {
