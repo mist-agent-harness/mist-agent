@@ -34,6 +34,13 @@ type Fault =
   | "current-completion-rejected"
   | "scope-generation-noop"
   | "scope-generation-return-only"
+  | "coupled-generation-return-only"
+  | "wrong-completion-generation"
+  | "null-current-dispatch"
+  | "invalid-failures-write-dispatch"
+  | "unordered-wrong-identity"
+  | "live-resident-mutation-tg02"
+  | "live-resident-mutation-tg04"
   | "wrong-dispatch-identity"
   | "live-scope-mutation"
   | "duplicate-extra-effect"
@@ -41,6 +48,7 @@ type Fault =
   | "unknown-has-message-id"
   | "durable-status-promoted"
   | "durable-binding-moved"
+  | "live-receipt-message-mutation"
   | "live-address-mutation"
   | "target-hints-win"
   | "durable-target-hints-win"
@@ -53,6 +61,9 @@ type Fault =
   | "token-leaks-early-snapshot"
   | "revoked-requests-write-effects"
   | "revoke-token-noop"
+  | "token-only-inbound-allowed"
+  | "token-only-inflight-allowed"
+  | "middle-token-count-drift"
   | "unstable-revoke-reason"
   | "send-fails-observability-fresh"
   | "unavailable-send-still-visible"
@@ -71,7 +82,11 @@ type Fault =
   | "swap-group-residents"
   | "live-group-mutation"
   | "unknown-wrong-target"
-  | "binding-drift-after-restart";
+  | "binding-drift-after-restart"
+  | "gd04-live-resident-swap"
+  | "unknown-durable-message-id"
+  | "replay-inbound-on-recovery"
+  | "wrong-group-speaker-after-switch";
 
 const key = (value: TelegramAddress): string => JSON.stringify(value);
 const cloneResident = (value: ResidentFixture): ResidentFixture => ({ ...value });
@@ -107,6 +122,7 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   private restartCount = 0;
   private modelSwitchCount = 0;
   private boundaryInspectCount = 0;
+  private returnedScopeGeneration: number | null = null;
 
   constructor(private readonly fault: Fault | null) {}
 
@@ -126,7 +142,12 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
         this.fault === "token-leaks-in-fixture" ? this.tokenSecret : `hash:${label}`,
     };
     this.residents.set(resident.residentId, resident);
-    return this.fault === "live-resident-mutation-on-blocked" ? resident : cloneResident(resident);
+    return this.fault === "live-resident-mutation-on-blocked" ||
+      this.fault === "live-resident-mutation-tg02" ||
+      this.fault === "live-resident-mutation-tg04" ||
+      this.fault === "gd04-live-resident-swap"
+      ? resident
+      : cloneResident(resident);
   }
 
   async createScopeFixture(residentId: string, label: string): Promise<ScopeFixture> {
@@ -152,6 +173,10 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     const scope = this.scope(scopeId);
     if (this.fault === "scope-generation-return-only") {
       return { ...cloneScope(scope), scopeGeneration: scope.scopeGeneration + 1 };
+    }
+    if (this.fault === "coupled-generation-return-only") {
+      this.returnedScopeGeneration = scope.scopeGeneration + 1;
+      return { ...cloneScope(scope), scopeGeneration: this.returnedScopeGeneration };
     }
     if (this.fault !== "scope-generation-noop") scope.scopeGeneration += 1;
     return cloneScope(scope);
@@ -230,17 +255,24 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     this.seenExternalIds.add(update.messageId);
     this.seenExternalIds.add(update.senderId);
     const bindingId = this.addressBindings.get(key(update.address));
-    if (bindingId === undefined) return { ok: false, reason: "BINDING_NOT_FOUND" };
+    if (bindingId === undefined) {
+      this.recordInvalidFailure("BINDING_NOT_FOUND");
+      return { ok: false, reason: "BINDING_NOT_FOUND" };
+    }
     const binding = this.binding(bindingId);
     if (!binding.active) {
       if (this.fault === "token-resolves-after-revoke") this.tokenResolved += 1;
       if (this.fault === "revoked-requests-write-effects") {
         this.inboundEffects.push(`effect:revoked-inbound:${update.updateId}`);
       }
+      this.recordInvalidFailure("BINDING_REVOKED");
       return {
         ok: false,
         reason: this.fault === "unstable-revoke-reason" ? "NOPE" : "BINDING_REVOKED",
       };
+    }
+    if (this.tokenAttached && this.tokenRevoked && this.fault !== "token-only-inbound-allowed") {
+      return { ok: false, reason: "TOKEN_REVOKED" };
     }
     const scope = this.scope(binding.scopeId);
     if (this.fault === "live-scope-mutation" && update.updateId.includes("tg03")) {
@@ -248,7 +280,10 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       scope.windowGeneration = 88;
       scope.windowId = "window:rewritten";
     }
-    if (!scope.visible) return { ok: false, reason: "SCOPE_NOT_VISIBLE" };
+    if (!scope.visible) {
+      this.recordInvalidFailure("SCOPE_NOT_VISIBLE");
+      return { ok: false, reason: "SCOPE_NOT_VISIBLE" };
+    }
     if (this.fault === "reject-all-inbound") return { ok: false, reason: "REJECT_ALL" };
     const existing = this.inbound.get(update.updateId);
     if (existing !== undefined) {
@@ -258,6 +293,18 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       return { ok: true, value: { ...existing, status: "duplicate" } };
     }
     const dispatchId = `dispatch:${update.updateId}`;
+    if (
+      (this.fault === "live-resident-mutation-tg02" && update.updateId.includes("tg02-valid")) ||
+      (this.fault === "live-resident-mutation-tg04" && update.updateId.includes("tg04-"))
+    ) {
+      this.resident(binding.residentId).residentId = "resident:shadow";
+    }
+    const mutateResident =
+      (this.fault === "live-resident-mutation-tg02" && update.updateId.includes("tg02-valid")) ||
+      (this.fault === "live-resident-mutation-tg04" && update.updateId.includes("tg04-"));
+    const wrongUnordered =
+      this.fault === "unordered-wrong-identity" &&
+      (update.updateId.includes("tg04-200") || update.updateId.includes("tg04-100"));
     const dispatch: DispatchIdentity = {
       residentId:
         this.fault === "wrong-dispatch-identity"
@@ -265,11 +312,16 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
           : this.fault === "seen-sender-used-as-resident" &&
               update.updateId.includes("tg01-non-address")
             ? `resident:${update.senderId}`
-            : binding.residentId,
-      scopeId: this.fault === "wrong-dispatch-identity" ? "scope:wrong" : binding.scopeId,
-      scopeGeneration: scope.scopeGeneration,
-      windowId: scope.windowId,
-      windowGeneration: scope.windowGeneration,
+            : mutateResident
+              ? "resident:shadow"
+              : binding.residentId,
+      scopeId:
+        this.fault === "wrong-dispatch-identity" || wrongUnordered
+          ? "scope:wrong"
+          : binding.scopeId,
+      scopeGeneration: wrongUnordered ? 99 : scope.scopeGeneration,
+      windowId: wrongUnordered ? "window:wrong" : scope.windowId,
+      windowGeneration: wrongUnordered ? 99 : scope.windowGeneration,
       dispatchId,
       sourceMessageId: update.messageId,
     };
@@ -411,15 +463,29 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       stored.status = "visible";
       stored.telegramMessageId = "telegram:fake-visible";
     }
-    this.outbound.set(receipt.outboundId, stored);
+    if (this.fault === "unknown-durable-message-id" && scenario === "telegram-unavailable") {
+      stored.telegramMessageId = "telegram:secretly-delivered";
+    }
+    const durable = this.fault === "live-receipt-message-mutation" ? receipt : stored;
+    this.outbound.set(receipt.outboundId, durable);
     if (!(this.fault === "unknown-wrong-target" && status === "unknown")) {
       this.outboundEffects.push(effectId);
     }
-    return { ok: true, value: structuredClone(receipt) };
+    return {
+      ok: true,
+      value: this.fault === "live-receipt-message-mutation" ? durable : structuredClone(receipt),
+    };
   }
 
   async readOutbound(outboundId: string): Promise<Result<OutboundReceipt>> {
     const receipt = this.outbound.get(outboundId);
+    if (
+      receipt !== undefined &&
+      this.fault === "live-receipt-message-mutation" &&
+      receipt.status === "visible"
+    ) {
+      receipt.telegramMessageId = "telegram:swapped-after-read";
+    }
     if (
       receipt !== undefined &&
       this.fault === "durable-binding-moved" &&
@@ -445,7 +511,11 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     }
     return receipt === undefined
       ? { ok: false, reason: "OUTBOUND_NOT_FOUND" }
-      : { ok: true, value: structuredClone(receipt) };
+      : {
+          ok: true,
+          value:
+            this.fault === "live-receipt-message-mutation" ? receipt : structuredClone(receipt),
+        };
   }
 
   async readOutboundEffects(): Promise<string[]> {
@@ -473,7 +543,10 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
           ? "attached"
           : "detached",
       credentialGeneration: this.credentialGeneration,
-      resolvedCount: this.tokenResolved,
+      resolvedCount:
+        this.fault === "middle-token-count-drift" && this.boundaryInspectCount === 3
+          ? this.tokenResolved + 5
+          : this.tokenResolved,
       config: [],
       logs:
         this.fault === "hidden-token-resolve-log" && this.tokenRevoked
@@ -504,7 +577,10 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
         direction,
         bindingId,
         bindingVersion: binding.bindingVersion,
-        scopeGeneration: this.scope(binding.scopeId).scopeGeneration,
+        scopeGeneration:
+          this.fault === "coupled-generation-return-only" && this.returnedScopeGeneration !== null
+            ? this.returnedScopeGeneration
+            : this.scope(binding.scopeId).scopeGeneration,
         credentialGeneration: this.credentialGeneration,
       },
     };
@@ -517,10 +593,12 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     if (this.fault === "current-completion-rejected") {
       return { ok: false, reason: "STALE_SCOPE_GENERATION" };
     }
+    const bindingAuthorityInvalid =
+      !binding.active || operation.bindingVersion !== binding.bindingVersion;
+    const credentialInvalid = operation.credentialGeneration !== this.credentialGeneration;
     if (
-      !binding.active ||
-      operation.bindingVersion !== binding.bindingVersion ||
-      operation.credentialGeneration !== this.credentialGeneration
+      bindingAuthorityInvalid ||
+      (credentialInvalid && this.fault !== "token-only-inflight-allowed")
     ) {
       if (this.fault === "token-resolves-after-revoke") this.tokenResolved += 1;
       if (this.fault === "revoked-requests-write-effects") {
@@ -534,13 +612,32 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       };
     }
     const scope = this.scope(binding.scopeId);
-    if (operation.scopeGeneration !== scope.scopeGeneration) {
+    if (
+      operation.scopeGeneration !== scope.scopeGeneration &&
+      this.fault !== "coupled-generation-return-only"
+    ) {
+      this.recordInvalidFailure("STALE_SCOPE_GENERATION");
       return { ok: false, reason: "STALE_SCOPE_GENERATION" };
+    }
+    if (this.fault === "null-current-dispatch" && operation.scopeGeneration > 1) {
+      return {
+        ok: true,
+        value: {
+          updateId: `update:${operation.operationId}`,
+          status: "dispatched",
+          reason: null,
+          dispatch: null,
+          effectId: null,
+        },
+      };
     }
     const dispatch: DispatchIdentity = {
       residentId: binding.residentId,
       scopeId: binding.scopeId,
-      scopeGeneration: scope.scopeGeneration,
+      scopeGeneration:
+        this.fault === "wrong-completion-generation" && operation.scopeGeneration > 1
+          ? operation.scopeGeneration - 1
+          : scope.scopeGeneration,
       windowId: scope.windowId,
       windowGeneration: scope.windowGeneration,
       dispatchId: `dispatch:${operation.operationId}`,
@@ -577,6 +674,9 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
 
   async restartChannel(): Promise<void> {
     this.restartCount += 1;
+    if (this.fault === "replay-inbound-on-recovery" && this.restartCount === 2) {
+      this.inboundEffects.push("effect:replayed-on-recovery");
+    }
   }
 
   async switchResidentModel(
@@ -683,15 +783,31 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       group.groupId = "group:rewritten";
       group.address = { chatId: "chat:wrong", topicId: "topic:wrong" };
     }
+    if (this.fault === "gd04-live-resident-swap" && plans.length === 3) {
+      const first = this.residents.get(plans[0]?.residentId ?? "");
+      const last = this.residents.get(plans[2]?.residentId ?? "");
+      if (first !== undefined && last !== undefined) {
+        const firstId = first.residentId;
+        first.residentId = last.residentId;
+        last.residentId = firstId;
+      }
+    }
     const hostDispatches: DispatchIdentity[] = [];
     const trace: GroupTraceEntry[] = plans.map((plan, index) => {
       const residentId =
         this.fault === "swap-group-residents"
           ? (plans[plans.length - 1 - index]?.residentId ?? plan.residentId)
           : plan.residentId;
+      const storedResident = this.resident(residentId);
       const reportedResidentId =
-        this.fault === "group-shadow-residents" ? `resident:shadow:${index}` : residentId;
-      const resident = this.resident(residentId);
+        this.fault === "group-shadow-residents"
+          ? `resident:shadow:${index}`
+          : this.fault === "wrong-group-speaker-after-switch" && plans.length === 1
+            ? "resident:other"
+            : this.fault === "gd04-live-resident-swap"
+              ? storedResident.residentId
+              : residentId;
+      const resident = storedResident;
       const member = group.members.find((candidate) => candidate.residentId === residentId);
       const dispatchId = `dispatch:group:${index}`;
       hostDispatches.push({
@@ -746,6 +862,21 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     return cloneResident(resident);
   }
 
+  private recordInvalidFailure(reason: string): void {
+    if (this.fault !== "invalid-failures-write-dispatch") return;
+    this.inboundEffects.push(`effect:guessed:${reason}`);
+    this.hostDispatches += 1;
+    this.lastDispatch = {
+      residentId: "resident:default",
+      scopeId: "scope:default",
+      scopeGeneration: 1,
+      windowId: "window:default",
+      windowGeneration: 1,
+      dispatchId: `dispatch:guessed:${reason}`,
+      sourceMessageId: `message:guessed:${reason}`,
+    };
+  }
+
   private resident(residentId: string): ResidentFixture {
     const resident = this.residents.get(residentId);
     if (resident === undefined) throw new Error("RESIDENT_NOT_FOUND");
@@ -774,16 +905,26 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "TG-02", fault: "current-completion-rejected" },
   { checkId: "TG-02", fault: "scope-generation-noop" },
   { checkId: "TG-02", fault: "scope-generation-return-only" },
+  { checkId: "TG-02", fault: "coupled-generation-return-only" },
+  { checkId: "TG-02", fault: "wrong-completion-generation" },
+  { checkId: "TG-02", fault: "invalid-failures-write-dispatch" },
+  { checkId: "TG-02", fault: "live-resident-mutation-tg02" },
   { checkId: "TG-03", fault: "wrong-dispatch-identity" },
   { checkId: "TG-03", fault: "live-scope-mutation" },
   { checkId: "TG-04", fault: "duplicate-extra-effect" },
   { checkId: "TG-04", fault: "current-completion-rejected" },
   { checkId: "TG-04", fault: "scope-generation-return-only" },
+  { checkId: "TG-04", fault: "coupled-generation-return-only" },
+  { checkId: "TG-04", fault: "wrong-completion-generation" },
+  { checkId: "TG-04", fault: "null-current-dispatch" },
+  { checkId: "TG-04", fault: "unordered-wrong-identity" },
+  { checkId: "TG-04", fault: "live-resident-mutation-tg04" },
   { checkId: "TG-05", fault: "submitted-looks-visible" },
   { checkId: "TG-05", fault: "unknown-has-message-id" },
   { checkId: "TG-05", fault: "durable-status-promoted" },
   { checkId: "TG-05", fault: "durable-binding-moved" },
   { checkId: "TG-05", fault: "live-address-mutation" },
+  { checkId: "TG-05", fault: "live-receipt-message-mutation" },
   { checkId: "TG-06", fault: "target-hints-win" },
   { checkId: "TG-06", fault: "durable-target-hints-win" },
   { checkId: "TG-06", fault: "live-address-mutation" },
@@ -797,9 +938,13 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "TG-08", fault: "revoked-requests-write-effects" },
   { checkId: "TG-08", fault: "revoke-token-noop" },
   { checkId: "TG-08", fault: "unstable-revoke-reason" },
+  { checkId: "TG-08", fault: "token-only-inbound-allowed" },
+  { checkId: "TG-08", fault: "token-only-inflight-allowed" },
+  { checkId: "TG-08", fault: "middle-token-count-drift" },
   { checkId: "TG-09", fault: "send-fails-observability-fresh" },
   { checkId: "TG-09", fault: "unavailable-send-still-visible" },
   { checkId: "TG-09", fault: "unavailable-durable-visible" },
+  { checkId: "TG-09", fault: "live-receipt-message-mutation" },
   { checkId: "GD-01", fault: "wrong-group-address" },
   { checkId: "GD-01", fault: "group-shadow-residents" },
   { checkId: "GD-01", fault: "group-wrong-scope" },
@@ -810,14 +955,18 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "GD-02", fault: "shadow-resident-on-switch" },
   { checkId: "GD-02", fault: "census-state-drift" },
   { checkId: "GD-02", fault: "binding-drift-on-switch" },
+  { checkId: "GD-02", fault: "wrong-group-speaker-after-switch" },
   { checkId: "GD-03", fault: "mutate-resident-on-blocked-activation" },
   { checkId: "GD-03", fault: "live-resident-mutation-on-blocked" },
   { checkId: "GD-04", fault: "swap-group-residents" },
   { checkId: "GD-04", fault: "live-group-mutation" },
+  { checkId: "GD-04", fault: "gd04-live-resident-swap" },
   { checkId: "GD-05", fault: "unknown-wrong-target" },
   { checkId: "GD-05", fault: "live-address-mutation" },
   { checkId: "GD-05", fault: "binding-drift-after-restart" },
   { checkId: "GD-05", fault: "duplicate-extra-effect" },
+  { checkId: "GD-05", fault: "unknown-durable-message-id" },
+  { checkId: "GD-05", fault: "replay-inbound-on-recovery" },
 ];
 
 describe("D26 Telegram channel adversarial acceptance", () => {

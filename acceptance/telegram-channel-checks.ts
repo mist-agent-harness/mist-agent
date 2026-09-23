@@ -83,6 +83,9 @@ const tg01: TelegramChannelCheck = {
     "createScopeFixture",
     "bindAddress",
     "ingestUpdate",
+    "readInboundEffects",
+    "readHostDispatch",
+    "readBinding",
     "resolveAddress",
     "reset",
   ],
@@ -164,6 +167,15 @@ const tg02: TelegramChannelCheck = {
       if (missing.ok || missing.reason !== "BINDING_NOT_FOUND") {
         return fail(`无绑定没有稳定拒绝：${json(missing)}`);
       }
+      const afterMissingEffects = await driver.readInboundEffects();
+      const afterMissingHost = await driver.readHostDispatch();
+      if (
+        afterMissingEffects.length !== 0 ||
+        afterMissingHost.hostProviderDispatches !== 0 ||
+        afterMissingHost.lastDispatch !== null
+      ) {
+        return fail("无绑定失败路径写入 effect、宿主派发或猜测 resident");
+      }
       const first = await readyChannel(
         driver,
         "tg02-first",
@@ -177,6 +189,9 @@ const tg02: TelegramChannelCheck = {
         "provider:b",
       );
       const secondScope = await driver.createScopeFixture(secondResident.residentId, "tg02-second");
+      const expectedResidentId = first.resident.residentId;
+      const expectedScope = structuredClone(first.scope);
+      const expectedBinding = structuredClone(first.binding);
       const conflict = await driver.bindAddress({
         address: first.binding.address,
         residentId: secondResident.residentId,
@@ -186,13 +201,20 @@ const tg02: TelegramChannelCheck = {
       await driver.setScopeVisibility(first.scope.scopeId, false);
       const hidden = await driver.ingestUpdate(update(first.binding.address, "tg02-hidden"));
       if (hidden.ok || hidden.reason !== "SCOPE_NOT_VISIBLE") return fail("不可见 scope 收到消息");
+      if (
+        json(await driver.readInboundEffects()) !== json(afterMissingEffects) ||
+        json(await driver.readHostDispatch()) !== json(afterMissingHost)
+      ) {
+        return fail("不可见 scope 的拒绝路径写入 effect 或宿主派发");
+      }
       await driver.setScopeVisibility(first.scope.scopeId, true);
       const valid = await driver.ingestUpdate(update(first.binding.address, "tg02-valid"));
       if (
         !valid.ok ||
         valid.value.status !== "dispatched" ||
-        valid.value.dispatch?.residentId !== first.resident.residentId ||
-        valid.value.dispatch.scopeId !== first.scope.scopeId
+        valid.value.dispatch?.residentId !== expectedResidentId ||
+        valid.value.dispatch.scopeId !== expectedScope.scopeId ||
+        json(await driver.readBinding(expectedBinding.bindingId)) !== json(expectedBinding)
       ) {
         return fail(`有效当前绑定正对照没有派发：${json(valid)}`);
       }
@@ -205,8 +227,9 @@ const tg02: TelegramChannelCheck = {
       if (
         !currentCompletion.ok ||
         currentCompletion.value.status !== "dispatched" ||
-        currentCompletion.value.dispatch?.residentId !== first.resident.residentId ||
-        currentCompletion.value.dispatch.scopeId !== first.scope.scopeId
+        currentCompletion.value.dispatch?.residentId !== expectedResidentId ||
+        currentCompletion.value.dispatch.scopeId !== expectedScope.scopeId ||
+        currentCompletion.value.dispatch.scopeGeneration !== expectedScope.scopeGeneration
       ) {
         return fail(`当前代际在途请求不能正常完成：${json(currentCompletion)}`);
       }
@@ -215,7 +238,7 @@ const tg02: TelegramChannelCheck = {
         first.binding.bindingId,
       );
       if (!inFlight.ok) throw new Error(`旧代际在途正对照失败：${inFlight.reason}`);
-      const advanced = await driver.advanceScopeGeneration(first.scope.scopeId);
+      const advanced = await driver.advanceScopeGeneration(expectedScope.scopeId);
       const advancedGeneration = advanced.scopeGeneration;
       if (advancedGeneration <= inFlight.value.scopeGeneration) {
         return fail("advanceScopeGeneration 没有推进 scope 代际");
@@ -237,18 +260,33 @@ const tg02: TelegramChannelCheck = {
       if (
         !postAdvanceCompletion.ok ||
         postAdvanceCompletion.value.status !== "dispatched" ||
-        postAdvanceCompletion.value.dispatch?.residentId !== first.resident.residentId ||
-        postAdvanceCompletion.value.dispatch.scopeId !== first.scope.scopeId
+        postAdvanceCompletion.value.dispatch?.residentId !== expectedResidentId ||
+        postAdvanceCompletion.value.dispatch.scopeId !== expectedScope.scopeId ||
+        postAdvanceCompletion.value.dispatch.scopeGeneration !== advancedGeneration
       ) {
         return fail(`推进后的当前代际不能正常完成：${json(postAdvanceCompletion)}`);
       }
+      const effectsBeforeStale = await driver.readInboundEffects();
+      const hostBeforeStale = await driver.readHostDispatch();
       const stale = await driver.completeInFlightChannelOperation(inFlight.value);
       if (stale.ok || stale.reason !== "STALE_SCOPE_GENERATION") {
         return fail(`旧代际在途消息没有稳定拒绝：${json(stale)}`);
       }
-      await driver.revokeBinding(first.binding.bindingId);
+      if (
+        json(await driver.readInboundEffects()) !== json(effectsBeforeStale) ||
+        json(await driver.readHostDispatch()) !== json(hostBeforeStale)
+      ) {
+        return fail("旧代际拒绝路径写入 effect、宿主派发或猜测 resident");
+      }
+      await driver.revokeBinding(expectedBinding.bindingId);
       const revoked = await driver.ingestUpdate(update(first.binding.address, "tg02-revoked"));
       if (revoked.ok || revoked.reason !== "BINDING_REVOKED") return fail("撤权绑定继续派发");
+      if (
+        json(await driver.readInboundEffects()) !== json(effectsBeforeStale) ||
+        json(await driver.readHostDispatch()) !== json(hostBeforeStale)
+      ) {
+        return fail("撤权绑定拒绝路径写入 effect、宿主派发或猜测 resident");
+      }
       return pass("有效当前绑定可派发；无绑定、冲突、不可见、旧代际与撤权均 fail-closed");
     } finally {
       await driver.reset();
@@ -316,6 +354,8 @@ const tg04: TelegramChannelCheck = {
   async run(driver) {
     try {
       const fixture = await readyChannel(driver, "tg04");
+      const expectedResidentId = fixture.resident.residentId;
+      const expectedScope = structuredClone(fixture.scope);
       const same = update(fixture.binding.address, "tg04-same");
       const first = await driver.ingestUpdate(same);
       const duplicate = await driver.ingestUpdate(same);
@@ -327,8 +367,16 @@ const tg04: TelegramChannelCheck = {
       if (
         !newer.ok ||
         !older.ok ||
-        newer.value.dispatch?.residentId !== fixture.resident.residentId ||
-        older.value.dispatch?.residentId !== fixture.resident.residentId
+        newer.value.dispatch?.residentId !== expectedResidentId ||
+        newer.value.dispatch.scopeId !== expectedScope.scopeId ||
+        newer.value.dispatch.scopeGeneration !== expectedScope.scopeGeneration ||
+        newer.value.dispatch.windowId !== expectedScope.windowId ||
+        newer.value.dispatch.windowGeneration !== expectedScope.windowGeneration ||
+        older.value.dispatch?.residentId !== expectedResidentId ||
+        older.value.dispatch.scopeId !== expectedScope.scopeId ||
+        older.value.dispatch.scopeGeneration !== expectedScope.scopeGeneration ||
+        older.value.dispatch.windowId !== expectedScope.windowId ||
+        older.value.dispatch.windowGeneration !== expectedScope.windowGeneration
       ) {
         return fail("乱序 update 改变了派发身份");
       }
@@ -351,8 +399,11 @@ const tg04: TelegramChannelCheck = {
       if (
         !currentCompletion.ok ||
         currentCompletion.value.status !== "dispatched" ||
-        currentCompletion.value.dispatch?.residentId !== fixture.resident.residentId ||
-        currentCompletion.value.dispatch.scopeId !== fixture.scope.scopeId
+        currentCompletion.value.dispatch?.residentId !== expectedResidentId ||
+        currentCompletion.value.dispatch.scopeId !== expectedScope.scopeId ||
+        currentCompletion.value.dispatch.scopeGeneration !== expectedScope.scopeGeneration ||
+        currentCompletion.value.dispatch.windowId !== expectedScope.windowId ||
+        currentCompletion.value.dispatch.windowGeneration !== expectedScope.windowGeneration
       ) {
         return fail(`当前代际在途结果不能正常完成：${json(currentCompletion)}`);
       }
@@ -361,8 +412,11 @@ const tg04: TelegramChannelCheck = {
         fixture.binding.bindingId,
       );
       if (!inFlight.ok) throw new Error(`在途正对照失败：${inFlight.reason}`);
-      const advanced = await driver.advanceScopeGeneration(fixture.scope.scopeId);
+      const advanced = await driver.advanceScopeGeneration(expectedScope.scopeId);
       const advancedGeneration = advanced.scopeGeneration;
+      if (advancedGeneration <= inFlight.value.scopeGeneration) {
+        return fail("advanceScopeGeneration 没有推进 scope 代际");
+      }
       const postAdvance = await driver.beginInFlightChannelOperation(
         "inbound",
         fixture.binding.bindingId,
@@ -377,7 +431,15 @@ const tg04: TelegramChannelCheck = {
       const postAdvanceCompletion = await driver.completeInFlightChannelOperation(
         postAdvance.value,
       );
-      if (!postAdvanceCompletion.ok || postAdvanceCompletion.value.status !== "dispatched") {
+      if (
+        !postAdvanceCompletion.ok ||
+        postAdvanceCompletion.value.status !== "dispatched" ||
+        postAdvanceCompletion.value.dispatch?.residentId !== expectedResidentId ||
+        postAdvanceCompletion.value.dispatch.scopeId !== expectedScope.scopeId ||
+        postAdvanceCompletion.value.dispatch.scopeGeneration !== advancedGeneration ||
+        postAdvanceCompletion.value.dispatch.windowId !== expectedScope.windowId ||
+        postAdvanceCompletion.value.dispatch.windowGeneration !== expectedScope.windowGeneration
+      ) {
         return fail("推进后的当前代际请求被一律当成 stale");
       }
       const stale = await driver.completeInFlightChannelOperation(inFlight.value);
@@ -462,6 +524,10 @@ const tg05: TelegramChannelCheck = {
         return fail(`丢回执没有外显 unknown：${json(lost)}`);
       }
       if (!visible.ok || !submitted.ok || !accepted.ok) throw new Error("出站正对照异常");
+      const visibleReturned = structuredClone(visible.value);
+      const submittedReturned = structuredClone(submitted.value);
+      const acceptedReturned = structuredClone(accepted.value);
+      const lostReturned = structuredClone(lost.value);
       const [visibleRead, submittedRead, acceptedRead, reread] = await Promise.all([
         driver.readOutbound(visible.value.outboundId),
         driver.readOutbound(submitted.value.outboundId),
@@ -470,19 +536,19 @@ const tg05: TelegramChannelCheck = {
       ]);
       if (
         !visibleRead.ok ||
-        json(visibleRead.value) !== json(visible.value) ||
+        json(visibleRead.value) !== json(visibleReturned) ||
         visibleRead.value.status !== "visible" ||
         visibleRead.value.telegramMessageId === null ||
         visibleRead.value.bindingId !== expectedBindingId ||
         json(visibleRead.value.target) !== json(expectedAddress) ||
         !submittedRead.ok ||
-        json(submittedRead.value) !== json(submitted.value) ||
+        json(submittedRead.value) !== json(submittedReturned) ||
         submittedRead.value.status !== "submitted" ||
         submittedRead.value.telegramMessageId !== null ||
         submittedRead.value.bindingId !== expectedBindingId ||
         json(submittedRead.value.target) !== json(expectedAddress) ||
         !acceptedRead.ok ||
-        json(acceptedRead.value) !== json(accepted.value) ||
+        json(acceptedRead.value) !== json(acceptedReturned) ||
         acceptedRead.value.status !== "accepted" ||
         acceptedRead.value.telegramMessageId !== null ||
         acceptedRead.value.bindingId !== expectedBindingId ||
@@ -492,7 +558,7 @@ const tg05: TelegramChannelCheck = {
       }
       if (
         !reread.ok ||
-        json(reread.value) !== json(lost.value) ||
+        json(reread.value) !== json(lostReturned) ||
         reread.value.status !== "unknown" ||
         reread.value.reason !== "RECEIPT_LOST" ||
         reread.value.telegramMessageId !== null ||
@@ -689,15 +755,25 @@ const tg08: TelegramChannelCheck = {
       }
       const inboundEffectsBeforeRevoke = await driver.readInboundEffects();
       const outboundEffectsBeforeRevoke = await driver.readOutboundEffects();
-      const inbound = await driver.beginInFlightChannelOperation(
+      const tokenInbound = await driver.beginInFlightChannelOperation(
         "inbound",
         fixture.binding.bindingId,
       );
-      const outbound = await driver.beginInFlightChannelOperation(
+      const tokenOutbound = await driver.beginInFlightChannelOperation(
         "outbound",
         fixture.binding.bindingId,
       );
-      if (!inbound.ok || !outbound.ok) throw new Error("在途正对照失败");
+      const bindingInbound = await driver.beginInFlightChannelOperation(
+        "inbound",
+        fixture.binding.bindingId,
+      );
+      const bindingOutbound = await driver.beginInFlightChannelOperation(
+        "outbound",
+        fixture.binding.bindingId,
+      );
+      if (!tokenInbound.ok || !tokenOutbound.ok || !bindingInbound.ok || !bindingOutbound.ok) {
+        throw new Error("在途正对照失败");
+      }
       const before = await driver.inspectTokenBoundary();
       if (
         before.resolvedCount < 1 ||
@@ -710,7 +786,8 @@ const tg08: TelegramChannelCheck = {
       const afterToken = await driver.inspectTokenBoundary();
       if (
         afterToken.credentialStatus !== "revoked" ||
-        afterToken.credentialGeneration <= before.credentialGeneration
+        afterToken.credentialGeneration <= before.credentialGeneration ||
+        afterToken.resolvedCount !== before.resolvedCount
       ) {
         return fail("credential 撤权没有独立推进状态与代际");
       }
@@ -724,14 +801,42 @@ const tg08: TelegramChannelCheck = {
       if (tokenOnly.ok || tokenOnly.reason !== "TOKEN_REVOKED") {
         return fail(`credential 撤权后 active binding 仍可出站：${json(tokenOnly)}`);
       }
+      const tokenFresh = await driver.ingestUpdate(
+        update(fixture.binding.address, "tg08-token-fresh"),
+      );
+      const tokenLateIn = await driver.completeInFlightChannelOperation(tokenInbound.value);
+      const tokenLateOut = await driver.completeInFlightChannelOperation(tokenOutbound.value);
+      if (
+        tokenFresh.ok ||
+        (!tokenFresh.ok && tokenFresh.reason !== "TOKEN_REVOKED") ||
+        tokenLateIn.ok ||
+        (!tokenLateIn.ok && tokenLateIn.reason !== "CHANNEL_AUTHORITY_REVOKED") ||
+        tokenLateOut.ok ||
+        (!tokenLateOut.ok && tokenLateOut.reason !== "CHANNEL_AUTHORITY_REVOKED")
+      ) {
+        return fail(
+          `credential 撤权后 active binding 的新入站或在途完成仍成功：${json({ tokenFresh, tokenLateIn, tokenLateOut })}`,
+        );
+      }
+      const afterTokenUse = await driver.inspectTokenBoundary();
+      if (
+        afterTokenUse.resolvedCount !== before.resolvedCount ||
+        afterTokenUse.credentialStatus !== "revoked" ||
+        afterTokenUse.credentialGeneration !== afterToken.credentialGeneration ||
+        json([before, afterToken, afterTokenUse]).includes(secret) ||
+        json(await driver.readInboundEffects()) !== json(inboundEffectsBeforeRevoke) ||
+        json(await driver.readOutboundEffects()) !== json(outboundEffectsBeforeRevoke)
+      ) {
+        return fail("credential 撤权后的中间快照、解析计数或 effect 账发生漂移");
+      }
       await driver.revokeBinding(fixture.binding.bindingId);
       const fresh = await driver.ingestUpdate(update(fixture.binding.address, "tg08-fresh"));
       const freshOut = await driver.sendOutbound(
         { context: dispatch, body: "after-revoke", untrustedTargetHints: [] },
         "visible",
       );
-      const lateIn = await driver.completeInFlightChannelOperation(inbound.value);
-      const lateOut = await driver.completeInFlightChannelOperation(outbound.value);
+      const lateIn = await driver.completeInFlightChannelOperation(bindingInbound.value);
+      const lateOut = await driver.completeInFlightChannelOperation(bindingOutbound.value);
       if (
         fresh.ok ||
         (!fresh.ok && fresh.reason !== "BINDING_REVOKED") ||
@@ -791,12 +896,13 @@ const tg09: TelegramChannelCheck = {
       if (!sent.ok || sent.value.status !== "visible" || sent.value.telegramMessageId === null) {
         return fail(`真实出站正对照失败：${json(sent)}`);
       }
+      const sentReturned = structuredClone(sent.value);
       const sentDurable = await driver.readOutbound(sent.value.outboundId);
       if (
         !sentDurable.ok ||
-        json(sentDurable.value) !== json(sent.value) ||
+        json(sentDurable.value) !== json(sentReturned) ||
         sentDurable.value.status !== "visible" ||
-        sentDurable.value.telegramMessageId !== sent.value.telegramMessageId ||
+        sentDurable.value.telegramMessageId !== sentReturned.telegramMessageId ||
         sentDurable.value.bindingId !== expectedBindingId ||
         json(sentDurable.value.target) !== json(expectedAddress)
       ) {
@@ -988,7 +1094,15 @@ const gd02: TelegramChannelCheck = {
       const trace = await driver.runGroupRound(group.groupId, [
         { residentId: switched.residentId, status: "visible" },
       ]);
-      if (trace[0]?.model !== "model:new" || trace[0]?.provider !== "provider:new") {
+      if (
+        trace.length !== 1 ||
+        trace[0]?.residentId !== expectedResident.residentId ||
+        trace[0].scopeId !== expectedBinding.scopeId ||
+        trace[0].model !== "model:new" ||
+        trace[0].provider !== "provider:new" ||
+        trace[0].status !== "visible" ||
+        trace[0].outboundStatus !== "visible"
+      ) {
         return fail("换模后的真实发言仍走旧运行通道");
       }
       return pass("运行通道已换，residentId、canonical state 与 binding 均不变");
@@ -1088,6 +1202,10 @@ const gd04: TelegramChannelCheck = {
       });
       const expectedGroupId = group.groupId;
       const expectedAddress = copyAddress(group.address);
+      const expectedMembers = residents.map((resident, index) => ({
+        residentId: resident.residentId,
+        scopeId: scopes[index]?.scopeId ?? "missing",
+      }));
       const expected = ["visible", "silent", "failed"] as const;
       const trace = await driver.runGroupRound(
         expectedGroupId,
@@ -1102,8 +1220,8 @@ const gd04: TelegramChannelCheck = {
           (entry, index) =>
             entry.groupId !== expectedGroupId ||
             json(entry.address) !== json(expectedAddress) ||
-            entry.residentId !== residents[index]?.residentId ||
-            entry.scopeId !== scopes[index]?.scopeId ||
+            entry.residentId !== expectedMembers[index]?.residentId ||
+            entry.scopeId !== expectedMembers[index]?.scopeId ||
             entry.status !== expected[index],
         )
       ) {
@@ -1181,12 +1299,15 @@ const gd05: TelegramChannelCheck = {
       if (
         !sent.ok ||
         sent.value.status !== "unknown" ||
+        sent.value.telegramMessageId !== null ||
+        sent.value.bindingId !== expectedBinding.bindingId ||
         sent.value.effectId === null ||
         json(sent.value.target) !== json(expectedAddress)
       ) {
         return fail("平台故障没有在原 target 留下可追的 unknown");
       }
       const beforeRecovery = await driver.readOutboundEffects();
+      const sentReturned = structuredClone(sent.value);
       if (beforeRecovery.length !== 1 || beforeRecovery[0] !== sent.value.effectId) {
         return fail(`unknown 出站没有耐久 effect 正证据：${json(beforeRecovery)}`);
       }
@@ -1198,11 +1319,17 @@ const gd05: TelegramChannelCheck = {
       }
       const afterRecovery = await driver.readOutboundEffects();
       if (json(afterRecovery) !== json(beforeRecovery)) return fail("恢复后自动重放了未知副作用");
+      const inboundAfterRecovery = await driver.readInboundEffects();
+      if (json(inboundAfterRecovery) !== json(inboundBeforeRestart)) {
+        return fail("恢复过程自动重放了入站副作用");
+      }
       const reread = await driver.readOutbound(sent.value.outboundId);
       if (
         !reread.ok ||
+        json(reread.value) !== json(sentReturned) ||
         reread.value.status !== "unknown" ||
-        reread.value.effectId !== sent.value.effectId ||
+        reread.value.telegramMessageId !== null ||
+        reread.value.effectId !== sentReturned.effectId ||
         json(reread.value.target) !== json(expectedAddress)
       ) {
         return fail("恢复后 unknown 回执的 target/effect 漂移");
