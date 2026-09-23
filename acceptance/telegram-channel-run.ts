@@ -2,7 +2,11 @@
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { telegramChannelChecks } from "./telegram-channel-checks.ts";
-import type { TelegramChannelCheck, TelegramChannelDriver } from "./telegram-channel-driver.ts";
+import {
+  type TelegramChannelCheck,
+  type TelegramChannelDriver,
+  cloneTelegramChannelDriverBoundary,
+} from "./telegram-channel-driver.ts";
 
 const DRIVER_SPECIFIER = "../src/telegram-channel-acceptance-driver.ts";
 const strict = process.argv.includes("--strict");
@@ -19,7 +23,9 @@ async function loadDriver(): Promise<{
     );
   }
   return {
-    driver: mod.createTelegramChannelDriver() as TelegramChannelDriver,
+    driver: cloneTelegramChannelDriverBoundary(
+      mod.createTelegramChannelDriver() as TelegramChannelDriver,
+    ),
     stubbed: new Set<string>(Array.isArray(mod.STUBBED) ? mod.STUBBED : []),
   };
 }

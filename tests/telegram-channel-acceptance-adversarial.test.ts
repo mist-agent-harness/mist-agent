@@ -1,28 +1,29 @@
 import { describe, expect, it } from "vitest";
 import { telegramChannelChecks } from "../acceptance/telegram-channel-checks.ts";
-import type {
-  ChannelBinding,
-  ChannelObservability,
-  ContinuityActivation,
-  ContinuityVotes,
-  DispatchContext,
-  DispatchIdentity,
-  GroupFixture,
-  GroupPlanStatus,
-  GroupTraceEntry,
-  HostDispatchSnapshot,
-  InFlightChannelOperation,
-  InboundReceipt,
-  OutboundReceipt,
-  OutboundRequest,
-  ResidentFixture,
-  Result,
-  ScopeFixture,
-  TelegramAddress,
-  TelegramChannelDriver,
-  TelegramUpdate,
-  TokenBoundarySnapshot,
-  TokenReference,
+import {
+  type ChannelBinding,
+  type ChannelObservability,
+  type ContinuityActivation,
+  type ContinuityVotes,
+  type DispatchContext,
+  type DispatchIdentity,
+  type GroupFixture,
+  type GroupPlanStatus,
+  type GroupTraceEntry,
+  type HostDispatchSnapshot,
+  type InFlightChannelOperation,
+  type InboundReceipt,
+  type OutboundReceipt,
+  type OutboundRequest,
+  type ResidentFixture,
+  type Result,
+  type ScopeFixture,
+  type TelegramAddress,
+  type TelegramChannelDriver,
+  type TelegramUpdate,
+  type TokenBoundarySnapshot,
+  type TokenReference,
+  cloneTelegramChannelDriverBoundary,
 } from "../acceptance/telegram-channel-driver.ts";
 
 type Fault =
@@ -80,7 +81,6 @@ type Fault =
   | "tg07-inbound-effects-leak-healed-by-boundary"
   | "tg07-outbound-effects-leak-healed-by-boundary"
   | "token-ref-healed-by-boundary"
-  | "fixture-leak-healed-by-boundary"
   | "token-resolves-after-revoke"
   | "hidden-token-resolve-log"
   | "token-leaks-early-snapshot"
@@ -117,6 +117,7 @@ type Fault =
   | "mutate-resident-on-blocked-activation"
   | "live-resident-mutation-on-blocked"
   | "gd03-activation-healed-by-canonical-read"
+  | "rejected-continuity-vote-activates"
   | "swap-group-residents"
   | "live-group-mutation"
   | "unknown-wrong-target"
@@ -232,8 +233,7 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       this.fault === "gd04-scope-create-swaps-residents" ||
       this.fault === "gd04-last-scope-swaps-residents" ||
       this.fault === "gd04-later-resident-mutates-first" ||
-      this.fault === "gd01-scope-mutates-models" ||
-      this.fault === "fixture-leak-healed-by-boundary"
+      this.fault === "gd01-scope-mutates-models"
       ? resident
       : cloneResident(resident);
   }
@@ -300,8 +300,7 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       this.fault === "bind-renames-ready-oracles" ||
       this.fault === "group-create-mutates-member-oracles" ||
       this.fault === "gd01-second-scope-mutates-first" ||
-      this.fault === "gd04-later-scope-mutates-first" ||
-      this.fault === "fixture-leak-healed-by-boundary"
+      this.fault === "gd04-later-scope-mutates-first"
       ? scope
       : cloneScope(scope);
   }
@@ -963,12 +962,6 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   }
 
   async readOutboundEffects(): Promise<string[]> {
-    if (this.fault === "fixture-leak-healed-by-boundary") {
-      const resident = this.residents.get("resident:tg07");
-      if (resident !== undefined) resident.model = this.tokenSecret;
-      const scope = this.scopes.get("scope:tg07");
-      if (scope !== undefined) scope.windowId = this.tokenSecret;
-    }
     if (this.fault === "tg08-inbound-baseline-healed-by-outbound-read") {
       const temporary = this.inboundEffects.indexOf("effect:temporary-baseline-drift");
       if (temporary !== -1) this.inboundEffects.splice(temporary, 1);
@@ -1003,12 +996,6 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   async inspectTokenBoundary(): Promise<TokenBoundarySnapshot> {
     if (this.fault === "token-ref-healed-by-boundary" && this.tokenReferenceView !== null) {
       this.tokenReferenceView.credentialRef = "credential:foreign-not-attached";
-    }
-    if (this.fault === "fixture-leak-healed-by-boundary") {
-      const resident = this.residents.get("resident:tg07");
-      if (resident !== undefined) resident.model = "model:tg07";
-      const scope = this.scopes.get("scope:tg07");
-      if (scope !== undefined) scope.windowId = "window:tg07";
     }
     if (this.fault === "tg07-inbound-effects-leak-healed-by-boundary") {
       const secret = this.inboundEffects.indexOf(this.tokenSecret);
@@ -1330,8 +1317,13 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     const votes = this.votes.get(residentId);
     const activated =
       votes?.machine === "passed" &&
-      votes.resident === "accepted" &&
-      votes.relationships.every((vote) => vote === "accepted");
+      (votes.resident === "accepted" ||
+        (this.fault === "rejected-continuity-vote-activates" && votes.resident !== "missing")) &&
+      votes.relationships.every(
+        (vote) =>
+          vote === "accepted" ||
+          (this.fault === "rejected-continuity-vote-activates" && vote !== "not-asked"),
+      );
     if (
       !activated &&
       (this.fault === "mutate-resident-on-blocked-activation" ||
@@ -1646,7 +1638,6 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "TG-07", fault: "tg07-inbound-effects-leak-healed-by-boundary" },
   { checkId: "TG-07", fault: "tg07-outbound-effects-leak-healed-by-boundary" },
   { checkId: "TG-07", fault: "token-ref-healed-by-boundary" },
-  { checkId: "TG-07", fault: "fixture-leak-healed-by-boundary" },
   { checkId: "TG-08", fault: "token-resolves-after-revoke" },
   { checkId: "TG-08", fault: "hidden-token-resolve-log" },
   { checkId: "TG-08", fault: "token-leaks-early-snapshot" },
@@ -1690,6 +1681,7 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "GD-03", fault: "mutate-resident-on-blocked-activation" },
   { checkId: "GD-03", fault: "live-resident-mutation-on-blocked" },
   { checkId: "GD-03", fault: "gd03-activation-healed-by-canonical-read" },
+  { checkId: "GD-03", fault: "rejected-continuity-vote-activates" },
   { checkId: "GD-04", fault: "swap-group-residents" },
   { checkId: "GD-04", fault: "live-group-mutation" },
   { checkId: "GD-04", fault: "gd04-live-resident-swap" },
@@ -1717,10 +1709,14 @@ describe("D26 Telegram channel adversarial acceptance", () => {
     const check = telegramChannelChecks.find(({ id }) => id === checkId);
     if (check === undefined) throw new Error(`missing check ${checkId}`);
 
-    const baseline = await check.run(new AdversarialTelegramDriver(null));
+    const baseline = await check.run(
+      cloneTelegramChannelDriverBoundary(new AdversarialTelegramDriver(null)),
+    );
     expect(baseline, `${checkId} synthetic positive control`).toMatchObject({ passed: true });
 
-    const attacked = await check.run(new AdversarialTelegramDriver(fault));
+    const attacked = await check.run(
+      cloneTelegramChannelDriverBoundary(new AdversarialTelegramDriver(fault)),
+    );
     expect(attacked, `${checkId} accepted adversarial fault ${fault}`).toMatchObject({
       passed: false,
     });

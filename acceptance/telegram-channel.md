@@ -15,6 +15,8 @@ npm run acceptance:telegram-channel:strict
 
 - 公共 CI 只用合成 update、receipt、token canary、resident 和 group；真实 bot token、私人聊天、家庭 bridge 与 launchd 不进入仓库。
 - 判卷通过 typed driver 操作真实插件/宿主接缝，不 import 功能实现内部模块。驱动缺失时十四盏全红；坏驱动直接报错。
+- 判卷面向如实回读状态的非对抗驱动：抓否定断言缺正对照、行为没有实际发生、只信返回值以及漏掉核心判词、授权或身份负例。
+- 观察间隙里先改坏再修复、改写调用方对象或让返回值与内部存储共用引用，由统一驱动边界深拷贝、代码评审、独立验收席与真实环境测试处理，不继续扩成逐调用点探针。
 - 否定断言带正对照：先证明绑定、派发、token resolver 与真实可见回执工作，再判 fail-closed、撤权和零泄漏。
 - 失败回执之后必须读取 canonical state、effect 或耐久回执；不能只信状态字。群聊 trace 必须带 group/address/resident/scope，不能靠数组顺序自报归属。
 - 外部 message/topic/session id 只作地址。身份连续性由 D23 判；Telegram 畅通、模型回复相似或同一 chat id 都不能替它点灯。
@@ -29,7 +31,7 @@ npm run acceptance:telegram-channel:strict
 | TG-02 | 分别制造无绑定、冲突绑定、scope 不可见、撤权和旧代际，并在 advance 前后各完成当前代际请求 | 安全集成 | binding/resident/scope 先冻结；advance 返回值、新请求代际与完成派发代际一致；负例不写 effect/宿主派发且不猜 resident |
 | TG-03 | 创建 resident/scope 时立即冻结初值，再绑定地址并让有效 update 经信道进入宿主 | 宿主集成 | binding 与派发身份逐字段等于绑定前冻结的 resident/scope/window/source message；插件自建宿主数为零 |
 | TG-04 | 冻结 resident/scope/window 后发送重复/乱序 update，并在 advance 前后各完成当前代际请求，再结算旧请求 | 集成 | 首次、重复和乱序回执身份逐字段对应冻结真源；三个唯一 update 恰有三份冻结 effect；重复与迟到不新增 effect |
-| TG-05 | 用四条 host-issued dispatch 分别制造 submitted、accepted、visible 与回执丢失，先冻结返回值再逐条耐久读回 | 传输集成 | 返回值与耐久账逐字一致且只有 visible 有 Telegram message id；活对象不得把先前返回值一起改写；unknown 保持原 binding/target |
+| TG-05 | 用四条 host-issued dispatch 分别制造 submitted、accepted、visible 与回执丢失，先冻结返回值再逐条耐久读回 | 传输集成 | 返回值与耐久账逐字一致且只有 visible 有 Telegram message id；unknown 保持原 binding/target |
 | TG-06 | 模型、正文与 resident memory 都夹带未授权 chat/topic/message hint，再从当前 context 出站并读耐久账 | 安全集成 | 返回值与耐久账的 chat/topic 来自冻结 binding、reply message 来自入站 context；三类 hint 全部无效 |
 | TG-07 | 用 token canary 建 opaque ref 并真实收发，扫描 fixture、入站 effect、边界、返回值与耐久出站回执 | 安全集成 | ref 非空且不含 canary，并被 resolver 使用；明文 token 不出现在任一可观察产物 |
 | TG-08 | 先做 token 真实解析与可见出站，再各建两组在途入站/出站；先单独撤 credential 并实测新入站/在途完成，再撤 binding | 并发＋撤权 | credential 状态/代际独立推进；边界快照与撤权前 effect 账当场冻结；两阶段新旧请求稳定拒绝且 effect 不增 |
@@ -41,8 +43,8 @@ npm run acceptance:telegram-channel:strict
 | --- | --- | --- | --- |
 | GD-01 | 先冻结两份 resident/scope/model/provider 输入，再建 group、完成一轮并读宿主派发账 | 端到端 | group fixture、trace 与宿主账都精确对应冻结输入；两条 model/provider 通道不同且 dispatchId 可回读 |
 | GD-02 | 冻结完整 binding/resident 后更换 model/provider/runtime session，再发言并读取住户普查 | 端到端 | binding 全字段与 residentId/hash 不变；session 变化；普查逐字段等于切换结果；真实 trace 仍归冻结 resident/scope 且走新运行通道 |
-| GD-03 | 冻结 resident/hash，依次缺 machine、resident、relationship 判词，再补齐；每次都读 canonical state | D23 集成 | 缺任一票与最终激活后，返回值和 canonical state 都保持冻结 resident/hash；三类判词齐全才激活 |
-| GD-04 | 冻结 group/address/resident/scope 后，同轮安排一位发言、一位沉默、一位失败 | 群聊集成 | 每条 trace 与冻结计划逐字段对应；活 resident 对象不可改写 oracle；outbound 分别为 visible/null/rejected |
+| GD-03 | 冻结 resident/hash，依次制造 machine、resident、relationship 缺票与 resident/relationship 否决，再补齐；每次都读 canonical state | D23 集成 | 缺任一票或任一方 rejected 时不能激活；各次失败与最终激活后，返回值和 canonical state 都保持冻结 resident/hash；三类判词全部 accepted 才激活 |
+| GD-04 | 冻结 group/address/resident/scope 后，同轮安排一位发言、一位沉默、一位失败 | 群聊集成 | 每条 trace 与冻结计划逐字段对应；outbound 分别为 visible/null/rejected |
 | GD-05 | 冷启动、重连、重复 update 与 Telegram 不可用后恢复 | 恢复端到端 | binding/canonical 不漂移；unknown 的冻结返回值与耐久账逐字一致且 message id 为 null；重启前 effect 快照独立冻结，恢复后入站/出站均不增加 |
 
 ## 点灯记录
@@ -62,4 +64,4 @@ npm run acceptance:telegram-channel:strict
 - [ ] GD-04 多 resident 派发、沉默、失败与送达可分
 - [ ] GD-05 冷启动、重连与平台故障不漂移不重放
 
-代价：十四盏灯跨绑定、宿主、Telegram transport、D23 与群聊编排；公共 CI 只能复演合成传输。最终真绿还需要隔离测试群和真实 Bot API 回执，因此验收比普通 adapter 单测更慢。
+代价：十四盏灯跨绑定、宿主、Telegram transport、D23 与群聊编排；公共 CI 只能复演合成传输。最终真绿还需要隔离测试群和真实 Bot API 回执，因此验收比普通 adapter 单测更慢。判卷只能证明照实回读的实现满足契约；存心在观察间隙作弊的驱动仍由代码评审、独立验收席和真实环境抓取。

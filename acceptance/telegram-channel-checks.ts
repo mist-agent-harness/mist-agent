@@ -1344,6 +1344,8 @@ const gd03: TelegramChannelCheck = {
         { machine: "missing", resident: "accepted", relationships: ["accepted"] },
         { machine: "passed", resident: "missing", relationships: ["accepted"] },
         { machine: "passed", resident: "accepted", relationships: ["not-asked"] },
+        { machine: "passed", resident: "rejected", relationships: ["accepted"] },
+        { machine: "passed", resident: "accepted", relationships: ["rejected"] },
       ] as const;
       for (const votes of cases) {
         await driver.setContinuityVotes(expectedResident.residentId, {
@@ -1361,7 +1363,9 @@ const gd03: TelegramChannelCheck = {
           canonical.residentId !== expectedResident.residentId ||
           canonical.canonicalStateHash !== expectedResident.canonicalStateHash
         ) {
-          return fail(`缺判词时 candidate/resident 真源发生变化：${json({ votes, blocked })}`);
+          return fail(
+            `判词缺失或被否决时 candidate/resident 真源发生变化：${json({ votes, blocked })}`,
+          );
         }
       }
       await driver.setContinuityVotes(expectedResident.residentId, {
@@ -1380,7 +1384,7 @@ const gd03: TelegramChannelCheck = {
       ) {
         return fail("激活成功后 canonical resident/hash 没有耐久保持");
       }
-      return pass("三类判词缺一时 candidate/resident 不变；齐全才激活同一 resident");
+      return pass("三类判词缺失或任一方否决时真源不变；全部接受才激活同一 resident");
     } finally {
       await driver.reset();
     }
