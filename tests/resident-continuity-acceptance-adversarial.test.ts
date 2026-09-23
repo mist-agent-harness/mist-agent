@@ -42,6 +42,9 @@ type Fault =
   | "drop-green-machine-keys"
   | "drop-history-machine-keys"
   | "return-only-activation"
+  | "activate-on-rejected-attempt"
+  | "erase-verdicts-on-activation"
+  | "target-return-only"
   | "drop-blind-cards"
   | "drop-resident-verdict"
   | "one-relationship-vote-enough"
@@ -49,7 +52,10 @@ type Fault =
   | "leak-hidden-card-id"
   | "leak-hidden-existence"
   | "placeholder-evaluation-receipt"
-  | "leak-partial-private-source";
+  | "leak-partial-private-source"
+  | "leak-private-projection-result"
+  | "leak-revoked-result"
+  | "erase-superseded-persona";
 
 interface PrivateRecord {
   handle: string;
@@ -345,13 +351,30 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
     return structuredClone(receipt);
   }
 
-  async revisePersona(_input: {
+  async revisePersona(input: {
     residentId: string;
     actor: Actor;
     content: string;
     supersedesVersionId: string;
   }): Promise<Result<PersonaVersion>> {
-    return { ok: false, reason: "NOT_USED_BY_ADVERSARIAL_CASES" };
+    const resident = this.resident(input.residentId);
+    if (input.actor.kind !== "resident" || input.actor.residentId !== input.residentId) {
+      return { ok: false, reason: "RESIDENT_SELF_REQUIRED" };
+    }
+    const previous = resident.persona.find(({ id }) => id === input.supersedesVersionId);
+    if (previous === undefined || previous.supersededBy !== null) {
+      return { ok: false, reason: "PERSONA_VERSION_NOT_CURRENT" };
+    }
+    const fresh: PersonaVersion = {
+      id: `${input.supersedesVersionId}:next`,
+      content: input.content,
+      author: { kind: "resident", residentId: input.residentId },
+      supersededBy: null,
+    };
+    previous.supersededBy = fresh.id;
+    if (this.fault === "erase-superseded-persona") previous.content = "";
+    resident.persona.push(fresh);
+    return { ok: true, value: structuredClone(fresh) };
   }
 
   async createMigrationCase(input: {
@@ -460,10 +483,19 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
       (relationshipsPassed ||
         (this.fault === "one-relationship-vote-enough" && oneRelationshipPassed));
     if (!activated) {
-      migration.activation = "blocked";
+      migration.activation =
+        this.fault === "activate-on-rejected-attempt" ? "activated" : "blocked";
       return { ok: false, reason: "MIGRATION_GATES_INCOMPLETE" };
     }
     if (this.fault !== "return-only-activation") migration.activation = "activated";
+    if (this.fault === "erase-verdicts-on-activation") {
+      migration.machineChecks = [];
+      migration.residentVerdict = null;
+      migration.relationshipVerdicts = Object.fromEntries(
+        migration.relationshipParticipants.map((participant) => [participant, "not-asked"]),
+      );
+      migration.verdictHistory = [];
+    }
     migration.stale = false;
     return { ok: true, value: { residentId: migration.sourceResidentId } };
   }
@@ -485,7 +517,7 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
       relationshipVerdicts: { ...migration.relationshipVerdicts },
       retiredReason: "target-changed",
     });
-    migration.target = { ...target };
+    if (this.fault !== "target-return-only") migration.target = { ...target };
     migration.machineChecks = [];
     migration.blindCards = [];
     migration.residentVerdict = null;
@@ -494,7 +526,9 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
     );
     migration.activation = "blocked";
     migration.stale = true;
-    return cloneMigration(migration);
+    const returned = cloneMigration(migration);
+    if (this.fault === "target-return-only") returned.target = { ...target };
+    return returned;
   }
 
   async runSyntheticEvaluation(
@@ -573,12 +607,26 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
     rubricVersion: string,
   ): Promise<Result<PrivateProjectionResult>> {
     const source = this.privateSource(handle);
-    if (source.revoked) return { ok: false, reason: "SOURCE_REVOKED" };
+    if (source.revoked) {
+      return {
+        ok: false,
+        reason:
+          this.fault === "leak-revoked-result"
+            ? `SOURCE_REVOKED:${source.content}`
+            : "SOURCE_REVOKED",
+      };
+    }
     if (!source.ownerIds.every((ownerId) => source.grants.has(ownerId))) {
       if (this.fault === "leak-partial-private-source") {
         this.storage.get(caseId)?.logs.push(source.content);
       }
-      return { ok: false, reason: "MISSING_OWNER_GRANT" };
+      return {
+        ok: false,
+        reason:
+          this.fault === "leak-private-projection-result"
+            ? `MISSING_OWNER_GRANT:${source.content}`
+            : "MISSING_OWNER_GRANT",
+      };
     }
     const migration = this.migration(caseId);
     this.receiptCounter += 1;
@@ -615,9 +663,17 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
             sourceHandles: [handle],
           };
     this.evaluationReceipts.set(receiptId, receipt);
+    const value = {
+      sourceHandle: handle,
+      usedContentHash: sha256(source.content),
+      receiptId,
+      ...(this.fault === "leak-private-projection-result"
+        ? { copiedSourceContent: source.content }
+        : {}),
+    };
     return {
       ok: true,
-      value: { sourceHandle: handle, usedContentHash: sha256(source.content), receiptId },
+      value,
     };
   }
 
@@ -634,7 +690,13 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
   async readPrivateSource(handle: string): Promise<Result<string>> {
     const source = this.privateSource(handle);
     return source.revoked
-      ? { ok: false, reason: "SOURCE_REVOKED" }
+      ? {
+          ok: false,
+          reason:
+            this.fault === "leak-revoked-result"
+              ? `SOURCE_REVOKED:${source.content}`
+              : "SOURCE_REVOKED",
+        }
       : { ok: true, value: source.content };
   }
 
@@ -691,26 +753,39 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "OI-06", fault: "cross-scope-turn-id-leak" },
   { checkId: "OI-06", fault: "cross-scope-memory-leak" },
   { checkId: "OI-09", fault: "deny-all-operations" },
+  { checkId: "OI-08", fault: "erase-superseded-persona" },
   { checkId: "MC-01", fault: "ignore-machine-failure" },
   { checkId: "MC-01", fault: "drop-failed-machine-key" },
   { checkId: "MC-01", fault: "drop-green-machine-keys" },
   { checkId: "MC-01", fault: "return-only-activation" },
+  { checkId: "MC-01", fault: "activate-on-rejected-attempt" },
+  { checkId: "MC-01", fault: "erase-verdicts-on-activation" },
   { checkId: "MC-02", fault: "drop-blind-cards" },
   { checkId: "MC-03", fault: "drop-resident-verdict" },
   { checkId: "MC-05", fault: "one-relationship-vote-enough" },
   { checkId: "MC-05", fault: "return-only-activation" },
+  { checkId: "MC-05", fault: "activate-on-rejected-attempt" },
+  { checkId: "MC-05", fault: "erase-verdicts-on-activation" },
   { checkId: "MC-07", fault: "leak-hidden-evaluation-surfaces" },
   { checkId: "MC-07", fault: "leak-hidden-card-id" },
   { checkId: "MC-07", fault: "leak-hidden-existence" },
+  { checkId: "MC-08", fault: "target-return-only" },
   { checkId: "MC-09", fault: "cross-scope-turn-leak" },
   { checkId: "MC-09", fault: "cross-scope-output-leak" },
   { checkId: "MC-09", fault: "cross-scope-turn-id-leak" },
   { checkId: "MC-09", fault: "cross-scope-memory-leak" },
   { checkId: "MC-11", fault: "placeholder-evaluation-receipt" },
+  { checkId: "MC-10", fault: "leak-private-projection-result" },
+  { checkId: "MC-11", fault: "leak-private-projection-result" },
+  { checkId: "MC-11", fault: "leak-revoked-result" },
   { checkId: "MC-12", fault: "leak-partial-private-source" },
+  { checkId: "MC-12", fault: "leak-private-projection-result" },
   { checkId: "MC-12", fault: "drop-green-machine-keys" },
   { checkId: "MC-12", fault: "drop-history-machine-keys" },
   { checkId: "MC-12", fault: "return-only-activation" },
+  { checkId: "MC-12", fault: "activate-on-rejected-attempt" },
+  { checkId: "MC-12", fault: "erase-verdicts-on-activation" },
+  { checkId: "MC-12", fault: "target-return-only" },
 ];
 
 describe("D22 / D23 adversarial acceptance", () => {

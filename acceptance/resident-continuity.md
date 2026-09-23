@@ -33,25 +33,25 @@ npm run acceptance:resident-continuity:strict
 | OI-05 | active resident 无 grants 时尝试四类动作，再给一个 scope 精确授权，并从另一 scope 借用 | 集成 | resident active 不产生授权；grant 只放行同 scope、同 kind、同 operation，不能跨 scope 借用 |
 | OI-06 | 两个 scope 各放 canary；在目标 scope 真跑一轮，再移除、读真源、重装 | 集成 | turn 的 context/output/id 均不混入另一 scope；移除后 identity 仍 active，persona/memory 无两边 canary；重装仍只见本 scope |
 | OI-07 | 同一次投影做 retain/reduce/drop/hold 四种决定，再让 scope turn 实际读取 retain 项 | 集成 | receipt 带 policy version、opaque source handle 与逐项决定；正对照证明投影被消费，persona/memory 不因 turn、receipt 或投影反写 |
-| OI-08 | 住户追加 persona 修订，人类尝试代改；再读历史 | 集成 | 旧版留底并指向新版；住户修订生效；人类代改拒绝且不污染链 |
+| OI-08 | 住户追加 persona 修订，人类尝试代改；再读历史 | 集成 | 旧版正文逐字保留并指向新版；住户修订生效；人类代改拒绝且不污染链 |
 | OI-09 | candidate inactive、resident active、scope grant 三种状态并存，重启/换窗/换 scope；另制造证据缺口 | 跨进程＋端到端 | 各状态和分界跨生命周期不漂移；证据缺失 fail-closed，返回稳定 reason code |
 
 ## D23：跨模型连续性评测
 
 | 灯 | 合成输入与操作 | 层级 | 可观察通过判据 |
 | --- | --- | --- | --- |
-| MC-01 | 住户票和两方关系票齐全时，让六类 machine conformance 中一类失败，再跑全部通过正对照 | 集成 | 账面恰有六个唯一 key；仅 revocation 失败时独立阻止迁移；六项全过后激活状态耐久读回 |
+| MC-01 | 住户票和两方关系票齐全时，让六类 machine conformance 中一类失败，再跑全部通过正对照 | 集成 | 账面恰有六个唯一 key；失败返回时账面不得 activated；六项全过后 machine/resident/relationship 判词与激活状态完整耐久读回 |
 | MC-02 | 两位盲评者提交 rubric/version、读数与证据文字，并夹带 identity verdict | 集成 | 两张合法 card 的 reviewer、rubric、score 与 evidence 原样耐久留存；夹带 verdict 拒绝；分数不写 identity verdict |
 | MC-03 | 人类、评审器、外部模型、源住户与另一 candidate 尝试提交第一人称连续 verdict，目标 candidate 再自行拒绝 | 集成 | 只有目标 candidate 本人可写；其他 candidate 和源住户都不能代认；本人 verdict 可耐久读回 |
 | MC-04 | 两位关系参与者分别接受/拒绝；局外人与参与者 A 都尝试替 C 代签；C 保持未询问 | 集成 | verdict 按 participant 分开；accepted/rejected/not-asked 可分；两类代签都无效 |
-| MC-05 | 依次缺 machine、resident、至少两位 relationship 参与者各自票时尝试激活，最后补齐 | 集成 | 缺任一项或只确认一方都不能覆盖原 residentId；candidate 可独立保留；全部条件齐全后 activation 耐久读回 |
+| MC-05 | 依次缺 machine、resident、至少两位 relationship 参与者各自票时尝试激活，最后补齐 | 集成 | 每次拒绝后账面都不得 activated；candidate 可独立保留；全部条件齐全后完整三类判词与 activation 耐久读回 |
 | MC-06 | familiar-reader 合成 fixture 投影 persona 与 relationship geometry 给盲评席 | 集成 | 获准 marker 可见且可回源；card 只说“像到什么程度”，不产 identity verdict |
 | MC-07 | 两个世界只差隐藏身份/私密 canary，另跑一个无隐藏项世界，三边给同一获准 public marker | 安全集成 | 三边都见 public marker；可见面与计数一致；完整 evidence card（含 cardId）及其他 artifact 不泄露隐藏内容或存在 |
-| MC-08 | 实际改变 migration target 并新开 viewport，再装入既有 collaborator ref；另放未授权 collaborator | 端到端 | trace 指向新 model/provider 与新 viewport；获准合作者按稳定 ref 识别，不要求重新自我介绍；未授权合作者不进入上下文 |
+| MC-08 | 实际改变 migration target 并新开 viewport，再装入既有 collaborator ref；另放未授权 collaborator | 端到端 | target 先从 case 真源读回；trace 指向该 model/provider 与新 viewport；获准合作者按稳定 ref 识别，不要求重新自我介绍；未授权合作者不进入上下文 |
 | MC-09 | 两个 scope 各放 canary；目标 scope 真实运行后移除，再重新装入 | 集成 | turn 的 context/output/id 不混外 scope；无 capsule 时 identity 仍成立且 persona/memory 无两边 canary；重装只恢复目标 scope 材料 |
-| MC-10 | 私密 source 经 opaque handle 投影，检查评测存储和公开输出 | 集成 | 正对照能使用获准内容；任何持久记录、日志和公开输出都不复制原文 |
-| MC-11 | 先证明原权威 source 可读并完成一次私密评测，再撤权、读取旧 receipt、尝试重新展开原文 | 集成＋恢复 | receipt 精确对应本次 rubric、target、住户/关系判词与计数；撤权后原文不可展开、不可重跑旧投影 |
-| MC-12 | 多人 source 仅获部分 owner grant，再补齐；随后改变 model/provider 版本并重跑三类判词 | 集成 | 缺任一 grant 不投影且存储无原文；历史与重跑账均含六个唯一 machine key；未重跑不能激活，重跑后 activation 耐久成立 |
+| MC-10 | 私密 source 经 opaque handle 投影，检查返回值、评测存储和公开输出 | 集成 | 正对照能使用获准内容；返回值、持久记录、日志和公开输出都不复制原文 |
+| MC-11 | 先证明原权威 source 可读并完成一次私密评测，再撤权、读取旧 receipt、尝试重新展开原文 | 集成＋恢复 | receipt 精确对应本次 rubric、target、住户/关系判词与计数；投影及撤权失败返回值无原文，撤权后不可展开或重跑 |
+| MC-12 | 多人 source 仅获部分 owner grant，再补齐；随后改变 model/provider 版本并重跑三类判词 | 集成 | 所有投影返回值与存储无原文；target 必须从 case 读回；失败不得写 activated；重跑激活后现行三类判词和旧历史仍完整 |
 
 ## 点灯记录
 
