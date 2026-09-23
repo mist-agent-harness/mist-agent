@@ -100,7 +100,14 @@ const tg01: TelegramChannelCheck = {
           return fail(`外部地址解析改变了权威身份：${json(resolved)}`);
         }
       }
-      return pass("chat 与 topic 两类地址都只投影到同一 resident/scope");
+      const nonAddressIds = update(root.value.address, "tg01-non-address");
+      for (const externalId of [nonAddressIds.messageId, nonAddressIds.senderId]) {
+        const misused = await driver.resolveAddress(address(externalId));
+        if (misused.ok || misused.reason !== "BINDING_NOT_FOUND") {
+          return fail(`message/user id 被误当成权威地址：${json(misused)}`);
+        }
+      }
+      return pass("chat 与 topic 只投影到 resident/scope；message/user id 不能参与解析");
     } finally {
       await driver.reset();
     }
@@ -151,6 +158,15 @@ const tg02: TelegramChannelCheck = {
       const hidden = await driver.ingestUpdate(update(first.binding.address, "tg02-hidden"));
       if (hidden.ok || hidden.reason !== "SCOPE_NOT_VISIBLE") return fail("不可见 scope 收到消息");
       await driver.setScopeVisibility(first.scope.scopeId, true);
+      const valid = await driver.ingestUpdate(update(first.binding.address, "tg02-valid"));
+      if (
+        !valid.ok ||
+        valid.value.status !== "dispatched" ||
+        valid.value.dispatch?.residentId !== first.resident.residentId ||
+        valid.value.dispatch.scopeId !== first.scope.scopeId
+      ) {
+        return fail(`有效当前绑定正对照没有派发：${json(valid)}`);
+      }
       const inFlight = await driver.beginInFlightChannelOperation(
         "inbound",
         first.binding.bindingId,
@@ -164,7 +180,7 @@ const tg02: TelegramChannelCheck = {
       await driver.revokeBinding(first.binding.bindingId);
       const revoked = await driver.ingestUpdate(update(first.binding.address, "tg02-revoked"));
       if (revoked.ok || revoked.reason !== "BINDING_REVOKED") return fail("撤权绑定继续派发");
-      return pass("无绑定、冲突、不可见、旧代际与撤权均 fail-closed");
+      return pass("有效当前绑定可派发；无绑定、冲突、不可见、旧代际与撤权均 fail-closed");
     } finally {
       await driver.reset();
     }
@@ -194,12 +210,14 @@ const tg03: TelegramChannelCheck = {
       if (
         host.hostProviderDispatches !== 1 ||
         host.channelOwnedHosts !== 0 ||
-        host.lastDispatch?.dispatchId !== dispatch.dispatchId ||
-        !dispatch.residentId ||
-        !dispatch.scopeId ||
-        dispatch.scopeGeneration < 1 ||
-        !dispatch.windowId ||
-        dispatch.windowGeneration < 1
+        json(host.lastDispatch) !== json(dispatch) ||
+        dispatch.residentId !== fixture.resident.residentId ||
+        dispatch.scopeId !== fixture.scope.scopeId ||
+        dispatch.scopeGeneration !== fixture.scope.scopeGeneration ||
+        dispatch.windowId !== fixture.scope.windowId ||
+        dispatch.windowGeneration !== fixture.scope.windowGeneration ||
+        dispatch.sourceMessageId !== "message:tg03" ||
+        dispatch.dispatchId.length === 0
       ) {
         return fail(`宿主派发证据不完整：${json({ host, dispatch })}`);
       }
@@ -244,8 +262,14 @@ const tg04: TelegramChannelCheck = {
         return fail("乱序 update 改变了派发身份");
       }
       const effects = await driver.readInboundEffects();
-      if (effects.filter((id) => id === first.value.effectId).length !== 1) {
-        return fail("重复 update 产生了多份副作用");
+      const expectedEffects = [first.value.effectId, newer.value.effectId, older.value.effectId];
+      if (
+        expectedEffects.some((effectId) => effectId === null) ||
+        new Set(expectedEffects).size !== expectedEffects.length ||
+        effects.length !== expectedEffects.length ||
+        !expectedEffects.every((effectId) => effects.includes(effectId as string))
+      ) {
+        return fail(`重复/乱序 update 的 effect 集合不精确：${json(effects)}`);
       }
       const inFlight = await driver.beginInFlightChannelOperation(
         "inbound",
@@ -255,6 +279,8 @@ const tg04: TelegramChannelCheck = {
       await driver.advanceScopeGeneration(fixture.scope.scopeId);
       const stale = await driver.completeInFlightChannelOperation(inFlight.value);
       if (stale.ok || stale.reason !== "STALE_SCOPE_GENERATION") return fail("迟到结果跨代点灯");
+      const afterStale = await driver.readInboundEffects();
+      if (json(afterStale) !== json(effects)) return fail("迟到结果被拒后仍写入新 effect");
       return pass("update 幂等、乱序身份稳定、迟到结果跨代拒绝");
     } finally {
       await driver.reset();
@@ -279,7 +305,7 @@ const tg05: TelegramChannelCheck = {
       const fixture = await readyChannel(driver, "tg05");
       const dispatch = await dispatchContext(driver, fixture, "tg05-context");
       const visible = await driver.sendOutbound(
-        { context: dispatch, body: "visible", modelTargetHint: null },
+        { context: dispatch, body: "visible", untrustedTargetHints: [] },
         "visible",
       );
       if (
@@ -289,20 +315,45 @@ const tg05: TelegramChannelCheck = {
       ) {
         return fail("用户可见正对照没有真实 message id");
       }
+      const submittedDispatch = await dispatchContext(driver, fixture, "tg05-submitted");
+      const submitted = await driver.sendOutbound(
+        { context: submittedDispatch, body: "submitted", untrustedTargetHints: [] },
+        "submitted-only",
+      );
+      const acceptedDispatch = await dispatchContext(driver, fixture, "tg05-accepted");
+      const accepted = await driver.sendOutbound(
+        { context: acceptedDispatch, body: "accepted", untrustedTargetHints: [] },
+        "accepted-only",
+      );
+      if (
+        !submitted.ok ||
+        submitted.value.status !== "submitted" ||
+        submitted.value.telegramMessageId !== null ||
+        !accepted.ok ||
+        accepted.value.status !== "accepted" ||
+        accepted.value.telegramMessageId !== null
+      ) {
+        return fail("submitted/accepted 被误当成用户可见回执");
+      }
+      const lostDispatch = await dispatchContext(driver, fixture, "tg05-lost");
       const lost = await driver.sendOutbound(
-        {
-          context: { ...dispatch, dispatchId: "dispatch:tg05-lost" },
-          body: "lost",
-          modelTargetHint: null,
-        },
+        { context: lostDispatch, body: "lost", untrustedTargetHints: [] },
         "receipt-lost",
       );
       if (!lost.ok || lost.value.status !== "unknown" || lost.value.reason !== "RECEIPT_LOST") {
         return fail(`丢回执没有外显 unknown：${json(lost)}`);
       }
       const reread = await driver.readOutbound(lost.value.outboundId);
-      if (!reread.ok || reread.value.status !== "unknown") return fail("unknown 没有耐久读回");
-      return pass("visible 与 receipt-lost unknown 分层且耐久可查");
+      if (
+        !reread.ok ||
+        reread.value.status !== "unknown" ||
+        reread.value.reason !== "RECEIPT_LOST" ||
+        reread.value.bindingId !== fixture.binding.bindingId ||
+        json(reread.value.target) !== json(fixture.binding.address)
+      ) {
+        return fail("unknown 没有按原 binding/target 耐久读回");
+      }
+      return pass("host-issued 出站分清 submitted/accepted/visible；丢回执耐久 unknown");
     } finally {
       await driver.reset();
     }
@@ -323,19 +374,46 @@ const tg06: TelegramChannelCheck = {
   async run(driver) {
     try {
       const fixture = await readyChannel(driver, "tg06");
-      const dispatch = await dispatchContext(driver, fixture, "tg06-context");
+      const inboundUpdate = update(fixture.binding.address, "tg06-context");
+      const inbound = await driver.ingestUpdate(inboundUpdate);
+      if (!inbound.ok || inbound.value.status !== "dispatched") {
+        throw new Error(`正对照 inbound 失败：${json(inbound)}`);
+      }
+      const dispatch = context(inbound.value, fixture.binding);
       const sent = await driver.sendOutbound(
         {
           context: dispatch,
-          body: "authorized-target-only",
-          modelTargetHint: address("chat:attacker", "topic:attacker"),
+          body: "chat:body-attacker topic:body-attacker message:body-attacker",
+          untrustedTargetHints: [
+            {
+              source: "model",
+              address: address("chat:model-attacker", "topic:model-attacker"),
+              messageId: "message:model-attacker",
+            },
+            {
+              source: "message-body",
+              address: address("chat:body-attacker", "topic:body-attacker"),
+              messageId: "message:body-attacker",
+            },
+            {
+              source: "resident-memory",
+              address: address("chat:memory-attacker", "topic:memory-attacker"),
+              messageId: "message:memory-attacker",
+            },
+          ],
         },
         "visible",
       );
-      if (!sent.ok || json(sent.value.target) !== json(fixture.binding.address)) {
+      if (
+        !sent.ok ||
+        json(sent.value.target) !== json(fixture.binding.address) ||
+        sent.value.replyToMessageId !== inboundUpdate.messageId
+      ) {
         return fail(`模型 target hint 改写了发送目标：${json(sent)}`);
       }
-      return pass("未授权 hint 被忽略，实际目标逐字段等于当前 binding");
+      return pass(
+        "模型、正文与 resident memory hint 均被忽略，chat/topic/message 来自当前 context",
+      );
     } finally {
       await driver.reset();
     }
@@ -360,11 +438,18 @@ const tg07: TelegramChannelCheck = {
     try {
       const secret = "telegram-token-canary-tg07";
       const token = await driver.createTokenReference(secret);
+      if (
+        token.credentialRef.length === 0 ||
+        token.credentialRef === secret ||
+        token.credentialRef.includes(secret)
+      ) {
+        return fail("token reference 本身不是 opaque");
+      }
       await driver.attachToken(token.credentialRef);
       const fixture = await readyChannel(driver, "tg07");
       const dispatch = await dispatchContext(driver, fixture, "tg07-context");
       const sent = await driver.sendOutbound(
-        { context: dispatch, body: "token-positive-control", modelTargetHint: null },
+        { context: dispatch, body: "token-positive-control", untrustedTargetHints: [] },
         "visible",
       );
       if (!sent.ok) return fail("token resolver 正对照无法完成出站");
@@ -373,12 +458,14 @@ const tg07: TelegramChannelCheck = {
         return fail("opaque token ref 没有被真实解析使用");
       }
       const artifacts = [
+        boundary.credentialRef,
         ...boundary.config,
         ...boundary.logs,
         ...boundary.receipts,
         ...boundary.errors,
+        json(sent.value),
       ];
-      if (artifacts.some((value) => value.includes(secret)))
+      if (artifacts.some((value) => value.includes(secret)) || json(boundary).includes(secret))
         return fail("明文 token canary 落入产物");
       return pass("token ref 被解析使用，明文未进入配置、日志、回执或错误");
     } finally {
@@ -401,6 +488,7 @@ const tg08: TelegramChannelCheck = {
     "revokeBinding",
     "revokeToken",
     "ingestUpdate",
+    "sendOutbound",
     "completeInFlightChannelOperation",
     "reset",
   ],
@@ -409,6 +497,14 @@ const tg08: TelegramChannelCheck = {
       const token = await driver.createTokenReference("telegram-token-canary-tg08");
       await driver.attachToken(token.credentialRef);
       const fixture = await readyChannel(driver, "tg08");
+      const dispatch = await dispatchContext(driver, fixture, "tg08-positive");
+      const sent = await driver.sendOutbound(
+        { context: dispatch, body: "token-positive-control", untrustedTargetHints: [] },
+        "visible",
+      );
+      if (!sent.ok || sent.value.status !== "visible") {
+        throw new Error("撤权前真实收发正对照失败");
+      }
       const inbound = await driver.beginInFlightChannelOperation(
         "inbound",
         fixture.binding.bindingId,
@@ -419,12 +515,28 @@ const tg08: TelegramChannelCheck = {
       );
       if (!inbound.ok || !outbound.ok) throw new Error("在途正对照失败");
       const before = await driver.inspectTokenBoundary();
+      if (before.resolvedCount < 1) return fail("撤权前 token 没有真实解析正对照");
       await driver.revokeBinding(fixture.binding.bindingId);
       await driver.revokeToken();
       const fresh = await driver.ingestUpdate(update(fixture.binding.address, "tg08-fresh"));
+      const freshOut = await driver.sendOutbound(
+        { context: dispatch, body: "after-revoke", untrustedTargetHints: [] },
+        "visible",
+      );
       const lateIn = await driver.completeInFlightChannelOperation(inbound.value);
       const lateOut = await driver.completeInFlightChannelOperation(outbound.value);
-      if (fresh.ok || lateIn.ok || lateOut.ok) return fail("撤权后仍有新旧收发路径成功");
+      if (
+        fresh.ok ||
+        (!fresh.ok && fresh.reason !== "BINDING_REVOKED") ||
+        freshOut.ok ||
+        (!freshOut.ok && freshOut.reason !== "BINDING_REVOKED") ||
+        lateIn.ok ||
+        (!lateIn.ok && lateIn.reason !== "CHANNEL_AUTHORITY_REVOKED") ||
+        lateOut.ok ||
+        (!lateOut.ok && lateOut.reason !== "CHANNEL_AUTHORITY_REVOKED")
+      ) {
+        return fail(`撤权后新旧收发没有稳定拒绝：${json({ fresh, freshOut, lateIn, lateOut })}`);
+      }
       const after = await driver.inspectTokenBoundary();
       if (after.resolvedCount !== before.resolvedCount) return fail("撤权后仍解析 token");
       return pass("binding/token 撤权切断新请求、在途旧请求与凭证解析");
@@ -452,7 +564,7 @@ const tg09: TelegramChannelCheck = {
       const fixture = await readyChannel(driver, "tg09");
       const dispatch = await dispatchContext(driver, fixture, "tg09-context");
       await driver.sendOutbound(
-        { context: dispatch, body: "observable", modelTargetHint: null },
+        { context: dispatch, body: "observable", untrustedTargetHints: [] },
         "visible",
       );
       const healthy = await driver.readObservability(fixture.binding.bindingId);
@@ -510,7 +622,12 @@ const gd01: TelegramChannelCheck = {
         new Set(trace.map((entry) => entry.residentId)).size !== 2 ||
         new Set(trace.map((entry) => `${entry.model}:${entry.provider}`)).size !== 2 ||
         trace.some(
-          (entry) => !entry.scopeId || !entry.dispatchId || entry.outboundStatus !== "visible",
+          (entry) =>
+            entry.groupId !== group.groupId ||
+            json(entry.address) !== json(group.address) ||
+            !entry.scopeId ||
+            !entry.dispatchId ||
+            entry.outboundStatus !== "visible",
         )
       ) {
         return fail(`多住户同群链路不可追或模型未独立：${json(trace)}`);
@@ -531,6 +648,7 @@ const gd02: TelegramChannelCheck = {
     "bindAddress",
     "readBinding",
     "switchResidentModel",
+    "listResidents",
     "createGroupFixture",
     "runGroupRound",
     "reset",
@@ -538,19 +656,25 @@ const gd02: TelegramChannelCheck = {
   async run(driver) {
     try {
       const fixture = await readyChannel(driver, "gd02", "model:old", "provider:old");
+      const residentsBefore = await driver.listResidents();
       const switched = await driver.switchResidentModel(
         fixture.resident.residentId,
         "model:new",
         "provider:new",
       );
       const binding = await driver.readBinding(fixture.binding.bindingId);
+      const residentsAfter = await driver.listResidents();
       if (
         switched.residentId !== fixture.resident.residentId ||
         switched.canonicalStateHash !== fixture.resident.canonicalStateHash ||
+        switched.runtimeSessionId === fixture.resident.runtimeSessionId ||
         binding.residentId !== fixture.resident.residentId ||
-        binding.scopeId !== fixture.scope.scopeId
+        binding.scopeId !== fixture.scope.scopeId ||
+        residentsAfter.length !== residentsBefore.length ||
+        residentsAfter.filter(({ residentId }) => residentId === fixture.resident.residentId)
+          .length !== 1
       ) {
-        return fail("换模型后 resident、canonical state 或 binding 漂移");
+        return fail("换模型后 resident/canonical/binding 漂移，session 未换，或出现影子 resident");
       }
       const group = await driver.createGroupFixture({
         address: fixture.binding.address,
@@ -572,7 +696,13 @@ const gd02: TelegramChannelCheck = {
 const gd03: TelegramChannelCheck = {
   id: "GD-03",
   title: "D23 三类判词齐全才激活跨模型连续性",
-  uses: ["createResidentFixture", "setContinuityVotes", "activateContinuity", "reset"],
+  uses: [
+    "createResidentFixture",
+    "setContinuityVotes",
+    "activateContinuity",
+    "readCanonicalState",
+    "reset",
+  ],
   async run(driver) {
     try {
       const resident = await driver.createResidentFixture("gd03", "model:new", "provider:new");
@@ -588,7 +718,15 @@ const gd03: TelegramChannelCheck = {
           relationships: [...votes.relationships],
         });
         const blocked = await driver.activateContinuity(resident.residentId);
-        if (blocked.activated) return fail(`缺判词仍激活：${json(votes)}`);
+        const canonical = await driver.readCanonicalState(resident.residentId);
+        if (
+          blocked.activated ||
+          blocked.residentId !== resident.residentId ||
+          canonical.residentId !== resident.residentId ||
+          canonical.canonicalStateHash !== resident.canonicalStateHash
+        ) {
+          return fail(`缺判词时 candidate/resident 真源发生变化：${json({ votes, blocked })}`);
+        }
       }
       await driver.setContinuityVotes(resident.residentId, {
         machine: "passed",
@@ -599,7 +737,7 @@ const gd03: TelegramChannelCheck = {
       if (!active.activated || active.residentId !== resident.residentId) {
         return fail("三类判词齐全正对照未激活");
       }
-      return pass("machine、resident、relationship 缺一不可，齐全才激活");
+      return pass("三类判词缺一时 candidate/resident 不变；齐全才激活同一 resident");
     } finally {
       await driver.reset();
     }
@@ -643,10 +781,24 @@ const gd04: TelegramChannelCheck = {
           status: expected[index] ?? "failed",
         })),
       );
-      if (trace.length !== 3 || trace.some((entry, index) => entry.status !== expected[index])) {
+      if (
+        trace.length !== 3 ||
+        trace.some(
+          (entry, index) =>
+            entry.groupId !== group.groupId ||
+            json(entry.address) !== json(group.address) ||
+            entry.residentId !== residents[index]?.residentId ||
+            entry.scopeId !== scopes[index]?.scopeId ||
+            entry.status !== expected[index],
+        )
+      ) {
         return fail(`三类群聊结果被压平或串位：${json(trace)}`);
       }
-      if (trace[0]?.outboundStatus !== "visible" || trace[1]?.outboundStatus !== null) {
+      if (
+        trace[0]?.outboundStatus !== "visible" ||
+        trace[1]?.outboundStatus !== null ||
+        trace[2]?.outboundStatus !== "rejected"
+      ) {
         return fail("发言与沉默的回执语义不清");
       }
       return pass("每位 resident 的派发归属独立，发言、沉默与失败分别留账");
@@ -669,6 +821,7 @@ const gd05: TelegramChannelCheck = {
     "readCanonicalState",
     "setTelegramAvailability",
     "sendOutbound",
+    "readOutbound",
     "readOutboundEffects",
     "reset",
   ],
@@ -697,17 +850,36 @@ const gd05: TelegramChannelCheck = {
         {
           context: context(first.value, fixture.binding),
           body: "platform-unavailable",
-          modelTargetHint: null,
+          untrustedTargetHints: [],
         },
         "telegram-unavailable",
       );
-      if (!sent.ok || sent.value.status !== "unknown") return fail("平台故障没有外显 unknown");
+      if (
+        !sent.ok ||
+        sent.value.status !== "unknown" ||
+        sent.value.effectId === null ||
+        json(sent.value.target) !== json(fixture.binding.address)
+      ) {
+        return fail("平台故障没有在原 target 留下可追的 unknown");
+      }
       const beforeRecovery = await driver.readOutboundEffects();
+      if (beforeRecovery.length !== 1 || beforeRecovery[0] !== sent.value.effectId) {
+        return fail(`unknown 出站没有耐久 effect 正证据：${json(beforeRecovery)}`);
+      }
       await driver.setTelegramAvailability(true);
       await driver.restartChannel();
       const afterRecovery = await driver.readOutboundEffects();
       if (json(afterRecovery) !== json(beforeRecovery)) return fail("恢复后自动重放了未知副作用");
-      return pass("冷启动保持账与身份；平台 unknown 恢复后不自动重放");
+      const reread = await driver.readOutbound(sent.value.outboundId);
+      if (
+        !reread.ok ||
+        reread.value.status !== "unknown" ||
+        reread.value.effectId !== sent.value.effectId ||
+        json(reread.value.target) !== json(fixture.binding.address)
+      ) {
+        return fail("恢复后 unknown 回执的 target/effect 漂移");
+      }
+      return pass("冷启动保持账与身份；平台 unknown 有耐久 effect，恢复后不换目标、不自动重放");
     } finally {
       await driver.reset();
     }

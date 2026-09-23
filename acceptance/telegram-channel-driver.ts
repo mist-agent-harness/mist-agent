@@ -11,6 +11,7 @@ export interface ResidentFixture {
   residentId: string;
   model: string;
   provider: string;
+  runtimeSessionId: string;
   canonicalStateHash: string;
 }
 
@@ -47,6 +48,7 @@ export interface DispatchIdentity {
   windowId: string;
   windowGeneration: number;
   dispatchId: string;
+  sourceMessageId: string;
 }
 
 export interface InboundReceipt {
@@ -64,8 +66,12 @@ export interface DispatchContext extends DispatchIdentity {
 export interface OutboundRequest {
   context: DispatchContext;
   body: string;
-  /** 负例输入；插件不得把模型建议当成发送授权。 */
-  modelTargetHint: TelegramAddress | null;
+  /** 负例输入；三类非权威内容都不得改写发送地址或 reply message。 */
+  untrustedTargetHints: Array<{
+    source: "model" | "message-body" | "resident-memory";
+    address: TelegramAddress;
+    messageId: string | null;
+  }>;
 }
 
 export interface OutboundReceipt {
@@ -74,13 +80,13 @@ export interface OutboundReceipt {
   reason: string | null;
   target: TelegramAddress;
   bindingId: string;
+  replyToMessageId: string | null;
   telegramMessageId: string | null;
   effectId: string | null;
 }
 
 export interface TokenReference {
   credentialRef: string;
-  secretCanary: string;
 }
 
 export interface TokenBoundarySnapshot {
@@ -124,6 +130,8 @@ export interface GroupFixture {
 export type GroupPlanStatus = "visible" | "silent" | "failed";
 
 export interface GroupTraceEntry {
+  groupId: string;
+  address: TelegramAddress;
   residentId: string;
   scopeId: string;
   dispatchId: string;
@@ -168,7 +176,12 @@ export interface TelegramChannelDriver {
 
   sendOutbound(
     request: OutboundRequest,
-    scenario: "visible" | "receipt-lost" | "telegram-unavailable",
+    scenario:
+      | "visible"
+      | "submitted-only"
+      | "accepted-only"
+      | "receipt-lost"
+      | "telegram-unavailable",
   ): Promise<Result<OutboundReceipt>>;
   readOutbound(outboundId: string): Promise<Result<OutboundReceipt>>;
   readOutboundEffects(): Promise<string[]>;
@@ -195,6 +208,7 @@ export interface TelegramChannelDriver {
     model: string,
     provider: string,
   ): Promise<ResidentFixture>;
+  listResidents(): Promise<ResidentFixture[]>;
   setContinuityVotes(residentId: string, votes: ContinuityVotes): Promise<void>;
   activateContinuity(residentId: string): Promise<ContinuityActivation>;
 

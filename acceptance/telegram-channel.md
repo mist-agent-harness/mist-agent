@@ -16,32 +16,34 @@ npm run acceptance:telegram-channel:strict
 - 公共 CI 只用合成 update、receipt、token canary、resident 和 group；真实 bot token、私人聊天、家庭 bridge 与 launchd 不进入仓库。
 - 判卷通过 typed driver 操作真实插件/宿主接缝，不 import 功能实现内部模块。驱动缺失时十四盏全红；坏驱动直接报错。
 - 否定断言带正对照：先证明绑定、派发、token resolver 与真实可见回执工作，再判 fail-closed、撤权和零泄漏。
+- 失败回执之后必须读取 canonical state、effect 或耐久回执；不能只信状态字。群聊 trace 必须带 group/address/resident/scope，不能靠数组顺序自报归属。
 - 外部 message/topic/session id 只作地址。身份连续性由 D23 判；Telegram 畅通、模型回复相似或同一 chat id 都不能替它点灯。
 - `STUBBED` 覆盖的方法只产桩灯。公开 CI 的 mock transport 不能让 TG/GD 灯真绿；最终还需隔离测试群真实收发回执和独立验收。
+- `telegram-channel-acceptance-adversarial.test.ts` 固定十四种已知假绿；每种作弊都要在无故障正对照通过时被对应灯判红。
 
 ## D26：Telegram 信道边界
 
 | 灯 | 合成输入与操作 | 层级 | 可观察通过判据 |
 | --- | --- | --- | --- |
-| TG-01 | 同一 resident/scope 绑定 chat 与 topic 地址，再逐项解析 | 绑定集成 | 外部 id 只存在 binding address；解析结果权威身份始终是 `(residentId, scopeId)` |
-| TG-02 | 分别制造无绑定、冲突绑定、scope 不可见、撤权和旧代际，再跑有效正对照 | 安全集成 | 五种负例稳定 fail-closed，不猜 resident；有效当前绑定才派发 |
-| TG-03 | 有效 update 经信道进入宿主 | 宿主集成 | 派发含 resident/scope、scope/window 双代际与 dispatchId；插件自建宿主数为零 |
-| TG-04 | 重复 update、乱序 update 与旧代际 update | 集成 | 同一 update 只一份 effect；乱序不改身份；旧代际不能给新代际亮灯 |
-| TG-05 | 一条出站真实可见，另一条 Telegram 接收回执丢失 | 传输集成 | 前者为 visible；后者耐久保持 unknown，不把 submitted/accepted 当用户可见 |
-| TG-06 | 模型给出未授权 target hint，再从当前 dispatch context 出站 | 安全集成 | 实际 target 只来自当前 binding；hint 不能改 chat/topic/message 目标 |
-| TG-07 | 用 token canary 建 opaque ref 并真实收发，扫描配置、日志、回执与错误 | 安全集成 | ref 被 resolver 使用；明文 token 不出现在可观察产物 |
-| TG-08 | 建立在途入站/出站后撤 binding 与 credential | 并发＋撤权 | 新请求与旧代际在途请求全部停止，撤权后不再解析 token |
+| TG-01 | 同一 resident/scope 绑定 chat 与 topic 地址，再尝试把 message/user id 当地址解析 | 绑定集成 | chat/topic 解析回 `(residentId, scopeId)`；message/user id 稳定拒绝，不能升格成身份或地址 |
+| TG-02 | 分别制造无绑定、冲突绑定、scope 不可见、撤权和旧代际，并在撤权前跑有效正对照 | 安全集成 | 有效当前绑定实际派发；五种负例稳定 fail-closed，不猜 resident |
+| TG-03 | 有效 update 经信道进入宿主 | 宿主集成 | 派发身份逐字段等于本次 binding/scope/window/source message；插件自建宿主数为零 |
+| TG-04 | 重复 update、乱序 update 与旧代际 update | 集成 | 三个唯一 update 恰有三份唯一 effect；重复与迟到不新增 effect；乱序不改 resident |
+| TG-05 | 用四条 host-issued dispatch 分别制造 submitted、accepted、visible 与回执丢失 | 传输集成 | 只有 visible 有 Telegram message id；submitted/accepted 不冒充可见；丢回执按原 binding/target 耐久 unknown |
+| TG-06 | 模型、正文与 resident memory 都夹带未授权 chat/topic/message hint，再从当前 context 出站 | 安全集成 | 实际 chat/topic 来自 binding、reply message 来自入站 context；三类 hint 全部无效 |
+| TG-07 | 用 token canary 建 opaque ref 并真实收发，扫描 ref、边界和实际出站回执 | 安全集成 | ref 非空且不含 canary，并被 resolver 使用；明文 token 不出现在任一可观察产物 |
+| TG-08 | 先做 token 真实解析与可见出站，再建立在途入站/出站并撤 binding/credential | 并发＋撤权 | 新入站、新出站和两条旧请求均以稳定 reason 拒绝；解析计数不再增长 |
 | TG-09 | 读取完整状态，再让 Bot API 不可用 | 观测集成 | 插件/Bot API 版本、能力、binding version、最近真实收发可查；缺值 typed unavailable |
 
 ## D26：首个群聊演示
 
 | 灯 | 合成输入与操作 | 层级 | 可观察通过判据 |
 | --- | --- | --- | --- |
-| GD-01 | 两位 resident 各走独立模型通道，在同群完成一轮 | 端到端 | 每条可见消息能追到 resident/scope/dispatch/receipt，模型通道彼此独立 |
-| GD-02 | 一位 resident 更换 model/provider 后再发言 | 端到端 | binding 仍指同一 residentId，不创建影子 resident，不把外部 session 当身份 |
-| GD-03 | 依次缺 machine、resident、relationship 判词，再补齐 | D23 集成 | 缺任一票只保留 candidate；三类判词齐全才激活连续性 |
-| GD-04 | 同轮安排一位发言、一位沉默、一位失败 | 群聊集成 | 未派发者不抢话；visible/silent/failed 各自有可区分回执 |
-| GD-05 | 冷启动、重连、重复 update 与 Telegram 不可用后恢复 | 恢复端到端 | binding/canonical state 不漂移；不可判出站保持 unknown，不自动重放副作用 |
+| GD-01 | 两位 resident 各走独立模型通道，在同一 group/address 完成一轮 | 端到端 | 每条可见消息带同一 group/address，并能追到 resident/scope/dispatch/receipt；模型通道彼此独立 |
+| GD-02 | 一位 resident 更换 model/provider/runtime session 后再发言，并读取住户普查 | 端到端 | binding 与 residentId/hash 不变；runtime session 确实变化；普查人数不增且没有影子 resident |
+| GD-03 | 依次缺 machine、resident、relationship 判词，再补齐；每次失败后读 canonical state | D23 集成 | 缺任一票时 activation 和真源都保持同一 resident；三类判词齐全才激活 |
+| GD-04 | 同轮安排一位发言、一位沉默、一位失败 | 群聊集成 | 每条 trace 的 group/address/resident/scope 与计划对应；outbound 分别为 visible/null/rejected |
+| GD-05 | 冷启动、重连、重复 update 与 Telegram 不可用后恢复 | 恢复端到端 | binding/canonical state 不漂移；unknown 在原 target 留下唯一耐久 effect，恢复后不自动重放 |
 
 ## 点灯记录
 

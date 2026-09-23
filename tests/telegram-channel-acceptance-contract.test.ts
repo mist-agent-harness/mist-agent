@@ -51,6 +51,7 @@ describe("D26 Telegram channel acceptance contract", () => {
       "setTelegramAvailability",
       "restartChannel",
       "switchResidentModel",
+      "listResidents",
       "setContinuityVotes",
       "activateContinuity",
       "createGroupFixture",
