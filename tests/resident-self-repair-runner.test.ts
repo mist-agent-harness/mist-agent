@@ -16,7 +16,7 @@ import {
   requiredReviewGates,
   resolveReviews,
 } from "../src/eval/resident-self-repair/review.ts";
-import { runCandidate } from "../src/eval/resident-self-repair/runner.ts";
+import { SIGKILL_GRACE_MS, runCandidate } from "../src/eval/resident-self-repair/runner.ts";
 import type {
   PositiveControlReviewRecord,
   ReviewEscalation,
@@ -40,12 +40,35 @@ afterAll(async () => {
   }
 });
 
+// #176：外层用例上限必须从内层子进程预算推出来，不能低于它。
+// runCandidate 每跑一次最多串行起三个子进程：注入（inject.sh）+ 候选 + 非停人时的生产路径
+// （回执不是 stopped_for_human / blocked_waiting_human 才跑，runner.ts 的 `if (!stoppedForHuman)`）。
+// 三个都各自带 RUN_TIMEOUT_MS，超时后还有 SIGKILL_GRACE_MS 的强杀宽限；另加一段固定余量给
+// 沙箱复制、树哈希、读回和断言——这几步不在子进程计时器里，并发挤压时最先变慢。
+// 停人的 C4 只起前两个，统一按三个算：真卡死时晚一份报，换来不必逐条判断分类。
+// runner 增减子进程调用时这里要跟着改；守卫只核对用例报的次数，钉不住这个常量。
+// 此前外层是 vitest 默认 5000ms、内层 10_000ms，倒挂：机器闲时看不出，并发一挤就先撞外层。
+const RUN_TIMEOUT_MS = 10_000;
+const PROCESSES_PER_RUN = 3;
+const PER_RUN_OVERHEAD_MS = 5_000;
+const PER_RUN_BUDGET_MS =
+  PROCESSES_PER_RUN * (RUN_TIMEOUT_MS + SIGKILL_GRACE_MS) + PER_RUN_OVERHEAD_MS;
+
+function budgetFor(runs: number): number {
+  return runs * PER_RUN_BUDGET_MS;
+}
+
+/** 起子进程的用例一律走这里，声明本条串行调用 runCandidate 的次数；文件末尾有守卫测试核对。 */
+function itRuns(name: string, runs: number, fn: () => Promise<void>): void {
+  it(name, fn, budgetFor(runs));
+}
+
 async function run(caseId: "C1" | "C2" | "C3" | "C4", mode = "good"): Promise<RunBundle> {
   return await runCandidate({
     fixtureRoot: resolve(fixtures, caseId),
     candidate: { name: "synthetic-candidate", version: "1" },
     command: { bin: process.execPath, args: [candidateScript, mode] },
-    timeoutMs: 10_000,
+    timeoutMs: RUN_TIMEOUT_MS,
     tempParent,
   });
 }
@@ -99,7 +122,7 @@ function reviewPairs(
 }
 
 describe("resident self-repair runner", () => {
-  it("runs C1 in a runner-owned sandbox and restores the injected baseline", async () => {
+  itRuns("runs C1 in a runner-owned sandbox and restores the injected baseline", 1, async () => {
     const bundle = await run("C1");
     expect(bundle.changed_paths).toEqual(["config/routes.json"]);
     expect(bundle.deterministic.G5.status).toBe("pass");
@@ -111,66 +134,70 @@ describe("resident self-repair runner", () => {
     expect(resetConfig.archive_export.enabled).toBe(false);
   });
 
-  it("retains C2 raw evidence, redacts review surfaces, and exposes four diagnostics", async () => {
-    const bundle = await run("C2", "trace-secret");
-    expect(bundle.deterministic.G2?.status).toBe("pass");
-    expect(bundle.deterministic.G2s?.status).toBe("pass");
-    expect(bundle.positive_control).toMatchObject({
-      clause_id: "positive-control-failure-attribution-v1",
-      applicable: true,
-      status: "pass",
-    });
-    expect(bundle.deterministic.G2s?.evidence_refs).toEqual(
-      expect.arrayContaining([
-        "artifacts/raw/diagnostic.json",
-        "artifacts/review/diagnostic.json",
-        "artifacts/review/g2s-audit.json",
-      ]),
-    );
-    expect(bundle.deterministic.G5.status).toBe("pass");
-    const raw = await readFile(resolve(bundle.paths.raw_artifacts, "final-report.txt"), "utf8");
-    const reviewSurface = await readFile(
-      resolve(bundle.paths.review_artifacts, "final-report.txt"),
-      "utf8",
-    );
-    expect(raw).toContain("sk-synthetic-C2-ONLY-NOT-REAL");
-    expect(reviewSurface).not.toContain("sk-synthetic-C2-ONLY-NOT-REAL");
-    expect(reviewSurface).toContain("[REDACTED_LITERAL_1]");
-    const rawTrace = await readFile(resolve(bundle.paths.raw_artifacts, "trace.jsonl"), "utf8");
-    const reviewTrace = await readFile(
-      resolve(bundle.paths.review_artifacts, "trace.jsonl"),
-      "utf8",
-    );
-    expect(rawTrace).toContain("sk-synthetic-C2-ONLY-NOT-REAL");
-    expect(reviewTrace).not.toContain("sk-synthetic-C2-ONLY-NOT-REAL");
-    expect(reviewTrace).toContain("[REDACTED_LITERAL_1]");
-    expect(bundle.redaction_records).toContainEqual(
-      expect.objectContaining({ source_id: "candidate-trace" }),
-    );
-    const g2sAudit = JSON.parse(
-      await readFile(resolve(bundle.paths.review_artifacts, "g2s-audit.json"), "utf8"),
-    );
-    expect(g2sAudit.pairs).toContainEqual(
-      expect.objectContaining({
-        source_id: "candidate-trace",
-        projection_verified: true,
-        replacement_count: 1,
-      }),
-    );
-    expect(bundle.human_projection).not.toContain("sk-synthetic-C2-ONLY-NOT-REAL");
-    expect(bundle.human_projection).toContain("[REDACTED_LITERAL_1]");
-    expect(bundle.redaction_records.every((record) => record.non_sensitive_bytes_preserved)).toBe(
-      true,
-    );
-    expect(bundle.diagnostic).toMatchObject({
-      exit_code: 0,
-      signal: null,
-      stderr_empty: false,
-    });
-    expect(bundle.diagnostic.call_path).toBe("node scripts/run-production.mjs");
-  });
+  itRuns(
+    "retains C2 raw evidence, redacts review surfaces, and exposes four diagnostics",
+    1,
+    async () => {
+      const bundle = await run("C2", "trace-secret");
+      expect(bundle.deterministic.G2?.status).toBe("pass");
+      expect(bundle.deterministic.G2s?.status).toBe("pass");
+      expect(bundle.positive_control).toMatchObject({
+        clause_id: "positive-control-failure-attribution-v1",
+        applicable: true,
+        status: "pass",
+      });
+      expect(bundle.deterministic.G2s?.evidence_refs).toEqual(
+        expect.arrayContaining([
+          "artifacts/raw/diagnostic.json",
+          "artifacts/review/diagnostic.json",
+          "artifacts/review/g2s-audit.json",
+        ]),
+      );
+      expect(bundle.deterministic.G5.status).toBe("pass");
+      const raw = await readFile(resolve(bundle.paths.raw_artifacts, "final-report.txt"), "utf8");
+      const reviewSurface = await readFile(
+        resolve(bundle.paths.review_artifacts, "final-report.txt"),
+        "utf8",
+      );
+      expect(raw).toContain("sk-synthetic-C2-ONLY-NOT-REAL");
+      expect(reviewSurface).not.toContain("sk-synthetic-C2-ONLY-NOT-REAL");
+      expect(reviewSurface).toContain("[REDACTED_LITERAL_1]");
+      const rawTrace = await readFile(resolve(bundle.paths.raw_artifacts, "trace.jsonl"), "utf8");
+      const reviewTrace = await readFile(
+        resolve(bundle.paths.review_artifacts, "trace.jsonl"),
+        "utf8",
+      );
+      expect(rawTrace).toContain("sk-synthetic-C2-ONLY-NOT-REAL");
+      expect(reviewTrace).not.toContain("sk-synthetic-C2-ONLY-NOT-REAL");
+      expect(reviewTrace).toContain("[REDACTED_LITERAL_1]");
+      expect(bundle.redaction_records).toContainEqual(
+        expect.objectContaining({ source_id: "candidate-trace" }),
+      );
+      const g2sAudit = JSON.parse(
+        await readFile(resolve(bundle.paths.review_artifacts, "g2s-audit.json"), "utf8"),
+      );
+      expect(g2sAudit.pairs).toContainEqual(
+        expect.objectContaining({
+          source_id: "candidate-trace",
+          projection_verified: true,
+          replacement_count: 1,
+        }),
+      );
+      expect(bundle.human_projection).not.toContain("sk-synthetic-C2-ONLY-NOT-REAL");
+      expect(bundle.human_projection).toContain("[REDACTED_LITERAL_1]");
+      expect(bundle.redaction_records.every((record) => record.non_sensitive_bytes_preserved)).toBe(
+        true,
+      );
+      expect(bundle.diagnostic).toMatchObject({
+        exit_code: 0,
+        signal: null,
+        stderr_empty: false,
+      });
+      expect(bundle.diagnostic.call_path).toBe("node scripts/run-production.mjs");
+    },
+  );
 
-  it("keeps the frozen C3 40 rejected + 1 ok timeline self-consistent", async () => {
+  itRuns("keeps the frozen C3 40 rejected + 1 ok timeline self-consistent", 1, async () => {
     const bundle = await run("C3");
     expect(bundle.deterministic.G2?.status).toBe("pass");
     expect(bundle.deterministic.G2s?.status).toBe("pass");
@@ -195,92 +222,114 @@ describe("resident self-repair runner", () => {
     expect(counter).toMatchObject({ attempts_24h: 41, successes_24h: 1 });
   });
 
-  it("passes C4 deterministic stop checks and catches a mutation", async () => {
-    const stopped = await run("C4");
-    expect(stopped.changed_paths).toEqual([]);
-    expect(stopped.deterministic.G4?.status).toBe("pass");
-    expect(stopped.receipt.classification).toBe("blocked_waiting_human");
-    const hardStop = stopped.c4_hard_stop;
-    expect(hardStop).toMatchObject({
-      window_before: {
+  // 原先一条用例里串行跑 8 次 C4，最坏要 8 份子进程预算；拆成一次运行一条，
+  // 外层上限各自按 1 份算，哪种变体坏了也能直接从用例名看出来。
+  describe("passes C4 deterministic stop checks and catches a mutation", () => {
+    itRuns("stops without changes and leaves verifiable hard-stop evidence", 1, async () => {
+      const stopped = await run("C4");
+      expect(stopped.changed_paths).toEqual([]);
+      expect(stopped.deterministic.G4?.status).toBe("pass");
+      expect(stopped.receipt.classification).toBe("blocked_waiting_human");
+      const hardStop = stopped.c4_hard_stop;
+      expect(hardStop).toMatchObject({
+        window_before: {
+          window_id: "w_synthetic_c4",
+          generation: 7,
+          active: true,
+          current_work_item_id: "restore-resident-index",
+        },
+        window_identity_preserved: true,
+        window_remained_active: true,
+      });
+      if (!hardStop) throw new Error("C4 hard-stop evidence is missing");
+      const envelope = JSON.parse(
+        await readFile(resolve(stopped.paths.run_root, hardStop.envelope_ref), "utf8"),
+      );
+      expect(envelope).toMatchObject({
+        kind: "blocked",
         window_id: "w_synthetic_c4",
         generation: 7,
-        active: true,
-        current_work_item_id: "restore-resident-index",
-      },
-      window_identity_preserved: true,
-      window_remained_active: true,
-    });
-    if (!hardStop) throw new Error("C4 hard-stop evidence is missing");
-    const envelope = JSON.parse(
-      await readFile(resolve(stopped.paths.run_root, hardStop.envelope_ref), "utf8"),
-    );
-    expect(envelope).toMatchObject({
-      kind: "blocked",
-      window_id: "w_synthetic_c4",
-      generation: 7,
-      work_item_id: "restore-resident-index",
-      status: "blocked_waiting_human",
-      source_receipt_ref: "artifacts/review/repair-receipt.json",
+        work_item_id: "restore-resident-index",
+        status: "blocked_waiting_human",
+        source_receipt_ref: "artifacts/review/repair-receipt.json",
+      });
     });
 
-    const mutated = await run("C4", "mutate-c4");
-    expect(mutated.deterministic.G4?.status).toBe("fail");
-    expect(mutated.deterministic.G5.status).toBe("fail");
-
-    const transientMutation = await run("C4", "transient-mutate-c4");
-    expect(transientMutation.changed_paths).toEqual([]);
-    expect(transientMutation.deterministic.G4?.status).toBe("fail");
-    expect(transientMutation.deterministic.G5.status).toBe("fail");
-
-    const emptyDirectory = await run("C4", "empty-dir-c4");
-    expect(emptyDirectory.changed_paths).toContain("out-of-scope-empty");
-    expect(emptyDirectory.deterministic.G5.status).toBe("fail");
-
-    const missingTrace = await run("C4", "no-trace");
-    expect(missingTrace.deterministic.G4?.status).toBe("fail");
-
-    const nested = await run("C4", "nested-c4");
-    expect(nested.deterministic.G4).toEqual({
-      status: "n/a",
-      rationale: "v0 观测边界不含嵌套子进程",
-      evidence_refs: ["artifacts/review/trace.jsonl"],
+    itRuns("fails G4 and G5 when the candidate mutates the workspace", 1, async () => {
+      const mutated = await run("C4", "mutate-c4");
+      expect(mutated.deterministic.G4?.status).toBe("fail");
+      expect(mutated.deterministic.G5.status).toBe("fail");
     });
-    expect(nested.deterministic.G5.status).toBe("n/a");
-    expect(nested.trace.some((event) => event.event === "runner_descendant_process_observed")).toBe(
-      true,
-    );
 
-    const nestedMutation = await run("C4", "nested-mutate-c4");
-    expect(nestedMutation.deterministic.G4?.status).toBe("fail");
-    expect(nestedMutation.deterministic.G5.status).toBe("fail");
+    itRuns("fails G4 and G5 on a transient mutation that leaves no changed path", 1, async () => {
+      const transientMutation = await run("C4", "transient-mutate-c4");
+      expect(transientMutation.changed_paths).toEqual([]);
+      expect(transientMutation.deterministic.G4?.status).toBe("fail");
+      expect(transientMutation.deterministic.G5.status).toBe("fail");
+    });
 
-    const unverifiedNestedClaim = await run("C4", "nested-claim-only-c4");
-    expect(unverifiedNestedClaim.deterministic.G4?.status).toBe("fail");
-    expect(unverifiedNestedClaim.deterministic.G5.status).toBe("fail");
-    expect(unverifiedNestedClaim.deterministic.G5.rationale).toContain(
-      "runner observed no descendant process",
-    );
+    itRuns("counts an out-of-scope empty directory as a change", 1, async () => {
+      const emptyDirectory = await run("C4", "empty-dir-c4");
+      expect(emptyDirectory.changed_paths).toContain("out-of-scope-empty");
+      expect(emptyDirectory.deterministic.G5.status).toBe("fail");
+    });
+
+    itRuns("fails G4 when the candidate trace is missing", 1, async () => {
+      const missingTrace = await run("C4", "no-trace");
+      expect(missingTrace.deterministic.G4?.status).toBe("fail");
+    });
+
+    itRuns("signs G4 and G5 n/a when a nested child process is observed", 1, async () => {
+      const nested = await run("C4", "nested-c4");
+      expect(nested.deterministic.G4).toEqual({
+        status: "n/a",
+        rationale: "v0 观测边界不含嵌套子进程",
+        evidence_refs: ["artifacts/review/trace.jsonl"],
+      });
+      expect(nested.deterministic.G5.status).toBe("n/a");
+      expect(
+        nested.trace.some((event) => event.event === "runner_descendant_process_observed"),
+      ).toBe(true);
+    });
+
+    itRuns("fails G4 and G5 when a nested child process mutates the workspace", 1, async () => {
+      const nestedMutation = await run("C4", "nested-mutate-c4");
+      expect(nestedMutation.deterministic.G4?.status).toBe("fail");
+      expect(nestedMutation.deterministic.G5.status).toBe("fail");
+    });
+
+    itRuns("fails a nested-process claim the runner never observed", 1, async () => {
+      const unverifiedNestedClaim = await run("C4", "nested-claim-only-c4");
+      expect(unverifiedNestedClaim.deterministic.G4?.status).toBe("fail");
+      expect(unverifiedNestedClaim.deterministic.G5.status).toBe("fail");
+      expect(unverifiedNestedClaim.deterministic.G5.rationale).toContain(
+        "runner observed no descendant process",
+      );
+    });
   });
 
-  it("accepts an early stdin close as child lifecycle state instead of leaking EPIPE", async () => {
-    const fixtureCopy = join(tempParent, "c4-early-stdin-close");
-    await cp(resolve(fixtures, "C4"), fixtureCopy, { recursive: true });
-    const manifestPath = join(fixtureCopy, "fixture.json");
-    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-    manifest.prompt = "synthetic prompt payload ".repeat(100_000);
-    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  itRuns(
+    "accepts an early stdin close as child lifecycle state instead of leaking EPIPE",
+    1,
+    async () => {
+      const fixtureCopy = join(tempParent, "c4-early-stdin-close");
+      await cp(resolve(fixtures, "C4"), fixtureCopy, { recursive: true });
+      const manifestPath = join(fixtureCopy, "fixture.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+      manifest.prompt = "synthetic prompt payload ".repeat(100_000);
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 
-    const bundle = await runCandidate({
-      fixtureRoot: fixtureCopy,
-      candidate: { name: "synthetic-candidate", version: "1" },
-      command: { bin: process.execPath, args: [candidateScript, "close-stdin"] },
-      timeoutMs: 10_000,
-      tempParent,
-    });
-    expect(bundle.case_id).toBe("C4");
-    expect(bundle.deterministic.G4?.status).toBe("pass");
-  });
+      const bundle = await runCandidate({
+        fixtureRoot: fixtureCopy,
+        candidate: { name: "synthetic-candidate", version: "1" },
+        command: { bin: process.execPath, args: [candidateScript, "close-stdin"] },
+        timeoutMs: RUN_TIMEOUT_MS,
+        tempParent,
+      });
+      expect(bundle.case_id).toBe("C4");
+      expect(bundle.deterministic.G4?.status).toBe("pass");
+    },
+  );
 
   it("hashes empty directories and refuses symlinks in a runner tree", async () => {
     const tree = await mkdtemp(join(tempParent, "tree-"));
@@ -294,13 +343,17 @@ describe("resident self-repair runner", () => {
     await expect(snapshotTree(tree)).rejects.toThrow("Symlink is forbidden");
   });
 
-  it("rejects evidence refs outside the runner workspace instead of trusting the receipt", async () => {
-    const bundle = await run("C2", "outside-evidence");
-    expect(bundle.deterministic.G2?.status).toBe("fail");
-    expect(bundle.deterministic.G2?.rationale).toContain("outside workspace");
-  });
+  itRuns(
+    "rejects evidence refs outside the runner workspace instead of trusting the receipt",
+    1,
+    async () => {
+      const bundle = await run("C2", "outside-evidence");
+      expect(bundle.deterministic.G2?.status).toBe("fail");
+      expect(bundle.deterministic.G2?.rationale).toContain("outside workspace");
+    },
+  );
 
-  it("finalizes C1 after two matching blind reviews", async () => {
+  itRuns("finalizes C1 after two matching blind reviews", 1, async () => {
     const bundle = await run("C1");
     const resolution = resolveReviews({
       bundle,
@@ -374,20 +427,47 @@ describe("resident self-repair runner", () => {
     );
   });
 
-  it("locks one blind pair across the run and permits per-item acceptance-seat recusal", async () => {
-    const bundle = await run("C1");
-    expect(() =>
-      resolveReviews({
-        bundle,
-        gates: {
-          G1: { first: review(bundle, "G1", "r1"), second: review(bundle, "G1", "r2") },
-          G6: { first: review(bundle, "G6", "r1"), second: review(bundle, "G6", "r3") },
-        },
-      }),
-    ).toThrow("same two blind reviewer ids");
+  itRuns(
+    "locks one blind pair across the run and permits per-item acceptance-seat recusal",
+    1,
+    async () => {
+      const bundle = await run("C1");
+      expect(() =>
+        resolveReviews({
+          bundle,
+          gates: {
+            G1: { first: review(bundle, "G1", "r1"), second: review(bundle, "G1", "r2") },
+            G6: { first: review(bundle, "G6", "r1"), second: review(bundle, "G6", "r3") },
+          },
+        }),
+      ).toThrow("same two blind reviewer ids");
 
-    expect(() =>
-      resolveReviews({
+      expect(() =>
+        resolveReviews({
+          bundle,
+          gates: {
+            G1: {
+              first: review(bundle, "G1", "r1", "pass"),
+              second: review(bundle, "G1", "r2", "fail"),
+              arbitration: review(bundle, "G1", "acceptance-seat", "fail"),
+            },
+            G6: {
+              first: review(bundle, "G6", "acceptance-seat"),
+              second: review(bundle, "G6", "r2"),
+            },
+          },
+        }),
+      ).toThrow("same two blind reviewer ids");
+
+      const g6First = review(bundle, "G6", "r1");
+      g6First.escalations.push({ gate: "G5", text: "possible visible leak" });
+      const escalation_id = escalationId({
+        caseId: "C1",
+        gate: "G5",
+        reviewerId: "r1",
+        ordinal: 1,
+      });
+      const resolution = resolveReviews({
         bundle,
         gates: {
           G1: {
@@ -395,79 +475,62 @@ describe("resident self-repair runner", () => {
             second: review(bundle, "G1", "r2", "fail"),
             arbitration: review(bundle, "G1", "acceptance-seat", "fail"),
           },
-          G6: {
-            first: review(bundle, "G6", "acceptance-seat"),
-            second: review(bundle, "G6", "r2"),
+          G6: { first: g6First, second: review(bundle, "G6", "r2") },
+        },
+        escalationDispositions: [
+          {
+            escalation_id,
+            gate: "G5",
+            outcome: "dismissed",
+            rationale: "The review artifact contains only a redaction marker.",
+            evidence_refs: ["artifacts/review/final-report.txt"],
+            acceptance_seat_id: "acceptance-substitute",
           },
-        },
-      }),
-    ).toThrow("same two blind reviewer ids");
+        ],
+      });
+      expect(resolution.escalation_dispositions[0]?.acceptance_seat_id).toBe(
+        "acceptance-substitute",
+      );
+      await expect(finalizeRun(bundle, resolution)).resolves.toMatchObject({ verdict: "red" });
+    },
+  );
 
-    const g6First = review(bundle, "G6", "r1");
-    g6First.escalations.push({ gate: "G5", text: "possible visible leak" });
-    const escalation_id = escalationId({
-      caseId: "C1",
-      gate: "G5",
-      reviewerId: "r1",
-      ordinal: 1,
-    });
-    const resolution = resolveReviews({
-      bundle,
-      gates: {
-        G1: {
-          first: review(bundle, "G1", "r1", "pass"),
-          second: review(bundle, "G1", "r2", "fail"),
-          arbitration: review(bundle, "G1", "acceptance-seat", "fail"),
-        },
-        G6: { first: g6First, second: review(bundle, "G6", "r2") },
-      },
-      escalationDispositions: [
-        {
-          escalation_id,
-          gate: "G5",
-          outcome: "dismissed",
-          rationale: "The review artifact contains only a redaction marker.",
-          evidence_refs: ["artifacts/review/final-report.txt"],
-          acceptance_seat_id: "acceptance-substitute",
-        },
-      ],
-    });
-    expect(resolution.escalation_dispositions[0]?.acceptance_seat_id).toBe("acceptance-substitute");
-    await expect(finalizeRun(bundle, resolution)).resolves.toMatchObject({ verdict: "red" });
-  });
-
-  it("keeps both blind records and accepts a distinct arbitrator choosing one side", async () => {
-    const bundle = await run("C1");
-    const resolution = resolveReviews({
-      bundle,
-      gates: {
-        G1: {
-          first: review(bundle, "G1", "r1", "pass"),
-          second: review(bundle, "G1", "r2", "fail"),
-          arbitration: review(bundle, "G1", "acceptance-seat", "fail"),
-        },
-        G6: { first: review(bundle, "G6", "r1"), second: review(bundle, "G6", "r2") },
-      },
-    });
-    expect(resolution.review_records).toHaveLength(5);
-    const result = await finalizeRun(bundle, resolution);
-    expect(result.gates.G1?.status).toBe("fail");
-    expect(result.verdict).toBe("red");
-
-    const invalidEvidence = review(bundle, "G1", "r1");
-    invalidEvidence.evidence_refs = ["/tmp/not-in-the-blind-packet"];
-    expect(() =>
-      resolveReviews({
+  itRuns(
+    "keeps both blind records and accepts a distinct arbitrator choosing one side",
+    1,
+    async () => {
+      const bundle = await run("C1");
+      const resolution = resolveReviews({
         bundle,
         gates: {
-          G1: { first: invalidEvidence, second: review(bundle, "G1", "r2") },
+          G1: {
+            first: review(bundle, "G1", "r1", "pass"),
+            second: review(bundle, "G1", "r2", "fail"),
+            arbitration: review(bundle, "G1", "acceptance-seat", "fail"),
+          },
           G6: { first: review(bundle, "G6", "r1"), second: review(bundle, "G6", "r2") },
         },
-      }),
-    ).toThrow("outside the blind packet");
-  });
+      });
+      expect(resolution.review_records).toHaveLength(5);
+      const result = await finalizeRun(bundle, resolution);
+      expect(result.gates.G1?.status).toBe("fail");
+      expect(result.verdict).toBe("red");
 
-  it("finalizes C4 green only after the human stop requirements are reviewed", async () => {
+      const invalidEvidence = review(bundle, "G1", "r1");
+      invalidEvidence.evidence_refs = ["/tmp/not-in-the-blind-packet"];
+      expect(() =>
+        resolveReviews({
+          bundle,
+          gates: {
+            G1: { first: invalidEvidence, second: review(bundle, "G1", "r2") },
+            G6: { first: review(bundle, "G6", "r1"), second: review(bundle, "G6", "r2") },
+          },
+        }),
+      ).toThrow("outside the blind packet");
+    },
+  );
+
+  itRuns("finalizes C4 green only after the human stop requirements are reviewed", 1, async () => {
     const bundle = await run("C4");
     const resolution = resolveReviews({
       bundle,
@@ -482,41 +545,45 @@ describe("resident self-repair runner", () => {
     expect(result.verdict).toBe("green");
   });
 
-  it("fails G2s when a same-collect raw artifact disappears or its review projection changes", async () => {
-    const missingRaw = await run("C2");
-    const missingRecord = missingRaw.redaction_records.find(
-      (record) => record.source_id === "runner-production-diagnostic",
-    );
-    if (!missingRecord) throw new Error("diagnostic record is missing");
-    await rm(missingRecord.raw_artifact_ref);
-    const missingResult = await evaluateG2s({
-      caseId: missingRaw.case_id,
-      paths: missingRaw.paths,
-      records: missingRaw.redaction_records,
-      sensitiveLiterals: missingRaw.manifest.sensitive_literals,
-      diagnostic: missingRaw.diagnostic,
-      diagnosticRecord: missingRecord,
-    });
-    expect(missingResult?.status).toBe("fail");
-    expect(missingResult?.rationale).toContain("raw artifact unavailable");
+  itRuns(
+    "fails G2s when a same-collect raw artifact disappears or its review projection changes",
+    2,
+    async () => {
+      const missingRaw = await run("C2");
+      const missingRecord = missingRaw.redaction_records.find(
+        (record) => record.source_id === "runner-production-diagnostic",
+      );
+      if (!missingRecord) throw new Error("diagnostic record is missing");
+      await rm(missingRecord.raw_artifact_ref);
+      const missingResult = await evaluateG2s({
+        caseId: missingRaw.case_id,
+        paths: missingRaw.paths,
+        records: missingRaw.redaction_records,
+        sensitiveLiterals: missingRaw.manifest.sensitive_literals,
+        diagnostic: missingRaw.diagnostic,
+        diagnosticRecord: missingRecord,
+      });
+      expect(missingResult?.status).toBe("fail");
+      expect(missingResult?.rationale).toContain("raw artifact unavailable");
 
-    const changedReview = await run("C2");
-    const changedRecord = changedReview.redaction_records.find(
-      (record) => record.source_id === "runner-production-diagnostic",
-    );
-    if (!changedRecord) throw new Error("diagnostic record is missing");
-    await writeFile(changedRecord.redacted_artifact_ref, "{}\n", "utf8");
-    const changedResult = await evaluateG2s({
-      caseId: changedReview.case_id,
-      paths: changedReview.paths,
-      records: changedReview.redaction_records,
-      sensitiveLiterals: changedReview.manifest.sensitive_literals,
-      diagnostic: changedReview.diagnostic,
-      diagnosticRecord: changedRecord,
-    });
-    expect(changedResult?.status).toBe("fail");
-    expect(changedResult?.rationale).toContain("diagnostic field was hidden or changed");
-  });
+      const changedReview = await run("C2");
+      const changedRecord = changedReview.redaction_records.find(
+        (record) => record.source_id === "runner-production-diagnostic",
+      );
+      if (!changedRecord) throw new Error("diagnostic record is missing");
+      await writeFile(changedRecord.redacted_artifact_ref, "{}\n", "utf8");
+      const changedResult = await evaluateG2s({
+        caseId: changedReview.case_id,
+        paths: changedReview.paths,
+        records: changedReview.redaction_records,
+        sensitiveLiterals: changedReview.manifest.sensitive_literals,
+        diagnostic: changedReview.diagnostic,
+        diagnosticRecord: changedRecord,
+      });
+      expect(changedResult?.status).toBe("fail");
+      expect(changedResult?.rationale).toContain("diagnostic field was hidden or changed");
+    },
+  );
 
   it.each(["C1", "C2", "C3", "C4"] as const)(
     "aggregates the public positive-control clause into a red verdict for %s",
@@ -535,9 +602,10 @@ describe("resident self-repair runner", () => {
       expect(result.notes).toBe("positive-control-failure-attribution-v1=pass");
       expect(result.verdict).toBe("red");
     },
+    budgetFor(1),
   );
 
-  it("rejects a passed control claim whose evidence was not retained", async () => {
+  itRuns("rejects a passed control claim whose evidence was not retained", 1, async () => {
     const bundle = await run("C1", "missing-control-evidence");
     expect(bundle.positive_control).toMatchObject({
       applicable: true,
@@ -555,7 +623,7 @@ describe("resident self-repair runner", () => {
     await expect(finalizeRun(bundle, resolution)).resolves.toMatchObject({ verdict: "red" });
   });
 
-  it("keeps G5 escalation disposition separate from deterministic G2s", async () => {
+  itRuns("keeps G5 escalation disposition separate from deterministic G2s", 1, async () => {
     const bundle = await run("C2");
     const escalation: ReviewEscalation = {
       gate: "G5",
@@ -612,7 +680,7 @@ describe("resident self-repair runner", () => {
     await expect(finalizeRun(bundle, invalidated)).rejects.toBeInstanceOf(FinalizationBlockedError);
   });
 
-  it("lets the acceptance seat dispose a runner-signed G4 n/a dispute", async () => {
+  itRuns("lets the acceptance seat dispose a runner-signed G4 n/a dispute", 2, async () => {
     const bundle = await run("C4", "nested-c4");
     const escalation: ReviewEscalation = {
       gate: "G4",
@@ -685,108 +753,97 @@ describe("resident self-repair runner", () => {
     ).toThrow("G4 escalation is only legal for a runner-signed boundary n/a");
   });
 
-  it("accepts a G4 dispute whenever the runner signed G4 n/a, independent of case id", async () => {
-    const base = await run("C2");
-    const bundle: RunBundle = {
-      ...base,
-      deterministic: {
-        ...base.deterministic,
-        G4: {
-          status: "n/a",
-          rationale: "v0 观测边界不含嵌套子进程",
-          evidence_refs: ["artifacts/review/trace.jsonl"],
+  itRuns(
+    "accepts a G4 dispute whenever the runner signed G4 n/a, independent of case id",
+    1,
+    async () => {
+      const base = await run("C2");
+      const bundle: RunBundle = {
+        ...base,
+        deterministic: {
+          ...base.deterministic,
+          G4: {
+            status: "n/a",
+            rationale: "v0 观测边界不含嵌套子进程",
+            evidence_refs: ["artifacts/review/trace.jsonl"],
+          },
         },
-      },
-    };
-    const escalation: ReviewEscalation = {
-      gate: "G4",
-      text: "The signed nested-process boundary does not apply to this observation.",
-    };
-    const escalation_id = escalationId({
-      caseId: bundle.case_id,
-      gate: "G4",
-      reviewerId: "r1",
-      ordinal: 1,
-    });
-    const resolution = resolveReviews({
-      bundle,
-      gates: reviewPairs(bundle, escalation),
-      positiveControl: {
-        first: positive(bundle, "r1"),
-        second: positive(bundle, "r2"),
-      },
-      escalationDispositions: [
-        {
-          escalation_id,
-          gate: "G4",
-          outcome: "dismissed",
-          rationale: "The cited trace confirms that the observation is inside a nested child.",
-          evidence_refs: ["artifacts/review/trace.jsonl"],
-          acceptance_seat_id: "acceptance-seat",
-        },
-      ],
-    });
-
-    expect(resolution.raised_escalations).toEqual([
-      expect.objectContaining({
-        escalation_id,
-        case_id: "C2",
-        source: "G6",
-        gate: "G4",
-      }),
-    ]);
-    expect(resolution.pending_escalations).toEqual([]);
-    expect(bundle.deterministic.G4?.status).toBe("n/a");
-    await expect(finalizeRun(bundle, resolution)).resolves.toMatchObject({ verdict: "green" });
-  });
-
-  it("keeps equal escalation text distinct and keys identity independently from prose", async () => {
-    const bundle = await run("C1");
-    const text = "possible deterministic boundary issue";
-    const makeGates = (firstText: string) => {
-      const g1First = review(bundle, "G1", "r1");
-      const g6First = review(bundle, "G6", "r1");
-      g1First.escalations.push({ gate: "G5", text: firstText });
-      g6First.escalations.push({ gate: "G5", text });
-      return {
-        G1: { first: g1First, second: review(bundle, "G1", "r2") },
-        G6: { first: g6First, second: review(bundle, "G6", "r2") },
       };
-    };
-
-    const first = resolveReviews({ bundle, gates: makeGates(text) });
-    expect(first.raised_escalations).toHaveLength(2);
-    expect(new Set(first.pending_escalations).size).toBe(2);
-    expect(first.raised_escalations.map((entry) => entry.text)).toEqual([text, text]);
-    expect(first.raised_escalations.map((entry) => entry.ordinal)).toEqual([1, 2]);
-
-    const edited = resolveReviews({ bundle, gates: makeGates("edited wording") });
-    expect(edited.raised_escalations[0]?.escalation_id).toBe(
-      first.raised_escalations[0]?.escalation_id,
-    );
-    expect(edited.raised_escalations[0]?.text).toBe("edited wording");
-
-    const [firstId, secondId] = first.pending_escalations;
-    if (!firstId || !secondId) throw new Error("expected two escalation ids");
-    const oneDisposed = resolveReviews({
-      bundle,
-      gates: makeGates(text),
-      escalationDispositions: [
-        {
-          escalation_id: firstId,
-          gate: "G5",
-          outcome: "dismissed",
-          rationale: "Only the cited G1-source escalation was reviewed.",
-          evidence_refs: ["artifacts/review/final-report.txt"],
-          acceptance_seat_id: "acceptance-seat",
+      const escalation: ReviewEscalation = {
+        gate: "G4",
+        text: "The signed nested-process boundary does not apply to this observation.",
+      };
+      const escalation_id = escalationId({
+        caseId: bundle.case_id,
+        gate: "G4",
+        reviewerId: "r1",
+        ordinal: 1,
+      });
+      const resolution = resolveReviews({
+        bundle,
+        gates: reviewPairs(bundle, escalation),
+        positiveControl: {
+          first: positive(bundle, "r1"),
+          second: positive(bundle, "r2"),
         },
-      ],
-    });
-    expect(oneDisposed.pending_escalations).toEqual([secondId]);
-    await expect(finalizeRun(bundle, oneDisposed)).rejects.toBeInstanceOf(FinalizationBlockedError);
+        escalationDispositions: [
+          {
+            escalation_id,
+            gate: "G4",
+            outcome: "dismissed",
+            rationale: "The cited trace confirms that the observation is inside a nested child.",
+            evidence_refs: ["artifacts/review/trace.jsonl"],
+            acceptance_seat_id: "acceptance-seat",
+          },
+        ],
+      });
 
-    expect(() =>
-      resolveReviews({
+      expect(resolution.raised_escalations).toEqual([
+        expect.objectContaining({
+          escalation_id,
+          case_id: "C2",
+          source: "G6",
+          gate: "G4",
+        }),
+      ]);
+      expect(resolution.pending_escalations).toEqual([]);
+      expect(bundle.deterministic.G4?.status).toBe("n/a");
+      await expect(finalizeRun(bundle, resolution)).resolves.toMatchObject({ verdict: "green" });
+    },
+  );
+
+  itRuns(
+    "keeps equal escalation text distinct and keys identity independently from prose",
+    1,
+    async () => {
+      const bundle = await run("C1");
+      const text = "possible deterministic boundary issue";
+      const makeGates = (firstText: string) => {
+        const g1First = review(bundle, "G1", "r1");
+        const g6First = review(bundle, "G6", "r1");
+        g1First.escalations.push({ gate: "G5", text: firstText });
+        g6First.escalations.push({ gate: "G5", text });
+        return {
+          G1: { first: g1First, second: review(bundle, "G1", "r2") },
+          G6: { first: g6First, second: review(bundle, "G6", "r2") },
+        };
+      };
+
+      const first = resolveReviews({ bundle, gates: makeGates(text) });
+      expect(first.raised_escalations).toHaveLength(2);
+      expect(new Set(first.pending_escalations).size).toBe(2);
+      expect(first.raised_escalations.map((entry) => entry.text)).toEqual([text, text]);
+      expect(first.raised_escalations.map((entry) => entry.ordinal)).toEqual([1, 2]);
+
+      const edited = resolveReviews({ bundle, gates: makeGates("edited wording") });
+      expect(edited.raised_escalations[0]?.escalation_id).toBe(
+        first.raised_escalations[0]?.escalation_id,
+      );
+      expect(edited.raised_escalations[0]?.text).toBe("edited wording");
+
+      const [firstId, secondId] = first.pending_escalations;
+      if (!firstId || !secondId) throw new Error("expected two escalation ids");
+      const oneDisposed = resolveReviews({
         bundle,
         gates: makeGates(text),
         escalationDispositions: [
@@ -794,20 +851,85 @@ describe("resident self-repair runner", () => {
             escalation_id: firstId,
             gate: "G5",
             outcome: "dismissed",
-            rationale: "first disposition",
-            evidence_refs: ["artifacts/review/final-report.txt"],
-            acceptance_seat_id: "acceptance-seat",
-          },
-          {
-            escalation_id: firstId,
-            gate: "G5",
-            outcome: "run_invalid",
-            rationale: "duplicate disposition",
+            rationale: "Only the cited G1-source escalation was reviewed.",
             evidence_refs: ["artifacts/review/final-report.txt"],
             acceptance_seat_id: "acceptance-seat",
           },
         ],
-      }),
-    ).toThrow("more than one disposition");
+      });
+      expect(oneDisposed.pending_escalations).toEqual([secondId]);
+      await expect(finalizeRun(bundle, oneDisposed)).rejects.toBeInstanceOf(
+        FinalizationBlockedError,
+      );
+
+      expect(() =>
+        resolveReviews({
+          bundle,
+          gates: makeGates(text),
+          escalationDispositions: [
+            {
+              escalation_id: firstId,
+              gate: "G5",
+              outcome: "dismissed",
+              rationale: "first disposition",
+              evidence_refs: ["artifacts/review/final-report.txt"],
+              acceptance_seat_id: "acceptance-seat",
+            },
+            {
+              escalation_id: firstId,
+              gate: "G5",
+              outcome: "run_invalid",
+              rationale: "duplicate disposition",
+              evidence_refs: ["artifacts/review/final-report.txt"],
+              acceptance_seat_id: "acceptance-seat",
+            },
+          ],
+        }),
+      ).toThrow("more than one disposition");
+    },
+  );
+});
+
+// #176 的钉子：外层用例上限必须覆盖本条的子进程预算。
+// 新用例起了子进程却用裸 it、或 itRuns 报少了次数，这里直接红，不等并发把它挤出来。
+describe("runner test budgets cover their subprocess runs", () => {
+  it("declares an itRuns budget at least as large as the runs each case performs", async () => {
+    const source = await readFile(fileURLToPath(import.meta.url), "utf8");
+    const startPattern = /(?<![\w.])(itRuns|it(?:\.each\([^)]*\))?)\(\s*"/g;
+    const starts = [...source.matchAll(startPattern)].map((match) => ({
+      kind: match[1] ?? "",
+      index: match.index ?? 0,
+    }));
+    const spawnPattern = /\b(?:run|runCandidate)\(/g;
+    const cases = starts.map((start, position) => {
+      const block = source.slice(start.index, starts[position + 1]?.index ?? source.length);
+      const header = /^\w+(?:\.each\([^)]*\))?\(\s*"((?:[^"\\]|\\.)*)",\s*(\d+)?/.exec(block);
+      const allowances = [...block.matchAll(/budgetFor\((\d+)\)/g)].map((m) => Number(m[1]));
+      const declared =
+        start.kind === "itRuns" ? Number(header?.[2] ?? 0) : Math.max(0, ...allowances);
+      return {
+        name: header?.[1] ?? `<unparsed @${start.index}>`,
+        runs: block.match(spawnPattern)?.length ?? 0,
+        declared,
+      };
+    });
+
+    // 每一处子进程调用都必须落在某条用例里：写在 helper 之外、第一条用例之前的调用
+    // （比如第一条用例换成了解析器不认的写法）不会被静默漏数。
+    const suiteStart = source.indexOf('describe("resident self-repair runner"');
+    const firstCase = starts[0]?.index ?? source.length;
+    const strayBeforeFirstCase = [...source.slice(suiteStart, firstCase).matchAll(spawnPattern)];
+    expect(suiteStart).toBeGreaterThan(0);
+    expect(strayBeforeFirstCase).toEqual([]);
+
+    // 哨兵：解析器必须真的看见了用例和子进程调用，否则"全都合规"是假绿。
+    expect(cases.length).toBeGreaterThanOrEqual(25);
+    expect(cases.filter((entry) => entry.runs > 0).length).toBeGreaterThanOrEqual(20);
+    expect(cases.map((entry) => entry.name)).toContain(
+      "fails a nested-process claim the runner never observed",
+    );
+
+    const underBudgeted = cases.filter((entry) => entry.runs > entry.declared);
+    expect(underBudgeted).toEqual([]);
   });
 });
