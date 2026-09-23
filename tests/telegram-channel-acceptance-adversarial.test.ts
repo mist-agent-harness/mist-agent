@@ -27,19 +27,38 @@ import type {
 
 type Fault =
   | "message-id-resolves"
+  | "seen-id-resolves"
+  | "seen-id-topic-resolves"
   | "reject-all-inbound"
+  | "current-completion-rejected"
+  | "scope-generation-noop"
   | "wrong-dispatch-identity"
   | "duplicate-extra-effect"
   | "submitted-looks-visible"
+  | "unknown-has-message-id"
+  | "durable-status-promoted"
+  | "live-address-mutation"
   | "target-hints-win"
   | "token-leaks-in-receipt"
+  | "token-leaks-in-fixture"
+  | "token-leaks-in-durable-receipt"
+  | "token-leaks-in-inbound-effect"
   | "token-resolves-after-revoke"
+  | "hidden-token-resolve-log"
+  | "revoke-token-noop"
   | "unstable-revoke-reason"
+  | "send-fails-observability-fresh"
+  | "unavailable-send-still-visible"
   | "wrong-group-address"
+  | "group-shadow-residents"
+  | "group-wrong-scope"
+  | "group-unissued-dispatch"
   | "shadow-resident-on-switch"
+  | "census-state-drift"
   | "mutate-resident-on-blocked-activation"
   | "swap-group-residents"
-  | "unknown-wrong-target";
+  | "unknown-wrong-target"
+  | "binding-drift-after-restart";
 
 const key = (value: TelegramAddress): string => JSON.stringify(value);
 const cloneResident = (value: ResidentFixture): ResidentFixture => ({ ...value });
@@ -60,7 +79,9 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   private readonly outboundEffects: string[] = [];
   private readonly issuedDispatches = new Set<string>();
   private readonly groups = new Map<string, GroupFixture>();
+  private readonly groupDispatches = new Map<string, DispatchIdentity[]>();
   private readonly votes = new Map<string, ContinuityVotes>();
+  private readonly seenExternalIds = new Set<string>();
   private hostDispatches = 0;
   private lastDispatch: DispatchIdentity | null = null;
   private tokenRef = "";
@@ -70,6 +91,7 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   private tokenResolved = 0;
   private credentialGeneration = 1;
   private telegramAvailable = true;
+  private restartCount = 0;
 
   constructor(private readonly fault: Fault | null) {}
 
@@ -82,10 +104,11 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   ): Promise<ResidentFixture> {
     const resident: ResidentFixture = {
       residentId: `resident:${label}`,
-      model,
+      model: this.fault === "token-leaks-in-fixture" ? this.tokenSecret : model,
       provider,
       runtimeSessionId: `session:${label}:1`,
-      canonicalStateHash: `hash:${label}`,
+      canonicalStateHash:
+        this.fault === "token-leaks-in-fixture" ? this.tokenSecret : `hash:${label}`,
     };
     this.residents.set(resident.residentId, resident);
     return cloneResident(resident);
@@ -112,7 +135,7 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
 
   async advanceScopeGeneration(scopeId: string): Promise<ScopeFixture> {
     const scope = this.scope(scopeId);
-    scope.scopeGeneration += 1;
+    if (this.fault !== "scope-generation-noop") scope.scopeGeneration += 1;
     return cloneScope(scope);
   }
 
@@ -134,15 +157,37 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     };
     this.bindings.set(binding.bindingId, binding);
     this.addressBindings.set(key(binding.address), binding.bindingId);
-    return { ok: true, value: cloneBinding(binding) };
+    return {
+      ok: true,
+      value: this.fault === "live-address-mutation" ? binding : cloneBinding(binding),
+    };
   }
 
   async readBinding(bindingId: string): Promise<ChannelBinding> {
-    return cloneBinding(this.binding(bindingId));
+    const value = cloneBinding(this.binding(bindingId));
+    if (this.fault === "binding-drift-after-restart" && this.restartCount > 0) {
+      value.address = { chatId: "chat:drifted", topicId: "topic:drifted" };
+      value.active = false;
+      value.bindingVersion = 99;
+    }
+    return value;
   }
 
   async resolveAddress(address: TelegramAddress): Promise<Result<ChannelBinding>> {
     const bindingId = this.addressBindings.get(key(address));
+    const externalIdUsed =
+      this.seenExternalIds.has(address.chatId) ||
+      (address.topicId !== null && this.seenExternalIds.has(address.topicId));
+    if (
+      bindingId === undefined &&
+      ((this.fault === "seen-id-resolves" && externalIdUsed) ||
+        (this.fault === "seen-id-topic-resolves" &&
+          address.topicId !== null &&
+          this.seenExternalIds.has(address.topicId)))
+    ) {
+      const first = this.bindings.values().next().value as ChannelBinding | undefined;
+      if (first !== undefined) return { ok: true, value: cloneBinding(first) };
+    }
     if (bindingId === undefined && this.fault === "message-id-resolves") {
       const first = this.bindings.values().next().value as ChannelBinding | undefined;
       if (first !== undefined) return { ok: true, value: cloneBinding(first) };
@@ -159,6 +204,8 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   }
 
   async ingestUpdate(update: TelegramUpdate): Promise<Result<InboundReceipt>> {
+    this.seenExternalIds.add(update.messageId);
+    this.seenExternalIds.add(update.senderId);
     const bindingId = this.addressBindings.get(key(update.address));
     if (bindingId === undefined) return { ok: false, reason: "BINDING_NOT_FOUND" };
     const binding = this.binding(bindingId);
@@ -194,7 +241,10 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       status: "dispatched",
       reason: null,
       dispatch,
-      effectId: `effect:${update.updateId}`,
+      effectId:
+        this.fault === "token-leaks-in-inbound-effect"
+          ? `effect:${this.tokenSecret}`
+          : `effect:${update.updateId}`,
     };
     this.inbound.set(update.updateId, receipt);
     this.inboundEffects.push(receipt.effectId as string);
@@ -237,6 +287,16 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     if (!this.issuedDispatches.has(request.context.dispatchId)) {
       return { ok: false, reason: "UNKNOWN_DISPATCH" };
     }
+    if (this.tokenAttached && this.tokenRevoked) {
+      return { ok: false, reason: "TOKEN_REVOKED" };
+    }
+    if (
+      this.fault === "send-fails-observability-fresh" &&
+      request.context.dispatchId.includes("tg09-context") &&
+      scenario === "visible"
+    ) {
+      return { ok: false, reason: "NO_SEND" };
+    }
     if (this.tokenAttached && !this.tokenRevoked) this.tokenResolved += 1;
     let status: OutboundReceipt["status"];
     if (scenario === "submitted-only") status = "submitted";
@@ -245,6 +305,18 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     else status = "unknown";
     if (this.fault === "submitted-looks-visible" && scenario === "submitted-only") {
       status = "visible";
+    }
+    if (this.fault === "unavailable-send-still-visible" && scenario === "telegram-unavailable") {
+      status = "visible";
+    }
+    if (
+      this.fault === "live-address-mutation" &&
+      (request.context.dispatchId.includes("tg05-lost") ||
+        request.context.dispatchId.includes("tg06-context") ||
+        scenario === "telegram-unavailable")
+    ) {
+      binding.address.chatId = "chat:mutated-live";
+      binding.address.topicId = "topic:mutated-live";
     }
     const hinted = request.untrustedTargetHints[0];
     const target =
@@ -272,10 +344,19 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       target: { ...target },
       bindingId: binding.bindingId,
       replyToMessageId,
-      telegramMessageId: status === "visible" ? `telegram:${this.outbound.size + 1}` : null,
+      telegramMessageId:
+        status === "visible" || (this.fault === "unknown-has-message-id" && status === "unknown")
+          ? `telegram:${this.outbound.size + 1}`
+          : null,
       effectId,
     };
-    this.outbound.set(receipt.outboundId, receipt);
+    const stored = structuredClone(receipt);
+    if (this.fault === "token-leaks-in-durable-receipt") {
+      stored.reason = this.tokenSecret;
+      stored.telegramMessageId = this.tokenSecret;
+      stored.effectId = this.tokenSecret;
+    }
+    this.outbound.set(receipt.outboundId, stored);
     if (!(this.fault === "unknown-wrong-target" && status === "unknown")) {
       this.outboundEffects.push(effectId);
     }
@@ -284,6 +365,20 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
 
   async readOutbound(outboundId: string): Promise<Result<OutboundReceipt>> {
     const receipt = this.outbound.get(outboundId);
+    if (
+      receipt !== undefined &&
+      this.fault === "durable-status-promoted" &&
+      (receipt.status === "submitted" || receipt.status === "accepted")
+    ) {
+      return {
+        ok: true,
+        value: {
+          ...structuredClone(receipt),
+          status: "visible",
+          telegramMessageId: "telegram:fake",
+        },
+      };
+    }
     return receipt === undefined
       ? { ok: false, reason: "OUTBOUND_NOT_FOUND" }
       : { ok: true, value: structuredClone(receipt) };
@@ -307,15 +402,25 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   async inspectTokenBoundary(): Promise<TokenBoundarySnapshot> {
     return {
       credentialRef: this.tokenRef,
+      credentialStatus: this.tokenRevoked
+        ? "revoked"
+        : this.tokenAttached
+          ? "attached"
+          : "detached",
+      credentialGeneration: this.credentialGeneration,
       resolvedCount: this.tokenResolved,
       config: [],
-      logs: [],
+      logs:
+        this.fault === "hidden-token-resolve-log" && this.tokenRevoked
+          ? [`resolved-after-revoke:${this.tokenSecret}`]
+          : [],
       receipts: [],
       errors: [],
     };
   }
 
   async revokeToken(): Promise<void> {
+    if (this.fault === "revoke-token-noop") return;
     this.tokenRevoked = true;
     this.credentialGeneration += 1;
   }
@@ -332,6 +437,7 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
         direction,
         bindingId,
         bindingVersion: binding.bindingVersion,
+        scopeGeneration: this.scope(binding.scopeId).scopeGeneration,
         credentialGeneration: this.credentialGeneration,
       },
     };
@@ -341,6 +447,9 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     operation: InFlightChannelOperation,
   ): Promise<Result<InboundReceipt | OutboundReceipt>> {
     const binding = this.binding(operation.bindingId);
+    if (this.fault === "current-completion-rejected") {
+      return { ok: false, reason: "STALE_SCOPE_GENERATION" };
+    }
     if (
       !binding.active ||
       operation.bindingVersion !== binding.bindingVersion ||
@@ -353,10 +462,28 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       };
     }
     const scope = this.scope(binding.scopeId);
-    if (operation.direction === "inbound" && scope.scopeGeneration > 1) {
+    if (operation.scopeGeneration !== scope.scopeGeneration) {
       return { ok: false, reason: "STALE_SCOPE_GENERATION" };
     }
-    return { ok: false, reason: "NO_SYNTHETIC_COMPLETION" };
+    const dispatch: DispatchIdentity = {
+      residentId: binding.residentId,
+      scopeId: binding.scopeId,
+      scopeGeneration: scope.scopeGeneration,
+      windowId: scope.windowId,
+      windowGeneration: scope.windowGeneration,
+      dispatchId: `dispatch:${operation.operationId}`,
+      sourceMessageId: `message:${operation.operationId}`,
+    };
+    return {
+      ok: true,
+      value: {
+        updateId: `update:${operation.operationId}`,
+        status: "dispatched",
+        reason: null,
+        dispatch,
+        effectId: null,
+      },
+    };
   }
 
   async readObservability(bindingId: string): Promise<ChannelObservability> {
@@ -376,7 +503,9 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     this.telegramAvailable = available;
   }
 
-  async restartChannel(): Promise<void> {}
+  async restartChannel(): Promise<void> {
+    this.restartCount += 1;
+  }
 
   async switchResidentModel(
     residentId: string,
@@ -397,7 +526,14 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   }
 
   async listResidents(): Promise<ResidentFixture[]> {
-    return [...this.residents.values()].map(cloneResident);
+    return [...this.residents.values()].map((resident) => {
+      const value = cloneResident(resident);
+      if (this.fault === "census-state-drift" && !value.residentId.includes("shadow")) {
+        value.canonicalStateHash = "hash:mutated-in-census";
+        value.runtimeSessionId = "session:stale";
+      }
+      return value;
+    });
   }
 
   async setContinuityVotes(residentId: string, votes: ContinuityVotes): Promise<void> {
@@ -436,7 +572,7 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       }),
     };
     this.groups.set(group.groupId, group);
-    return structuredClone(group);
+    return this.fault === "live-address-mutation" ? group : structuredClone(group);
   }
 
   async runGroupRound(
@@ -445,24 +581,44 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   ): Promise<GroupTraceEntry[]> {
     const group = this.groups.get(groupId);
     if (group === undefined) throw new Error("GROUP_NOT_FOUND");
-    return plans.map((plan, index) => {
+    if (this.fault === "live-address-mutation") {
+      group.address.chatId = "chat:mutated-live";
+      group.address.topicId = "topic:mutated-live";
+    }
+    const hostDispatches: DispatchIdentity[] = [];
+    const trace: GroupTraceEntry[] = plans.map((plan, index) => {
       const residentId =
         this.fault === "swap-group-residents"
           ? (plans[plans.length - 1 - index]?.residentId ?? plan.residentId)
           : plan.residentId;
+      const reportedResidentId =
+        this.fault === "group-shadow-residents" ? `resident:shadow:${index}` : residentId;
       const resident = this.resident(residentId);
       const member = group.members.find((candidate) => candidate.residentId === residentId);
+      const dispatchId = `dispatch:group:${index}`;
+      hostDispatches.push({
+        residentId,
+        scopeId: member?.scopeId ?? "scope:missing",
+        scopeGeneration: 1,
+        windowId: `window:group:${index}`,
+        windowGeneration: 1,
+        dispatchId,
+        sourceMessageId: `message:group:${index}`,
+      });
       return {
         groupId: this.fault === "wrong-group-address" ? "group:wrong" : group.groupId,
         address:
           this.fault === "wrong-group-address"
             ? { chatId: "chat:wrong", topicId: null }
             : { ...group.address },
-        residentId,
-        scopeId: member?.scopeId ?? "scope:missing",
-        dispatchId: `dispatch:group:${index}`,
-        model: resident.model,
-        provider: resident.provider,
+        residentId: reportedResidentId,
+        scopeId:
+          this.fault === "group-wrong-scope" ? "scope:wrong" : (member?.scopeId ?? "scope:missing"),
+        dispatchId:
+          this.fault === "group-unissued-dispatch" ? `dispatch:not-issued:${index}` : dispatchId,
+        model: this.fault === "group-shadow-residents" ? `model:shadow:${index}` : resident.model,
+        provider:
+          this.fault === "group-shadow-residents" ? `provider:shadow:${index}` : resident.provider,
         status: plan.status,
         outboundStatus:
           plan.status === "visible"
@@ -474,6 +630,12 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
                 : "rejected",
       };
     });
+    this.groupDispatches.set(group.groupId, hostDispatches);
+    return trace;
+  }
+
+  async readGroupDispatches(groupId: string): Promise<DispatchIdentity[]> {
+    return structuredClone(this.groupDispatches.get(groupId) ?? []);
   }
 
   async readCanonicalState(residentId: string): Promise<ResidentFixture> {
@@ -507,19 +669,42 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
 
 const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "TG-01", fault: "message-id-resolves" },
+  { checkId: "TG-01", fault: "seen-id-resolves" },
+  { checkId: "TG-01", fault: "seen-id-topic-resolves" },
   { checkId: "TG-02", fault: "reject-all-inbound" },
+  { checkId: "TG-02", fault: "current-completion-rejected" },
+  { checkId: "TG-02", fault: "scope-generation-noop" },
   { checkId: "TG-03", fault: "wrong-dispatch-identity" },
   { checkId: "TG-04", fault: "duplicate-extra-effect" },
   { checkId: "TG-05", fault: "submitted-looks-visible" },
+  { checkId: "TG-05", fault: "unknown-has-message-id" },
+  { checkId: "TG-05", fault: "durable-status-promoted" },
+  { checkId: "TG-05", fault: "live-address-mutation" },
   { checkId: "TG-06", fault: "target-hints-win" },
+  { checkId: "TG-06", fault: "live-address-mutation" },
   { checkId: "TG-07", fault: "token-leaks-in-receipt" },
+  { checkId: "TG-07", fault: "token-leaks-in-fixture" },
+  { checkId: "TG-07", fault: "token-leaks-in-durable-receipt" },
+  { checkId: "TG-07", fault: "token-leaks-in-inbound-effect" },
   { checkId: "TG-08", fault: "token-resolves-after-revoke" },
+  { checkId: "TG-08", fault: "hidden-token-resolve-log" },
+  { checkId: "TG-08", fault: "revoke-token-noop" },
   { checkId: "TG-08", fault: "unstable-revoke-reason" },
+  { checkId: "TG-09", fault: "send-fails-observability-fresh" },
+  { checkId: "TG-09", fault: "unavailable-send-still-visible" },
   { checkId: "GD-01", fault: "wrong-group-address" },
+  { checkId: "GD-01", fault: "group-shadow-residents" },
+  { checkId: "GD-01", fault: "group-wrong-scope" },
+  { checkId: "GD-01", fault: "group-unissued-dispatch" },
+  { checkId: "GD-01", fault: "live-address-mutation" },
   { checkId: "GD-02", fault: "shadow-resident-on-switch" },
+  { checkId: "GD-02", fault: "census-state-drift" },
   { checkId: "GD-03", fault: "mutate-resident-on-blocked-activation" },
   { checkId: "GD-04", fault: "swap-group-residents" },
   { checkId: "GD-05", fault: "unknown-wrong-target" },
+  { checkId: "GD-05", fault: "live-address-mutation" },
+  { checkId: "GD-05", fault: "binding-drift-after-restart" },
+  { checkId: "GD-05", fault: "duplicate-extra-effect" },
 ];
 
 describe("D26 Telegram channel adversarial acceptance", () => {

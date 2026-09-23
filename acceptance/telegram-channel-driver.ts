@@ -91,6 +91,8 @@ export interface TokenReference {
 
 export interface TokenBoundarySnapshot {
   credentialRef: string;
+  credentialStatus: "detached" | "attached" | "revoked";
+  credentialGeneration: number;
   resolvedCount: number;
   config: string[];
   logs: string[];
@@ -112,6 +114,7 @@ export interface InFlightChannelOperation {
   direction: "inbound" | "outbound";
   bindingId: string;
   bindingVersion: number;
+  scopeGeneration: number;
   credentialGeneration: number;
 }
 
@@ -220,6 +223,7 @@ export interface TelegramChannelDriver {
     groupId: string,
     plans: Array<{ residentId: string; status: GroupPlanStatus }>,
   ): Promise<GroupTraceEntry[]>;
+  readGroupDispatches(groupId: string): Promise<DispatchIdentity[]>;
   readCanonicalState(residentId: string): Promise<ResidentFixture>;
 }
 

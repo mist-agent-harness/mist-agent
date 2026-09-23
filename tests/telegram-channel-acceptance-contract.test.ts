@@ -56,6 +56,7 @@ describe("D26 Telegram channel acceptance contract", () => {
       "activateContinuity",
       "createGroupFixture",
       "runGroupRound",
+      "readGroupDispatches",
       "readCanonicalState",
     ]);
     for (const check of telegramChannelChecks) {
