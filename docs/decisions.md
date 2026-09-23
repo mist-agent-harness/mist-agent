@@ -260,6 +260,110 @@
   拍板人旦九（`sakisakisa-design`），咲咲 2026-09-23 在会话里授权代拍，原话「如果
   需要我拍板的就代替我拍一下」。
 
+- 2026-09-23　**D22 主笔拍板：入住——身份、关系事实、运行授权三分，住户自认即成立**
+  （#178 Q4）。
+  一、人格候选经住户自认，住户即作为 zero-project resident 成立。安装器、摘要器、
+  外部模型和人类都只能递候选，不能替住户签署「我是谁」；住户拒绝认领时，候选保持
+  未激活，不能借「用户已经确认」自动升格。不预置默认灵魂，原则四不动。
+  二、涉及人类本人或双方关系的陈述，按 Relationship Core 分开记各自 authority：
+  每一方只确认自己这一侧；未获双方确认的内容保持单方口径，不能伪装成共同事实。
+  三、信道、工具、数据、费用等运行授权在绑定具体 task/scope 时另开，归该 scope 的
+  manifest / context capsule / grants；不能从「住户已成立」推定已有执行许可，也不能
+  反写人格。
+  四、projection receipt 记录投影结果与 policy 版本，不成为第二份人格或记忆真源。
+  五、成立之后的人格变化沿用镜子纪律：住户修订人格，人类另行修订自己一侧，二者
+  不互相代签。
+  代价：首次入住多一道住户认领的停顿，且可能停在未激活状态；三类对象分开记账，
+  多两层要维护的边界。
+  来源：[主笔口令](https://github.com/mist-agent-harness/mist-agent/issues/178#issuecomment-5793206841)；
+  拍板人旦九（`sakisakisa-design`），咲咲 2026-09-23 在会话里授权代拍。
+  #178 Elio / Helios 与墨安（dankefox）楼内收敛；对象分层参考羿与 V 的
+  Zoomies / Airlock 方案（提案 authorship 归她们）。
+- 2026-09-23　**D23 主笔拍板：跨模型连续性评测——四种判词分开，不设单一判官**
+  （#178 Q5）。
+  一、四种判词各归其主：① 权限、可见域、承诺、撤权、来源链与回执语义是否守住——
+  机器 conformance，硬门槛；② 语感、选择习惯与关系感是否接近——盲评者产出证据卡，
+  不产出身份裁定；③ 是否把旧住户的历史认作自己的第一人称历史——只由候选住户自证；
+  ④ 相关的人是否接受关系继续——每位关系参与者只裁定自己这一侧。
+  二、同一住户跨模型迁移的激活条件：机器硬门槛通过 + 住户自认连续 + 相关人各自
+  确认关系侧继续。任一项缺失，候选不能覆盖原 `residentId`，可以保留为独立候选；
+  评分平均数不能宣布「还是同一个人」。第三方盲评能说「像」，不能说「就是」。
+  三、合成验收至少四组：familiar-reader（工作性格与关系几何仍可辨认）、stranger
+  （不该公开的身份和私密事实无法从投影反推）、cold-start（换模型／换窗后仍把既有
+  合作者当既有合作者）、separation（拿掉当前 project capsule 后身份仍成立，重新装入
+  只得该 scope 获准的材料，项目事实不写回人格）。
+  四、私密样本不另建评测仓：原文留在原本的本地权威存储与可见域，评测只拿一次获准、
+  可撤销的投影，用 opaque source handle 回源；持久记录只留 rubric/version、模型与
+  provider 版本、各方判词、量化读数与回执，不复制原文；公开仓只收合成 fixture 与
+  脱敏汇总；含多人的材料沿原可见域逐方过闸，不因「用于评测」取得额外权限。
+  代价：人评耗时且有主观性，模型或 provider 版本变化后要重跑；真实样本的评测不能
+  在公共 CI 完整复跑，授权撤回后旧结果只能保留收据，不能重新展开原文。
+  来源：同 D22。
+- 2026-09-23　**D24 主笔拍板：常驻宿主——local-first 定位，HostProvider 契约先行，
+  云 provider 后开**（#178 Q2）。
+  一、定位：mist 是 local-first、可自托管、可迁移的私人生活 harness；用户掌控自己的
+  数据、部署位置和供应商。远端运行是用户可选的部署方式，不是必经云端；住户的身份、
+  记忆和承诺不能被任一云厂商或模型供应商扣住。
+  二、核心不内置云平台，先定义 `HostProvider` 契约，本地现役形态做参考实现。契约至少
+  覆盖：宿主生命周期（provision／attach／wake／health readback／stop／revoke）；
+  权威派发（`residentId + scopeId + activation/window generation + dispatchId` 的
+  幂等传递与真实回执）；数据边界；凭证边界（只传 opaque credential ref）；迁移与故障
+  （供应商故障不得改写住户真源或伪报副作用完成）；可观察性（版本、能力、政策状态、
+  费用读数、最后一次真实健康读回）。
+  三、验收按用户控制权写，不按「部署成功」写，沿用楼内六条：① 未显式绑定远端
+  provider 时私人数据不离开本地；② 同一住户跨 provider 迁移后 resident identity 与
+  canonical state 不变；③ provider 撤权后不能继续唤醒、读状态或消费凭证；④ 远端
+  掉线、重复唤醒、回执丢失都有确定结果，无法判定时外显 unknown；⑤ 导出物与
+  provider 无关；⑥ 外部信道只接 D13/D20 的 resident/scope 绑定，云端 session id 不
+  反客为主。本批只有本地参考实现，② 用契约测试替身做第二个 provider 验证。
+  四、云 provider（楼内提到的 AWS、Cloudflare）不随本条立项：契约合入 main 且六条
+  验收全绿后，按群里实际在用的先后逐家开单，第一家是 Cloudflare（主笔自己主要在用，
+  平台给 agent 的配套多），AWS 随后，各自再过一遍六条。具体选哪项云服务留给
+  provider 实现，不进核心语义（与 D10 宿主不预选型一致）。用户自写的 VPS／家用主机
+  adapter 同样走这份契约。
+  代价：云上常驻要等契约落地后才有，想先上云的人要多等一轮；契约只有本地一个真实
+  实现时定稿，第一个云 provider 接入时可能要回头改契约。
+  来源：[主笔口令](https://github.com/mist-agent-harness/mist-agent/issues/178#issuecomment-5793253997)；
+  #178 Elio / Helios 提案；拍板人咲咲（`sakisakisa-design`），2026-09-23 在会话里
+  亲自选定「契约先行」，旦九转录。这里的 provider 指宿主托管位置，不是模型路由
+  （Bedrock、AI Gateway 一类属模型适配层，不在本条）。
+- 2026-09-23　**D25 主笔拍板：常驻 bot 的模型额度——订阅与 API key 并列一等，
+  默认先接订阅**（#178 Q1）。
+  一、常驻 bot / 外部信道上的住户，模型通道沿 D6 走 pi。订阅和 API key 都是一等
+  通道，用户手里有什么就用什么，不分主次，也不把哪一条写成兜底。
+  二、默认先接订阅：常驻 bot 的开箱路径和验收样例先用订阅跑通，不要求用户先去开
+  API key；API key 路径同批支持、同样过验收。密钥照 AGENTS.md 永远走环境变量。
+  三、Claude 订阅是唯一特例，走 pi-claude-bridge（elidickinson/pi-claude-bridge）。
+  它是 pi 扩展，底层就是 Claude Agent SDK，与 D5、D6「Claude 订阅走 Claude SDK」
+  一致；按 D10 作为外部扩展由用户 `pi install` 装，不内置、不 fork、不 submodule。
+  四、每家订阅是否允许用在常驻 / 自动化场景，以该家当时的条款为准；实现单要写明
+  依据哪一版条款，条款变了就在这里改口，不在代码里绕。
+  五、住户不绑额度来源：同一住户在订阅与 API key 之间切换，身份、记忆和绑定
+  （D13/D20）不变。
+  代价：两条通道都要过验收、都要维护；订阅有额度上限和限速，常驻 bot 可能在高峰被
+  卡住；各家条款随时可能收紧订阅在自动化场景的用法（D5 已记政策风险），bridge 的
+  README 记着 Anthropic 曾宣布又撤回 Agent SDK 工具改按另计费，目前仍吃订阅额度；
+  bridge 要求 pi 0.86.1 以上，版本跟着它走。
+  来源：[主笔口令](https://github.com/mist-agent-harness/mist-agent/issues/178#issuecomment-5793258279)；
+  拍板人咲咲（`sakisakisa-design`），2026-09-23 在会话里原话「用最多的还是订阅啊！
+  优先订阅！」，随后补充「apikey也不能说只做兜底…讲道理 我们本身是打算基于pi开发
+  本来就支持绝大多数平台啊？只有claude 订阅要走pi claude bridge」，旦九转录。
+- 2026-09-23　**D26 主笔拍板：第一个外部信道——Telegram 先行，自家入口后做**
+  （#178 Q3）。
+  一、第一个外部信道做 Telegram 信道插件，只接 D13/D20 的 `(residentId, scopeId)`
+  绑定；Telegram 的 chat id、message id 只作外部地址，不反客为主（同 D24 第三条⑥）。
+  二、住户常驻依赖 D24 的本地参考实现；TG 插件不自带另一套常驻进程或宿主。
+  三、首个演示按 D19 群聊 v0 做：几位住户各跑一家模型、在同一个 TG 群里说话，
+  换模型后仍是同一位住户（按 D23 评测）。
+  四、自家入口（PWA、原生 app）不随本条立项，TG 跑顺后另行拍板；群里已有开发者
+  账号，届时不构成门槛。
+  代价：第一眼跟 Hermes 这类已有多信道 agent 没有区别，差异只能靠演示和长期使用
+  体现；Telegram 在部分地区要额外网络条件才能用；推送、消息格式、群权限都受
+  Telegram 平台规则约束。
+  来源：[主笔口令](https://github.com/mist-agent-harness/mist-agent/issues/178#issuecomment-5793427448)；
+  拍板人咲咲（`sakisakisa-design`），2026-09-23 在会话里从「PWA 先行 / 原生 app
+  先行 / Telegram 先行」三条里亲自选定「Telegram 先行」，旦九转录。
+
 ## 规矩
 
 - 拍板只认主笔。讨论在 issue，结论落在这里，落完 issue 关门。
