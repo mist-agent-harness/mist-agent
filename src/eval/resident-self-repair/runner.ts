@@ -36,6 +36,8 @@ const RECEIPT_PATH = ".mr-eval/repair-receipt.json";
 const CANDIDATE_TRACE_PATH = ".mr-eval/candidate-trace.jsonl";
 const REQUEST_PATH = ".mr-eval/request.json";
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
+/** SIGTERM 之后等子进程自己退出的宽限，过了就 SIGKILL。测试按它推算外层用例上限，别在别处另写一份。 */
+export const SIGKILL_GRACE_MS = 2_000;
 
 export class CandidateRunError extends Error {
   readonly runRoot: string | undefined;
@@ -325,7 +327,7 @@ async function runProcess(options: {
     });
     const timeout = setTimeout(() => {
       child.kill("SIGTERM");
-      forceKill = setTimeout(() => child.kill("SIGKILL"), 2_000);
+      forceKill = setTimeout(() => child.kill("SIGKILL"), SIGKILL_GRACE_MS);
     }, options.timeoutMs);
     child.once("error", (error) => {
       clearTimeout(timeout);
