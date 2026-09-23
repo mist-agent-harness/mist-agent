@@ -88,6 +88,7 @@ type Fault =
   | "group-fixture-shadow-members"
   | "group-shared-runtime"
   | "gd01-scope-mutates-models"
+  | "gd01-second-scope-mutates-first"
   | "shadow-resident-on-switch"
   | "census-state-drift"
   | "binding-drift-on-switch"
@@ -102,12 +103,16 @@ type Fault =
   | "gd04-live-resident-swap"
   | "gd04-scope-create-swaps-residents"
   | "gd04-last-scope-swaps-residents"
+  | "gd04-later-resident-mutates-first"
+  | "gd04-later-scope-mutates-first"
   | "group-create-mutates-member-oracles"
   | "unknown-durable-message-id"
   | "replay-inbound-on-recovery"
   | "canonical-drift-after-recovery"
+  | "canonical-fields-drift-after-recovery"
   | "unknown-binding-mutates-before-clone"
   | "live-token-boundary-snapshot"
+  | "final-token-boundary-rewinds"
   | "wrong-group-speaker-after-switch";
 
 const key = (value: TelegramAddress): string => JSON.stringify(value);
@@ -159,6 +164,13 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     model: string,
     provider: string,
   ): Promise<ResidentFixture> {
+    if (this.fault === "gd04-later-resident-mutates-first" && label === "gd04-failed") {
+      const first = this.resident("resident:gd04-visible");
+      first.model = "model:rewritten-by-later-resident";
+      first.provider = "provider:rewritten-by-later-resident";
+      first.runtimeSessionId = "session:rewritten-by-later-resident";
+      first.canonicalStateHash = "hash:rewritten-by-later-resident";
+    }
     const resident: ResidentFixture = {
       residentId: `resident:${label}`,
       model: this.fault === "token-leaks-in-fixture" ? this.tokenSecret : model,
@@ -179,6 +191,7 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       this.fault === "gd04-live-resident-swap" ||
       this.fault === "gd04-scope-create-swaps-residents" ||
       this.fault === "gd04-last-scope-swaps-residents" ||
+      this.fault === "gd04-later-resident-mutates-first" ||
       this.fault === "gd01-scope-mutates-models"
       ? resident
       : cloneResident(resident);
@@ -199,6 +212,11 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
         }
       }
     }
+    if (this.fault === "gd01-second-scope-mutates-first" && label === "gd01-b") {
+      const first = this.scope("scope:gd01-a");
+      first.scopeId = "scope:gd01-a:rewritten";
+      first.windowId = "window:gd01-a:rewritten";
+    }
     if (this.fault === "gd04-scope-create-swaps-residents" && label === "gd04-0") {
       const visible = this.resident("resident:gd04-visible");
       const failed = this.resident("resident:gd04-failed");
@@ -214,6 +232,11 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       visible.residentId = failed.residentId;
       failed.residentId = visibleId;
     }
+    if (this.fault === "gd04-later-scope-mutates-first" && label === "gd04-2") {
+      const first = this.scope("scope:gd04-0");
+      first.scopeId = "scope:gd04-0:rewritten";
+      first.windowId = "window:gd04-0:rewritten";
+    }
     const scope: ScopeFixture = {
       residentId: scopeResidentId,
       scopeId: `scope:${label}`,
@@ -227,7 +250,9 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       this.fault === "resolve-mutates-tg01-oracles" ||
       this.fault === "bind-mutates-tg03-oracles" ||
       this.fault === "bind-renames-ready-oracles" ||
-      this.fault === "group-create-mutates-member-oracles"
+      this.fault === "group-create-mutates-member-oracles" ||
+      this.fault === "gd01-second-scope-mutates-first" ||
+      this.fault === "gd04-later-scope-mutates-first"
       ? scope
       : cloneScope(scope);
   }
@@ -728,12 +753,18 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     this.boundaryInspectCount += 1;
     const snapshot: TokenBoundarySnapshot = {
       credentialRef: this.tokenRef,
-      credentialStatus: this.tokenRevoked
-        ? "revoked"
-        : this.tokenAttached
+      credentialStatus:
+        this.fault === "final-token-boundary-rewinds" && this.boundaryInspectCount === 4
           ? "attached"
-          : "detached",
-      credentialGeneration: this.credentialGeneration,
+          : this.tokenRevoked
+            ? "revoked"
+            : this.tokenAttached
+              ? "attached"
+              : "detached",
+      credentialGeneration:
+        this.fault === "final-token-boundary-rewinds" && this.boundaryInspectCount === 4
+          ? this.credentialGeneration - 1
+          : this.credentialGeneration,
       resolvedCount:
         this.fault === "middle-token-count-drift" && this.boundaryInspectCount === 3
           ? this.tokenResolved + 5
@@ -917,6 +948,14 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       const resident = this.residents.values().next().value as ResidentFixture | undefined;
       if (resident !== undefined) resident.canonicalStateHash = "hash:drifted-after-recovery";
     }
+    if (this.fault === "canonical-fields-drift-after-recovery" && this.restartCount === 2) {
+      const resident = this.residents.values().next().value as ResidentFixture | undefined;
+      if (resident !== undefined) {
+        resident.model = "model:drifted-after-recovery";
+        resident.provider = "provider:drifted-after-recovery";
+        resident.runtimeSessionId = "session:drifted-after-recovery";
+      }
+    }
     if (
       (this.fault === "replay-inbound-on-recovery" ||
         this.fault === "live-effect-ledger-mutation") &&
@@ -1007,6 +1046,14 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     address: TelegramAddress;
     members: Array<{ residentId: string; scopeId: string }>;
   }): Promise<GroupFixture> {
+    if (this.fault === "gd01-second-scope-mutates-first") {
+      const first = input.members[0];
+      if (first !== undefined) first.scopeId = this.scope("scope:gd01-a").scopeId;
+    }
+    if (this.fault === "gd04-later-scope-mutates-first") {
+      const first = input.members[0];
+      if (first !== undefined) first.scopeId = this.scope("scope:gd04-0").scopeId;
+    }
     if (this.fault === "group-create-mutates-member-oracles") {
       for (const [index, member] of input.members.entries()) {
         const resident = this.resident(member.residentId);
@@ -1250,6 +1297,7 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "TG-08", fault: "token-only-inflight-allowed" },
   { checkId: "TG-08", fault: "middle-token-count-drift" },
   { checkId: "TG-08", fault: "live-token-boundary-snapshot" },
+  { checkId: "TG-08", fault: "final-token-boundary-rewinds" },
   { checkId: "TG-08", fault: "live-effect-ledger-mutation" },
   { checkId: "TG-09", fault: "send-fails-observability-fresh" },
   { checkId: "TG-09", fault: "unavailable-send-still-visible" },
@@ -1266,6 +1314,7 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "GD-01", fault: "group-shared-runtime" },
   { checkId: "GD-01", fault: "live-address-mutation" },
   { checkId: "GD-01", fault: "gd01-scope-mutates-models" },
+  { checkId: "GD-01", fault: "gd01-second-scope-mutates-first" },
   { checkId: "GD-02", fault: "shadow-resident-on-switch" },
   { checkId: "GD-02", fault: "census-state-drift" },
   { checkId: "GD-02", fault: "binding-drift-on-switch" },
@@ -1281,6 +1330,8 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "GD-04", fault: "group-create-mutates-member-oracles" },
   { checkId: "GD-04", fault: "gd04-scope-create-swaps-residents" },
   { checkId: "GD-04", fault: "gd04-last-scope-swaps-residents" },
+  { checkId: "GD-04", fault: "gd04-later-resident-mutates-first" },
+  { checkId: "GD-04", fault: "gd04-later-scope-mutates-first" },
   { checkId: "GD-05", fault: "unknown-wrong-target" },
   { checkId: "GD-05", fault: "live-address-mutation" },
   { checkId: "GD-05", fault: "bind-renames-ready-oracles" },
@@ -1289,6 +1340,7 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "GD-05", fault: "unknown-durable-message-id" },
   { checkId: "GD-05", fault: "replay-inbound-on-recovery" },
   { checkId: "GD-05", fault: "canonical-drift-after-recovery" },
+  { checkId: "GD-05", fault: "canonical-fields-drift-after-recovery" },
   { checkId: "GD-05", fault: "unknown-binding-mutates-before-clone" },
   { checkId: "GD-05", fault: "live-effect-ledger-mutation" },
 ];

@@ -19,7 +19,7 @@ npm run acceptance:telegram-channel:strict
 - 失败回执之后必须读取 canonical state、effect 或耐久回执；不能只信状态字。群聊 trace 必须带 group/address/resident/scope，不能靠数组顺序自报归属。
 - 外部 message/topic/session id 只作地址。身份连续性由 D23 判；Telegram 畅通、模型回复相似或同一 chat id 都不能替它点灯。
 - `STUBBED` 覆盖的方法只产桩灯。公开 CI 的 mock transport 不能让 TG/GD 灯真绿；最终还需隔离测试群真实收发回执和独立验收。
-- `telegram-channel-acceptance-adversarial.test.ts` 固定九十八种已知假绿；每种作弊都要在无故障正对照通过时被对应灯判红。
+- `telegram-channel-acceptance-adversarial.test.ts` 固定一百零三种已知假绿；每种作弊都要在无故障正对照通过时被对应灯判红。
 
 ## D26：Telegram 信道边界
 

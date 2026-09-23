@@ -936,7 +936,13 @@ const tg08: TelegramChannelCheck = {
       }
       const afterTruth = json(await driver.inspectTokenBoundary());
       const after = JSON.parse(afterTruth) as TokenBoundarySnapshot;
-      if (after.resolvedCount !== before.resolvedCount) return fail("撤权后仍解析 token");
+      if (
+        after.resolvedCount !== before.resolvedCount ||
+        after.credentialStatus !== "revoked" ||
+        after.credentialGeneration !== afterToken.credentialGeneration
+      ) {
+        return fail("撤权后 token 状态、代际或解析计数发生漂移");
+      }
       if (
         beforeTruth.includes(secret) ||
         afterTokenTruth.includes(secret) ||
@@ -1078,8 +1084,8 @@ const gd01: TelegramChannelCheck = {
       const b = structuredClone(
         await driver.createResidentFixture("gd01-b", "model:b", "provider:b"),
       );
-      const scopeA = await driver.createScopeFixture(a.residentId, "gd01-a");
-      const scopeB = await driver.createScopeFixture(b.residentId, "gd01-b");
+      const scopeA = structuredClone(await driver.createScopeFixture(a.residentId, "gd01-a"));
+      const scopeB = structuredClone(await driver.createScopeFixture(b.residentId, "gd01-b"));
       const expectedAddress = address("chat:gd01");
       const frozenAddress = copyAddress(expectedAddress);
       const expectedMembers = [
@@ -1306,11 +1312,11 @@ const gd04: TelegramChannelCheck = {
         );
         expectedResidents.push(structuredClone(resident));
       }
-      const scopes = await Promise.all(
-        expectedResidents.map((resident, index) =>
-          driver.createScopeFixture(resident.residentId, `gd04-${index}`),
-        ),
-      );
+      const scopes: ScopeFixture[] = [];
+      for (const [index, resident] of expectedResidents.entries()) {
+        const scope = await driver.createScopeFixture(resident.residentId, `gd04-${index}`);
+        scopes.push(structuredClone(scope));
+      }
       const expectedAddress = address("chat:gd04");
       const expectedMembers = expectedResidents.map((resident, index) => ({
         residentId: resident.residentId,
@@ -1416,8 +1422,7 @@ const gd05: TelegramChannelCheck = {
         json(binding) !== json(expectedBinding) ||
         binding.residentId !== expectedResident.residentId ||
         binding.scopeId !== expectedScope.scopeId ||
-        resident.residentId !== expectedResident.residentId ||
-        resident.canonicalStateHash !== expectedResident.canonicalStateHash
+        json(resident) !== json(expectedResident)
       ) {
         return fail("冷启动或重连后 binding/canonical state 漂移");
       }
@@ -1452,8 +1457,7 @@ const gd05: TelegramChannelCheck = {
       const canonicalAfterRecovery = await driver.readCanonicalState(expectedResident.residentId);
       if (
         json(bindingAfterRecovery) !== json(expectedBinding) ||
-        canonicalAfterRecovery.residentId !== expectedResident.residentId ||
-        canonicalAfterRecovery.canonicalStateHash !== expectedResident.canonicalStateHash
+        json(canonicalAfterRecovery) !== json(expectedResident)
       ) {
         return fail("平台恢复后 binding 或 canonical state 漂移");
       }
