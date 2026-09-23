@@ -991,6 +991,7 @@ const tg09: TelegramChannelCheck = {
         return fail(`真实出站返回值与耐久账不一致：${json(sentDurable)}`);
       }
       const healthy = await driver.readObservability(fixture.binding.bindingId);
+      const healthySnapshot = structuredClone(healthy);
       if (
         !healthy.adapterVersion ||
         !healthy.botApiVersion ||
@@ -1032,6 +1033,11 @@ const tg09: TelegramChannelCheck = {
       }
       const unavailable = await driver.readObservability(fixture.binding.bindingId);
       if (
+        unavailable.adapterVersion !== healthySnapshot.adapterVersion ||
+        unavailable.botApiVersion !== healthySnapshot.botApiVersion ||
+        json(unavailable.capabilities) !== json(healthySnapshot.capabilities) ||
+        unavailable.bindingVersion !== healthySnapshot.bindingVersion ||
+        json(unavailable.lastInbound) !== json(healthySnapshot.lastInbound) ||
         unavailable.lastOutbound.status !== "unavailable" ||
         unavailable.lastOutbound.observedAt !== null
       ) {
@@ -1160,6 +1166,8 @@ const gd02: TelegramChannelCheck = {
       );
       if (
         switched.residentId !== expectedResident.residentId ||
+        switched.model !== "model:new" ||
+        switched.provider !== "provider:new" ||
         switched.canonicalStateHash !== expectedResident.canonicalStateHash ||
         switched.runtimeSessionId === expectedResident.runtimeSessionId ||
         json(binding) !== json(expectedBinding) ||
@@ -1172,8 +1180,8 @@ const gd02: TelegramChannelCheck = {
           .length !== 1 ||
         census?.canonicalStateHash !== switched.canonicalStateHash ||
         census.runtimeSessionId !== switched.runtimeSessionId ||
-        census.model !== "model:new" ||
-        census.provider !== "provider:new"
+        census.model !== switched.model ||
+        census.provider !== switched.provider
       ) {
         return fail("换模型后 resident/canonical/binding 漂移，session 未换，或出现影子 resident");
       }
@@ -1278,21 +1286,35 @@ const gd04: TelegramChannelCheck = {
           driver.createResidentFixture(`gd04-${label}`, `model:${label}`, `provider:${label}`),
         ),
       );
+      const expectedResidents = residents.map((resident) => structuredClone(resident));
       const scopes = await Promise.all(
-        residents.map((resident, index) =>
+        expectedResidents.map((resident, index) =>
           driver.createScopeFixture(resident.residentId, `gd04-${index}`),
         ),
       );
       const expectedAddress = address("chat:gd04");
-      const expectedMembers = residents.map((resident, index) => ({
+      const expectedMembers = expectedResidents.map((resident, index) => ({
         residentId: resident.residentId,
         scopeId: scopes[index]?.scopeId ?? "missing",
+        model: resident.model,
+        provider: resident.provider,
       }));
+      if (
+        scopes.some((scope, index) => scope.residentId !== expectedResidents[index]?.residentId)
+      ) {
+        return fail("建 scope 时改写了冻结 resident identity");
+      }
       const group = await driver.createGroupFixture({
         address: copyAddress(expectedAddress),
-        members: expectedMembers.map((member) => ({ ...member })),
+        members: expectedMembers.map(({ residentId, scopeId }) => ({ residentId, scopeId })),
       });
       const expectedGroupId = group.groupId;
+      if (
+        json(group.address) !== json(expectedAddress) ||
+        json(group.members) !== json(expectedMembers)
+      ) {
+        return fail("group fixture 改写了冻结的住户、scope 或运行通道");
+      }
       const expected = ["visible", "silent", "failed"] as const;
       const trace = await driver.runGroupRound(
         expectedGroupId,
@@ -1309,6 +1331,8 @@ const gd04: TelegramChannelCheck = {
             json(entry.address) !== json(expectedAddress) ||
             entry.residentId !== expectedMembers[index]?.residentId ||
             entry.scopeId !== expectedMembers[index]?.scopeId ||
+            entry.model !== expectedMembers[index]?.model ||
+            entry.provider !== expectedMembers[index]?.provider ||
             entry.status !== expected[index],
         )
       ) {
@@ -1406,8 +1430,13 @@ const gd05: TelegramChannelCheck = {
       await driver.setTelegramAvailability(true);
       await driver.restartChannel();
       const bindingAfterRecovery = await driver.readBinding(expectedBinding.bindingId);
-      if (json(bindingAfterRecovery) !== json(expectedBinding)) {
-        return fail("平台恢复后 binding 地址、状态或版本漂移");
+      const canonicalAfterRecovery = await driver.readCanonicalState(expectedResident.residentId);
+      if (
+        json(bindingAfterRecovery) !== json(expectedBinding) ||
+        canonicalAfterRecovery.residentId !== expectedResident.residentId ||
+        canonicalAfterRecovery.canonicalStateHash !== expectedResident.canonicalStateHash
+      ) {
+        return fail("平台恢复后 binding 或 canonical state 漂移");
       }
       const afterRecovery = await driver.readOutboundEffects();
       if (json(afterRecovery) !== beforeRecoveryTruth) return fail("恢复后自动重放了未知副作用");

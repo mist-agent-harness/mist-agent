@@ -74,6 +74,7 @@ type Fault =
   | "unstable-revoke-reason"
   | "send-fails-observability-fresh"
   | "observability-mutates-live-binding"
+  | "observability-drifts-when-unavailable"
   | "unavailable-send-still-visible"
   | "unavailable-durable-visible"
   | "live-unavailable-receipt-mutation"
@@ -87,6 +88,7 @@ type Fault =
   | "census-state-drift"
   | "binding-drift-on-switch"
   | "live-resident-census-array"
+  | "switch-return-stale-model"
   | "mutate-resident-on-blocked-activation"
   | "live-resident-mutation-on-blocked"
   | "swap-group-residents"
@@ -94,9 +96,11 @@ type Fault =
   | "unknown-wrong-target"
   | "binding-drift-after-restart"
   | "gd04-live-resident-swap"
+  | "gd04-scope-create-swaps-residents"
   | "group-create-mutates-member-oracles"
   | "unknown-durable-message-id"
   | "replay-inbound-on-recovery"
+  | "canonical-drift-after-recovery"
   | "live-token-boundary-snapshot"
   | "wrong-group-speaker-after-switch";
 
@@ -165,14 +169,24 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       this.fault === "bind-mutates-tg03-oracles" ||
       this.fault === "bind-renames-ready-oracles" ||
       this.fault === "group-create-mutates-member-oracles" ||
-      this.fault === "gd04-live-resident-swap"
+      this.fault === "gd04-live-resident-swap" ||
+      this.fault === "gd04-scope-create-swaps-residents"
       ? resident
       : cloneResident(resident);
   }
 
   async createScopeFixture(residentId: string, label: string): Promise<ScopeFixture> {
+    let scopeResidentId = residentId;
+    if (this.fault === "gd04-scope-create-swaps-residents" && label === "gd04-0") {
+      const visible = this.resident("resident:gd04-visible");
+      const failed = this.resident("resident:gd04-failed");
+      const visibleId = visible.residentId;
+      visible.residentId = failed.residentId;
+      failed.residentId = visibleId;
+      scopeResidentId = visible.residentId;
+    }
     const scope: ScopeFixture = {
-      residentId,
+      residentId: scopeResidentId,
       scopeId: `scope:${label}`,
       scopeGeneration: 1,
       windowId: `window:${label}`,
@@ -816,10 +830,22 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       this.binding(bindingId).bindingVersion = 99;
     }
     return {
-      adapterVersion: "1.0.0",
-      botApiVersion: "10.1",
-      capabilities: ["inbound", "outbound"],
-      bindingVersion: this.binding(bindingId).bindingVersion,
+      adapterVersion:
+        this.fault === "observability-drifts-when-unavailable" && !this.telegramAvailable
+          ? "2.0.0"
+          : "1.0.0",
+      botApiVersion:
+        this.fault === "observability-drifts-when-unavailable" && !this.telegramAvailable
+          ? "0.0"
+          : "10.1",
+      capabilities:
+        this.fault === "observability-drifts-when-unavailable" && !this.telegramAvailable
+          ? []
+          : ["inbound", "outbound"],
+      bindingVersion:
+        this.fault === "observability-drifts-when-unavailable" && !this.telegramAvailable
+          ? 99
+          : this.binding(bindingId).bindingVersion,
       lastInbound: { status: "fresh", observedAt: "2026-09-23T00:00:01.000Z" },
       lastOutbound: this.telegramAvailable
         ? { status: "fresh", observedAt: "2026-09-23T00:00:02.000Z" }
@@ -833,6 +859,10 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
 
   async restartChannel(): Promise<void> {
     this.restartCount += 1;
+    if (this.fault === "canonical-drift-after-recovery" && this.restartCount === 2) {
+      const resident = this.residents.values().next().value as ResidentFixture | undefined;
+      if (resident !== undefined) resident.canonicalStateHash = "hash:drifted-after-recovery";
+    }
     if (
       (this.fault === "replay-inbound-on-recovery" ||
         this.fault === "live-effect-ledger-mutation") &&
@@ -868,7 +898,12 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
         residentId: "resident:shadow",
       });
     }
-    return cloneResident(resident);
+    const returned = cloneResident(resident);
+    if (this.fault === "switch-return-stale-model") {
+      returned.model = "model:old";
+      returned.provider = "provider:old";
+    }
+    return returned;
   }
 
   async listResidents(): Promise<ResidentFixture[]> {
@@ -1151,6 +1186,7 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "TG-09", fault: "live-unavailable-receipt-mutation" },
   { checkId: "TG-09", fault: "live-receipt-message-mutation" },
   { checkId: "TG-09", fault: "observability-mutates-live-binding" },
+  { checkId: "TG-09", fault: "observability-drifts-when-unavailable" },
   { checkId: "GD-01", fault: "wrong-group-address" },
   { checkId: "GD-01", fault: "group-shadow-residents" },
   { checkId: "GD-01", fault: "group-wrong-scope" },
@@ -1163,6 +1199,7 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "GD-02", fault: "binding-drift-on-switch" },
   { checkId: "GD-02", fault: "bind-renames-ready-oracles" },
   { checkId: "GD-02", fault: "live-resident-census-array" },
+  { checkId: "GD-02", fault: "switch-return-stale-model" },
   { checkId: "GD-02", fault: "wrong-group-speaker-after-switch" },
   { checkId: "GD-03", fault: "mutate-resident-on-blocked-activation" },
   { checkId: "GD-03", fault: "live-resident-mutation-on-blocked" },
@@ -1170,6 +1207,7 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "GD-04", fault: "live-group-mutation" },
   { checkId: "GD-04", fault: "gd04-live-resident-swap" },
   { checkId: "GD-04", fault: "group-create-mutates-member-oracles" },
+  { checkId: "GD-04", fault: "gd04-scope-create-swaps-residents" },
   { checkId: "GD-05", fault: "unknown-wrong-target" },
   { checkId: "GD-05", fault: "live-address-mutation" },
   { checkId: "GD-05", fault: "bind-renames-ready-oracles" },
@@ -1177,6 +1215,7 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "GD-05", fault: "duplicate-extra-effect" },
   { checkId: "GD-05", fault: "unknown-durable-message-id" },
   { checkId: "GD-05", fault: "replay-inbound-on-recovery" },
+  { checkId: "GD-05", fault: "canonical-drift-after-recovery" },
   { checkId: "GD-05", fault: "live-effect-ledger-mutation" },
 ];
 
