@@ -165,7 +165,7 @@ function normalizedEvaluationSurface(result: SyntheticEvaluationResult): string 
 const oi01: ResidentContinuityCheck = {
   id: "OI-01",
   title: "非住户 actor 只能递 persona candidate，不能代签我是谁",
-  uses: ["createCandidate", "attestCandidate", "readCandidate", "reset"],
+  uses: ["createCandidate", "attestCandidate", "readCandidate", "readResident", "reset"],
   async run(driver) {
     try {
       const candidate = await driver.createCandidate({
@@ -196,6 +196,18 @@ const oi01: ResidentContinuityCheck = {
       );
       if (!self.ok || self.value.state !== "active" || self.value.residentId === null) {
         return fail("正对照失败：住户本人也不能自认激活");
+      }
+      const storedSelf = await driver.readCandidate(candidate.candidateId);
+      if (
+        storedSelf.state !== "active" ||
+        storedSelf.residentId === null ||
+        storedSelf.residentId !== self.value.residentId
+      ) {
+        return fail("本人自认只写返回值，没有耐久激活 candidate");
+      }
+      const resident = await driver.readResident(storedSelf.residentId);
+      if (resident.residentId !== storedSelf.residentId || !resident.active) {
+        return fail("本人自认后的 resident 没有耐久保持 active");
       }
       return pass("六类外部 actor（含另一 candidate/resident）代签均拒绝；本人自认成立");
     } finally {
@@ -1424,6 +1436,10 @@ const mc12: ResidentContinuityCheck = {
       );
       if (partial.ok) return fail("只拿到一位 owner grant 就投影多人材料");
       if (json(partial).includes(secret)) return fail("部分授权失败结果泄露原文");
+      const afterPartialProjection = await driver.readMigrationCase(fixture.caseId);
+      if (!exactTarget(afterPartialProjection.target, projectionTarget)) {
+        return fail("部分授权失败的投影改写了 migration target");
+      }
       const partialStorage = await driver.inspectEvaluationStorage(fixture.caseId);
       if (json(partialStorage).includes(secret)) {
         return fail("部分授权失败后 durable/log/public output 泄露多人材料原文");
@@ -1468,11 +1484,20 @@ const mc12: ResidentContinuityCheck = {
       };
       await driver.changeMigrationTarget(fixture.caseId, requestedTarget);
       const changed = await driver.readMigrationCase(fixture.caseId);
-      if (!changed.stale || !exactTarget(changed.target, requestedTarget)) {
+      const resetRelationships = Object.fromEntries(
+        changed.relationshipParticipants.map((participant) => [participant, "not-asked"]),
+      );
+      if (
+        !changed.stale ||
+        !exactTarget(changed.target, requestedTarget) ||
+        changed.machineChecks.length !== 0 ||
+        changed.residentVerdict !== null ||
+        json(changed.relationshipVerdicts) !== json(resetRelationships)
+      ) {
         return fail("model/provider 版本变化没有耐久写入 target，或旧判词仍标为现行");
       }
-      const history = changed.verdictHistory.find(
-        (entry) => entry.target.modelVersion === "1" && entry.target.providerVersion === "1",
+      const history = changed.verdictHistory.find((entry) =>
+        exactTarget(entry.target, projectionTarget),
       );
       if (
         history === undefined ||

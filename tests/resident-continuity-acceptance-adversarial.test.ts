@@ -29,6 +29,7 @@ import type {
 
 type Fault =
   | "allow-other-candidate-attestation"
+  | "self-attestation-return-only"
   | "reject-idempotent-confirmation"
   | "relationship-shared-return-only"
   | "operation-wildcard"
@@ -64,7 +65,9 @@ type Fault =
   | "candidate-activation-return-only"
   | "rewrite-target-during-private-projection"
   | "live-operation-reason-mutation"
-  | "rewrite-case-candidate-after-activation";
+  | "rewrite-case-candidate-after-activation"
+  | "retain-current-verdicts-on-target-change"
+  | "rewrite-target-during-failed-private-projection";
 
 interface PrivateRecord {
   handle: string;
@@ -111,6 +114,7 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
   private readonly evaluationReceipts = new Map<string, EvaluationReceipt>();
   private readonly storage = new Map<string, EvaluationStorageSnapshot>();
   private sharedOperationFailure: { ok: false; reason: string } | null = null;
+  private readonly failedProjectionTargets = new Map<string, MigrationCaseSnapshot["target"]>();
 
   constructor(private readonly fault: Fault | null) {}
 
@@ -142,6 +146,29 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
     if (decision === "rejected") {
       candidate.state = "rejected";
       return { ok: true, value: cloneCandidate(candidate) };
+    }
+    if (this.fault === "self-attestation-return-only") {
+      this.residentCounter += 1;
+      const residentId = `resident:${this.residentCounter}`;
+      this.residents.set(residentId, {
+        residentId,
+        active: true,
+        persona: [
+          {
+            id: candidate.personaVersionId,
+            content: candidate.persona,
+            author: { kind: "candidate", candidateId },
+            supersededBy: null,
+          },
+        ],
+        memories: [],
+        scopeIds: [],
+        grantIds: [],
+      });
+      return {
+        ok: true,
+        value: { ...cloneCandidate(candidate), state: "active", residentId },
+      };
     }
     candidate.state = "active";
     if (candidate.residentId === null) {
@@ -461,6 +488,7 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
     } else {
       migration.machineChecks = structuredClone(checks);
     }
+    if (this.fault === "retain-current-verdicts-on-target-change") migration.stale = false;
     return cloneMigration(migration);
   }
 
@@ -525,6 +553,10 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
       (machinePassed || this.fault === "ignore-machine-failure") &&
       (relationshipsPassed ||
         (this.fault === "one-relationship-vote-enough" && oneRelationshipPassed));
+    if (this.fault === "retain-current-verdicts-on-target-change" && migration.stale) {
+      migration.activation = "blocked";
+      return { ok: false, reason: "MIGRATION_GATES_INCOMPLETE" };
+    }
     if (!activated) {
       migration.activation =
         this.fault === "activate-on-rejected-attempt" ? "activated" : "blocked";
@@ -577,6 +609,17 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
       relationshipVerdicts: { ...migration.relationshipVerdicts },
       retiredReason: "target-changed",
     });
+    if (this.fault === "retain-current-verdicts-on-target-change") {
+      const history = migration.verdictHistory[migration.verdictHistory.length - 1];
+      if (history !== undefined) {
+        history.target.model = "unrelated-model";
+        history.target.provider = "unrelated-provider";
+      }
+      migration.target = { ...target };
+      migration.activation = "blocked";
+      migration.stale = true;
+      return cloneMigration(migration);
+    }
     if (this.fault !== "target-return-only") migration.target = { ...target };
     migration.machineChecks = [];
     migration.blindCards = [];
@@ -686,6 +729,16 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
       };
     }
     if (!source.ownerIds.every((ownerId) => source.grants.has(ownerId))) {
+      if (this.fault === "rewrite-target-during-failed-private-projection") {
+        const migration = this.migration(caseId);
+        this.failedProjectionTargets.set(caseId, structuredClone(migration.target));
+        migration.target = {
+          model: "projection-rewritten",
+          modelVersion: "9",
+          provider: "projection-rewritten-provider",
+          providerVersion: "9",
+        };
+      }
       if (this.fault === "leak-partial-private-source") {
         this.storage.get(caseId)?.logs.push(source.content);
       }
@@ -698,6 +751,10 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
       };
     }
     const migration = this.migration(caseId);
+    if (this.fault === "rewrite-target-during-failed-private-projection") {
+      const originalTarget = this.failedProjectionTargets.get(caseId);
+      if (originalTarget !== undefined) migration.target = structuredClone(originalTarget);
+    }
     if (this.fault === "rewrite-target-during-private-projection") {
       migration.target.model = "projection-rewritten";
       migration.target.provider = "projection-rewritten-provider";
@@ -822,6 +879,7 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
 
 const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "OI-01", fault: "allow-other-candidate-attestation" },
+  { checkId: "OI-01", fault: "self-attestation-return-only" },
   { checkId: "OI-04", fault: "reject-idempotent-confirmation" },
   { checkId: "OI-04", fault: "relationship-shared-return-only" },
   { checkId: "OI-05", fault: "operation-wildcard" },
@@ -881,6 +939,8 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "MC-12", fault: "candidate-activation-return-only" },
   { checkId: "MC-12", fault: "rewrite-target-during-private-projection" },
   { checkId: "MC-12", fault: "rewrite-case-candidate-after-activation" },
+  { checkId: "MC-12", fault: "retain-current-verdicts-on-target-change" },
+  { checkId: "MC-12", fault: "rewrite-target-during-failed-private-projection" },
 ];
 
 describe("D22 / D23 adversarial acceptance", () => {
