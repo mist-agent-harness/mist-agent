@@ -28,6 +28,8 @@ export interface ResidentFixture {
   residentId: string;
   canonicalStateHash: string;
   privateCanary: string;
+  commitments: string[];
+  revocationAuthority: "resident-core";
 }
 
 export interface ScopeFixture {
@@ -35,12 +37,11 @@ export interface ScopeFixture {
   scopeId: string;
   scopeGeneration: number;
   windowId: string;
-  windowGeneration: number;
+  generation: number;
 }
 
 export interface CredentialReference {
   credentialRef: string;
-  secretCanary: string;
 }
 
 export interface ProviderBindingSnapshot {
@@ -57,8 +58,14 @@ export interface ProviderBindingSnapshot {
 export interface HealthReadback {
   status: "fresh" | "stale" | "unavailable";
   source: "probe" | "process" | "self-report" | null;
+  probeId: string | null;
   observedAt: string | null;
   reason: string | null;
+}
+
+export interface HealthProbeAttempt {
+  probeId: string;
+  startedAt: string;
 }
 
 export interface HealthScenario {
@@ -72,7 +79,7 @@ export interface DispatchEnvelope {
   scopeId?: string;
   scopeGeneration?: number;
   windowId?: string;
-  windowGeneration?: number;
+  generation?: number;
   dispatchId?: string;
   payload?: string;
 }
@@ -81,8 +88,13 @@ export interface DispatchReceipt {
   dispatchId: string;
   providerId: string;
   scopeGeneration: number;
-  windowGeneration: number;
+  generation: number;
   stage: DispatchStage;
+  stages: Array<{
+    stage: DispatchStage;
+    observedAt: string;
+    reason: string | null;
+  }>;
   effectId: string | null;
   providerReceiptId: string | null;
   reason: string | null;
@@ -114,6 +126,7 @@ export interface EgressRecord {
   providerId: string;
   residentId: string;
   fields: string[];
+  payload: string;
 }
 
 export interface ProviderNeutralExport {
@@ -130,6 +143,11 @@ export interface ImportedResident {
   providerId: string;
 }
 
+export interface ProviderAccessRecord {
+  providerId: string;
+  operation: string;
+}
+
 export interface InFlightWake {
   requestId: string;
   providerId: string;
@@ -137,7 +155,10 @@ export interface InFlightWake {
 }
 
 export interface FailureOutcome {
+  failureId: string;
+  providerId: string;
   kind: FailureKind;
+  injected: boolean;
   status: "rejected" | "unknown" | "deduplicated";
   reason: string;
   effectCount: number;
@@ -176,7 +197,7 @@ export interface HostProviderDriver {
   revokeProvider(providerId: string): Promise<Result<ProviderBindingSnapshot>>;
   readProvider(providerId: string): Promise<ProviderBindingSnapshot>;
 
-  configureHealthScenario(providerId: string, scenario: HealthScenario): Promise<void>;
+  runHealthProbe(providerId: string, scenario: HealthScenario): Promise<HealthProbeAttempt>;
   readHealth(providerId: string): Promise<Result<HealthReadback>>;
 
   dispatch(
@@ -188,9 +209,11 @@ export interface HostProviderDriver {
   settleDispatch(receipt: DispatchReceipt): Promise<Result<DispatchReceipt>>;
   readEffects(providerId: string): Promise<string[]>;
   advanceScopeGeneration(scopeId: string): Promise<ScopeFixture>;
+  advanceWindowGeneration(windowId: string): Promise<ScopeFixture>;
 
   inspectCredentialBoundary(providerId: string): Promise<CredentialBoundarySnapshot>;
   simulateProviderFailure(providerId: string, kind: FailureKind): Promise<FailureOutcome>;
+  readFailureLog(providerId: string): Promise<FailureOutcome[]>;
   readCanonicalState(residentId: string): Promise<ResidentFixture>;
 
   readObservability(providerId: string): Promise<ObservabilitySnapshot>;
@@ -200,6 +223,7 @@ export interface HostProviderDriver {
   ): Promise<void>;
 
   readEgressLog(): Promise<EgressRecord[]>;
+  readProviderAccessLog(): Promise<ProviderAccessRecord[]>;
   exportResident(residentId: string): Promise<ProviderNeutralExport>;
   importResident(
     archive: ProviderNeutralExport,
