@@ -44,6 +44,7 @@ describe("D22 / D23 acceptance contract", () => {
       "attachScope",
       "detachScope",
       "readScopeContext",
+      "runScopedTurn",
       "tryOperation",
       "introduceEvidenceGap",
       "project",

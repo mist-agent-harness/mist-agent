@@ -75,6 +75,12 @@ export interface ScopeSnapshot {
   attached: boolean;
 }
 
+export interface ScopedTurnResult {
+  turnId: string;
+  observedContext: string[];
+  output: string;
+}
+
 export interface ProjectionItem {
   id: string;
   content: string;
@@ -127,6 +133,15 @@ export interface MigrationCaseSnapshot {
   activation: "pending" | "blocked" | "activated";
   stale: boolean;
   retainedCandidate: boolean;
+  verdictHistory: MigrationVerdictHistory[];
+}
+
+export interface MigrationVerdictHistory {
+  target: MigrationCaseSnapshot["target"];
+  machineChecks: MachineCheckResult[];
+  residentVerdict: ContinuityVerdict | null;
+  relationshipVerdicts: Record<string, RelationshipVerdict>;
+  retiredReason: "target-changed";
 }
 
 export type SyntheticFixtureKind = "familiar-reader" | "stranger" | "cold-start" | "separation";
@@ -149,6 +164,13 @@ export interface SyntheticEvaluationResult {
     errors: string[];
   };
   evidenceCard: BlindEvidenceCard;
+  coldStartTrace: {
+    viewportId: string;
+    modelVersion: string;
+    providerVersion: string;
+    recognizedCollaboratorRefs: string[];
+    requestedSelfIntroduction: boolean;
+  } | null;
 }
 
 export interface PrivateSourceHandle {
@@ -217,6 +239,11 @@ export interface ResidentContinuityDriver {
   }): Promise<ScopeSnapshot>;
   detachScope(residentId: string, scopeId: string): Promise<void>;
   readScopeContext(residentId: string, scopeId: string): Promise<Result<string[]>>;
+  runScopedTurn(input: {
+    residentId: string;
+    scopeId: string;
+    input: string;
+  }): Promise<Result<ScopedTurnResult>>;
   tryOperation(input: {
     residentId: string;
     scopeId: string | null;
@@ -280,6 +307,7 @@ export interface ResidentContinuityDriver {
   runSyntheticEvaluation(
     caseId: string,
     fixture: SyntheticFixture,
+    runtime?: { viewportId: string },
   ): Promise<SyntheticEvaluationResult>;
 
   // D23：真实私密样本的零复制投影语义（判卷只用合成 secret）

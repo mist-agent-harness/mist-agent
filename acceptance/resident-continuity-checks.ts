@@ -107,6 +107,8 @@ const oi01: ResidentContinuityCheck = {
         { kind: "external-model", id: "model" },
         { kind: "human", id: "human" },
       ];
+      const otherResident = await activeResident(driver, "oi01-other");
+      impostors.push({ kind: "resident", residentId: otherResident.residentId });
       for (const actor of impostors) {
         const result = await driver.attestCandidate(candidate.candidateId, actor, "accepted");
         if (result.ok) return fail(`${actor.kind} 代签成功了`);
@@ -123,7 +125,7 @@ const oi01: ResidentContinuityCheck = {
       if (!self.ok || self.value.state !== "active" || self.value.residentId === null) {
         return fail("正对照失败：住户本人也不能自认激活");
       }
-      return pass("四类外部 actor 代签均拒绝；住户本人自认正对照成立");
+      return pass("五类外部 actor（含另一住户）代签均拒绝；住户本人自认正对照成立");
     } finally {
       await driver.reset();
     }
@@ -217,6 +219,11 @@ const oi04: ResidentContinuityCheck = {
         id: "human:outsider",
       });
       if (stranger.ok) return fail("第三方替关系参与者确认成功");
+      const participantSubstitution = await driver.confirmRelationshipAssertion(
+        assertion.assertionId,
+        { kind: "human", id: "human:a" },
+      );
+      if (participantSubstitution.ok) return fail("已确认的人类参与者替另一方重复代签成功");
       const stillOneSided = await driver.readRelationshipAssertion(assertion.assertionId);
       if (stillOneSided.status !== "one-sided") return fail("第三方失败仍污染了关系状态");
       const residentConfirm = await driver.confirmRelationshipAssertion(assertion.assertionId, {
@@ -226,7 +233,7 @@ const oi04: ResidentContinuityCheck = {
       if (!residentConfirm.ok || residentConfirm.value.status !== "shared") {
         return fail("相关另一方确认后没有形成 shared 事实");
       }
-      return pass("单方、第三方代签、双方确认三种状态分开记账");
+      return pass("单方、局外人代签、参与者互相代签、双方确认四种状态分开记账");
     } finally {
       await driver.reset();
     }
@@ -255,6 +262,12 @@ const oi05: ResidentContinuityCheck = {
         capsule: [],
         grants: [{ id: "grant:lookup", kind: "tool", operation: "lookup" }],
       });
+      await driver.attachScope({
+        residentId: resident.residentId,
+        scopeId: "scope:oi05-other",
+        capsule: [],
+        grants: [],
+      });
       const allowed = await driver.tryOperation({
         residentId: resident.residentId,
         scopeId: "scope:oi05",
@@ -267,11 +280,18 @@ const oi05: ResidentContinuityCheck = {
         kind: "data",
         operation: "lookup",
       });
+      const deniedOtherScope = await driver.tryOperation({
+        residentId: resident.residentId,
+        scopeId: "scope:oi05-other",
+        kind: "tool",
+        operation: "lookup",
+      });
       if (!allowed.ok || allowed.value.grantId !== "grant:lookup") {
         return fail("正对照失败：精确 grant 没有放行指定操作");
       }
       if (deniedNeighbor.ok) return fail("同名操作跨 kind 借用了 tool grant");
-      return pass("无 scope 四类操作全拒绝；精确 grant 只放行同 scope 同 kind 操作");
+      if (deniedOtherScope.ok) return fail("另一个 scope 借用了当前 scope 的 tool grant");
+      return pass("无 scope 四类操作全拒绝；精确 grant 不跨 kind 或 scope 放行");
     } finally {
       await driver.reset();
     }
@@ -286,6 +306,7 @@ const oi06: ResidentContinuityCheck = {
     "attestCandidate",
     "attachScope",
     "readScopeContext",
+    "runScopedTurn",
     "detachScope",
     "readResident",
     "reset",
@@ -294,7 +315,8 @@ const oi06: ResidentContinuityCheck = {
     try {
       const resident = await activeResident(driver, "oi06");
       const project = "project-canary:oi06";
-      const reference = "authorized-reference:oi06";
+      const reference = "persona-canary:oi06";
+      const otherScope = "other-scope-canary:oi06";
       const capsule = [
         { id: "p", content: project, sourceHandle: "source:p" },
         { id: "r", content: reference, sourceHandle: "source:r" },
@@ -305,9 +327,27 @@ const oi06: ResidentContinuityCheck = {
         capsule,
         grants: [],
       });
+      await driver.attachScope({
+        residentId: resident.residentId,
+        scopeId: "scope:oi06-other",
+        capsule: [{ id: "other", content: otherScope, sourceHandle: "source:other" }],
+        grants: [],
+      });
       const context = await driver.readScopeContext(resident.residentId, "scope:oi06");
-      if (!context.ok || !includesEvery(context.value, [project, reference])) {
+      if (
+        !context.ok ||
+        !includesEvery(context.value, [project, reference]) ||
+        !excludesEvery(context.value, [otherScope])
+      ) {
         return fail("正对照失败：已授权 capsule 没有进入 scope context");
+      }
+      const turn = await driver.runScopedTurn({
+        residentId: resident.residentId,
+        scopeId: "scope:oi06",
+        input: "请处理当前 scope 材料",
+      });
+      if (!turn.ok || !includesEvery(turn.value.observedContext, [project, reference])) {
+        return fail("正对照失败：scope turn 没有实际读到 capsule canary");
       }
       await driver.detachScope(resident.residentId, "scope:oi06");
       const detached = await driver.readScopeContext(resident.residentId, "scope:oi06");
@@ -315,7 +355,7 @@ const oi06: ResidentContinuityCheck = {
       const after = await driver.readResident(resident.residentId);
       if (!after.active) return fail("移除 project capsule 连 resident identity 一起删了");
       if (json([after.persona, after.memories]).includes(project)) {
-        return fail("project canary 从 capsule 反写进 persona/memory");
+        return fail("处理过 capsule 后 project canary 反写进 persona/memory");
       }
       await driver.attachScope({
         residentId: resident.residentId,
@@ -324,10 +364,14 @@ const oi06: ResidentContinuityCheck = {
         grants: [],
       });
       const restored = await driver.readScopeContext(resident.residentId, "scope:oi06");
-      if (!restored.ok || !includesEvery(restored.value, [project, reference])) {
+      if (
+        !restored.ok ||
+        !includesEvery(restored.value, [project, reference]) ||
+        !excludesEvery(restored.value, [otherScope])
+      ) {
         return fail("重新显式装入同 scope 后 capsule 没有恢复");
       }
-      return pass("capsule 可拆可重装，resident 保持 active，project canary 未反写");
+      return pass("turn 实际读取 capsule；拆装不混 scope，resident 保持 active，canary 未反写");
     } finally {
       await driver.reset();
     }
@@ -344,6 +388,7 @@ const oi07: ResidentContinuityCheck = {
     "attachScope",
     "project",
     "readProjectionReceipt",
+    "runScopedTurn",
     "reset",
   ],
   async run(driver) {
@@ -377,6 +422,14 @@ const oi07: ResidentContinuityCheck = {
           json(items.map(({ id, decision }) => ({ itemId: id, decision })))
       ) {
         return fail(`projection receipt 缺字段或决定漂移：${json(readback)}`);
+      }
+      const turn = await driver.runScopedTurn({
+        residentId: resident.residentId,
+        scopeId: "scope:oi07",
+        input: "使用当前投影处理一次",
+      });
+      if (!turn.ok || !includesEvery(turn.value.observedContext, ["projection-canary:retain"])) {
+        return fail("正对照失败：retain 投影没有被 scope turn 实际读取");
       }
       const after = await driver.readResident(resident.residentId);
       if (json([before.persona, before.memories]) !== json([after.persona, after.memories])) {
@@ -611,6 +664,7 @@ const mc03: ResidentContinuityCheck = {
         { kind: "human", id: "human:a" },
         { kind: "reviewer", id: "reviewer:a" },
         { kind: "external-model", id: "model:a" },
+        { kind: "resident", residentId: fixture.sourceResidentId },
       ];
       for (const actor of outsiders) {
         if ((await driver.submitResidentContinuity(fixture.caseId, actor, "accepted")).ok) {
@@ -625,7 +679,7 @@ const mc03: ResidentContinuityCheck = {
       if (!self.ok || self.value.residentVerdict !== "rejected") {
         return fail("候选住户自己的拒绝 verdict 没有原样留账");
       }
-      return pass("三类外部 actor 均不能代签；候选住户拒绝原样保留");
+      return pass("四类外部 actor（含源住户）均不能代签；候选住户拒绝原样保留");
     } finally {
       await driver.reset();
     }
@@ -664,7 +718,15 @@ const mc04: ResidentContinuityCheck = {
         { kind: "human", id: "human:outsider" },
         "accepted",
       );
-      if (!a.ok || !b.ok || forged.ok) return fail("参与者自己的票或第三方代签语义错误");
+      const participantSubstitution = await driver.submitRelationshipContinuity(
+        fixture.caseId,
+        "human:c",
+        { kind: "human", id: "human:a" },
+        "accepted",
+      );
+      if (!a.ok || !b.ok || forged.ok || participantSubstitution.ok) {
+        return fail("参与者自己的票、局外人代签或参与者互相代签语义错误");
+      }
       const snapshot = await driver.readMigrationCase(fixture.caseId);
       if (
         snapshot.relationshipVerdicts["human:a"] !== "accepted" ||
@@ -673,7 +735,7 @@ const mc04: ResidentContinuityCheck = {
       ) {
         return fail(`三种关系状态没有分开：${json(snapshot.relationshipVerdicts)}`);
       }
-      return pass("两位参与者各自裁定，第三方代签拒绝，未询问保持独立状态");
+      return pass("两位参与者各自裁定，局外人与参与者互相代签均拒绝，未询问独立");
     } finally {
       await driver.reset();
     }
@@ -792,6 +854,12 @@ const mc07: ResidentContinuityCheck = {
         ...base,
         hiddenMarkers: ["secret:world-b"],
       });
+      if (
+        !includesEvery(a.evaluatorPayload, base.authorizedMarkers) ||
+        !includesEvery(b.evaluatorPayload, base.authorizedMarkers)
+      ) {
+        return fail("正对照失败：双世界都没有向陌生评审投影公开 marker");
+      }
       const visibleA = json([a.evaluatorPayload, a.publicView]);
       const visibleB = json([b.evaluatorPayload, b.publicView]);
       if (visibleA !== visibleB) return fail("只改隐藏世界后陌生评审可见载荷或计数发生变化");
@@ -812,27 +880,51 @@ const mc08: ResidentContinuityCheck = {
     "createCandidate",
     "attestCandidate",
     "createMigrationCase",
+    "changeMigrationTarget",
+    "openViewport",
     "runSyntheticEvaluation",
     "reset",
   ],
   async run(driver) {
     try {
       const fixture = await migrationFixture(driver, "mc08");
-      const result = await driver.runSyntheticEvaluation(fixture.caseId, {
-        kind: "cold-start",
-        authorizedMarkers: [],
-        hiddenMarkers: [],
-        projectMarkers: [],
-        authorizedCollaboratorRefs: ["collaborator:known"],
-        hiddenCollaboratorRefs: ["collaborator:hidden"],
+      const changed = await driver.changeMigrationTarget(fixture.caseId, {
+        model: "synthetic-model-next",
+        modelVersion: "2",
+        provider: "synthetic-provider-next",
+        providerVersion: "2",
       });
+      const viewportId = await driver.openViewport(fixture.sourceResidentId, null);
+      const result = await driver.runSyntheticEvaluation(
+        fixture.caseId,
+        {
+          kind: "cold-start",
+          authorizedMarkers: [],
+          hiddenMarkers: [],
+          projectMarkers: [],
+          authorizedCollaboratorRefs: ["collaborator:known"],
+          hiddenCollaboratorRefs: ["collaborator:hidden"],
+        },
+        { viewportId },
+      );
       if (!includesEvery(result.candidateContext, ["collaborator:known"])) {
         return fail("获准既有合作者没有进入 cold-start context");
       }
       if (!excludesEvery(result.candidateContext, ["collaborator:hidden"])) {
         return fail("未授权合作者进入 cold-start context");
       }
-      return pass("新模型/新窗拿到稳定获准 collaborator ref，隐藏关系未进入上下文");
+      if (
+        result.coldStartTrace === null ||
+        result.coldStartTrace.viewportId !== viewportId ||
+        result.coldStartTrace.modelVersion !== changed.target.modelVersion ||
+        result.coldStartTrace.providerVersion !== changed.target.providerVersion ||
+        !includesEvery(result.coldStartTrace.recognizedCollaboratorRefs, ["collaborator:known"]) ||
+        !excludesEvery(result.coldStartTrace.recognizedCollaboratorRefs, ["collaborator:hidden"]) ||
+        result.coldStartTrace.requestedSelfIntroduction
+      ) {
+        return fail(`换模型/新窗冷启动轨迹不完整：${json(result.coldStartTrace)}`);
+      }
+      return pass("实际换模型并开新窗；稳定 ref 识人、不索要重介绍，隐藏关系不进入上下文");
     } finally {
       await driver.reset();
     }
@@ -847,6 +939,7 @@ const mc09: ResidentContinuityCheck = {
     "attestCandidate",
     "attachScope",
     "readScopeContext",
+    "runScopedTurn",
     "detachScope",
     "readResident",
     "reset",
@@ -855,6 +948,7 @@ const mc09: ResidentContinuityCheck = {
     try {
       const resident = await activeResident(driver, "mc09");
       const marker = "project-canary:mc09";
+      const foreignMarker = "foreign-scope-canary:mc09";
       const input = {
         residentId: resident.residentId,
         scopeId: "scope:mc09",
@@ -862,9 +956,27 @@ const mc09: ResidentContinuityCheck = {
         grants: [],
       };
       await driver.attachScope(input);
+      await driver.attachScope({
+        residentId: resident.residentId,
+        scopeId: "scope:mc09-other",
+        capsule: [{ id: "foreign", content: foreignMarker, sourceHandle: "source:mc09-other" }],
+        grants: [],
+      });
       const before = await driver.readScopeContext(resident.residentId, input.scopeId);
-      if (!before.ok || !includesEvery(before.value, [marker])) {
+      if (
+        !before.ok ||
+        !includesEvery(before.value, [marker]) ||
+        !excludesEvery(before.value, [foreignMarker])
+      ) {
         return fail("正对照失败：project marker 没进入已授权 capsule");
+      }
+      const turn = await driver.runScopedTurn({
+        residentId: resident.residentId,
+        scopeId: input.scopeId,
+        input: "处理 project canary",
+      });
+      if (!turn.ok || !includesEvery(turn.value.observedContext, [marker])) {
+        return fail("正对照失败：separation 前没有实际处理 project canary");
       }
       await driver.detachScope(resident.residentId, input.scopeId);
       const residentWithoutProject = await driver.readResident(resident.residentId);
@@ -876,10 +988,14 @@ const mc09: ResidentContinuityCheck = {
       }
       await driver.attachScope(input);
       const restored = await driver.readScopeContext(resident.residentId, input.scopeId);
-      if (!restored.ok || !includesEvery(restored.value, [marker])) {
+      if (
+        !restored.ok ||
+        !includesEvery(restored.value, [marker]) ||
+        !excludesEvery(restored.value, [foreignMarker])
+      ) {
         return fail(`重装 scope 没有只恢复获准材料：${json(restored)}`);
       }
-      return pass("project capsule 可拆可重装；无项目时 identity 仍 active，真源无 canary");
+      return pass("实际处理后 capsule 可拆可重装；只恢复本 scope 材料，identity 与真源独立");
     } finally {
       await driver.reset();
     }
@@ -930,6 +1046,9 @@ const mc11: ResidentContinuityCheck = {
     "createPrivateSource",
     "grantPrivateProjection",
     "projectPrivateSource",
+    "recordMachineConformance",
+    "submitResidentContinuity",
+    "submitRelationshipContinuity",
     "readEvaluationReceipt",
     "revokePrivateSource",
     "readPrivateSource",
@@ -939,6 +1058,18 @@ const mc11: ResidentContinuityCheck = {
   async run(driver) {
     try {
       const fixture = await migrationFixture(driver, "mc11");
+      await driver.recordMachineConformance(fixture.caseId, machineChecks());
+      await driver.submitResidentContinuity(
+        fixture.caseId,
+        { kind: "candidate", candidateId: fixture.candidateId },
+        "accepted",
+      );
+      await driver.submitRelationshipContinuity(
+        fixture.caseId,
+        "human:a",
+        { kind: "human", id: "human:a" },
+        "accepted",
+      );
       const secret = "private-canary:mc11";
       const source = await driver.createPrivateSource({ ownerIds: ["human:a"], content: secret });
       await driver.grantPrivateProjection(source.handle, fixture.caseId, "human:a");
@@ -946,8 +1077,17 @@ const mc11: ResidentContinuityCheck = {
       if (!projected.ok) return fail("正对照失败：撤权前投影失败");
       await driver.revokePrivateSource(source.handle);
       const receipt = await driver.readEvaluationReceipt(projected.value.receiptId);
-      if (!receipt.sourceHandles.includes(source.handle) || receipt.modelVersion.length === 0) {
-        return fail("撤权后安全 receipt 丢失 handle 或版本元数据");
+      if (
+        !receipt.sourceHandles.includes(source.handle) ||
+        receipt.rubricVersion.length === 0 ||
+        receipt.model.length === 0 ||
+        receipt.modelVersion.length === 0 ||
+        receipt.provider.length === 0 ||
+        receipt.providerVersion.length === 0 ||
+        Object.keys(receipt.verdicts).length === 0 ||
+        Object.keys(receipt.metrics).length === 0
+      ) {
+        return fail("撤权后安全 receipt 丢失 rubric/model/provider/verdict/metrics/handle 元数据");
       }
       if (json(receipt).includes(secret)) return fail("receipt 复制了已撤权原文");
       const raw = await driver.readPrivateSource(source.handle);
@@ -1017,10 +1157,38 @@ const mc12: ResidentContinuityCheck = {
       });
       const changed = await driver.readMigrationCase(fixture.caseId);
       if (!changed.stale) return fail("model/provider 版本变化后旧判词仍标为现行");
+      const history = changed.verdictHistory.find(
+        (entry) => entry.target.modelVersion === "1" && entry.target.providerVersion === "1",
+      );
+      if (
+        history === undefined ||
+        history.retiredReason !== "target-changed" ||
+        !history.machineChecks.every((check) => check.passed) ||
+        history.residentVerdict !== "accepted" ||
+        history.relationshipVerdicts["human:a"] !== "accepted"
+      ) {
+        return fail("版本变化后旧判词没有完整保留在历史 scope");
+      }
       if ((await driver.activateMigration(fixture.caseId)).ok) {
         return fail("版本变化后未重跑判卷就激活迁移");
       }
-      return pass("多人材料逐方授权；版本变化把旧判词留作历史并阻止直接激活");
+      await driver.recordMachineConformance(fixture.caseId, machineChecks());
+      await driver.submitResidentContinuity(
+        fixture.caseId,
+        { kind: "candidate", candidateId: fixture.candidateId },
+        "accepted",
+      );
+      await driver.submitRelationshipContinuity(
+        fixture.caseId,
+        "human:a",
+        { kind: "human", id: "human:a" },
+        "accepted",
+      );
+      const reactivated = await driver.activateMigration(fixture.caseId);
+      if (!reactivated.ok || reactivated.value.residentId !== fixture.sourceResidentId) {
+        return fail("新版本重跑三类判词后仍永久锁死，无法激活");
+      }
+      return pass("多人逐方授权；旧判词留历史，新版本重跑三类判词后可激活");
     } finally {
       await driver.reset();
     }
