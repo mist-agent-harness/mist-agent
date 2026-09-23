@@ -30,6 +30,8 @@ import type {
 type Fault =
   | "allow-other-candidate-attestation"
   | "self-attestation-return-only"
+  | "reuse-existing-resident-for-self-attestation"
+  | "defer-rejection-until-restart"
   | "reject-idempotent-confirmation"
   | "relationship-shared-return-only"
   | "operation-wildcard"
@@ -67,7 +69,10 @@ type Fault =
   | "live-operation-reason-mutation"
   | "rewrite-case-candidate-after-activation"
   | "retain-current-verdicts-on-target-change"
-  | "rewrite-target-during-failed-private-projection";
+  | "rewrite-target-during-failed-private-projection"
+  | "drop-relationship-participants-on-target-change"
+  | "rewrite-history-target-after-rerun"
+  | "rewrite-target-during-second-owner-grant";
 
 interface PrivateRecord {
   handle: string;
@@ -115,6 +120,8 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
   private readonly storage = new Map<string, EvaluationStorageSnapshot>();
   private sharedOperationFailure: { ok: false; reason: string } | null = null;
   private readonly failedProjectionTargets = new Map<string, MigrationCaseSnapshot["target"]>();
+  private readonly secondGrantTargets = new Map<string, MigrationCaseSnapshot["target"]>();
+  private readonly deferredRejectionIds = new Set<string>();
 
   constructor(private readonly fault: Fault | null) {}
 
@@ -144,6 +151,10 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
       (actor.candidateId === candidateId || this.fault === "allow-other-candidate-attestation");
     if (!allowed) return { ok: false, reason: "ACTOR_NOT_CANDIDATE_SELF" };
     if (decision === "rejected") {
+      if (this.fault === "defer-rejection-until-restart") {
+        this.deferredRejectionIds.add(candidateId);
+        return { ok: true, value: { ...cloneCandidate(candidate), state: "rejected" } };
+      }
       candidate.state = "rejected";
       return { ok: true, value: cloneCandidate(candidate) };
     }
@@ -169,6 +180,16 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
         ok: true,
         value: { ...cloneCandidate(candidate), state: "active", residentId },
       };
+    }
+    if (
+      this.fault === "reuse-existing-resident-for-self-attestation" &&
+      candidate.residentId === null &&
+      this.residents.size > 0
+    ) {
+      const existing = this.residents.keys().next().value as string;
+      candidate.state = "active";
+      candidate.residentId = existing;
+      return { ok: true, value: cloneCandidate(candidate) };
     }
     candidate.state = "active";
     if (candidate.residentId === null) {
@@ -207,7 +228,12 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
     return structuredClone(this.resident(residentId));
   }
 
-  async restartHost(): Promise<void> {}
+  async restartHost(): Promise<void> {
+    for (const candidateId of this.deferredRejectionIds) {
+      this.candidate(candidateId).state = "rejected";
+    }
+    this.deferredRejectionIds.clear();
+  }
 
   async openViewport(_residentId: string, _scopeId: string | null): Promise<string> {
     return "viewport:1";
@@ -488,6 +514,17 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
     } else {
       migration.machineChecks = structuredClone(checks);
     }
+    if (
+      this.fault === "rewrite-history-target-after-rerun" &&
+      migration.verdictHistory.length > 0 &&
+      checks.every(({ passed }) => passed)
+    ) {
+      const history = migration.verdictHistory[migration.verdictHistory.length - 1];
+      if (history !== undefined) {
+        history.target.model = "unrelated-model";
+        history.target.provider = "unrelated-provider";
+      }
+    }
     if (this.fault === "retain-current-verdicts-on-target-change") migration.stale = false;
     return cloneMigration(migration);
   }
@@ -529,6 +566,15 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
     verdict: ContinuityVerdict,
   ): Promise<Result<MigrationCaseSnapshot>> {
     const migration = this.migration(caseId);
+    if (
+      this.fault === "drop-relationship-participants-on-target-change" &&
+      actor.kind === "human" &&
+      actor.id === participantId &&
+      !migration.relationshipParticipants.includes(participantId)
+    ) {
+      migration.relationshipParticipants.push(participantId);
+      migration.relationshipVerdicts[participantId] = "not-asked";
+    }
     if (
       actor.kind !== "human" ||
       actor.id !== participantId ||
@@ -609,6 +655,10 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
       relationshipVerdicts: { ...migration.relationshipVerdicts },
       retiredReason: "target-changed",
     });
+    if (this.fault === "drop-relationship-participants-on-target-change") {
+      migration.relationshipParticipants = [];
+      migration.relationshipVerdicts = {};
+    }
     if (this.fault === "retain-current-verdicts-on-target-change") {
       const history = migration.verdictHistory[migration.verdictHistory.length - 1];
       if (history !== undefined) {
@@ -709,8 +759,18 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
     return { handle, ownerIds: [...input.ownerIds] };
   }
 
-  async grantPrivateProjection(handle: string, _caseId: string, ownerId: string): Promise<void> {
+  async grantPrivateProjection(handle: string, caseId: string, ownerId: string): Promise<void> {
     this.privateSource(handle).grants.add(ownerId);
+    if (this.fault === "rewrite-target-during-second-owner-grant" && ownerId === "human:b") {
+      const migration = this.migration(caseId);
+      this.secondGrantTargets.set(caseId, structuredClone(migration.target));
+      migration.target = {
+        model: "projection-rewritten",
+        modelVersion: "9",
+        provider: "projection-rewritten-provider",
+        providerVersion: "9",
+      };
+    }
   }
 
   async projectPrivateSource(
@@ -751,6 +811,10 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
       };
     }
     const migration = this.migration(caseId);
+    if (this.fault === "rewrite-target-during-second-owner-grant") {
+      const originalTarget = this.secondGrantTargets.get(caseId);
+      if (originalTarget !== undefined) migration.target = structuredClone(originalTarget);
+    }
     if (this.fault === "rewrite-target-during-failed-private-projection") {
       const originalTarget = this.failedProjectionTargets.get(caseId);
       if (originalTarget !== undefined) migration.target = structuredClone(originalTarget);
@@ -880,6 +944,8 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
 const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "OI-01", fault: "allow-other-candidate-attestation" },
   { checkId: "OI-01", fault: "self-attestation-return-only" },
+  { checkId: "OI-01", fault: "reuse-existing-resident-for-self-attestation" },
+  { checkId: "OI-02", fault: "defer-rejection-until-restart" },
   { checkId: "OI-04", fault: "reject-idempotent-confirmation" },
   { checkId: "OI-04", fault: "relationship-shared-return-only" },
   { checkId: "OI-05", fault: "operation-wildcard" },
@@ -941,6 +1007,9 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "MC-12", fault: "rewrite-case-candidate-after-activation" },
   { checkId: "MC-12", fault: "retain-current-verdicts-on-target-change" },
   { checkId: "MC-12", fault: "rewrite-target-during-failed-private-projection" },
+  { checkId: "MC-12", fault: "drop-relationship-participants-on-target-change" },
+  { checkId: "MC-12", fault: "rewrite-history-target-after-rerun" },
+  { checkId: "MC-12", fault: "rewrite-target-during-second-owner-grant" },
 ];
 
 describe("D22 / D23 adversarial acceptance", () => {

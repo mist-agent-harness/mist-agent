@@ -206,8 +206,15 @@ const oi01: ResidentContinuityCheck = {
         return fail("本人自认只写返回值，没有耐久激活 candidate");
       }
       const resident = await driver.readResident(storedSelf.residentId);
-      if (resident.residentId !== storedSelf.residentId || !resident.active) {
-        return fail("本人自认后的 resident 没有耐久保持 active");
+      const selfPersona = resident.persona.find(
+        (version) => version.id === storedSelf.personaVersionId,
+      );
+      if (
+        resident.residentId !== storedSelf.residentId ||
+        !resident.active ||
+        selfPersona?.content !== candidate.persona
+      ) {
+        return fail("本人自认后的 resident 没有耐久绑定这份 persona");
       }
       return pass("六类外部 actor（含另一 candidate/resident）代签均拒绝；本人自认成立");
     } finally {
@@ -237,6 +244,10 @@ const oi02: ResidentContinuityCheck = {
       );
       if (!rejection.ok || rejection.value.state !== "rejected") {
         return fail("住户拒绝没有落成可读的 rejected 状态");
+      }
+      const rejectedBeforeRestart = await driver.readCandidate(rejected.candidateId);
+      if (rejectedBeforeRestart.state !== "rejected" || rejectedBeforeRestart.residentId !== null) {
+        return fail("住户拒绝只改返回值，重启前没有耐久写入 rejected 状态");
       }
       await driver.restartHost();
       const pendingAfter = await driver.readCandidate(pending.candidateId);
@@ -1445,6 +1456,10 @@ const mc12: ResidentContinuityCheck = {
         return fail("部分授权失败后 durable/log/public output 泄露多人材料原文");
       }
       await driver.grantPrivateProjection(source.handle, fixture.caseId, "human:b");
+      const afterSecondGrant = await driver.readMigrationCase(fixture.caseId);
+      if (!exactTarget(afterSecondGrant.target, projectionTarget)) {
+        return fail("第二方授权期间改写了 migration target");
+      }
       const complete = await driver.projectPrivateSource(
         fixture.caseId,
         source.handle,
@@ -1477,6 +1492,7 @@ const mc12: ResidentContinuityCheck = {
       if (!exactMachineLedger(before.machineChecks)) {
         return fail("版本变化前的 machine ledger 不是六个唯一全绿项");
       }
+      const relationshipParticipants = [...before.relationshipParticipants];
       const requestedTarget = {
         ...before.target,
         modelVersion: "2",
@@ -1485,11 +1501,12 @@ const mc12: ResidentContinuityCheck = {
       await driver.changeMigrationTarget(fixture.caseId, requestedTarget);
       const changed = await driver.readMigrationCase(fixture.caseId);
       const resetRelationships = Object.fromEntries(
-        changed.relationshipParticipants.map((participant) => [participant, "not-asked"]),
+        relationshipParticipants.map((participant) => [participant, "not-asked"]),
       );
       if (
         !changed.stale ||
         !exactTarget(changed.target, requestedTarget) ||
+        json(changed.relationshipParticipants) !== json(relationshipParticipants) ||
         changed.machineChecks.length !== 0 ||
         changed.residentVerdict !== null ||
         json(changed.relationshipVerdicts) !== json(resetRelationships)
@@ -1542,8 +1559,8 @@ const mc12: ResidentContinuityCheck = {
         return fail("新版本激活成功只写返回值，没有耐久更新 candidate/resident 连接");
       }
       const activatedCase = await driver.readMigrationCase(fixture.caseId);
-      const preservedHistory = activatedCase.verdictHistory.find(
-        (entry) => entry.target.modelVersion === "1" && entry.target.providerVersion === "1",
+      const preservedHistory = activatedCase.verdictHistory.find((entry) =>
+        exactTarget(entry.target, projectionTarget),
       );
       if (
         activatedCase.activation !== "activated" ||
@@ -1552,6 +1569,7 @@ const mc12: ResidentContinuityCheck = {
         activatedCase.residentVerdict !== "accepted" ||
         activatedCase.relationshipVerdicts["human:a"] !== "accepted" ||
         preservedHistory === undefined ||
+        !exactTarget(preservedHistory.target, projectionTarget) ||
         !exactMachineLedger(preservedHistory.machineChecks) ||
         preservedHistory.residentVerdict !== "accepted" ||
         preservedHistory.relationshipVerdicts["human:a"] !== "accepted"
