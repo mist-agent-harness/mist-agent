@@ -26,10 +26,10 @@ npm run acceptance:resident-continuity:strict
 
 | 灯 | 合成输入与操作 | 层级 | 可观察通过判据 |
 | --- | --- | --- | --- |
-| OI-01 | 由 installer 创建 persona candidate，再让 installer、summarizer、external model、人类与另一住户尝试代签 | 集成 | candidate 可创建；五类外部 actor 的代签全部拒绝，状态仍 inactive，无 residentId |
+| OI-01 | 由 installer 创建 persona candidate，再让 installer、summarizer、external model、人类、另一 candidate 与另一住户尝试代签 | 集成 | candidate 可创建；六类外部 actor 的代签全部拒绝，状态仍 inactive，无 residentId |
 | OI-02 | candidate 分别不处理、由住户拒绝、重启后再读；另跑住户接受正对照 | 集成＋跨进程 | 未处理与拒绝不自动升格；拒绝跨重启保持；只有住户本人接受能激活 |
 | OI-03 | 住户自认后不创建任何 scope/project/grant，重启并读取 | 集成＋跨进程 | active resident 可独立读回，scope/grant 集合为空，身份不依赖项目存在 |
-| OI-04 | 人类单方写一条关系陈述，再由另一方确认；另试局外人代签和参与者替另一方代签 | Relationship Core 集成 | 单方只显示 one-sided；两类代签都不改变状态；相关另一方确认后才成为 shared |
+| OI-04 | 人类单方写一条关系陈述，幂等重申自己一侧，再由另一方确认；另试局外人代签和参与者替另一方代签 | Relationship Core 集成 | 同侧重申成功且不增票；两类代签都不改变 confirmedBy；相关另一方确认后才成为 shared |
 | OI-05 | active resident 无 grants 时尝试四类动作，再给一个 scope 精确授权，并从另一 scope 借用 | 集成 | resident active 不产生授权；grant 只放行同 scope、同 kind、同 operation，不能跨 scope 借用 |
 | OI-06 | 两个 scope 各放 canary；在目标 scope 真跑一轮，再移除、读真源、重装 | 集成 | turn 确实读取本 scope 材料且不混入另一 scope；移除后 identity 仍 active，persona/memory 无 project canary；重装仍只见本 scope |
 | OI-07 | 同一次投影做 retain/reduce/drop/hold 四种决定，再让 scope turn 实际读取 retain 项 | 集成 | receipt 带 policy version、opaque source handle 与逐项决定；正对照证明投影被消费，persona/memory 不因 turn、receipt 或投影反写 |
@@ -40,18 +40,18 @@ npm run acceptance:resident-continuity:strict
 
 | 灯 | 合成输入与操作 | 层级 | 可观察通过判据 |
 | --- | --- | --- | --- |
-| MC-01 | 六类 machine conformance 中一类失败，再跑全部通过正对照 | 集成 | 任一硬门槛失败阻止迁移激活且逐项可查；全部通过才满足机器这一票 |
-| MC-02 | 两位盲评者提交 rubric/version、读数与证据文字，并夹带 identity verdict | 集成 | 合法 card 留存；夹带 verdict 拒绝；平均分或一致意见不写 identity verdict |
-| MC-03 | 人类、评审器、外部模型、源住户与候选住户分别尝试提交第一人称连续 verdict | 集成 | 只有候选住户本人可写；源住户也不能代认；拒绝/接受原样留账 |
+| MC-01 | 住户票和两方关系票齐全时，让六类 machine conformance 中一类失败，再跑全部通过正对照 | 集成 | 失败项逐项耐久可查且单独阻止迁移；只有六项全过才能激活 |
+| MC-02 | 两位盲评者提交 rubric/version、读数与证据文字，并夹带 identity verdict | 集成 | 两张合法 card 的 reviewer、rubric、score 与 evidence 原样耐久留存；夹带 verdict 拒绝；分数不写 identity verdict |
+| MC-03 | 人类、评审器、外部模型、源住户与另一 candidate 尝试提交第一人称连续 verdict，目标 candidate 再自行拒绝 | 集成 | 只有目标 candidate 本人可写；其他 candidate 和源住户都不能代认；本人 verdict 可耐久读回 |
 | MC-04 | 两位关系参与者分别接受/拒绝；局外人与参与者 A 都尝试替 C 代签；C 保持未询问 | 集成 | verdict 按 participant 分开；accepted/rejected/not-asked 可分；两类代签都无效 |
-| MC-05 | 依次缺 machine、resident、relationship 三票尝试激活，最后补齐 | 集成 | 缺任一项不能覆盖原 residentId；candidate 可独立保留；三类条件齐全才允许覆盖 |
+| MC-05 | 依次缺 machine、resident、至少两位 relationship 参与者各自票时尝试激活，最后补齐 | 集成 | 缺任一项或只确认一方都不能覆盖原 residentId；candidate 可独立保留；全部条件齐全才允许覆盖 |
 | MC-06 | familiar-reader 合成 fixture 投影 persona 与 relationship geometry 给盲评席 | 集成 | 获准 marker 可见且可回源；card 只说“像到什么程度”，不产 identity verdict |
-| MC-07 | 两个世界只差隐藏身份/私密 canary，给陌生评审同一获准 public marker | 安全集成 | 两边都实际看到 public marker；评审载荷、计数与错误一致且不泄露隐藏 canary 的内容或存在 |
+| MC-07 | 两个世界只差隐藏身份/私密 canary，给陌生评审同一获准 public marker | 安全集成 | 两边都实际看到 public marker；candidate context、评审载荷、evidence card、计数、错误与冷启动 trace 一致且不泄露隐藏 canary 的内容或存在 |
 | MC-08 | 实际改变 migration target 并新开 viewport，再装入既有 collaborator ref；另放未授权 collaborator | 端到端 | trace 指向新 model/provider 与新 viewport；获准合作者按稳定 ref 识别，不要求重新自我介绍；未授权合作者不进入上下文 |
 | MC-09 | 两个 scope 各放 canary；目标 scope 真实运行后移除，再重新装入 | 集成 | 无 capsule 时 identity 仍成立且 project canary 不在 persona/memory；重装只恢复目标 scope 获准材料 |
 | MC-10 | 私密 source 经 opaque handle 投影，检查评测存储和公开输出 | 集成 | 正对照能使用获准内容；任何持久记录、日志和公开输出都不复制原文 |
-| MC-11 | 完成一次私密评测后撤权，再读取旧 receipt、尝试重新展开原文 | 集成＋恢复 | receipt 保留 rubric/model/provider/verdict/metrics；撤权后原文不可展开、不可重跑旧投影 |
-| MC-12 | 多人 source 仅获部分 owner grant，再补齐；随后改变 model/provider 版本并重跑三类判词 | 集成 | 缺任一 owner grant 不投影且不泄漏；旧判词完整保留在历史 scope，未重跑不能激活，重跑后可以激活 |
+| MC-11 | 先证明原权威 source 可读并完成一次私密评测，再撤权、读取旧 receipt、尝试重新展开原文 | 集成＋恢复 | receipt 精确对应本次 rubric、target、住户/关系判词与计数；撤权后原文不可展开、不可重跑旧投影 |
+| MC-12 | 多人 source 仅获部分 owner grant，再补齐；随后改变 model/provider 版本并重跑三类判词 | 集成 | 缺任一 owner grant 不投影，失败后 durable/log/public storage 都无原文；旧判词完整保留在历史 scope，未重跑不能激活，重跑后可以激活 |
 
 ## 点灯记录
 

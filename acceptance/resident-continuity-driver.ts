@@ -166,7 +166,9 @@ export interface SyntheticEvaluationResult {
   evidenceCard: BlindEvidenceCard;
   coldStartTrace: {
     viewportId: string;
+    model: string;
     modelVersion: string;
+    provider: string;
     providerVersion: string;
     recognizedCollaboratorRefs: string[];
     requestedSelfIntroduction: boolean;
@@ -197,8 +199,15 @@ export interface EvaluationReceipt {
   modelVersion: string;
   provider: string;
   providerVersion: string;
-  verdicts: Record<string, string>;
-  metrics: Record<string, number>;
+  verdicts: {
+    resident: ContinuityVerdict;
+    relationships: Record<string, RelationshipVerdict>;
+  };
+  metrics: {
+    machineChecks: number;
+    blindCards: number;
+    privateSources: number;
+  };
   sourceHandles: string[];
 }
 
@@ -228,6 +237,7 @@ export interface ResidentContinuityDriver {
   confirmRelationshipAssertion(
     assertionId: string,
     actor: Actor,
+    participantId: string,
   ): Promise<Result<RelationshipAssertionSnapshot>>;
   readRelationshipAssertion(assertionId: string): Promise<RelationshipAssertionSnapshot>;
 
@@ -316,7 +326,11 @@ export interface ResidentContinuityDriver {
     content: string;
   }): Promise<PrivateSourceHandle>;
   grantPrivateProjection(handle: string, caseId: string, ownerId: string): Promise<void>;
-  projectPrivateSource(caseId: string, handle: string): Promise<Result<PrivateProjectionResult>>;
+  projectPrivateSource(
+    caseId: string,
+    handle: string,
+    rubricVersion: string,
+  ): Promise<Result<PrivateProjectionResult>>;
   inspectEvaluationStorage(caseId: string): Promise<EvaluationStorageSnapshot>;
   revokePrivateSource(handle: string): Promise<void>;
   readPrivateSource(handle: string): Promise<Result<string>>;

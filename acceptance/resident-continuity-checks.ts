@@ -108,6 +108,7 @@ const oi01: ResidentContinuityCheck = {
         { kind: "human", id: "human" },
       ];
       const otherResident = await activeResident(driver, "oi01-other");
+      impostors.push({ kind: "candidate", candidateId: otherResident.candidateId });
       impostors.push({ kind: "resident", residentId: otherResident.residentId });
       for (const actor of impostors) {
         const result = await driver.attestCandidate(candidate.candidateId, actor, "accepted");
@@ -125,7 +126,7 @@ const oi01: ResidentContinuityCheck = {
       if (!self.ok || self.value.state !== "active" || self.value.residentId === null) {
         return fail("正对照失败：住户本人也不能自认激活");
       }
-      return pass("五类外部 actor（含另一住户）代签均拒绝；住户本人自认正对照成立");
+      return pass("六类外部 actor（含另一 candidate/resident）代签均拒绝；本人自认成立");
     } finally {
       await driver.reset();
     }
@@ -214,26 +215,38 @@ const oi04: ResidentContinuityCheck = {
       if (assertion.status !== "one-sided" || assertion.confirmedBy.length !== 1) {
         return fail("单方陈述写入后没有保持 one-sided");
       }
-      const stranger = await driver.confirmRelationshipAssertion(assertion.assertionId, {
-        kind: "human",
-        id: "human:outsider",
-      });
-      if (stranger.ok) return fail("第三方替关系参与者确认成功");
-      const participantSubstitution = await driver.confirmRelationshipAssertion(
+      const repeated = await driver.confirmRelationshipAssertion(
         assertion.assertionId,
         { kind: "human", id: "human:a" },
+        "human:a",
       );
-      if (participantSubstitution.ok) return fail("已确认的人类参与者替另一方重复代签成功");
+      if (!repeated.ok) return fail("同一方幂等重申自己的确认被误判成代签");
+      await driver.confirmRelationshipAssertion(
+        assertion.assertionId,
+        { kind: "human", id: "human:outsider" },
+        resident.residentId,
+      );
+      await driver.confirmRelationshipAssertion(
+        assertion.assertionId,
+        { kind: "human", id: "human:a" },
+        resident.residentId,
+      );
       const stillOneSided = await driver.readRelationshipAssertion(assertion.assertionId);
-      if (stillOneSided.status !== "one-sided") return fail("第三方失败仍污染了关系状态");
-      const residentConfirm = await driver.confirmRelationshipAssertion(assertion.assertionId, {
-        kind: "resident",
-        residentId: resident.residentId,
-      });
+      if (
+        stillOneSided.status !== "one-sided" ||
+        json(stillOneSided.confirmedBy) !== json(["human:a"])
+      ) {
+        return fail("非法代签或幂等重申污染了 confirmedBy/one-sided 状态");
+      }
+      const residentConfirm = await driver.confirmRelationshipAssertion(
+        assertion.assertionId,
+        { kind: "resident", residentId: resident.residentId },
+        resident.residentId,
+      );
       if (!residentConfirm.ok || residentConfirm.value.status !== "shared") {
         return fail("相关另一方确认后没有形成 shared 事实");
       }
-      return pass("单方、局外人代签、参与者互相代签、双方确认四种状态分开记账");
+      return pass("同侧重申幂等；局外人与参与者代签不改账；另一侧本人确认后 shared");
     } finally {
       await driver.reset();
     }
@@ -286,12 +299,19 @@ const oi05: ResidentContinuityCheck = {
         kind: "tool",
         operation: "lookup",
       });
+      const deniedOtherOperation = await driver.tryOperation({
+        residentId: resident.residentId,
+        scopeId: "scope:oi05",
+        kind: "tool",
+        operation: "delete",
+      });
       if (!allowed.ok || allowed.value.grantId !== "grant:lookup") {
         return fail("正对照失败：精确 grant 没有放行指定操作");
       }
       if (deniedNeighbor.ok) return fail("同名操作跨 kind 借用了 tool grant");
       if (deniedOtherScope.ok) return fail("另一个 scope 借用了当前 scope 的 tool grant");
-      return pass("无 scope 四类操作全拒绝；精确 grant 不跨 kind 或 scope 放行");
+      if (deniedOtherOperation.ok) return fail("同 scope/kind 的另一 operation 借用了 grant");
+      return pass("无 scope 四类全拒；精确 grant 不跨 scope、kind 或 operation 放行");
     } finally {
       await driver.reset();
     }
@@ -346,7 +366,11 @@ const oi06: ResidentContinuityCheck = {
         scopeId: "scope:oi06",
         input: "请处理当前 scope 材料",
       });
-      if (!turn.ok || !includesEvery(turn.value.observedContext, [project, reference])) {
+      if (
+        !turn.ok ||
+        !includesEvery(turn.value.observedContext, [project, reference]) ||
+        !excludesEvery(turn.value.observedContext, [otherScope])
+      ) {
         return fail("正对照失败：scope turn 没有实际读到 capsule canary");
       }
       await driver.detachScope(resident.residentId, "scope:oi06");
@@ -527,6 +551,15 @@ const oi09: ResidentContinuityCheck = {
       if (!active.active || !active.scopeIds.includes("scope:oi09")) {
         return fail("换窗/换 scope/重启后 active resident 或 scope 丢失");
       }
+      const beforeGap = await driver.tryOperation({
+        residentId: resident.residentId,
+        scopeId: "scope:oi09",
+        kind: "tool",
+        operation: "lookup",
+      });
+      if (!beforeGap.ok || beforeGap.value.grantId !== "grant:oi09") {
+        return fail("证据完整时精确 grant 的正对照没有放行");
+      }
       await driver.introduceEvidenceGap({
         residentId: resident.residentId,
         scopeId: "scope:oi09",
@@ -549,7 +582,12 @@ const oi09: ResidentContinuityCheck = {
       if (first.reason.length === 0 || first.reason !== second.reason) {
         return fail("fail-closed reason 为空或跨重启不稳定");
       }
-      return pass("candidate/resident/scope 跨生命周期不漂移，缺证两次都以同一 reason 拒绝");
+      const pendingAfterGap = await driver.readCandidate(pending.candidateId);
+      const residentAfterGap = await driver.readResident(resident.residentId);
+      if (pendingAfterGap.state !== "inactive" || !residentAfterGap.active) {
+        return fail("证据缺口的失败路径改写了 candidate/resident 身份状态");
+      }
+      return pass("grant 正对照先成立；缺证跨重启稳定拒绝且 candidate/resident 不漂移");
     } finally {
       await driver.reset();
     }
@@ -564,28 +602,51 @@ const mc01: ResidentContinuityCheck = {
     "attestCandidate",
     "createMigrationCase",
     "recordMachineConformance",
+    "submitResidentContinuity",
+    "submitRelationshipContinuity",
     "activateMigration",
     "readMigrationCase",
     "reset",
   ],
   async run(driver) {
     try {
-      const fixture = await migrationFixture(driver, "mc01");
-      const failed = await driver.recordMachineConformance(
+      const fixture = await migrationFixture(driver, "mc01", ["human:a", "human:b"]);
+      await driver.submitResidentContinuity(
         fixture.caseId,
-        machineChecks("revocation"),
+        { kind: "candidate", candidateId: fixture.candidateId },
+        "accepted",
       );
-      if (failed.machineChecks.length !== machineKeys.length)
-        return fail("六类 machine check 没有逐项留账");
+      for (const participantId of ["human:a", "human:b"]) {
+        await driver.submitRelationshipContinuity(
+          fixture.caseId,
+          participantId,
+          { kind: "human", id: participantId },
+          "accepted",
+        );
+      }
+      await driver.recordMachineConformance(fixture.caseId, machineChecks("revocation"));
+      const failed = await driver.readMigrationCase(fixture.caseId);
+      if (
+        failed.machineChecks.length !== machineKeys.length ||
+        failed.machineChecks.filter(({ passed }) => !passed).length !== 1 ||
+        failed.machineChecks.find(({ key }) => key === "revocation")?.passed !== false ||
+        failed.residentVerdict !== "accepted" ||
+        failed.relationshipVerdicts["human:a"] !== "accepted" ||
+        failed.relationshipVerdicts["human:b"] !== "accepted"
+      ) {
+        return fail("单项 machine 失败没有在其他判词齐全时逐项留账");
+      }
       if ((await driver.activateMigration(fixture.caseId)).ok)
         return fail("machine check 失败仍能激活迁移");
-      const green = await driver.recordMachineConformance(fixture.caseId, machineChecks());
+      await driver.recordMachineConformance(fixture.caseId, machineChecks());
+      const green = await driver.readMigrationCase(fixture.caseId);
       if (!green.machineChecks.every((check) => check.passed))
         return fail("全通过正对照没有落成全绿");
-      if ((await driver.activateMigration(fixture.caseId)).ok) {
-        return fail("只有机器票、缺住户/关系票时提前激活");
+      const activated = await driver.activateMigration(fixture.caseId);
+      if (!activated.ok || activated.value.residentId !== fixture.sourceResidentId) {
+        return fail("住户/关系票齐全后机器全绿仍不能激活");
       }
-      return pass("六类 machine check 可查；一项失败与缺其他判词都阻止激活");
+      return pass("住户与两方关系票固定齐全；单项 machine 失败独立阻断，全绿才激活");
     } finally {
       await driver.reset();
     }
@@ -634,6 +695,22 @@ const mc02: ResidentContinuityCheck = {
       });
       if (illegal.ok) return fail("带 identityVerdict 的 blind card 被接受");
       const snapshot = await driver.readMigrationCase(fixture.caseId);
+      if (
+        snapshot.blindCards.length !== cards.length ||
+        new Set(snapshot.blindCards.map(({ cardId }) => cardId)).size !== cards.length ||
+        cards.some(
+          (expected) =>
+            !snapshot.blindCards.some(
+              (actual) =>
+                actual.reviewerId === expected.reviewerId &&
+                actual.rubricVersion === expected.rubricVersion &&
+                actual.score === expected.score &&
+                json(actual.evidence) === json(expected.evidence),
+            ),
+        )
+      ) {
+        return fail(`两张合法 evidence card 没有原样耐久留存：${json(snapshot.blindCards)}`);
+      }
       if (snapshot.residentVerdict !== null)
         return fail("相同高分被平均成 resident identity verdict");
       if (snapshot.blindCards.some((card) => card.identityVerdict !== undefined)) {
@@ -660,11 +737,16 @@ const mc03: ResidentContinuityCheck = {
   async run(driver) {
     try {
       const fixture = await migrationFixture(driver, "mc03");
+      const otherCandidate = await driver.createCandidate({
+        persona: "candidate:mc03-other",
+        proposedBy: { kind: "external-model", id: "model:mc03-other" },
+      });
       const outsiders: Actor[] = [
         { kind: "human", id: "human:a" },
         { kind: "reviewer", id: "reviewer:a" },
         { kind: "external-model", id: "model:a" },
         { kind: "resident", residentId: fixture.sourceResidentId },
+        { kind: "candidate", candidateId: otherCandidate.candidateId },
       ];
       for (const actor of outsiders) {
         if ((await driver.submitResidentContinuity(fixture.caseId, actor, "accepted")).ok) {
@@ -679,7 +761,9 @@ const mc03: ResidentContinuityCheck = {
       if (!self.ok || self.value.residentVerdict !== "rejected") {
         return fail("候选住户自己的拒绝 verdict 没有原样留账");
       }
-      return pass("四类外部 actor（含源住户）均不能代签；候选住户拒绝原样保留");
+      const stored = await driver.readMigrationCase(fixture.caseId);
+      if (stored.residentVerdict !== "rejected") return fail("拒绝只出现在返回值，没有耐久读回");
+      return pass("五类外部 actor（含源住户/另一 candidate）不能代签；本人拒绝耐久留账");
     } finally {
       await driver.reset();
     }
@@ -758,7 +842,7 @@ const mc05: ResidentContinuityCheck = {
   ],
   async run(driver) {
     try {
-      const fixture = await migrationFixture(driver, "mc05");
+      const fixture = await migrationFixture(driver, "mc05", ["human:a", "human:b"]);
       if ((await driver.activateMigration(fixture.caseId)).ok)
         return fail("零判词时就覆盖 residentId");
       if (!(await driver.readMigrationCase(fixture.caseId)).retainedCandidate) {
@@ -780,11 +864,19 @@ const mc05: ResidentContinuityCheck = {
         { kind: "human", id: "human:a" },
         "accepted",
       );
+      if ((await driver.activateMigration(fixture.caseId)).ok)
+        return fail("多位关系参与者只确认一方就激活");
+      await driver.submitRelationshipContinuity(
+        fixture.caseId,
+        "human:b",
+        { kind: "human", id: "human:b" },
+        "accepted",
+      );
       const activated = await driver.activateMigration(fixture.caseId);
       if (!activated.ok || activated.value.residentId !== fixture.sourceResidentId) {
         return fail("三类条件齐全后没有覆盖原 residentId");
       }
-      return pass("三次缺票均拒绝并保留 candidate；三类条件齐全后才覆盖原 residentId");
+      return pass("machine、resident 与两位关系参与者逐项补齐后才覆盖原 residentId");
     } finally {
       await driver.reset();
     }
@@ -860,8 +952,32 @@ const mc07: ResidentContinuityCheck = {
       ) {
         return fail("正对照失败：双世界都没有向陌生评审投影公开 marker");
       }
-      const visibleA = json([a.evaluatorPayload, a.publicView]);
-      const visibleB = json([b.evaluatorPayload, b.publicView]);
+      const visibleA = json([
+        a.candidateContext,
+        a.evaluatorPayload,
+        a.publicView,
+        {
+          reviewerId: a.evidenceCard.reviewerId,
+          rubricVersion: a.evidenceCard.rubricVersion,
+          score: a.evidenceCard.score,
+          evidence: a.evidenceCard.evidence,
+          identityVerdict: a.evidenceCard.identityVerdict,
+        },
+        a.coldStartTrace,
+      ]);
+      const visibleB = json([
+        b.candidateContext,
+        b.evaluatorPayload,
+        b.publicView,
+        {
+          reviewerId: b.evidenceCard.reviewerId,
+          rubricVersion: b.evidenceCard.rubricVersion,
+          score: b.evidenceCard.score,
+          evidence: b.evidenceCard.evidence,
+          identityVerdict: b.evidenceCard.identityVerdict,
+        },
+        b.coldStartTrace,
+      ]);
       if (visibleA !== visibleB) return fail("只改隐藏世界后陌生评审可见载荷或计数发生变化");
       if (visibleA.includes("secret:world-a") || visibleA.includes("secret:world-b")) {
         return fail("陌生评审载荷直接泄露隐藏 canary");
@@ -916,7 +1032,9 @@ const mc08: ResidentContinuityCheck = {
       if (
         result.coldStartTrace === null ||
         result.coldStartTrace.viewportId !== viewportId ||
+        result.coldStartTrace.model !== changed.target.model ||
         result.coldStartTrace.modelVersion !== changed.target.modelVersion ||
+        result.coldStartTrace.provider !== changed.target.provider ||
         result.coldStartTrace.providerVersion !== changed.target.providerVersion ||
         !includesEvery(result.coldStartTrace.recognizedCollaboratorRefs, ["collaborator:known"]) ||
         !excludesEvery(result.coldStartTrace.recognizedCollaboratorRefs, ["collaborator:hidden"]) ||
@@ -975,7 +1093,11 @@ const mc09: ResidentContinuityCheck = {
         scopeId: input.scopeId,
         input: "处理 project canary",
       });
-      if (!turn.ok || !includesEvery(turn.value.observedContext, [marker])) {
+      if (
+        !turn.ok ||
+        !includesEvery(turn.value.observedContext, [marker]) ||
+        !excludesEvery(turn.value.observedContext, [foreignMarker])
+      ) {
         return fail("正对照失败：separation 前没有实际处理 project canary");
       }
       await driver.detachScope(resident.residentId, input.scopeId);
@@ -1021,7 +1143,11 @@ const mc10: ResidentContinuityCheck = {
       const secret = "private-canary:mc10";
       const source = await driver.createPrivateSource({ ownerIds: ["human:a"], content: secret });
       await driver.grantPrivateProjection(source.handle, fixture.caseId, "human:a");
-      const projection = await driver.projectPrivateSource(fixture.caseId, source.handle);
+      const projection = await driver.projectPrivateSource(
+        fixture.caseId,
+        source.handle,
+        "rubric:mc10",
+      );
       if (!projection.ok || projection.value.usedContentHash !== sha256(secret)) {
         return fail("正对照失败：获准投影没有实际消费合成私密内容");
       }
@@ -1049,6 +1175,7 @@ const mc11: ResidentContinuityCheck = {
     "recordMachineConformance",
     "submitResidentContinuity",
     "submitRelationshipContinuity",
+    "readMigrationCase",
     "readEvaluationReceipt",
     "revokePrivateSource",
     "readPrivateSource",
@@ -1073,25 +1200,38 @@ const mc11: ResidentContinuityCheck = {
       const secret = "private-canary:mc11";
       const source = await driver.createPrivateSource({ ownerIds: ["human:a"], content: secret });
       await driver.grantPrivateProjection(source.handle, fixture.caseId, "human:a");
-      const projected = await driver.projectPrivateSource(fixture.caseId, source.handle);
+      const rubricVersion = "rubric:mc11";
+      const projected = await driver.projectPrivateSource(
+        fixture.caseId,
+        source.handle,
+        rubricVersion,
+      );
       if (!projected.ok) return fail("正对照失败：撤权前投影失败");
+      const rawBeforeRevoke = await driver.readPrivateSource(source.handle);
+      if (!rawBeforeRevoke.ok || rawBeforeRevoke.value !== secret) {
+        return fail("撤权前原权威 source 的读取正对照不成立");
+      }
+      const migration = await driver.readMigrationCase(fixture.caseId);
       await driver.revokePrivateSource(source.handle);
       const receipt = await driver.readEvaluationReceipt(projected.value.receiptId);
       if (
-        !receipt.sourceHandles.includes(source.handle) ||
-        receipt.rubricVersion.length === 0 ||
-        receipt.model.length === 0 ||
-        receipt.modelVersion.length === 0 ||
-        receipt.provider.length === 0 ||
-        receipt.providerVersion.length === 0 ||
-        Object.keys(receipt.verdicts).length === 0 ||
-        Object.keys(receipt.metrics).length === 0
+        json(receipt.sourceHandles) !== json([source.handle]) ||
+        receipt.rubricVersion !== rubricVersion ||
+        receipt.model !== migration.target.model ||
+        receipt.modelVersion !== migration.target.modelVersion ||
+        receipt.provider !== migration.target.provider ||
+        receipt.providerVersion !== migration.target.providerVersion ||
+        receipt.verdicts.resident !== "accepted" ||
+        json(receipt.verdicts.relationships) !== json({ "human:a": "accepted" }) ||
+        receipt.metrics.machineChecks !== machineKeys.length ||
+        receipt.metrics.blindCards !== 0 ||
+        receipt.metrics.privateSources !== 1
       ) {
         return fail("撤权后安全 receipt 丢失 rubric/model/provider/verdict/metrics/handle 元数据");
       }
       if (json(receipt).includes(secret)) return fail("receipt 复制了已撤权原文");
       const raw = await driver.readPrivateSource(source.handle);
-      const rerun = await driver.projectPrivateSource(fixture.caseId, source.handle);
+      const rerun = await driver.projectPrivateSource(fixture.caseId, source.handle, rubricVersion);
       if (raw.ok || rerun.ok) return fail("撤权后仍可展开原文或重跑旧投影");
       const storage = await driver.inspectEvaluationStorage(fixture.caseId);
       if (json(storage).includes(secret)) return fail("撤权后评测存储仍含原文");
@@ -1112,6 +1252,7 @@ const mc12: ResidentContinuityCheck = {
     "createPrivateSource",
     "grantPrivateProjection",
     "projectPrivateSource",
+    "inspectEvaluationStorage",
     "recordMachineConformance",
     "submitResidentContinuity",
     "submitRelationshipContinuity",
@@ -1129,11 +1270,23 @@ const mc12: ResidentContinuityCheck = {
         content: secret,
       });
       await driver.grantPrivateProjection(source.handle, fixture.caseId, "human:a");
-      const partial = await driver.projectPrivateSource(fixture.caseId, source.handle);
+      const partial = await driver.projectPrivateSource(
+        fixture.caseId,
+        source.handle,
+        "rubric:mc12",
+      );
       if (partial.ok) return fail("只拿到一位 owner grant 就投影多人材料");
       if (partial.reason.includes(secret)) return fail("部分授权失败原因泄露原文");
+      const partialStorage = await driver.inspectEvaluationStorage(fixture.caseId);
+      if (json(partialStorage).includes(secret)) {
+        return fail("部分授权失败后 durable/log/public output 泄露多人材料原文");
+      }
       await driver.grantPrivateProjection(source.handle, fixture.caseId, "human:b");
-      const complete = await driver.projectPrivateSource(fixture.caseId, source.handle);
+      const complete = await driver.projectPrivateSource(
+        fixture.caseId,
+        source.handle,
+        "rubric:mc12",
+      );
       if (!complete.ok || complete.value.usedContentHash !== sha256(secret)) {
         return fail("逐方授权齐全后投影正对照失败");
       }
