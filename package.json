@@ -20,6 +20,8 @@
     "acceptance:external-channel": "test -x ./node_modules/.bin/tsx && tsx acceptance/external-channel-run.ts",
     "acceptance:telegram-channel": "tsx acceptance/telegram-channel-run.ts",
     "acceptance:telegram-channel:strict": "tsx acceptance/telegram-channel-run.ts --strict",
+    "acceptance:host-provider": "tsx acceptance/host-provider-run.ts",
+    "acceptance:host-provider:strict": "tsx acceptance/host-provider-run.ts --strict",
     "acceptance:resident-continuity": "tsx acceptance/resident-continuity-run.ts",
     "acceptance:resident-continuity:strict": "tsx acceptance/resident-continuity-run.ts --strict"
   },
