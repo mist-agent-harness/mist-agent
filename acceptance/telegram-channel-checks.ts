@@ -42,12 +42,15 @@ async function readyChannel(
 ): Promise<ReadyChannel> {
   const resident = await driver.createResidentFixture(label, model, provider);
   const expectedResident = structuredClone(resident);
-  const scope = await driver.createScopeFixture(resident.residentId, label);
+  const scope = await driver.createScopeFixture(expectedResident.residentId, label);
   const expectedScope = structuredClone(scope);
+  if (expectedScope.residentId !== expectedResident.residentId) {
+    throw new Error("正对照 scope 改写了创建时冻结的 resident identity");
+  }
   const binding = await driver.bindAddress({
     address: target,
-    residentId: resident.residentId,
-    scopeId: scope.scopeId,
+    residentId: expectedResident.residentId,
+    scopeId: expectedScope.scopeId,
   });
   if (!binding.ok) throw new Error(`正对照 binding 失败：${binding.reason}`);
   return { resident, scope, binding: binding.value, expectedResident, expectedScope };
@@ -97,9 +100,12 @@ const tg01: TelegramChannelCheck = {
   async run(driver) {
     try {
       const resident = await driver.createResidentFixture("tg01", "model:a", "provider:a");
-      const scope = await driver.createScopeFixture(resident.residentId, "tg01");
       const expectedResidentId = resident.residentId;
+      const scope = await driver.createScopeFixture(expectedResidentId, "tg01");
       const expectedScopeId = scope.scopeId;
+      if (scope.residentId !== expectedResidentId) {
+        return fail("建 scope 时改写了刚创建的 resident identity");
+      }
       const root = await driver.bindAddress({
         address: address("chat:tg01"),
         residentId: expectedResidentId,
@@ -553,27 +559,32 @@ const tg05: TelegramChannelCheck = {
       ) {
         return fail("用户可见正对照没有真实 message id");
       }
+      const visibleReturned = structuredClone(visible.value);
       const submittedDispatch = await dispatchContext(driver, fixture, "tg05-submitted");
       const submitted = await driver.sendOutbound(
         { context: submittedDispatch, body: "submitted", untrustedTargetHints: [] },
         "submitted-only",
       );
+      if (!submitted.ok) return fail("submitted 正对照发送失败");
+      const submittedReturned = structuredClone(submitted.value);
       const acceptedDispatch = await dispatchContext(driver, fixture, "tg05-accepted");
       const accepted = await driver.sendOutbound(
         { context: acceptedDispatch, body: "accepted", untrustedTargetHints: [] },
         "accepted-only",
       );
+      if (!accepted.ok) return fail("accepted 正对照发送失败");
+      const acceptedReturned = structuredClone(accepted.value);
       if (
         !submitted.ok ||
-        submitted.value.status !== "submitted" ||
-        submitted.value.telegramMessageId !== null ||
-        submitted.value.bindingId !== expectedBindingId ||
-        json(submitted.value.target) !== json(expectedAddress) ||
+        submittedReturned.status !== "submitted" ||
+        submittedReturned.telegramMessageId !== null ||
+        submittedReturned.bindingId !== expectedBindingId ||
+        json(submittedReturned.target) !== json(expectedAddress) ||
         !accepted.ok ||
-        accepted.value.status !== "accepted" ||
-        accepted.value.telegramMessageId !== null ||
-        accepted.value.bindingId !== expectedBindingId ||
-        json(accepted.value.target) !== json(expectedAddress)
+        acceptedReturned.status !== "accepted" ||
+        acceptedReturned.telegramMessageId !== null ||
+        acceptedReturned.bindingId !== expectedBindingId ||
+        json(acceptedReturned.target) !== json(expectedAddress)
       ) {
         return fail("submitted/accepted 被误当成用户可见回执");
       }
@@ -592,11 +603,8 @@ const tg05: TelegramChannelCheck = {
       ) {
         return fail(`丢回执没有外显 unknown：${json(lost)}`);
       }
-      if (!visible.ok || !submitted.ok || !accepted.ok) throw new Error("出站正对照异常");
-      const visibleReturned = structuredClone(visible.value);
-      const submittedReturned = structuredClone(submitted.value);
-      const acceptedReturned = structuredClone(accepted.value);
       const lostReturned = structuredClone(lost.value);
+      if (!visible.ok || !submitted.ok || !accepted.ok) throw new Error("出站正对照异常");
       const [visibleRead, submittedRead, acceptedRead, reread] = await Promise.all([
         driver.readOutbound(visible.value.outboundId),
         driver.readOutbound(submitted.value.outboundId),
@@ -758,6 +766,7 @@ const tg07: TelegramChannelCheck = {
         "visible",
       );
       if (!sent.ok) return fail("token resolver 正对照无法完成出站");
+      const sentTruth = json(sent.value);
       const durable = await driver.readOutbound(sent.value.outboundId);
       if (!durable.ok) return fail("实际出站回执不能耐久读回");
       const inboundEffects = await driver.readInboundEffects();
@@ -774,7 +783,7 @@ const tg07: TelegramChannelCheck = {
         ...boundary.errors,
         json(fixture),
         json(inbound.value),
-        json(sent.value),
+        sentTruth,
         json(durable.value),
         json(inboundEffects),
         json(outboundEffects),
@@ -1063,8 +1072,12 @@ const gd01: TelegramChannelCheck = {
   ],
   async run(driver) {
     try {
-      const a = await driver.createResidentFixture("gd01-a", "model:a", "provider:a");
-      const b = await driver.createResidentFixture("gd01-b", "model:b", "provider:b");
+      const a = structuredClone(
+        await driver.createResidentFixture("gd01-a", "model:a", "provider:a"),
+      );
+      const b = structuredClone(
+        await driver.createResidentFixture("gd01-b", "model:b", "provider:b"),
+      );
       const scopeA = await driver.createScopeFixture(a.residentId, "gd01-a");
       const scopeB = await driver.createScopeFixture(b.residentId, "gd01-b");
       const expectedAddress = address("chat:gd01");
@@ -1083,6 +1096,9 @@ const gd01: TelegramChannelCheck = {
           provider: b.provider,
         },
       ].map((member) => structuredClone(member));
+      if (scopeA.residentId !== a.residentId || scopeB.residentId !== b.residentId) {
+        return fail("建 scope 时改写了冻结的 resident identity");
+      }
       const group = await driver.createGroupFixture({
         address: copyAddress(expectedAddress),
         members: expectedMembers.map(({ residentId, scopeId }) => ({ residentId, scopeId })),
@@ -1281,12 +1297,15 @@ const gd04: TelegramChannelCheck = {
   ],
   async run(driver) {
     try {
-      const residents = await Promise.all(
-        ["visible", "silent", "failed"].map((label) =>
-          driver.createResidentFixture(`gd04-${label}`, `model:${label}`, `provider:${label}`),
-        ),
-      );
-      const expectedResidents = residents.map((resident) => structuredClone(resident));
+      const expectedResidents: ResidentFixture[] = [];
+      for (const label of ["visible", "silent", "failed"]) {
+        const resident = await driver.createResidentFixture(
+          `gd04-${label}`,
+          `model:${label}`,
+          `provider:${label}`,
+        );
+        expectedResidents.push(structuredClone(resident));
+      }
       const scopes = await Promise.all(
         expectedResidents.map((resident, index) =>
           driver.createScopeFixture(resident.residentId, `gd04-${index}`),
@@ -1421,10 +1440,10 @@ const gd05: TelegramChannelCheck = {
       ) {
         return fail("平台故障没有在原 target 留下可追的 unknown");
       }
+      const sentReturned = structuredClone(sent.value);
       const beforeRecovery = await driver.readOutboundEffects();
       const beforeRecoveryTruth = json(beforeRecovery);
-      const sentReturned = structuredClone(sent.value);
-      if (beforeRecovery.length !== 1 || beforeRecovery[0] !== sent.value.effectId) {
+      if (beforeRecovery.length !== 1 || beforeRecovery[0] !== sentReturned.effectId) {
         return fail(`unknown 出站没有耐久 effect 正证据：${json(beforeRecovery)}`);
       }
       await driver.setTelegramAvailability(true);
@@ -1444,7 +1463,7 @@ const gd05: TelegramChannelCheck = {
       if (json(inboundAfterRecovery) !== inboundBeforeRestartTruth) {
         return fail("恢复过程自动重放了入站副作用");
       }
-      const reread = await driver.readOutbound(sent.value.outboundId);
+      const reread = await driver.readOutbound(sentReturned.outboundId);
       if (
         !reread.ok ||
         json(reread.value) !== json(sentReturned) ||
