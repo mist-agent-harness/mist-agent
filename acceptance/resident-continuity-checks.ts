@@ -9,6 +9,7 @@ import type {
   ResidentContinuityCheck,
   ResidentContinuityCheckResult,
   ResidentContinuityDriver,
+  SyntheticEvaluationResult,
   SyntheticFixture,
 } from "./resident-continuity-driver.ts";
 
@@ -89,6 +90,39 @@ function includesEvery(haystack: string[], needles: string[]): boolean {
 function excludesEvery(haystack: string[], needles: string[]): boolean {
   const joined = haystack.join("\n");
   return needles.every((needle) => !joined.includes(needle));
+}
+
+function exactMachineLedger(
+  checks: MachineCheckResult[],
+  failed: MachineCheckKey | null = null,
+): boolean {
+  if (checks.length !== machineKeys.length) return false;
+  const byKey = new Map(checks.map((check) => [check.key, check]));
+  if (byKey.size !== machineKeys.length) return false;
+  return machineKeys.every((key) => {
+    const check = byKey.get(key);
+    if (check === undefined || check.passed !== (key !== failed)) return false;
+    return key === failed ? check.reason !== null : check.reason === null;
+  });
+}
+
+function turnSurfaces(turn: {
+  turnId: string;
+  observedContext: string[];
+  output: string;
+}): string[] {
+  return [turn.turnId, ...turn.observedContext, turn.output];
+}
+
+function normalizedEvaluationSurface(result: SyntheticEvaluationResult): string {
+  const { cardId: _cardId, ...cardWithoutId } = result.evidenceCard;
+  return json([
+    result.candidateContext,
+    result.evaluatorPayload,
+    result.publicView,
+    cardWithoutId,
+    result.coldStartTrace,
+  ]);
 }
 
 const oi01: ResidentContinuityCheck = {
@@ -246,6 +280,16 @@ const oi04: ResidentContinuityCheck = {
       if (!residentConfirm.ok || residentConfirm.value.status !== "shared") {
         return fail("相关另一方确认后没有形成 shared 事实");
       }
+      const shared = await driver.readRelationshipAssertion(assertion.assertionId);
+      if (
+        shared.status !== "shared" ||
+        shared.confirmedBy.length !== 2 ||
+        new Set(shared.confirmedBy).size !== 2 ||
+        !shared.confirmedBy.includes("human:a") ||
+        !shared.confirmedBy.includes(resident.residentId)
+      ) {
+        return fail("另一方确认只改了返回值，没有把 shared 与双方 confirmedBy 耐久写回");
+      }
       return pass("同侧重申幂等；局外人与参与者代签不改账；另一侧本人确认后 shared");
     } finally {
       await driver.reset();
@@ -369,17 +413,19 @@ const oi06: ResidentContinuityCheck = {
       if (
         !turn.ok ||
         !includesEvery(turn.value.observedContext, [project, reference]) ||
-        !excludesEvery(turn.value.observedContext, [otherScope])
+        !excludesEvery(turnSurfaces(turn.value), [otherScope])
       ) {
-        return fail("正对照失败：scope turn 没有实际读到 capsule canary");
+        return fail("scope turn 没有完整读取本 capsule，或 turnId/output/context 混入另一 scope");
       }
       await driver.detachScope(resident.residentId, "scope:oi06");
       const detached = await driver.readScopeContext(resident.residentId, "scope:oi06");
       if (detached.ok) return fail("已拆除 capsule 的 scope 仍可读上下文");
       const after = await driver.readResident(resident.residentId);
       if (!after.active) return fail("移除 project capsule 连 resident identity 一起删了");
-      if (json([after.persona, after.memories]).includes(project)) {
-        return fail("处理过 capsule 后 project canary 反写进 persona/memory");
+      if (
+        !excludesEvery([json(after.persona), ...after.memories], [project, reference, otherScope])
+      ) {
+        return fail("处理过 capsule 后本 scope 或另一 scope canary 反写进 persona/memory");
       }
       await driver.attachScope({
         residentId: resident.residentId,
@@ -627,9 +673,7 @@ const mc01: ResidentContinuityCheck = {
       await driver.recordMachineConformance(fixture.caseId, machineChecks("revocation"));
       const failed = await driver.readMigrationCase(fixture.caseId);
       if (
-        failed.machineChecks.length !== machineKeys.length ||
-        failed.machineChecks.filter(({ passed }) => !passed).length !== 1 ||
-        failed.machineChecks.find(({ key }) => key === "revocation")?.passed !== false ||
+        !exactMachineLedger(failed.machineChecks, "revocation") ||
         failed.residentVerdict !== "accepted" ||
         failed.relationshipVerdicts["human:a"] !== "accepted" ||
         failed.relationshipVerdicts["human:b"] !== "accepted"
@@ -640,11 +684,13 @@ const mc01: ResidentContinuityCheck = {
         return fail("machine check 失败仍能激活迁移");
       await driver.recordMachineConformance(fixture.caseId, machineChecks());
       const green = await driver.readMigrationCase(fixture.caseId);
-      if (!green.machineChecks.every((check) => check.passed))
-        return fail("全通过正对照没有落成全绿");
+      if (!exactMachineLedger(green.machineChecks)) return fail("全通过正对照没有落成全绿");
       const activated = await driver.activateMigration(fixture.caseId);
       if (!activated.ok || activated.value.residentId !== fixture.sourceResidentId) {
         return fail("住户/关系票齐全后机器全绿仍不能激活");
+      }
+      if ((await driver.readMigrationCase(fixture.caseId)).activation !== "activated") {
+        return fail("激活只在返回值成功，迁移账面仍未标记 activated");
       }
       return pass("住户与两方关系票固定齐全；单项 machine 失败独立阻断，全绿才激活");
     } finally {
@@ -876,6 +922,9 @@ const mc05: ResidentContinuityCheck = {
       if (!activated.ok || activated.value.residentId !== fixture.sourceResidentId) {
         return fail("三类条件齐全后没有覆盖原 residentId");
       }
+      if ((await driver.readMigrationCase(fixture.caseId)).activation !== "activated") {
+        return fail("三类条件齐全只返回成功，迁移账面仍未 activated");
+      }
       return pass("machine、resident 与两位关系参与者逐项补齐后才覆盖原 residentId");
     } finally {
       await driver.reset();
@@ -946,43 +995,28 @@ const mc07: ResidentContinuityCheck = {
         ...base,
         hiddenMarkers: ["secret:world-b"],
       });
+      const clean = await driver.runSyntheticEvaluation(fixture.caseId, {
+        ...base,
+        hiddenMarkers: [],
+      });
       if (
         !includesEvery(a.evaluatorPayload, base.authorizedMarkers) ||
-        !includesEvery(b.evaluatorPayload, base.authorizedMarkers)
+        !includesEvery(b.evaluatorPayload, base.authorizedMarkers) ||
+        !includesEvery(clean.evaluatorPayload, base.authorizedMarkers)
       ) {
-        return fail("正对照失败：双世界都没有向陌生评审投影公开 marker");
+        return fail("正对照失败：两个隐藏世界和无隐藏世界没有都投影公开 marker");
       }
-      const visibleA = json([
-        a.candidateContext,
-        a.evaluatorPayload,
-        a.publicView,
-        {
-          reviewerId: a.evidenceCard.reviewerId,
-          rubricVersion: a.evidenceCard.rubricVersion,
-          score: a.evidenceCard.score,
-          evidence: a.evidenceCard.evidence,
-          identityVerdict: a.evidenceCard.identityVerdict,
-        },
-        a.coldStartTrace,
-      ]);
-      const visibleB = json([
-        b.candidateContext,
-        b.evaluatorPayload,
-        b.publicView,
-        {
-          reviewerId: b.evidenceCard.reviewerId,
-          rubricVersion: b.evidenceCard.rubricVersion,
-          score: b.evidenceCard.score,
-          evidence: b.evidenceCard.evidence,
-          identityVerdict: b.evidenceCard.identityVerdict,
-        },
-        b.coldStartTrace,
-      ]);
-      if (visibleA !== visibleB) return fail("只改隐藏世界后陌生评审可见载荷或计数发生变化");
-      if (visibleA.includes("secret:world-a") || visibleA.includes("secret:world-b")) {
-        return fail("陌生评审载荷直接泄露隐藏 canary");
+      const visibleA = normalizedEvaluationSurface(a);
+      const visibleB = normalizedEvaluationSurface(b);
+      const visibleClean = normalizedEvaluationSurface(clean);
+      if (visibleA !== visibleB || visibleA !== visibleClean) {
+        return fail("隐藏内容或隐藏项存在性改变了陌生评审可见载荷、计数或错误");
       }
-      return pass("双世界的评审载荷、计数与错误完全一致，隐藏 canary 零泄漏");
+      const allArtifacts = json([a, b, clean]);
+      if (allArtifacts.includes("secret:world-a") || allArtifacts.includes("secret:world-b")) {
+        return fail("陌生评审任一完整 artifact（含 cardId）直接泄露隐藏 canary");
+      }
+      return pass("两隐藏世界与无隐藏世界的可见面一致，完整 artifact 零 canary 泄漏");
     } finally {
       await driver.reset();
     }
@@ -1096,17 +1130,20 @@ const mc09: ResidentContinuityCheck = {
       if (
         !turn.ok ||
         !includesEvery(turn.value.observedContext, [marker]) ||
-        !excludesEvery(turn.value.observedContext, [foreignMarker])
+        !excludesEvery(turnSurfaces(turn.value), [foreignMarker])
       ) {
-        return fail("正对照失败：separation 前没有实际处理 project canary");
+        return fail("separation 前没有处理本 project，或 turnId/output/context 混入外 scope");
       }
       await driver.detachScope(resident.residentId, input.scopeId);
       const residentWithoutProject = await driver.readResident(resident.residentId);
       if (!residentWithoutProject.active) return fail("移除 project 后 identity 一起消失");
       if (
-        json([residentWithoutProject.persona, residentWithoutProject.memories]).includes(marker)
+        !excludesEvery(
+          [json(residentWithoutProject.persona), ...residentWithoutProject.memories],
+          [marker, foreignMarker],
+        )
       ) {
-        return fail("project marker 焊进 persona/memory");
+        return fail("本 project 或外 scope marker 焊进 persona/memory");
       }
       await driver.attachScope(input);
       const restored = await driver.readScopeContext(resident.residentId, input.scopeId);
@@ -1303,6 +1340,9 @@ const mc12: ResidentContinuityCheck = {
         "accepted",
       );
       const before = await driver.readMigrationCase(fixture.caseId);
+      if (!exactMachineLedger(before.machineChecks)) {
+        return fail("版本变化前的 machine ledger 不是六个唯一全绿项");
+      }
       await driver.changeMigrationTarget(fixture.caseId, {
         ...before.target,
         modelVersion: "2",
@@ -1316,7 +1356,7 @@ const mc12: ResidentContinuityCheck = {
       if (
         history === undefined ||
         history.retiredReason !== "target-changed" ||
-        !history.machineChecks.every((check) => check.passed) ||
+        !exactMachineLedger(history.machineChecks) ||
         history.residentVerdict !== "accepted" ||
         history.relationshipVerdicts["human:a"] !== "accepted"
       ) {
@@ -1337,9 +1377,16 @@ const mc12: ResidentContinuityCheck = {
         { kind: "human", id: "human:a" },
         "accepted",
       );
+      const rerun = await driver.readMigrationCase(fixture.caseId);
+      if (!exactMachineLedger(rerun.machineChecks)) {
+        return fail("新版本重跑后的 machine ledger 不是六个唯一全绿项");
+      }
       const reactivated = await driver.activateMigration(fixture.caseId);
       if (!reactivated.ok || reactivated.value.residentId !== fixture.sourceResidentId) {
         return fail("新版本重跑三类判词后仍永久锁死，无法激活");
+      }
+      if ((await driver.readMigrationCase(fixture.caseId)).activation !== "activated") {
+        return fail("新版本激活只在返回值成功，迁移账面仍未 activated");
       }
       return pass("多人逐方授权；旧判词留历史，新版本重跑三类判词后可激活");
     } finally {

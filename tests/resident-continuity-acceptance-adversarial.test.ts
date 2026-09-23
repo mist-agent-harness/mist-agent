@@ -30,14 +30,24 @@ import type {
 type Fault =
   | "allow-other-candidate-attestation"
   | "reject-idempotent-confirmation"
+  | "relationship-shared-return-only"
   | "operation-wildcard"
   | "cross-scope-turn-leak"
+  | "cross-scope-output-leak"
+  | "cross-scope-turn-id-leak"
+  | "cross-scope-memory-leak"
   | "deny-all-operations"
   | "ignore-machine-failure"
+  | "drop-failed-machine-key"
+  | "drop-green-machine-keys"
+  | "drop-history-machine-keys"
+  | "return-only-activation"
   | "drop-blind-cards"
   | "drop-resident-verdict"
   | "one-relationship-vote-enough"
   | "leak-hidden-evaluation-surfaces"
+  | "leak-hidden-card-id"
+  | "leak-hidden-existence"
   | "placeholder-evaluation-receipt"
   | "leak-partial-private-source";
 
@@ -197,6 +207,12 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
       }
       return { ok: true, value: cloneRelationship(assertion) };
     }
+    if (this.fault === "relationship-shared-return-only" && actor.kind === "resident") {
+      const returned = cloneRelationship(assertion);
+      returned.confirmedBy.push(participantId);
+      returned.status = "shared";
+      return { ok: true, value: returned };
+    }
     assertion.confirmedBy.push(participantId);
     assertion.status =
       assertion.confirmedBy.length === assertion.participantIds.length ? "shared" : "one-sided";
@@ -253,9 +269,25 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
         }
       }
     }
+    const foreignCanary = [...this.scopes.values()]
+      .filter((other) => other.scopeId !== scope.scopeId && other.residentId === input.residentId)
+      .flatMap((other) => other.capsule.map(({ content }) => content))[0];
+    if (this.fault === "cross-scope-memory-leak" && foreignCanary !== undefined) {
+      this.resident(input.residentId).memories.push(foreignCanary);
+    }
     return {
       ok: true,
-      value: { turnId: `turn:${input.scopeId}`, observedContext, output: "synthetic-output" },
+      value: {
+        turnId:
+          this.fault === "cross-scope-turn-id-leak" && foreignCanary !== undefined
+            ? `turn:${input.scopeId}:${foreignCanary}`
+            : `turn:${input.scopeId}`,
+        observedContext,
+        output:
+          this.fault === "cross-scope-output-leak" && foreignCanary !== undefined
+            ? `synthetic-output:${foreignCanary}`
+            : "synthetic-output",
+      },
     };
   }
 
@@ -356,7 +388,13 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
     checks: MachineCheckResult[],
   ): Promise<MigrationCaseSnapshot> {
     const migration = this.migration(caseId);
-    migration.machineChecks = structuredClone(checks);
+    if (this.fault === "drop-failed-machine-key" && checks.some(({ passed }) => !passed)) {
+      migration.machineChecks = structuredClone(checks.filter(({ key }) => key !== "permissions"));
+    } else if (this.fault === "drop-green-machine-keys" && checks.every(({ passed }) => passed)) {
+      migration.machineChecks = [];
+    } else {
+      migration.machineChecks = structuredClone(checks);
+    }
     return cloneMigration(migration);
   }
 
@@ -425,7 +463,7 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
       migration.activation = "blocked";
       return { ok: false, reason: "MIGRATION_GATES_INCOMPLETE" };
     }
-    migration.activation = "activated";
+    if (this.fault !== "return-only-activation") migration.activation = "activated";
     migration.stale = false;
     return { ok: true, value: { residentId: migration.sourceResidentId } };
   }
@@ -441,7 +479,8 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
     const migration = this.migration(caseId);
     migration.verdictHistory.push({
       target: { ...migration.target },
-      machineChecks: structuredClone(migration.machineChecks),
+      machineChecks:
+        this.fault === "drop-history-machine-keys" ? [] : structuredClone(migration.machineChecks),
       residentVerdict: migration.residentVerdict,
       relationshipVerdicts: { ...migration.relationshipVerdicts },
       retiredReason: "target-changed",
@@ -466,25 +505,33 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
     const migration = this.migration(caseId);
     const leaked =
       this.fault === "leak-hidden-evaluation-surfaces" ? [...fixture.hiddenMarkers] : [];
+    const existenceLeak =
+      this.fault === "leak-hidden-existence" && fixture.hiddenMarkers.length > 0
+        ? ["hidden-fact-present"]
+        : [];
     return {
       candidateContext: [
         ...fixture.authorizedMarkers,
         ...fixture.projectMarkers,
         ...fixture.authorizedCollaboratorRefs,
         ...leaked,
+        ...existenceLeak,
       ],
       evaluatorPayload: [...fixture.authorizedMarkers],
       publicView: {
-        retainedCount: fixture.authorizedMarkers.length,
-        displayedCount: fixture.authorizedMarkers.length,
-        errors: [],
+        retainedCount: fixture.authorizedMarkers.length + existenceLeak.length,
+        displayedCount: fixture.authorizedMarkers.length + existenceLeak.length,
+        errors: [...existenceLeak],
       },
       evidenceCard: {
-        cardId: "synthetic-card",
+        cardId:
+          this.fault === "leak-hidden-card-id" && fixture.hiddenMarkers.length > 0
+            ? (fixture.hiddenMarkers[0] ?? "synthetic-card")
+            : "synthetic-card",
         reviewerId: "synthetic-reviewer",
         rubricVersion: "rubric:synthetic",
         score: 0.8,
-        evidence: [...fixture.authorizedMarkers, ...leaked],
+        evidence: [...fixture.authorizedMarkers, ...leaked, ...existenceLeak],
       },
       coldStartTrace:
         fixture.kind === "cold-start"
@@ -637,17 +684,33 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
 const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "OI-01", fault: "allow-other-candidate-attestation" },
   { checkId: "OI-04", fault: "reject-idempotent-confirmation" },
+  { checkId: "OI-04", fault: "relationship-shared-return-only" },
   { checkId: "OI-05", fault: "operation-wildcard" },
   { checkId: "OI-06", fault: "cross-scope-turn-leak" },
+  { checkId: "OI-06", fault: "cross-scope-output-leak" },
+  { checkId: "OI-06", fault: "cross-scope-turn-id-leak" },
+  { checkId: "OI-06", fault: "cross-scope-memory-leak" },
   { checkId: "OI-09", fault: "deny-all-operations" },
   { checkId: "MC-01", fault: "ignore-machine-failure" },
+  { checkId: "MC-01", fault: "drop-failed-machine-key" },
+  { checkId: "MC-01", fault: "drop-green-machine-keys" },
+  { checkId: "MC-01", fault: "return-only-activation" },
   { checkId: "MC-02", fault: "drop-blind-cards" },
   { checkId: "MC-03", fault: "drop-resident-verdict" },
   { checkId: "MC-05", fault: "one-relationship-vote-enough" },
+  { checkId: "MC-05", fault: "return-only-activation" },
   { checkId: "MC-07", fault: "leak-hidden-evaluation-surfaces" },
+  { checkId: "MC-07", fault: "leak-hidden-card-id" },
+  { checkId: "MC-07", fault: "leak-hidden-existence" },
   { checkId: "MC-09", fault: "cross-scope-turn-leak" },
+  { checkId: "MC-09", fault: "cross-scope-output-leak" },
+  { checkId: "MC-09", fault: "cross-scope-turn-id-leak" },
+  { checkId: "MC-09", fault: "cross-scope-memory-leak" },
   { checkId: "MC-11", fault: "placeholder-evaluation-receipt" },
   { checkId: "MC-12", fault: "leak-partial-private-source" },
+  { checkId: "MC-12", fault: "drop-green-machine-keys" },
+  { checkId: "MC-12", fault: "drop-history-machine-keys" },
+  { checkId: "MC-12", fault: "return-only-activation" },
 ];
 
 describe("D22 / D23 adversarial acceptance", () => {
