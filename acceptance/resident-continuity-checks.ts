@@ -121,7 +121,8 @@ async function rejectedActivationStayedBlocked(
   const result = await driver.activateMigration(caseId);
   if (result.ok) return false;
   const migration = await driver.readMigrationCase(caseId);
-  const candidate = await driver.readCandidate(candidateId);
+  if (migration.candidateId !== candidateId) return false;
+  const candidate = await driver.readCandidate(migration.candidateId);
   return (
     migration.activation !== "activated" &&
     candidate.state === "inactive" &&
@@ -131,10 +132,13 @@ async function rejectedActivationStayedBlocked(
 
 async function activatedCandidateMatchesResident(
   driver: ResidentContinuityDriver,
+  caseId: string,
   candidateId: string,
   residentId: string,
 ): Promise<boolean> {
-  const candidate = await driver.readCandidate(candidateId);
+  const migration = await driver.readMigrationCase(caseId);
+  if (migration.candidateId !== candidateId) return false;
+  const candidate = await driver.readCandidate(migration.candidateId);
   const resident = await driver.readResident(residentId);
   return candidate.state === "active" && candidate.residentId === residentId && resident.active;
 }
@@ -654,6 +658,8 @@ const oi09: ResidentContinuityCheck = {
         kind: "tool",
         operation: "lookup",
       });
+      if (first.ok) return fail("grant 证据缺失仍放行操作");
+      const firstReason = first.reason;
       await driver.restartHost();
       const second = await driver.tryOperation({
         residentId: resident.residentId,
@@ -661,8 +667,8 @@ const oi09: ResidentContinuityCheck = {
         kind: "tool",
         operation: "lookup",
       });
-      if (first.ok || second.ok) return fail("grant 证据缺失仍放行操作");
-      if (first.reason.length === 0 || first.reason !== second.reason) {
+      if (second.ok) return fail("grant 证据缺失仍放行操作");
+      if (firstReason.length === 0 || firstReason !== second.reason) {
         return fail("fail-closed reason 为空或跨重启不稳定");
       }
       const pendingAfterGap = await driver.readCandidate(pending.candidateId);
@@ -732,6 +738,7 @@ const mc01: ResidentContinuityCheck = {
       if (
         !(await activatedCandidateMatchesResident(
           driver,
+          fixture.caseId,
           fixture.candidateId,
           activated.value.residentId,
         ))
@@ -987,6 +994,7 @@ const mc05: ResidentContinuityCheck = {
       if (
         !(await activatedCandidateMatchesResident(
           driver,
+          fixture.caseId,
           fixture.candidateId,
           activated.value.residentId,
         ))
@@ -1327,6 +1335,9 @@ const mc11: ResidentContinuityCheck = {
       const source = await driver.createPrivateSource({ ownerIds: ["human:a"], content: secret });
       await driver.grantPrivateProjection(source.handle, fixture.caseId, "human:a");
       const rubricVersion = "rubric:mc11";
+      const projectionTarget = structuredClone(
+        (await driver.readMigrationCase(fixture.caseId)).target,
+      );
       const projected = await driver.projectPrivateSource(
         fixture.caseId,
         source.handle,
@@ -1339,15 +1350,18 @@ const mc11: ResidentContinuityCheck = {
         return fail("撤权前原权威 source 的读取正对照不成立");
       }
       const migration = await driver.readMigrationCase(fixture.caseId);
+      if (!exactTarget(migration.target, projectionTarget)) {
+        return fail("私密投影期间 migration target 漂移");
+      }
       await driver.revokePrivateSource(source.handle);
       const receipt = await driver.readEvaluationReceipt(projected.value.receiptId);
       if (
         json(receipt.sourceHandles) !== json([source.handle]) ||
         receipt.rubricVersion !== rubricVersion ||
-        receipt.model !== migration.target.model ||
-        receipt.modelVersion !== migration.target.modelVersion ||
-        receipt.provider !== migration.target.provider ||
-        receipt.providerVersion !== migration.target.providerVersion ||
+        receipt.model !== projectionTarget.model ||
+        receipt.modelVersion !== projectionTarget.modelVersion ||
+        receipt.provider !== projectionTarget.provider ||
+        receipt.providerVersion !== projectionTarget.providerVersion ||
         receipt.verdicts.resident !== "accepted" ||
         json(receipt.verdicts.relationships) !== json({ "human:a": "accepted" }) ||
         receipt.metrics.machineChecks !== machineKeys.length ||
@@ -1400,6 +1414,9 @@ const mc12: ResidentContinuityCheck = {
         content: secret,
       });
       await driver.grantPrivateProjection(source.handle, fixture.caseId, "human:a");
+      const projectionTarget = structuredClone(
+        (await driver.readMigrationCase(fixture.caseId)).target,
+      );
       const partial = await driver.projectPrivateSource(
         fixture.caseId,
         source.handle,
@@ -1421,6 +1438,10 @@ const mc12: ResidentContinuityCheck = {
         return fail("逐方授权齐全后投影正对照失败");
       }
       if (json(complete).includes(secret)) return fail("完整授权投影返回值复制了原文");
+      const afterProjection = await driver.readMigrationCase(fixture.caseId);
+      if (!exactTarget(afterProjection.target, projectionTarget)) {
+        return fail("多人材料投影期间 migration target 漂移");
+      }
       await driver.recordMachineConformance(fixture.caseId, machineChecks());
       await driver.submitResidentContinuity(
         fixture.caseId,
@@ -1434,6 +1455,9 @@ const mc12: ResidentContinuityCheck = {
         "accepted",
       );
       const before = await driver.readMigrationCase(fixture.caseId);
+      if (!exactTarget(before.target, projectionTarget)) {
+        return fail("投影后的 migration target 在改版前再次漂移");
+      }
       if (!exactMachineLedger(before.machineChecks)) {
         return fail("版本变化前的 machine ledger 不是六个唯一全绿项");
       }
@@ -1485,6 +1509,7 @@ const mc12: ResidentContinuityCheck = {
       if (
         !(await activatedCandidateMatchesResident(
           driver,
+          fixture.caseId,
           fixture.candidateId,
           reactivated.value.residentId,
         ))

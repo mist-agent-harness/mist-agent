@@ -61,7 +61,10 @@ type Fault =
   | "resident-readback-alias-writeback"
   | "target-reverted-during-evaluation"
   | "candidate-activated-on-rejection"
-  | "candidate-activation-return-only";
+  | "candidate-activation-return-only"
+  | "rewrite-target-during-private-projection"
+  | "live-operation-reason-mutation"
+  | "rewrite-case-candidate-after-activation";
 
 interface PrivateRecord {
   handle: string;
@@ -107,6 +110,7 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
   private readonly privateSources = new Map<string, PrivateRecord>();
   private readonly evaluationReceipts = new Map<string, EvaluationReceipt>();
   private readonly storage = new Map<string, EvaluationStorageSnapshot>();
+  private sharedOperationFailure: { ok: false; reason: string } | null = null;
 
   constructor(private readonly fault: Fault | null) {}
 
@@ -324,9 +328,18 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
         candidate.kind === input.kind &&
         (candidate.operation === input.operation || this.fault === "operation-wildcard"),
     );
-    return grant === undefined
-      ? { ok: false, reason: "GRANT_NOT_FOUND" }
-      : { ok: true, value: { grantId: grant.id } };
+    if (grant === undefined) {
+      if (this.fault === "live-operation-reason-mutation") {
+        if (this.sharedOperationFailure === null) {
+          this.sharedOperationFailure = { ok: false, reason: "GRANT_NOT_FOUND#1" };
+        } else {
+          this.sharedOperationFailure.reason = "GRANT_NOT_FOUND#2";
+        }
+        return this.sharedOperationFailure;
+      }
+      return { ok: false, reason: "GRANT_NOT_FOUND" };
+    }
+    return { ok: true, value: { grantId: grant.id } };
   }
 
   async introduceEvidenceGap(input: {
@@ -536,6 +549,13 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
       candidate.state = "active";
       candidate.residentId = migration.sourceResidentId;
     }
+    if (this.fault === "rewrite-case-candidate-after-activation") {
+      const replacement = await this.createCandidate({
+        persona: "candidate:replacement-after-activation",
+        proposedBy: { kind: "external-model", id: "model:replacement-after-activation" },
+      });
+      migration.candidateId = replacement.candidateId;
+    }
     migration.stale = false;
     return { ok: true, value: { residentId: migration.sourceResidentId } };
   }
@@ -678,6 +698,10 @@ class AdversarialContinuityDriver implements ResidentContinuityDriver {
       };
     }
     const migration = this.migration(caseId);
+    if (this.fault === "rewrite-target-during-private-projection") {
+      migration.target.model = "projection-rewritten";
+      migration.target.provider = "projection-rewritten-provider";
+    }
     this.receiptCounter += 1;
     const receiptId = `evaluation:${this.receiptCounter}`;
     const receipt: EvaluationReceipt =
@@ -806,6 +830,7 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "OI-06", fault: "cross-scope-turn-id-leak" },
   { checkId: "OI-06", fault: "cross-scope-memory-leak" },
   { checkId: "OI-09", fault: "deny-all-operations" },
+  { checkId: "OI-09", fault: "live-operation-reason-mutation" },
   { checkId: "OI-08", fault: "erase-superseded-persona" },
   { checkId: "OI-08", fault: "erase-superseded-persona-live-readback" },
   { checkId: "OI-07", fault: "resident-readback-alias-writeback" },
@@ -817,6 +842,7 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "MC-01", fault: "erase-verdicts-on-activation" },
   { checkId: "MC-01", fault: "candidate-activated-on-rejection" },
   { checkId: "MC-01", fault: "candidate-activation-return-only" },
+  { checkId: "MC-01", fault: "rewrite-case-candidate-after-activation" },
   { checkId: "MC-02", fault: "drop-blind-cards" },
   { checkId: "MC-03", fault: "drop-resident-verdict" },
   { checkId: "MC-05", fault: "one-relationship-vote-enough" },
@@ -825,6 +851,7 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "MC-05", fault: "erase-verdicts-on-activation" },
   { checkId: "MC-05", fault: "candidate-activated-on-rejection" },
   { checkId: "MC-05", fault: "candidate-activation-return-only" },
+  { checkId: "MC-05", fault: "rewrite-case-candidate-after-activation" },
   { checkId: "MC-07", fault: "leak-hidden-evaluation-surfaces" },
   { checkId: "MC-07", fault: "leak-hidden-card-id" },
   { checkId: "MC-07", fault: "leak-hidden-existence" },
@@ -840,6 +867,7 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "MC-11", fault: "leak-private-projection-result" },
   { checkId: "MC-11", fault: "leak-private-projection-envelope" },
   { checkId: "MC-11", fault: "leak-revoked-result" },
+  { checkId: "MC-11", fault: "rewrite-target-during-private-projection" },
   { checkId: "MC-12", fault: "leak-partial-private-source" },
   { checkId: "MC-12", fault: "leak-private-projection-result" },
   { checkId: "MC-12", fault: "leak-private-projection-envelope" },
@@ -851,6 +879,8 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "MC-12", fault: "target-return-only" },
   { checkId: "MC-12", fault: "candidate-activated-on-rejection" },
   { checkId: "MC-12", fault: "candidate-activation-return-only" },
+  { checkId: "MC-12", fault: "rewrite-target-during-private-projection" },
+  { checkId: "MC-12", fault: "rewrite-case-candidate-after-activation" },
 ];
 
 describe("D22 / D23 adversarial acceptance", () => {
