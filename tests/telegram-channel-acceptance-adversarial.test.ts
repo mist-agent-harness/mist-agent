@@ -44,10 +44,15 @@ type Fault =
   | "live-resident-mutation-tg02"
   | "live-resident-mutation-tg04"
   | "bind-renames-ready-oracles"
+  | "ready-binding-healed-by-later-call"
   | "live-host-dispatch-snapshot"
+  | "tg03-dispatch-healed-by-host-read"
   | "bind-mutates-tg03-oracles"
   | "tg04-first-wrong-identity"
   | "duplicate-replayed-dispatch"
+  | "tg04-first-healed-by-duplicate"
+  | "tg04-newer-healed-by-older"
+  | "tg04-effect-ids-healed-by-ledger-read"
   | "live-effect-ledger-mutation"
   | "wrong-dispatch-identity"
   | "live-scope-mutation"
@@ -66,6 +71,10 @@ type Fault =
   | "token-leaks-in-durable-receipt"
   | "token-leaks-in-inbound-effect"
   | "live-token-receipt-cleared-before-scan"
+  | "tg07-inbound-leak-healed-by-send"
+  | "tg07-durable-leak-healed-by-effect-read"
+  | "tg07-inbound-effects-leak-healed-by-boundary"
+  | "tg07-outbound-effects-leak-healed-by-boundary"
   | "token-resolves-after-revoke"
   | "hidden-token-resolve-log"
   | "token-leaks-early-snapshot"
@@ -75,6 +84,7 @@ type Fault =
   | "token-only-inflight-allowed"
   | "middle-token-count-drift"
   | "unstable-revoke-reason"
+  | "tg08-inbound-baseline-healed-by-outbound-read"
   | "send-fails-observability-fresh"
   | "observability-mutates-live-binding"
   | "observability-drifts-when-unavailable"
@@ -89,13 +99,17 @@ type Fault =
   | "group-shared-runtime"
   | "gd01-scope-mutates-models"
   | "gd01-second-scope-mutates-first"
+  | "gd01-trace-healed-by-host-read"
   | "shadow-resident-on-switch"
   | "census-state-drift"
   | "binding-drift-on-switch"
   | "live-resident-census-array"
   | "switch-return-stale-model"
+  | "gd02-switch-healed-by-binding-read"
+  | "gd02-binding-healed-by-resident-list"
   | "mutate-resident-on-blocked-activation"
   | "live-resident-mutation-on-blocked"
+  | "gd03-activation-healed-by-canonical-read"
   | "swap-group-residents"
   | "live-group-mutation"
   | "unknown-wrong-target"
@@ -111,6 +125,7 @@ type Fault =
   | "canonical-drift-after-recovery"
   | "canonical-fields-drift-after-recovery"
   | "unknown-binding-mutates-before-clone"
+  | "gd05-binding-healed-by-canonical-read"
   | "live-token-boundary-snapshot"
   | "final-token-boundary-rewinds"
   | "wrong-group-speaker-after-switch";
@@ -154,6 +169,20 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   private hostDispatchView: HostDispatchSnapshot | null = null;
   private tokenBoundaryView: TokenBoundarySnapshot | null = null;
   private residentCensusView: ResidentFixture[] | null = null;
+  private readyBindingView: ChannelBinding | null = null;
+  private readyBindingTruth: ChannelBinding | null = null;
+  private tg03InboundView: InboundReceipt | null = null;
+  private tg04NewerView: InboundReceipt | null = null;
+  private tg07InboundView: InboundReceipt | null = null;
+  private tg07DurableView: OutboundReceipt | null = null;
+  private tg08BaselineInjected = false;
+  private groupTraceView: GroupTraceEntry[] | null = null;
+  private groupTraceTruth: GroupTraceEntry[] | null = null;
+  private switchedView: ResidentFixture | null = null;
+  private switchedTruth: ResidentFixture | null = null;
+  private bindingView: ChannelBinding | null = null;
+  private bindingTruth: ChannelBinding | null = null;
+  private activationView: ContinuityActivation | null = null;
 
   constructor(private readonly fault: Fault | null) {}
 
@@ -164,6 +193,14 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     model: string,
     provider: string,
   ): Promise<ResidentFixture> {
+    if (
+      this.fault === "ready-binding-healed-by-later-call" &&
+      label === "tg02-second" &&
+      this.readyBindingView !== null &&
+      this.readyBindingTruth !== null
+    ) {
+      Object.assign(this.readyBindingView, cloneBinding(this.readyBindingTruth));
+    }
     if (this.fault === "gd04-later-resident-mutates-first" && label === "gd04-failed") {
       const first = this.resident("resident:gd04-visible");
       first.model = "model:rewritten-by-later-resident";
@@ -303,6 +340,15 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     }
     this.bindings.set(binding.bindingId, binding);
     this.addressBindings.set(key(binding.address), binding.bindingId);
+    if (
+      this.fault === "ready-binding-healed-by-later-call" &&
+      input.address.chatId === "chat:tg02"
+    ) {
+      this.readyBindingTruth = cloneBinding(binding);
+      this.readyBindingView = binding;
+      binding.residentId = "resident:temporary-wrong";
+      binding.scopeId = "scope:temporary-wrong";
+    }
     if (this.fault === "bind-mutates-tg03-oracles" && input.scopeId.includes("tg03")) {
       this.resident(input.residentId).residentId = "resident:rewritten";
       const scope = this.scope(input.scopeId);
@@ -315,13 +361,21 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       ok: true,
       value:
         this.fault === "live-address-mutation" ||
-        this.fault === "observability-mutates-live-binding"
+        this.fault === "observability-mutates-live-binding" ||
+        this.fault === "ready-binding-healed-by-later-call"
           ? binding
           : cloneBinding(binding),
     };
   }
 
   async readBinding(bindingId: string): Promise<ChannelBinding> {
+    if (
+      this.fault === "gd02-switch-healed-by-binding-read" &&
+      this.switchedView !== null &&
+      this.switchedTruth !== null
+    ) {
+      Object.assign(this.switchedView, cloneResident(this.switchedTruth));
+    }
     const value = cloneBinding(this.binding(bindingId));
     if (this.fault === "binding-drift-after-restart" && this.restartCount > 0) {
       value.address = { chatId: "chat:drifted", topicId: "topic:drifted" };
@@ -332,6 +386,18 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       value.address = { chatId: "chat:drifted", topicId: "topic:drifted" };
       value.active = false;
       value.bindingVersion = 99;
+    }
+    if (this.fault === "gd02-binding-healed-by-resident-list" && this.modelSwitchCount > 0) {
+      this.bindingTruth = cloneBinding(value);
+      this.bindingView = value;
+      value.residentId = "resident:temporary-wrong";
+      return value;
+    }
+    if (this.fault === "gd05-binding-healed-by-canonical-read" && this.restartCount > 0) {
+      this.bindingTruth = cloneBinding(value);
+      this.bindingView = value;
+      value.scopeId = "scope:temporary-wrong";
+      return value;
     }
     return value;
   }
@@ -400,6 +466,21 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     }
     this.seenExternalIds.add(update.messageId);
     this.seenExternalIds.add(update.senderId);
+    if (
+      this.fault === "tg04-newer-healed-by-older" &&
+      update.updateId.includes("tg04-100") &&
+      this.tg04NewerView?.dispatch !== null &&
+      this.tg04NewerView !== null
+    ) {
+      this.tg04NewerView.dispatch = {
+        ...this.tg04NewerView.dispatch,
+        residentId: "resident:tg04",
+        scopeId: "scope:tg04",
+        scopeGeneration: 1,
+        windowId: "window:tg04",
+        windowGeneration: 1,
+      };
+    }
     const bindingId = this.addressBindings.get(key(update.address));
     if (bindingId === undefined) {
       this.recordInvalidFailure("BINDING_NOT_FOUND");
@@ -442,6 +523,20 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     if (this.fault === "reject-all-inbound") return { ok: false, reason: "REJECT_ALL" };
     const existing = this.inbound.get(update.updateId);
     if (existing !== undefined) {
+      if (
+        this.fault === "tg04-first-healed-by-duplicate" &&
+        update.updateId.includes("tg04-same") &&
+        existing.dispatch !== null
+      ) {
+        existing.dispatch = {
+          ...existing.dispatch,
+          residentId: binding.residentId,
+          scopeId: binding.scopeId,
+          scopeGeneration: scope.scopeGeneration,
+          windowId: scope.windowId,
+          windowGeneration: scope.windowGeneration,
+        };
+      }
       if (this.fault === "duplicate-extra-effect" || this.fault === "live-effect-ledger-mutation") {
         this.inboundEffects.push("effect:duplicate-extra");
       }
@@ -512,16 +607,88 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     this.hostDispatches += 1;
     this.lastDispatch = { ...dispatch };
     if (this.tokenAttached && !this.tokenRevoked) this.tokenResolved += 1;
+    if (
+      this.fault === "tg03-dispatch-healed-by-host-read" &&
+      update.updateId.includes("tg03") &&
+      receipt.dispatch !== null
+    ) {
+      receipt.dispatch.residentId = "resident:temporary-wrong";
+      this.tg03InboundView = receipt;
+      return { ok: true, value: receipt };
+    }
+    if (
+      this.fault === "tg04-first-healed-by-duplicate" &&
+      update.updateId.includes("tg04-same") &&
+      receipt.dispatch !== null
+    ) {
+      receipt.dispatch.residentId = "resident:temporary-wrong";
+      return { ok: true, value: receipt };
+    }
+    if (
+      this.fault === "tg04-newer-healed-by-older" &&
+      update.updateId.includes("tg04-200") &&
+      receipt.dispatch !== null
+    ) {
+      receipt.dispatch.scopeId = "scope:temporary-wrong";
+      this.tg04NewerView = receipt;
+      return { ok: true, value: receipt };
+    }
+    if (
+      this.fault === "tg04-effect-ids-healed-by-ledger-read" &&
+      update.updateId.includes("tg04")
+    ) {
+      receipt.effectId = `temporary-wrong:${update.updateId}`;
+      return { ok: true, value: receipt };
+    }
+    if (
+      this.fault === "tg07-inbound-leak-healed-by-send" &&
+      update.updateId.includes("tg07-context")
+    ) {
+      receipt.effectId = this.tokenSecret;
+      this.tg07InboundView = receipt;
+      return { ok: true, value: receipt };
+    }
     return { ok: true, value: structuredClone(receipt) };
   }
 
   async readInboundEffects(): Promise<string[]> {
+    if (this.fault === "tg04-effect-ids-healed-by-ledger-read") {
+      for (const receipt of this.inbound.values()) {
+        const effectId = this.inboundEffects.find((candidate) =>
+          candidate.includes(receipt.updateId),
+        );
+        if (effectId !== undefined) receipt.effectId = effectId;
+      }
+    }
+    if (this.fault === "tg07-durable-leak-healed-by-effect-read" && this.tg07DurableView !== null) {
+      this.tg07DurableView.reason = null;
+    }
+    if (this.fault === "tg07-inbound-effects-leak-healed-by-boundary") {
+      this.inboundEffects.push(this.tokenSecret);
+      return this.inboundEffects;
+    }
+    if (
+      this.fault === "tg08-inbound-baseline-healed-by-outbound-read" &&
+      !this.tg08BaselineInjected
+    ) {
+      this.tg08BaselineInjected = true;
+      this.inboundEffects.push("effect:temporary-baseline-drift");
+      return this.inboundEffects;
+    }
     return this.fault === "live-effect-ledger-mutation"
       ? this.inboundEffects
       : [...this.inboundEffects];
   }
 
   async readHostDispatch(): Promise<HostDispatchSnapshot> {
+    if (
+      this.fault === "tg03-dispatch-healed-by-host-read" &&
+      this.tg03InboundView?.dispatch !== null &&
+      this.tg03InboundView !== null &&
+      this.lastDispatch !== null
+    ) {
+      this.tg03InboundView.dispatch = { ...this.lastDispatch };
+    }
     const snapshot: HostDispatchSnapshot = {
       hostProviderDispatches: this.hostDispatches,
       channelOwnedHosts: 0,
@@ -542,6 +709,9 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       | "receipt-lost"
       | "telegram-unavailable",
   ): Promise<Result<OutboundReceipt>> {
+    if (this.fault === "tg07-inbound-leak-healed-by-send" && this.tg07InboundView !== null) {
+      this.tg07InboundView.effectId = "effect:update:tg07-context";
+    }
     const binding = this.bindings.get(request.context.bindingId);
     if (binding === undefined || !binding.active) {
       if (this.fault === "token-resolves-after-revoke") this.tokenResolved += 1;
@@ -675,6 +845,15 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
 
   async readOutbound(outboundId: string): Promise<Result<OutboundReceipt>> {
     const receipt = this.outbound.get(outboundId);
+    if (
+      receipt !== undefined &&
+      this.fault === "tg07-durable-leak-healed-by-effect-read" &&
+      receipt.outboundId === "outbound:1"
+    ) {
+      receipt.reason = this.tokenSecret;
+      this.tg07DurableView = receipt;
+      return { ok: true, value: receipt };
+    }
     if (receipt !== undefined && this.fault === "live-token-receipt-cleared-before-scan") {
       receipt.reason = null;
     }
@@ -728,10 +907,18 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   }
 
   async readOutboundEffects(): Promise<string[]> {
+    if (this.fault === "tg08-inbound-baseline-healed-by-outbound-read") {
+      const temporary = this.inboundEffects.indexOf("effect:temporary-baseline-drift");
+      if (temporary !== -1) this.inboundEffects.splice(temporary, 1);
+    }
     if (this.fault === "unknown-binding-mutates-before-clone") {
       for (const receipt of this.outbound.values()) {
         if (receipt.status === "unknown") receipt.bindingId = "binding:moved";
       }
+    }
+    if (this.fault === "tg07-outbound-effects-leak-healed-by-boundary") {
+      this.outboundEffects.push(this.tokenSecret);
+      return this.outboundEffects;
     }
     return this.fault === "live-effect-ledger-mutation"
       ? this.outboundEffects
@@ -750,6 +937,14 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   }
 
   async inspectTokenBoundary(): Promise<TokenBoundarySnapshot> {
+    if (this.fault === "tg07-inbound-effects-leak-healed-by-boundary") {
+      const secret = this.inboundEffects.indexOf(this.tokenSecret);
+      if (secret !== -1) this.inboundEffects.splice(secret, 1);
+    }
+    if (this.fault === "tg07-outbound-effects-leak-healed-by-boundary") {
+      const secret = this.outboundEffects.indexOf(this.tokenSecret);
+      if (secret !== -1) this.outboundEffects.splice(secret, 1);
+    }
     this.boundaryInspectCount += 1;
     const snapshot: TokenBoundarySnapshot = {
       credentialRef: this.tokenRef,
@@ -996,10 +1191,23 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       returned.model = "model:old";
       returned.provider = "provider:old";
     }
+    if (this.fault === "gd02-switch-healed-by-binding-read") {
+      this.switchedTruth = cloneResident(returned);
+      this.switchedView = returned;
+      returned.model = "model:temporary-wrong";
+      return returned;
+    }
     return returned;
   }
 
   async listResidents(): Promise<ResidentFixture[]> {
+    if (
+      this.fault === "gd02-binding-healed-by-resident-list" &&
+      this.bindingView !== null &&
+      this.bindingTruth !== null
+    ) {
+      Object.assign(this.bindingView, cloneBinding(this.bindingTruth));
+    }
     if (this.fault === "live-resident-census-array" && this.residentCensusView !== null) {
       return this.residentCensusView;
     }
@@ -1035,11 +1243,16 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       resident.canonicalStateHash = "hash:mutated";
       return { residentId: "resident:shadow", activated: false, reason: "MISSING_VOTE" };
     }
-    return {
+    const result: ContinuityActivation = {
       residentId,
       activated,
       reason: activated ? null : "MISSING_VOTE",
     };
+    if (this.fault === "gd03-activation-healed-by-canonical-read") {
+      result.residentId = "resident:temporary-shadow";
+      this.activationView = result;
+    }
+    return result;
   }
 
   async createGroupFixture(input: {
@@ -1184,14 +1397,42 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       };
     });
     this.groupDispatches.set(group.groupId, hostDispatches);
+    if (this.fault === "gd01-trace-healed-by-host-read" && plans.length === 2) {
+      this.groupTraceTruth = structuredClone(trace);
+      this.groupTraceView = trace;
+      const first = trace[0];
+      if (first !== undefined) first.residentId = "resident:temporary-shadow";
+      return trace;
+    }
     return trace;
   }
 
   async readGroupDispatches(groupId: string): Promise<DispatchIdentity[]> {
+    if (
+      this.fault === "gd01-trace-healed-by-host-read" &&
+      this.groupTraceView !== null &&
+      this.groupTraceTruth !== null
+    ) {
+      this.groupTraceView.splice(
+        0,
+        this.groupTraceView.length,
+        ...structuredClone(this.groupTraceTruth),
+      );
+    }
     return structuredClone(this.groupDispatches.get(groupId) ?? []);
   }
 
   async readCanonicalState(residentId: string): Promise<ResidentFixture> {
+    if (this.fault === "gd03-activation-healed-by-canonical-read" && this.activationView !== null) {
+      this.activationView.residentId = residentId;
+    }
+    if (
+      this.fault === "gd05-binding-healed-by-canonical-read" &&
+      this.bindingView !== null &&
+      this.bindingTruth !== null
+    ) {
+      Object.assign(this.bindingView, cloneBinding(this.bindingTruth));
+    }
     const resident = this.residents.get(residentId);
     if (resident === undefined) {
       const mutated = [...this.residents.values()][0];
@@ -1255,11 +1496,13 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "TG-02", fault: "invalid-failures-write-dispatch" },
   { checkId: "TG-02", fault: "live-resident-mutation-tg02" },
   { checkId: "TG-02", fault: "bind-renames-ready-oracles" },
+  { checkId: "TG-02", fault: "ready-binding-healed-by-later-call" },
   { checkId: "TG-02", fault: "live-host-dispatch-snapshot" },
   { checkId: "TG-02", fault: "live-effect-ledger-mutation" },
   { checkId: "TG-03", fault: "wrong-dispatch-identity" },
   { checkId: "TG-03", fault: "live-scope-mutation" },
   { checkId: "TG-03", fault: "bind-mutates-tg03-oracles" },
+  { checkId: "TG-03", fault: "tg03-dispatch-healed-by-host-read" },
   { checkId: "TG-04", fault: "duplicate-extra-effect" },
   { checkId: "TG-04", fault: "current-completion-rejected" },
   { checkId: "TG-04", fault: "scope-generation-return-only" },
@@ -1272,6 +1515,9 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "TG-04", fault: "tg04-first-wrong-identity" },
   { checkId: "TG-04", fault: "duplicate-replayed-dispatch" },
   { checkId: "TG-04", fault: "live-effect-ledger-mutation" },
+  { checkId: "TG-04", fault: "tg04-first-healed-by-duplicate" },
+  { checkId: "TG-04", fault: "tg04-newer-healed-by-older" },
+  { checkId: "TG-04", fault: "tg04-effect-ids-healed-by-ledger-read" },
   { checkId: "TG-05", fault: "submitted-looks-visible" },
   { checkId: "TG-05", fault: "unknown-has-message-id" },
   { checkId: "TG-05", fault: "durable-status-promoted" },
@@ -1287,6 +1533,10 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "TG-07", fault: "token-leaks-in-durable-receipt" },
   { checkId: "TG-07", fault: "token-leaks-in-inbound-effect" },
   { checkId: "TG-07", fault: "live-token-receipt-cleared-before-scan" },
+  { checkId: "TG-07", fault: "tg07-inbound-leak-healed-by-send" },
+  { checkId: "TG-07", fault: "tg07-durable-leak-healed-by-effect-read" },
+  { checkId: "TG-07", fault: "tg07-inbound-effects-leak-healed-by-boundary" },
+  { checkId: "TG-07", fault: "tg07-outbound-effects-leak-healed-by-boundary" },
   { checkId: "TG-08", fault: "token-resolves-after-revoke" },
   { checkId: "TG-08", fault: "hidden-token-resolve-log" },
   { checkId: "TG-08", fault: "token-leaks-early-snapshot" },
@@ -1299,6 +1549,7 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "TG-08", fault: "live-token-boundary-snapshot" },
   { checkId: "TG-08", fault: "final-token-boundary-rewinds" },
   { checkId: "TG-08", fault: "live-effect-ledger-mutation" },
+  { checkId: "TG-08", fault: "tg08-inbound-baseline-healed-by-outbound-read" },
   { checkId: "TG-09", fault: "send-fails-observability-fresh" },
   { checkId: "TG-09", fault: "unavailable-send-still-visible" },
   { checkId: "TG-09", fault: "unavailable-durable-visible" },
@@ -1315,6 +1566,7 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "GD-01", fault: "live-address-mutation" },
   { checkId: "GD-01", fault: "gd01-scope-mutates-models" },
   { checkId: "GD-01", fault: "gd01-second-scope-mutates-first" },
+  { checkId: "GD-01", fault: "gd01-trace-healed-by-host-read" },
   { checkId: "GD-02", fault: "shadow-resident-on-switch" },
   { checkId: "GD-02", fault: "census-state-drift" },
   { checkId: "GD-02", fault: "binding-drift-on-switch" },
@@ -1322,8 +1574,11 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "GD-02", fault: "live-resident-census-array" },
   { checkId: "GD-02", fault: "switch-return-stale-model" },
   { checkId: "GD-02", fault: "wrong-group-speaker-after-switch" },
+  { checkId: "GD-02", fault: "gd02-switch-healed-by-binding-read" },
+  { checkId: "GD-02", fault: "gd02-binding-healed-by-resident-list" },
   { checkId: "GD-03", fault: "mutate-resident-on-blocked-activation" },
   { checkId: "GD-03", fault: "live-resident-mutation-on-blocked" },
+  { checkId: "GD-03", fault: "gd03-activation-healed-by-canonical-read" },
   { checkId: "GD-04", fault: "swap-group-residents" },
   { checkId: "GD-04", fault: "live-group-mutation" },
   { checkId: "GD-04", fault: "gd04-live-resident-swap" },
@@ -1343,6 +1598,7 @@ const adversarialCases: Array<{ checkId: string; fault: Fault }> = [
   { checkId: "GD-05", fault: "canonical-fields-drift-after-recovery" },
   { checkId: "GD-05", fault: "unknown-binding-mutates-before-clone" },
   { checkId: "GD-05", fault: "live-effect-ledger-mutation" },
+  { checkId: "GD-05", fault: "gd05-binding-healed-by-canonical-read" },
 ];
 
 describe("D26 Telegram channel adversarial acceptance", () => {
