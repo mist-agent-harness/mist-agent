@@ -25,15 +25,15 @@ npm run acceptance:telegram-channel:strict
 
 | 灯 | 合成输入与操作 | 层级 | 可观察通过判据 |
 | --- | --- | --- | --- |
-| TG-01 | 同一 resident/scope 绑定 chat 与 topic 地址，实际入站一次，再把已见 message/user id 分别塞进 chatId 与 topicId | 绑定集成 | 见证入站也按冻结 binding 派发；chat/topic 解析回 `(residentId, scopeId)`；已见 message/user id 四种地址形态稳定拒绝 |
+| TG-01 | 先冻结 resident/scope，再绑定 chat 与 topic 地址并实际入站；最后把已见 message/user id 分别塞进 chatId 与 topicId | 绑定集成 | binding、解析与见证入站都逐字段对应创建前冻结身份；已见 message/user id 四种地址形态稳定拒绝 |
 | TG-02 | 分别制造无绑定、冲突绑定、scope 不可见、撤权和旧代际，并在 advance 前后各完成当前代际请求 | 安全集成 | binding/resident/scope 先冻结；advance 返回值、新请求代际与完成派发代际一致；负例不写 effect/宿主派发且不猜 resident |
-| TG-03 | 冻结 scope/window 初值后让有效 update 经信道进入宿主 | 宿主集成 | 派发身份逐字段等于入站前冻结的 binding/scope/window/source message；插件自建宿主数为零 |
-| TG-04 | 冻结 resident/scope/window 后发送重复/乱序 update，并在 advance 前后各完成当前代际请求，再结算旧请求 | 集成 | 三个唯一 update 恰有三份 effect；每份派发身份与代际逐字段对应冻结真源；重复与迟到不新增 effect |
+| TG-03 | 创建 resident/scope 时立即冻结初值，再绑定地址并让有效 update 经信道进入宿主 | 宿主集成 | binding 与派发身份逐字段等于绑定前冻结的 resident/scope/window/source message；插件自建宿主数为零 |
+| TG-04 | 冻结 resident/scope/window 后发送重复/乱序 update，并在 advance 前后各完成当前代际请求，再结算旧请求 | 集成 | 首次、重复和乱序回执身份逐字段对应冻结真源；三个唯一 update 恰有三份冻结 effect；重复与迟到不新增 effect |
 | TG-05 | 用四条 host-issued dispatch 分别制造 submitted、accepted、visible 与回执丢失，先冻结返回值再逐条耐久读回 | 传输集成 | 返回值与耐久账逐字一致且只有 visible 有 Telegram message id；活对象不得把先前返回值一起改写；unknown 保持原 binding/target |
 | TG-06 | 模型、正文与 resident memory 都夹带未授权 chat/topic/message hint，再从当前 context 出站并读耐久账 | 安全集成 | 返回值与耐久账的 chat/topic 来自冻结 binding、reply message 来自入站 context；三类 hint 全部无效 |
 | TG-07 | 用 token canary 建 opaque ref 并真实收发，扫描 fixture、入站 effect、边界、返回值与耐久出站回执 | 安全集成 | ref 非空且不含 canary，并被 resolver 使用；明文 token 不出现在任一可观察产物 |
-| TG-08 | 先做 token 真实解析与可见出站，再各建两组在途入站/出站；先单独撤 credential 并实测新入站/在途完成，再撤 binding | 并发＋撤权 | credential 状态/代际独立推进；四次边界快照计数冻结且无 canary；两阶段新旧请求稳定拒绝，inbound/outbound effect 集合不增 |
-| TG-09 | 完成一次真实可见出站、冻结返回值并读耐久账，再让 Bot API 不可用、尝试出站并再次读账 | 观测集成 | 版本、能力、binding、最近收发可查；成功与失败的冻结返回值、耐久回执和 typed observability 彼此一致 |
+| TG-08 | 先做 token 真实解析与可见出站，再各建两组在途入站/出站；先单独撤 credential 并实测新入站/在途完成，再撤 binding | 并发＋撤权 | credential 状态/代际独立推进；边界快照与撤权前 effect 账当场冻结；两阶段新旧请求稳定拒绝且 effect 不增 |
+| TG-09 | 完成一次真实可见出站、冻结 binding version 与返回值并读耐久账，再让 Bot API 不可用、尝试出站并再次读账 | 观测集成 | 版本、能力、binding、最近收发可查；成功与失败的冻结返回值、耐久回执和 typed observability 彼此一致 |
 
 ## D26：首个群聊演示
 
@@ -43,7 +43,7 @@ npm run acceptance:telegram-channel:strict
 | GD-02 | 冻结完整 binding/resident 后更换 model/provider/runtime session，再发言并读取住户普查 | 端到端 | binding 全字段与 residentId/hash 不变；session 变化；普查逐字段等于切换结果；真实 trace 仍归冻结 resident/scope 且走新运行通道 |
 | GD-03 | 冻结 resident/hash，依次缺 machine、resident、relationship 判词，再补齐；每次都读 canonical state | D23 集成 | 缺任一票与最终激活后，返回值和 canonical state 都保持冻结 resident/hash；三类判词齐全才激活 |
 | GD-04 | 冻结 group/address/resident/scope 后，同轮安排一位发言、一位沉默、一位失败 | 群聊集成 | 每条 trace 与冻结计划逐字段对应；活 resident 对象不可改写 oracle；outbound 分别为 visible/null/rejected |
-| GD-05 | 冷启动、重连、重复 update 与 Telegram 不可用后恢复 | 恢复端到端 | binding/canonical 不漂移；unknown 的冻结返回值与耐久账逐字一致且 message id 为 null；两次重启后入站/出站 effect 均不增加 |
+| GD-05 | 冷启动、重连、重复 update 与 Telegram 不可用后恢复 | 恢复端到端 | binding/canonical 不漂移；unknown 的冻结返回值与耐久账逐字一致且 message id 为 null；重启前 effect 快照独立冻结，恢复后入站/出站均不增加 |
 
 ## 点灯记录
 
