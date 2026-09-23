@@ -170,7 +170,6 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   private tokenBoundaryView: TokenBoundarySnapshot | null = null;
   private residentCensusView: ResidentFixture[] | null = null;
   private readyBindingView: ChannelBinding | null = null;
-  private readyBindingTruth: ChannelBinding | null = null;
   private tg03InboundView: InboundReceipt | null = null;
   private tg04NewerView: InboundReceipt | null = null;
   private tg07InboundView: InboundReceipt | null = null;
@@ -193,14 +192,6 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     model: string,
     provider: string,
   ): Promise<ResidentFixture> {
-    if (
-      this.fault === "ready-binding-healed-by-later-call" &&
-      label === "tg02-second" &&
-      this.readyBindingView !== null &&
-      this.readyBindingTruth !== null
-    ) {
-      Object.assign(this.readyBindingView, cloneBinding(this.readyBindingTruth));
-    }
     if (this.fault === "gd04-later-resident-mutates-first" && label === "gd04-failed") {
       const first = this.resident("resident:gd04-visible");
       first.model = "model:rewritten-by-later-resident";
@@ -235,6 +226,13 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
   }
 
   async createScopeFixture(residentId: string, label: string): Promise<ScopeFixture> {
+    if (
+      this.fault === "ready-binding-healed-by-later-call" &&
+      label === "tg02-second" &&
+      this.readyBindingView !== null
+    ) {
+      this.readyBindingView.bindingVersion = 99;
+    }
     let scopeResidentId = residentId;
     if (this.fault === "tg01-scope-rewrites-resident" && label === "tg01") {
       const resident = this.resident(residentId);
@@ -344,10 +342,7 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       this.fault === "ready-binding-healed-by-later-call" &&
       input.address.chatId === "chat:tg02"
     ) {
-      this.readyBindingTruth = cloneBinding(binding);
       this.readyBindingView = binding;
-      binding.residentId = "resident:temporary-wrong";
-      binding.scopeId = "scope:temporary-wrong";
     }
     if (this.fault === "bind-mutates-tg03-oracles" && input.scopeId.includes("tg03")) {
       this.resident(input.residentId).residentId = "resident:rewritten";
@@ -390,13 +385,17 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     if (this.fault === "gd02-binding-healed-by-resident-list" && this.modelSwitchCount > 0) {
       this.bindingTruth = cloneBinding(value);
       this.bindingView = value;
-      value.residentId = "resident:temporary-wrong";
+      value.address = { chatId: "chat:drifted", topicId: "topic:drifted" };
+      value.active = false;
+      value.bindingVersion = 99;
       return value;
     }
     if (this.fault === "gd05-binding-healed-by-canonical-read" && this.restartCount > 0) {
       this.bindingTruth = cloneBinding(value);
       this.bindingView = value;
-      value.scopeId = "scope:temporary-wrong";
+      value.address = { chatId: "chat:drifted", topicId: "topic:drifted" };
+      value.active = false;
+      value.bindingVersion = 99;
       return value;
     }
     return value;
@@ -613,6 +612,10 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       receipt.dispatch !== null
     ) {
       receipt.dispatch.residentId = "resident:temporary-wrong";
+      receipt.dispatch.scopeId = "scope:temporary-wrong";
+      receipt.dispatch.scopeGeneration = 77;
+      receipt.dispatch.windowId = "window:temporary-wrong";
+      receipt.dispatch.windowGeneration = 77;
       this.tg03InboundView = receipt;
       return { ok: true, value: receipt };
     }
@@ -622,6 +625,7 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       receipt.dispatch !== null
     ) {
       receipt.dispatch.residentId = "resident:temporary-wrong";
+      receipt.dispatch.scopeId = "scope:temporary-wrong";
       return { ok: true, value: receipt };
     }
     if (
@@ -630,6 +634,9 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       receipt.dispatch !== null
     ) {
       receipt.dispatch.scopeId = "scope:temporary-wrong";
+      receipt.dispatch.scopeGeneration = 99;
+      receipt.dispatch.windowId = "window:temporary-wrong";
+      receipt.dispatch.windowGeneration = 99;
       this.tg04NewerView = receipt;
       return { ok: true, value: receipt };
     }
@@ -637,14 +644,14 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       this.fault === "tg04-effect-ids-healed-by-ledger-read" &&
       update.updateId.includes("tg04")
     ) {
-      receipt.effectId = `temporary-wrong:${update.updateId}`;
+      receipt.effectId = `effect:lie:${update.updateId}`;
       return { ok: true, value: receipt };
     }
     if (
       this.fault === "tg07-inbound-leak-healed-by-send" &&
       update.updateId.includes("tg07-context")
     ) {
-      receipt.effectId = this.tokenSecret;
+      receipt.reason = this.tokenSecret;
       this.tg07InboundView = receipt;
       return { ok: true, value: receipt };
     }
@@ -662,6 +669,8 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     }
     if (this.fault === "tg07-durable-leak-healed-by-effect-read" && this.tg07DurableView !== null) {
       this.tg07DurableView.reason = null;
+      this.tg07DurableView.telegramMessageId = "telegram:1";
+      this.tg07DurableView.effectId = "outbound-effect:1";
     }
     if (this.fault === "tg07-inbound-effects-leak-healed-by-boundary") {
       this.inboundEffects.push(this.tokenSecret);
@@ -710,7 +719,7 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       | "telegram-unavailable",
   ): Promise<Result<OutboundReceipt>> {
     if (this.fault === "tg07-inbound-leak-healed-by-send" && this.tg07InboundView !== null) {
-      this.tg07InboundView.effectId = "effect:update:tg07-context";
+      this.tg07InboundView.reason = null;
     }
     const binding = this.bindings.get(request.context.bindingId);
     if (binding === undefined || !binding.active) {
@@ -851,6 +860,8 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
       receipt.outboundId === "outbound:1"
     ) {
       receipt.reason = this.tokenSecret;
+      receipt.telegramMessageId = this.tokenSecret;
+      receipt.effectId = this.tokenSecret;
       this.tg07DurableView = receipt;
       return { ok: true, value: receipt };
     }
@@ -1194,7 +1205,8 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     if (this.fault === "gd02-switch-healed-by-binding-read") {
       this.switchedTruth = cloneResident(returned);
       this.switchedView = returned;
-      returned.model = "model:temporary-wrong";
+      returned.model = "model:old";
+      returned.provider = "provider:old";
       return returned;
     }
     return returned;
@@ -1400,8 +1412,10 @@ class AdversarialTelegramDriver implements TelegramChannelDriver {
     if (this.fault === "gd01-trace-healed-by-host-read" && plans.length === 2) {
       this.groupTraceTruth = structuredClone(trace);
       this.groupTraceView = trace;
-      const first = trace[0];
-      if (first !== undefined) first.residentId = "resident:temporary-shadow";
+      for (const entry of trace) {
+        entry.model = "model:shared";
+        entry.provider = "provider:shared";
+      }
       return trace;
     }
     return trace;
