@@ -4,6 +4,15 @@
 本页只钉行为与证据，不替 #84 决定 schema、字段名或端点名；下面出现的
 `eventId`、`streamSeq` 都表示 #84 已拍板的语义把手，最终拼写随其第一刀落地后对齐。
 
+可执行版在 `window-history-checks.ts`，驱动契约在 `window-history-driver.ts`，
+WH-06 的静态审计在 `window-history-write-surface.ts`；两边编号必须同步改，
+判卷以代码为准。报告模式与严格模式分别为：
+
+```bash
+npm run acceptance:window-history
+npm run acceptance:window-history:strict
+```
+
 认领口径（#120 楼内，issuecomment-5447844494；先决①于 2026-08-29 经 #120
 楼里当面确认——望舒主笔授意批字认可「一份」，issuecomment-5461040293）：
 **一份底座**——canonical stream event store 是唯一底座与唯一写方；window

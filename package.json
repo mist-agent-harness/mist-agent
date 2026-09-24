@@ -23,7 +23,9 @@
     "acceptance:host-provider": "tsx acceptance/host-provider-run.ts",
     "acceptance:host-provider:strict": "tsx acceptance/host-provider-run.ts --strict",
     "acceptance:resident-continuity": "tsx acceptance/resident-continuity-run.ts",
-    "acceptance:resident-continuity:strict": "tsx acceptance/resident-continuity-run.ts --strict"
+    "acceptance:resident-continuity:strict": "tsx acceptance/resident-continuity-run.ts --strict",
+    "acceptance:window-history": "tsx acceptance/window-history-run.ts",
+    "acceptance:window-history:strict": "tsx acceptance/window-history-run.ts --strict"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
