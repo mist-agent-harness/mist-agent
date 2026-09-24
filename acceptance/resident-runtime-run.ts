@@ -71,6 +71,10 @@ async function main(): Promise<void> {
   for (const check of residentRuntimeChecks) {
     const stub = usesStub(check, loaded.stubbed);
     try {
+      // 每盏灯前清干净（契约：「每盏灯后清掉合成住户、通道、落盘目录与注入的故障」）。
+      // 灯与灯之间不许共享住户状态——否则上一盏留下的流 / 凭证 / 故障会把下一盏判红，
+      // 那是判卷自己造的假红，不是被测实现的毛病。
+      await loaded.driver.reset();
       const result = await check.run(loaded.driver);
       if (result.passed && stub) {
         stubGreen += 1;

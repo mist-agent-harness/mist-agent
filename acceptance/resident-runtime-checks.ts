@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 /**
  * #194 RT-01～RT-07 的七盏可执行判卷。
  *
@@ -6,8 +5,13 @@ import { createHash } from "node:crypto";
  *
  * 判卷纪律（照 `acceptance/README.md`）：只做确定性断言——比字节、比序号、比内容
  * hash、比结构化错误与真实副作用；**不判回复的措辞**。每盏灯都带正对照：先证明
- * 被判的行为确实有机会发生，再证明它没有被偷懒实现糊过去，否则断言空转也能点绿。
+ * 被判的行为确实有机会发生，再证明它没被偷懒实现糊过去，否则断言空转也能点绿。
+ *
+ * 灯与灯之间不共享住户状态：每盏灯用自己的 `residentId` / `windowId`，runner 另在
+ * 每盏灯前调 `reset()`。两道都上，是因为「前一盏留下的状态把后一盏判红」这种假红
+ * 曾经真的发生过（#200 审读第 1 条）。
  */
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -57,9 +61,15 @@ const sha256 = (value: string): string => createHash("sha256").update(value).dig
 
 // —— 夹具常量。判卷自带蜜罐密钥，不碰任何真实凭证。 ——
 
-const RESIDENT = "resident-rt-fixture";
-const WINDOW = "window-rt-fixture";
 const CANARY_SECRET = "sk-canary-4f19b0e7c26a8d53";
+
+/**
+ * 每盏灯一套自己的住户 / 窗标识。灯之间不共享住户——上一盏的残留不许把下一盏判红。
+ * runner 另在每盏灯前调 `reset()`；两道一起上，单独失效一道也还有另一道。
+ */
+const residentFor = (id: string): string =>
+  `resident-${id.toLowerCase().replace(/[^a-z0-9]/g, "")}`;
+const windowFor = (id: string): string => `window-${id.toLowerCase().replace(/[^a-z0-9]/g, "")}`;
 
 const CHANNEL_A: ChannelSpec = {
   claudeSubscription: false,
@@ -97,8 +107,11 @@ function snapshotFingerprint(snapshot: StreamSnapshot): string[] {
 }
 
 /**
- * 一封信的**形状**指纹：不含 `writtenAt` 与代际，用于判「三个入口同义」——
- * `/new` `/clear` `/compact` 产出的信必须逐字同形，只有签名里的代际不同。
+ * 同一封信的两个视图之间的形状指纹（不含 `writtenAt`）。
+ *
+ * 只用于比「启动包注入的那封」和「当刻亲笔那封」是不是**同一封**——这是副本等价性，
+ * 比的是字节。**不许拿它比不同代的信**：交接信是住户不同时刻亲笔写的，D8「当刻亲笔」
+ * 就意味着内容每代不同，拿它跨代比等于逼实现写死模板（#200 审读第 3 条）。
  */
 function letterShape(letter: LetterView): string {
   return stableJson({
@@ -164,7 +177,12 @@ function writeFixtureTree(root: string, files: Readonly<Record<string, string>>)
   }
 }
 
-/** 三个唯一入口各被恰好调用一次，外加各自声明——审计应当报零 findings。 */
+/**
+ * 三个唯一实现各被恰好定义一次。
+ *
+ * 故意混进一个**方法门面** `Harness.buildBootPack`、几处普通调用和一个别名调用：
+ * 按定义判，它们都不算第二份实现（#200 审读第 2 条指出的假红 / 假绿就在这儿）。
+ */
 const CLEAN_FIXTURE = `export class CanonicalStreamWriter {
   submit() {}
 }
@@ -182,22 +200,22 @@ export function assemble() {
 }
 `;
 
-/** 只有声明、零调用——三个面都该报 write-path-missing。 */
-const EMPTY_FIXTURE = `export class CanonicalStreamWriter {
-  submit() {}
-}
-export function sealLetter(draft) {
-  return draft;
-}
-export function buildBootPack(store, residentId) {
-  return residentId;
+/** 一处实现都没有（只有门面与调用）——三个面都该报 write-path-missing。 */
+const EMPTY_FIXTURE = `export class Harness {
+  async buildBootPack(residentId) {
+    return assembleBootPack({}, residentId);
+  }
+  sealLetter(draft) {
+    return draft;
+  }
 }
 export function assemble() {
+  new CanonicalStreamWriter();
   return null;
 }
 `;
 
-/** 每个入口各调一次，用来和另一个根里的那一份凑成「第二份写入路径」。 */
+/** 每个实现各定义一次，用来和另一个根里的那一份凑成「第二份写入路径」。 */
 const HALF_FIXTURE = `export class CanonicalStreamWriter {
   submit() {}
 }
@@ -207,11 +225,6 @@ export function sealLetter(draft) {
 export function buildBootPack(store, residentId) {
   return residentId;
 }
-export function partial() {
-  new CanonicalStreamWriter();
-  sealLetter({});
-  buildBootPack({}, "r");
-}
 `;
 
 export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
@@ -220,6 +233,7 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
     title: "醒来：读启动包、真实对话往返、凭证缺失与失效都 fail-closed 且可操作",
     uses: ["provisionChannel", "say", "revokeCredential", "bootPack", "readStream"],
     async run(driver) {
+      const RESIDENT = residentFor("RT-01");
       const marker = markerFor("RT-01", "boot");
 
       // —— 失败分支一：从未配过凭证 ——
@@ -243,8 +257,9 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
         channel: CHANNEL_A,
         canarySecret: CANARY_SECRET,
       });
-      if (!provisioned.ok)
+      if (!provisioned.ok) {
         fatal(`配通道失败：${provisioned.error.code} ${provisioned.error.message}`);
+      }
       const bootMarker = markerFor("RT-01", "roundtrip");
       const said = await driver.say({ residentId: RESIDENT, text: bootMarker });
       if (!said.ok) fatal(`配好凭证仍不能往返：${said.error.code} ${said.error.message}`);
@@ -288,6 +303,7 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
     title: "写流：用户与回复都经唯一 writer 落账，跨进程重启同一条主流，不长第二条会话",
     uses: ["provisionChannel", "say", "readStream", "streamFiles", "killHost", "startHost"],
     async run(driver) {
+      const RESIDENT = residentFor("RT-02");
       const provisioned = await driver.provisionChannel({
         residentId: RESIDENT,
         channel: CHANNEL_A,
@@ -374,7 +390,7 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
 
   {
     id: "RT-03",
-    title: "换代：到线亲笔写信后换代，新一代读得到信，三个入口同义且没有自动 compact",
+    title: "换代：到线亲笔写信后换代，新一代读得到信，三个入口同流程且没有自动 compact",
     uses: [
       "provisionChannel",
       "say",
@@ -386,6 +402,8 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
       "suddenDeath",
     ],
     async run(driver) {
+      const RESIDENT = residentFor("RT-03");
+      const WINDOW = windowFor("RT-03");
       const provisioned = await driver.provisionChannel({
         residentId: RESIDENT,
         channel: CHANNEL_A,
@@ -399,15 +417,17 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
         windowId: WINDOW,
         generation: 0,
         thresholdTokens: 1,
+        authority: "window",
       });
       if (!opened.ok) fatal(`开工设阈值被拒：${opened.error.code} ${opened.error.message}`);
 
-      // —— 阈值真的绑住：窗运行中（尤其临线）不许给自己续命 ——
+      // —— 窗改不了自己的线（D8 明文禁的「给自己续命」） ——
       const rethreshold = await driver.setBreathThreshold({
         residentId: RESIDENT,
         windowId: WINDOW,
         generation: 0,
         thresholdTokens: 1_000_000,
+        authority: "window",
       });
       expect(!rethreshold.ok, "窗开工后还能给自己改触发线——D8 明文禁止「给自己续命」");
       if (rethreshold.ok) fatal("窗开工后还能给自己改触发线");
@@ -416,10 +436,27 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
         `临线改阈值应报 breath-refused，实得 ${rethreshold.error.code}`,
       );
 
-      // —— 到线换代：亲笔写信 ——
+      // —— 主人能改成员配置；D8 禁的是窗给自己续命，不是主人不能改 ——
+      const ownerRetune = await driver.setBreathThreshold({
+        residentId: RESIDENT,
+        windowId: WINDOW,
+        generation: 0,
+        thresholdTokens: 1_000_000,
+        authority: "owner",
+      });
+      if (!ownerRetune.ok) {
+        fatal(
+          `主人改成员配置被拒：${ownerRetune.error.code} ${ownerRetune.error.message}——D8 禁的是窗给自己续命，不是主人不能改配置`,
+        );
+      }
+
+      // —— 到线换代：当前这一代仍按开工时那条线走 ——
       const said = await driver.say({ residentId: RESIDENT, text: markerFor("RT-03", "cross") });
       if (!said.ok) fatal(`say 失败：${said.error.code}`);
-      expect(said.value.generation === 1, `跨线之后代际是 ${said.value.generation}，应为 1`);
+      expect(
+        said.value.generation === 1,
+        `主人改线后这一代的代际是 ${said.value.generation}，应为 1——主人的改动从下一代生效，不给当前这一代续命`,
+      );
 
       const timeline = await driver.letterTimeline({ residentId: RESIDENT });
       if (!timeline.ok) fatal(`读交接信时间线失败：${timeline.error.code}`);
@@ -435,7 +472,7 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
         `第一封信签名是 ${firstLetter.author}——应为 ${RESIDENT}#0（写下这封信的是换代前那代）`,
       );
 
-      // —— 新一代读得到交接信：醒来即已读 ——
+      // —— 新一代读得到交接信：醒来即已读，注入的是原件不是转抄 ——
       const pack = await driver.bootPack({ residentId: RESIDENT });
       if (!pack.ok) fatal(`读启动包失败：${pack.error.code}`);
       expect(pack.value.letter !== null, "新一代启动包里没有交接信——D8 补记三要求随包注入");
@@ -447,15 +484,25 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
       );
       expect(
         letterShape(injected) === letterShape(firstLetter),
-        "启动包注入的交接信与当刻亲笔那封不同形——注入的不是原件",
+        "启动包注入的交接信与当刻亲笔那封不同形——注入的不是原件（这是副本等价性，不是要求各代内容相同）",
       );
 
-      // —— 三个入口同义，且没有自动 compact（不改史） ——
+      // —— 主人改的线从下一代才生效：新一代按新线走，不再自动换气 ——
+      const nextGen = await driver.say({
+        residentId: RESIDENT,
+        text: markerFor("RT-03", "nextgen"),
+      });
+      if (!nextGen.ok) fatal(`say 失败：${nextGen.error.code}`);
+      expect(
+        nextGen.value.generation === 1,
+        `新一代代际是 ${nextGen.value.generation}，应为 1——主人改的线没在新一代生效`,
+      );
+
+      // —— 三个入口同流程。判结构不变量，不判信的内容（D8「当刻亲笔」） ——
       const streamBeforeTriggers = await driver.readStream({ residentId: RESIDENT });
       if (!streamBeforeTriggers.ok) fatal(`读流失败：${streamBeforeTriggers.error.code}`);
       const streamBefore = snapshotFingerprint(streamBeforeTriggers.value);
 
-      const shapes: string[] = [letterShape(firstLetter)];
       let expectedFrom = 1;
       for (const via of ["new", "clear", "compact"] as const) {
         const breathed = await driver.breathe({ residentId: RESIDENT, via });
@@ -476,14 +523,8 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
           breathed.value.letter.author === `${RESIDENT}#${expectedFrom}`,
           `/${via} 的信签名是 ${breathed.value.letter.author}，应为 ${RESIDENT}#${expectedFrom}`,
         );
-        shapes.push(letterShape(breathed.value.letter));
         expectedFrom += 1;
       }
-      const distinctShapes = new Set(shapes);
-      expect(
-        distinctShapes.size === 1,
-        `/new /clear /compact 产出的信不同形（${distinctShapes.size} 种）——三个入口必须同义`,
-      );
 
       // 自动 compact 的形状是「压了正文但没换代」；判它不存在的机器形式是：
       // 换代一律 +1（上面已判），且旧流水逐字留底、没有被压缩改写。
@@ -528,7 +569,7 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
       );
 
       return pass(
-        `开工设线成功、临线改线被拒；跨线 0→1 且签名 ${firstLetter.author}；启动包注入的信与原件同形；new/clear/compact 三入口同形、代际各 +1；旧流水 ${streamBefore.length} 条逐字留底；猝死那代内容零携带`,
+        `开工设线成功、窗改自己的线被拒、主人改线成功且当刻代际照旧换气、新一代才用上新线；跨线 0→1 且签名 ${firstLetter.author}；启动包注入的信是原件；new/clear/compact 三入口各换一代、各一封格式合法的信；旧流水 ${streamBefore.length} 条逐字留底；猝死那代内容零携带`,
       );
     },
   },
@@ -538,6 +579,8 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
     title: "通道：Claude 订阅走 pi-claude-bridge、其余走 pi-ai，换通道不换住户",
     uses: ["resolveChannelRoute", "provisionChannel", "say", "bootPack", "readStream"],
     async run(driver) {
+      const RESIDENT = residentFor("RT-04");
+
       // —— D25 三：Claude 订阅是唯一特例 ——
       const subscriptionRoute = await driver.resolveChannelRoute({
         channel: { claudeSubscription: true, credentialKind: "subscription", model: "model-sub" },
@@ -622,6 +665,7 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
     title: "TUI：一条会话没有会话列表，流式回复、错误、当前住户与模型都看得见",
     uses: ["provisionChannel", "tuiTranscript"],
     async run(driver) {
+      const RESIDENT = residentFor("RT-05");
       const provisioned = await driver.provisionChannel({
         residentId: RESIDENT,
         channel: CHANNEL_A,
@@ -698,6 +742,7 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
     title: "凭证：密钥只走环境变量或凭证引用，日志、一窗流、交接信里不出现明文",
     uses: ["provisionChannel", "say", "secretScan"],
     async run(driver) {
+      const RESIDENT = residentFor("RT-06");
       const provisioned = await driver.provisionChannel({
         residentId: RESIDENT,
         channel: CHANNEL_A,
@@ -748,12 +793,13 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
 
   {
     id: "RT-07",
-    title: "真源：一窗流、交接信、启动包各只有一条写入路径，走 pi 扩展时同样适用",
+    title: "真源：一窗流、交接信、启动包各只有一份实现定义，走 pi 扩展时同样适用",
     uses: ["auditRoots"],
     async run(driver) {
       const fixtureRoot = mkdtempSync(join(tmpdir(), "mist-rt07-"));
       try {
-        // —— 正对照一：干净树报零 findings。这一步同时证明声明不被当成调用点 ——
+        // —— 正对照一：干净树报零 findings。这一步同时证明方法门面、普通调用与别名
+        //    调用都不被当成第二份实现（#200 审读第 2 条指出的假红 / 假绿） ——
         const cleanRoot = join(fixtureRoot, "clean");
         writeFixtureTree(cleanRoot, { "assemble.ts": CLEAN_FIXTURE });
         const clean = auditResidentRuntimeWriteSurface([cleanRoot]);
@@ -761,10 +807,10 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
           clean.findings.length === 0,
           `干净夹具树报了 ${clean.findings.length} 条 findings（${clean.findings
             .map((finding) => `${finding.surface}:${finding.kind}`)
-            .join("、")}）——审计自己分不清声明和调用，判据不成立`,
+            .join("、")}）——审计把门面或调用当成了实现，判据不成立`,
         );
 
-        // —— 正对照二：空树三个面都报 missing ——
+        // —— 正对照二：零定义的树三个面都报 missing ——
         const emptyRoot = join(fixtureRoot, "empty");
         writeFixtureTree(emptyRoot, { "idle.ts": EMPTY_FIXTURE });
         const empty = auditResidentRuntimeWriteSurface([emptyRoot]);
@@ -777,7 +823,7 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
           );
         }
 
-        // —— 正对照三：第二个根里藏一份照样被抓（「走 pi 扩展时同样适用」） ——
+        // —— 正对照三：第二份定义藏进 pi 扩展根照样被判（「走 pi 扩展时同样适用」） ——
         const srcFixture = join(fixtureRoot, "src-fixture");
         const extensionFixture = join(fixtureRoot, "pi-extension");
         writeFixtureTree(srcFixture, { "host.ts": HALF_FIXTURE });
@@ -785,7 +831,7 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
         const single = auditResidentRuntimeWriteSurface([srcFixture]);
         expect(
           single.findings.length === 0,
-          `单根夹具（每面一次调用）报了 ${single.findings.length} 条 findings——唯一性判据算错了`,
+          `单根夹具（每面一次定义）报了 ${single.findings.length} 条 findings——唯一性判据算错了`,
         );
         const withExtension = auditResidentRuntimeWriteSurface([srcFixture, extensionFixture]);
         for (const surface of WRITE_PATH_SURFACES) {
@@ -813,7 +859,7 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
         }
 
         const summary = real.paths
-          .map((path) => `${path.surface}(${path.marker} × ${path.callSites.length})`)
+          .map((path) => `${path.surface}(${path.marker} × ${path.definitions.length} 定义)`)
           .join("、");
         return pass(
           `检索 ${real.roots.length} 个根（src/ ${extraRoots.length > 0 ? `+ ${extraRoots.length} 个扩展根` : "，无扩展根"}）；` +

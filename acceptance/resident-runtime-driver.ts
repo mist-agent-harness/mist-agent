@@ -283,14 +283,20 @@ export interface ResidentRuntimeDriver {
 
   // —— 换气（D8） ——
   /**
-   * 设触发线。**只能在窗开工时调**——运行中的窗（尤其临线）请求改阈值必须
-   * fail-closed 拒绝并返回 `breath-refused`，这是 D8 明文禁的「给自己续命」。
+   * 设触发线（D8 一：成员级配置，只能在窗开工时设定）。
+   *
+   * `authority` 分清是谁在改，因为 D8 禁的只是**窗给自己续命**，不是主人不能改配置：
+   * - `window` —— 这扇窗改自己的线。窗已开工就 fail-closed 拒绝、返回 `breath-refused`
+   *   （D8 明文「临近红线的窗无权给自己续命」；D8 补记一「跑没跑完的判断权在账侧，
+   *   临线的窗无权自判」）。
+   * - `owner` —— 主人改成员配置。允许，但**从下一代生效**，不给当前这一代续命。
    */
   setBreathThreshold(input: {
     residentId: string;
     windowId: string;
     generation: number;
     thresholdTokens: number;
+    authority: "window" | "owner";
   }): Promise<Result<void>>;
   /** 走 D8 的统一流程：住户亲笔写信 → 换代重生。三个入口同义。 */
   breathe(input: {

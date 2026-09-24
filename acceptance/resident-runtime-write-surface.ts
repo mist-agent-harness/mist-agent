@@ -1,31 +1,44 @@
 /**
- * RT-07 的静态判卷：一窗流、交接信、启动包都只有一条写入路径。
+ * RT-07 的静态判卷：一窗流、交接信、启动包各只有一份写入路径。
  *
  * 清单原文要求「全局检索确认……没有第二份写入路径（走 pi 扩展时同样适用）」，
- * 所以这盏灯不经驱动自述——驱动说自己没有第二份不算证据。本模块直接读源码树，
- * 回答一件可核事实：三样东西各自的唯一写入入口，在被检索的树里**恰好被调用一次**。
+ * 所以这盏灯不经驱动自述——驱动说自己没有第二份不算证据。本模块直接读源码树。
  *
- * 三样东西的唯一入口（真源分别是 D9 / D8 / acceptance/README.md C2）：
+ * ## 判什么：定义唯一，不是调用唯一
  *
- * 1. **一窗流** —— `CanonicalStreamWriter`。D9 一位住户一条权威生命线，
- *    底座 store 是唯一写方；第二个写句柄就是第二条生命线。
- * 2. **交接信** —— `sealLetter`。D8 交接信每代一封、当刻亲笔；第二个封缄口
- *    就是第二条能伪造签名的路。
- * 3. **启动包** —— `buildBootPack`。启动包必须由存储生成，不是手写文件；
- *    第二个装配器就是第二份住户身份真源。
+ * 「一份写入路径」的机器形式是**那份实现恰好被定义一次**。三样东西的唯一实现：
  *
- * 检索根由调用方传入（可以是多个：`src/` 加上 pi 扩展目录），所以同一套判据既能
- * 指向真实源码树，也能在测试里指向夹具树做正对照——否则这盏灯只有红态可验，
- * 等于没验过。走 pi 扩展那条路线时把扩展目录一起传进来，藏在里面的第二份照样被抓。
+ * 1. **一窗流** —— `CanonicalStreamWriter`。D9 一位住户一条权威生命线，底座 store
+ *    是唯一写方。运行时构造写句柄几次是合法的（不同 data root / 不同宿主），所以
+ *    数的是**类定义**，不是 `new` 出现几次；同一进程同一 data root 只能有一个写句柄
+ *    由 `WriterOwnershipError` 在运行时兜住，不归本审计。
+ * 2. **交接信** —— `sealLetter`。D8 交接信每代一封、当刻亲笔；封缄口只能有一个。
+ *    换几代办几封信都合法，所以数的也是**函数定义**。
+ * 3. **启动包** —— `buildBootPack`。启动包必须由存储生成、由唯一装配器生成；它是纯读
+ *    函数，醒来要调、换代后要调、各路驱动也要调，所以**调用次数天然不唯一**，数的是
+ *    **函数定义**。
  *
- * 能力边界（写明，不含糊）：本审计读的是源码文本，抓的是「写错或偷懒的实现」，
- * 抓不了存心用反射、动态 import 或字符串拼名字绕开检索的代码。按 D27 一，
- * 那类问题归代码评审与独立验收席。
+ * 按定义判的三个直接后果（都写明，不含糊）：
+ *
+ * - **别名调用不算第二份**。`import { buildBootPack as assembleBootPack }` 之后调
+ *   `assembleBootPack(...)`，复用的是同一个装配器，本来就不构成第二条写入路径。
+ * - **方法门面不算第二份**。类上叫 `buildBootPack` 的包装方法（如
+ *   `src/acceptance-driver.ts` 的 P3 门面）不是一份新装配器，它只是接线层的一格。
+ * - **pi 扩展里另起一份同名副本会被抓到**。这正是 D28 二「不在 pi 里另起一份副本」
+ *   的机器形式——检索根可以是多个（`src/` 加扩展目录），两处定义就判红。
+ *
+ * 检索根由调用方传入，所以同一套判据既能指向真实源码树，也能在测试里指向夹具树做
+ * 正对照——否则这盏灯只有红态可验，等于没验过。
+ *
+ * 能力边界（写明，不含糊）：本审计读源码文本、按标识符认实现，抓的是「写错或偷懒的
+ * 实现」和「同名副本」。抓不了换个名字另写一份的实现（比如手搓一个 `SealedLetter`
+ * 对象字面量、或直接写 `*.stream.json`），也抓不了用反射、动态 import、字符串拼名字
+ * 绕开检索的代码。按 D27 一，那类问题归代码评审与独立验收席。
  */
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 
-/** 三样东西各自的唯一写入入口标识符。 */
+/** 三样东西各自的唯一实现标识符。 */
 export const WRITE_PATH_MARKERS = {
   /** D9：一窗流唯一写方。 */
   "one-stream": "CanonicalStreamWriter",
@@ -39,10 +52,26 @@ export type WritePathSurface = keyof typeof WRITE_PATH_MARKERS;
 
 export const WRITE_PATH_SURFACES = Object.keys(WRITE_PATH_MARKERS) as WritePathSurface[];
 
+/**
+ * 认「定义」的关键词。**不含方法声明**——类方法没有这些前缀词，正好不会被当成一份
+ * 新实现；`async buildBootPack(...)`、`private sealLetter(...)` 之类的门面因此被正确
+ * 忽略，而 `function buildBootPack(...)` / `class CanonicalStreamWriter` 会被认到。
+ */
+const DECLARATION_KEYWORDS = [
+  "class",
+  "function",
+  "const",
+  "let",
+  "var",
+  "interface",
+  "type",
+  "enum",
+] as const;
+
 export type WriteSurfaceFindingKind =
-  /** 唯一入口在树里一次都没被调用：这条路还没接线。 */
+  /** 唯一实现在树里一次都没定义：没接线，或检索根指错了地方。 */
   | "write-path-missing"
-  /** 唯一入口被调用多次：长出了第二份写入路径。 */
+  /** 唯一实现在树里被定义多次：长出了第二份（含 pi 扩展里的同名副本）。 */
   | "write-path-duplicated";
 
 export interface WriteSurfaceFinding {
@@ -51,16 +80,18 @@ export interface WriteSurfaceFinding {
   readonly detail: string;
 }
 
-export interface WritePathCallSite {
+export interface WritePathDefinitionSite {
   /** 相对所在检索根的路径。 */
   readonly file: string;
   readonly line: number;
+  /** 命中的是哪个声明关键词，评审时可直接看出这算不算一份实现。 */
+  readonly keyword: string;
 }
 
 export interface WritePathAudit {
   readonly surface: WritePathSurface;
   readonly marker: string;
-  readonly callSites: readonly WritePathCallSite[];
+  readonly definitions: readonly WritePathDefinitionSite[];
 }
 
 export interface ResidentRuntimeWriteSurfaceReport {
@@ -112,18 +143,6 @@ function stripCommentsAndStrings(source: string): string {
   return output;
 }
 
-/**
- * 抹掉声明本身（`function sealLetter(` / `class CanonicalStreamWriter` 之类），
- * 只留调用点。声明不是写入路径，调用才是。
- */
-function stripDeclarations(source: string, marker: string): string {
-  const declaration = new RegExp(
-    String.raw`(?:export\s+)?(?:declare\s+)?(?:abstract\s+)?(?:class|function|const|let|var|interface|type|enum)\s+${marker}\b`,
-    "g",
-  );
-  return source.replace(declaration, (match) => " ".repeat(match.length));
-}
-
 function collectTypeScriptFiles(root: string): string[] {
   const files: string[] = [];
   const walk = (directory: string): void => {
@@ -149,17 +168,31 @@ function lineNumberAt(source: string, index: number): number {
   return line;
 }
 
-/** 统计一个标识符的**调用点**：`new 标识符` 或 `标识符(`，声明已抹掉。 */
-function findCallSites(source: string, marker: string): number[] {
-  const withoutDeclarations = stripDeclarations(source, marker);
-  const invocation = new RegExp(String.raw`(?:new\s+${marker}\b|${marker}\s*\()`, "g");
-  const lines: number[] = [];
-  let match = invocation.exec(withoutDeclarations);
+/**
+ * 找出一个标识符的**定义**：`class 标识符` / `function 标识符(` / `const 标识符` 之类。
+ *
+ * `export` / `declare` / `abstract` / `default` 这些修饰词可有可无。`\b` 保证
+ * `CanonicalStreamWriterOptions` 不会被 `CanonicalStreamWriter` 认成一次定义。
+ */
+function findDeclarationSites(source: string, marker: string): { line: number; keyword: string }[] {
+  const keywordGroup = DECLARATION_KEYWORDS.join("|");
+  const pattern = new RegExp(
+    String.raw`(?:export\s+|declare\s+|abstract\s+|default\s+|async\s+)*(?:${keywordGroup})\s+${marker}\b`,
+    "g",
+  );
+  const sites: { line: number; keyword: string }[] = [];
+  let match = pattern.exec(source);
   while (match !== null) {
-    lines.push(lineNumberAt(withoutDeclarations, match.index));
-    match = invocation.exec(withoutDeclarations);
+    // 先把命中片段和位置取出来再进回调——闭包里的 `match` 收窄不到非空。
+    const matched = match[0];
+    const at = match.index;
+    const keyword = DECLARATION_KEYWORDS.find((candidate) =>
+      new RegExp(String.raw`(?:^|\s)${candidate}\s+${marker}\b$`).test(matched),
+    );
+    sites.push({ line: lineNumberAt(source, at), keyword: keyword ?? "?" });
+    match = pattern.exec(source);
   }
-  return lines;
+  return sites;
 }
 
 export function auditResidentRuntimeWriteSurface(
@@ -176,30 +209,33 @@ export function auditResidentRuntimeWriteSurface(
 
   for (const surface of WRITE_PATH_SURFACES) {
     const marker = WRITE_PATH_MARKERS[surface];
-    const callSites: WritePathCallSite[] = [];
+    const definitions: WritePathDefinitionSite[] = [];
     for (const { root, file } of files) {
       const source = stripCommentsAndStrings(readFileSync(file, "utf8"));
-      for (const line of findCallSites(source, marker)) {
-        callSites.push({ file: relative(root, file), line });
+      for (const site of findDeclarationSites(source, marker)) {
+        definitions.push({
+          file: relative(root, file),
+          line: site.line,
+          keyword: site.keyword,
+        });
       }
     }
 
-    paths.push({ surface, marker, callSites });
+    paths.push({ surface, marker, definitions });
 
-    if (callSites.length === 0) {
+    const where = definitions.map((site) => `${site.file}:${site.line}`).join("、");
+    if (definitions.length === 0) {
       findings.push({
         kind: "write-path-missing",
         surface,
-        detail: `${roots.join("、")} 下没有任何 ${marker} 调用点：${surface} 的写入路径还没接线`,
+        detail: `${roots.join("、")} 下没有任何 ${marker} 的实现定义：要么这条路还没接线，要么检索根指错了地方`,
       });
     }
-    if (callSites.length > 1) {
+    if (definitions.length > 1) {
       findings.push({
         kind: "write-path-duplicated",
         surface,
-        detail: `${surface} 的写入入口 ${marker} 被调用 ${callSites.length} 次，长出了第二份写入路径：${callSites
-          .map((site) => `${site.file}:${site.line}`)
-          .join("、")}`,
+        detail: `${surface} 的实现 ${marker} 被定义 ${definitions.length} 次（${where}），长出了第二份写入路径——含 pi 扩展里的同名副本`,
       });
     }
   }
