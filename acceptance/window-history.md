@@ -34,7 +34,9 @@ history 是它按 `(windowId, generation)` 的只读 projection，不构成第�
 fail-closed 会把一部分「其实没事」的读取故障显式报红，增加误报处理成本；格式版本
 字段与墓碑让每一条记录为未必发生的迁移付钱；「一份」裁定下 history 投影主流与
 OS-03/04「局部 transcript 不入主流、归档流水只进证据面」的并存语义，留待施工时
-交代清楚，不在清单里含糊。这些是「history 不活在内存里」的代价。
+交代清楚，不在清单里含糊（施工交代见
+[docs/design/window-history-projection.md](../docs/design/window-history-projection.md) §2）。
+这些是「history 不活在内存里」的代价。
 
 ## 六盏灯
 
