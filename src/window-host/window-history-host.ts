@@ -2,8 +2,10 @@
  * #120 window-history 生产宿主的组装根。
  *
  * 先决①（一份底座）：canonical stream event store（src/one-stream/）是唯一底座与
- * 唯一写方。本类是全 src/ 里**唯一**构造 `new CanonicalStreamWriter` 的地方
- * （WH-06 静态判卷数的就是这一处），把窗级写入串到底座唯一写方上，并把只读投影
+ * 唯一写方。全 src/ 里**唯一**的 `new CanonicalStreamWriter` 构造点在本文件的
+ * `openCanonicalStreamWriter` 开把手上（WH-06 静态判卷数的就是这一处）；本类与
+ * 住户运行时（#194，src/resident-runtime/runtime.ts）都只能经它拿写句柄，
+ * 把窗级写入串到底座唯一写方上，并把只读投影
  * （FEAT-001 的 WindowHistoryProjection）接到底座读端口 + 一个由本类实现的
  * WindowLifecycleView 上。落盘存储格式/迁移/回滚/墓碑归 WindowStorageFormatAdmin。
  *
@@ -74,6 +76,7 @@ import {
   type CanonicalEventDraft,
   CanonicalStreamStore,
   CanonicalStreamWriter,
+  type CanonicalStreamWriterOptions,
   type EventActor,
   IdempotencyConflictError,
   WriterClosedError,
@@ -106,6 +109,24 @@ import type {
 import { WindowHostFaultInjector } from "./window-host-faults.ts";
 
 const HOST_ACTOR: EventActor = { kind: "host", id: "mist-host" };
+
+/**
+ * 底座唯一写方的开把手（先决①）。
+ *
+ * 全 src/ 里**唯一**允许出现 `new CanonicalStreamWriter` 的地方就是这个函数
+ * （WH-06 静态判卷剥掉注释后数的就是这一处）：WindowHistoryHost 与住户运行时
+ * （#194 D28，`src/resident-runtime/runtime.ts`）都只能经它拿写句柄。谁另开一处
+ * `new CanonicalStreamWriter`，WH-06 的 writer-duplicated 与 resident-runtime.md
+ * 理由二的「全仓只有一个构造点」会同时破功 —— 这是两条线共享的硬不变量。
+ * 同一根的双写方另有 WriterOwnershipError 按数据根把关。
+ */
+export function openCanonicalStreamWriter(
+  store: CanonicalStreamStore,
+  options: CanonicalStreamWriterOptions = {},
+): CanonicalStreamWriter {
+  // —— 全 src/ 唯一的 new CanonicalStreamWriter 构造点（WH-06 数的就是这一处）——
+  return new CanonicalStreamWriter(store, options);
+}
 
 /**
  * 窗事件与窗账事实的 `occurredAt` 哨兵值。
@@ -235,10 +256,11 @@ export class WindowHistoryHost implements MistWindowHistoryPort {
   constructor(options: WindowHistoryHostOptions = {}) {
     const dataDir = resolveDataDir(options.dataDir);
     this.#store = new CanonicalStreamStore({ dataDir });
-    // —— 全 src/ 唯一的 new CanonicalStreamWriter 构造点（WH-06 数的就是这一处）——
-    this.#writer = new CanonicalStreamWriter(this.#store, {
-      ...(options.newEventId === undefined ? {} : { newEventId: options.newEventId }),
-    });
+    // 写句柄经先决①的唯一开把手拿（构造点在 openCanonicalStreamWriter 里，全仓唯一）。
+    this.#writer = openCanonicalStreamWriter(
+      this.#store,
+      options.newEventId === undefined ? {} : { newEventId: options.newEventId },
+    );
     this.#storage = new WindowStorageFormatAdmin(dataDir);
     // fault-aware 读端口：包住底座 store，按盘上故障标记改写读路径（WH-04）。
     this.#faults = new WindowHostFaultInjector(dataDir, this.#store);
