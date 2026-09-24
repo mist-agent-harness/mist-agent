@@ -914,10 +914,15 @@ describe("#120 window-history adversarial acceptance", () => {
     });
   });
 
-  it("WH-06 stays red against the real src/ tree in this PR", async () => {
+  it("WH-06 goes green against the real src/ tree once the single writer lands", async () => {
+    // 生产只读投影 + port（src/window-history/）与唯一写方
+    // new CanonicalStreamWriter（src/window-host/window-history-host.ts）都已落地：
+    // port 只有 summarize/read、唯一写方恰好一处且在投影目录之外、投影目录既不持有
+    // writer 也不自带落盘写。所以这盏静态灯此刻真绿，findings 为空。
     const result = await checkById("WH-06").run(driverFor(null));
-    expect(result.passed).toBe(false);
-    expect(result.detail).toContain("port-missing");
-    expect(result.detail).toContain("writer-missing");
+    expect(result.passed).toBe(true);
+    expect(result.detail).not.toContain("writer-missing");
+    expect(result.detail).not.toContain("port-missing");
+    expect(result.detail).toContain("window-host/window-history-host.ts");
   });
 });

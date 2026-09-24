@@ -194,15 +194,17 @@ export const projection = 1;
     expect(findingKinds(fixtureTree(tree))).toEqual([]);
   });
 
-  it("reports the real src/ tree as not yet having a production write surface", () => {
-    // 判卷先行的红灯起点，写成断言而不是口头声明：本 PR 合入时 WH-06 必须是红的。
+  it("reports the real src/ tree with the read-only port present and the single writer wired", () => {
+    // 生产只读投影 + port 已落地在 src/window-history/（恰好一处 MistWindowHistoryPort，
+    // 成员恰好 read/summarize，该目录不持有 writer、不落盘），且唯一
+    // new CanonicalStreamWriter 已接在 src/window-host/window-history-host.ts —— 投影目录
+    // 之外恰好一处。所以审计 findings 为空，WH-06 此刻真绿。
     const audit = auditWindowHistoryWriteSurface(join(repoRoot, "src"));
-    expect(audit.portDeclarations).toEqual([]);
-    expect(audit.writerConstructionSites).toEqual([]);
-    expect(audit.findings.map((finding) => finding.kind)).toEqual([
-      "port-missing",
-      "writer-missing",
-    ]);
+    expect(audit.portDeclarations).toHaveLength(1);
+    expect(audit.portDeclarations[0]?.typeName).toBe("MistWindowHistoryPort");
+    expect(audit.portDeclarations[0]?.members).toEqual(["read", "summarize"]);
+    expect(audit.writerConstructionSites).toEqual(["window-host/window-history-host.ts"]);
+    expect(audit.findings).toEqual([]);
   });
 });
 
@@ -218,27 +220,36 @@ describe("#120 judging runner", () => {
     return { status: result.status, stdout: `${result.stdout}${result.stderr}` };
   }
 
-  it("keeps all six lamps red while the production driver is absent", () => {
+  it("lights all six lamps true-green now that the production driver has landed", () => {
+    // 本 PR（FEAT-003）交生产驱动：src/window-history-acceptance-driver.ts 已存在并
+    // 导出 createWindowHistoryDriver()，真起子进程、真落盘、真 SIGKILL，把 WH-01～WH-05
+    // 用真实证据点绿；WH-06 早在唯一写方落地时静态真绿。所以判卷此刻真绿 6/6、无红无桩。
     expect(
       existsSync(driverPath),
-      "本 PR 只交判卷，src/window-history-acceptance-driver.ts 不该存在",
-    ).toBe(false);
+      "FEAT-003 交生产驱动，src/window-history-acceptance-driver.ts 必须存在",
+    ).toBe(true);
 
     const report = runRunner([]);
     expect(report.status, "报告模式必须退出 0").toBe(0);
     for (const id of expectedWindowHistoryCheckIds) {
-      expect(report.stdout).toContain(`🔴 ${id} 缺驱动`);
+      expect(report.stdout).toContain(`🟢 ${id}`);
     }
-    expect(report.stdout).toContain(`真绿 0 / ${expectedWindowHistoryCheckIds.length}`);
-    expect(report.stdout).not.toContain("🟢");
+    expect(report.stdout).toContain(
+      `真绿 ${expectedWindowHistoryCheckIds.length} / ${expectedWindowHistoryCheckIds.length}`,
+    );
+    expect(report.stdout).not.toContain("🔴");
     expect(report.stdout).not.toContain("🟡");
 
     const strict = runRunner(["--strict"]);
-    expect(strict.status, "严格模式必须退出 1").toBe(1);
+    expect(strict.status, "严格模式必须退出 0").toBe(0);
   });
 
-  it("errors out on a broken driver instead of faking the red starting point", () => {
-    expect(existsSync(driverPath)).toBe(false);
+  it("errors out on a broken driver instead of silently downgrading it", () => {
+    // 判卷不允许「驱动存在但坏」伪装成缺驱动的红灯起点。用真实驱动的备份换上一个只导出
+    // STUBBED、没有 createWindowHistoryDriver() 的坏驱动，断言 runner 直接抛错，然后原样
+    // 还原真实驱动（本用例不得破坏 FEAT-003 交付的生产驱动）。
+    expect(existsSync(driverPath)).toBe(true);
+    const original = readFileSync(driverPath, "utf8");
     writeFileSync(driverPath, "export const STUBBED = [];\n");
     try {
       const result = runRunner([]);
@@ -246,8 +257,8 @@ describe("#120 judging runner", () => {
       expect(result.stdout).toContain("没有导出 createWindowHistoryDriver()");
       expect(result.stdout).not.toContain("缺驱动");
     } finally {
-      rmSync(driverPath, { force: true });
+      writeFileSync(driverPath, original);
     }
-    expect(existsSync(driverPath)).toBe(false);
+    expect(readFileSync(driverPath, "utf8")).toBe(original);
   });
 });
