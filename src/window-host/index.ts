@@ -12,6 +12,11 @@ export {
   WindowStorageInterrupted,
   INITIAL_FORMAT_VERSION,
 } from "./storage-format.ts";
+export type { WindowStorageFormatAdminOptions } from "./storage-format.ts";
+export {
+  WINDOW_EVENT_OCCURRED_AT,
+  WINDOW_LIFECYCLE_PAYLOAD_KIND,
+} from "./window-history-host.ts";
 export type {
   AppendReceipt,
   AppendWindowEventInput,
