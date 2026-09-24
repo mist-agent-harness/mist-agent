@@ -66,6 +66,18 @@ interface HostWindow {
   archived: boolean;
 }
 
+/**
+ * 窗账的复合主键：`(residentId, windowId)`。windowId 只在住户内唯一，跨住户同名窗
+ * 是**两扇不同的窗**（壳共享魂私有：串房是本项目性质上最严重的事故）。落盘存储侧
+ * （storage-format.ts）本就按 `residentId/windowId` 复合键管窗；内存窗账必须用同一
+ * 口径，否则 windowExists/openWindow/写入/换气/归档/删除会拿别的住户的同名窗当自己
+ * 的用 —— 那正是审核意见 P1-① 复现的串房。用与 storage-format 相同的分隔符与转义
+ * 无关的原样拼接（判卷/存储侧都不含 `/` 于 residentId），保证两侧键一一对应。
+ */
+function windowKeyOf(residentId: string, windowId: string): string {
+  return `${residentId}/${windowId}`;
+}
+
 function ok<T>(value: T): Result<T> {
   return { ok: true, value };
 }
@@ -99,7 +111,7 @@ export class WindowHistoryHost implements MistWindowHistoryPort {
   readonly #faults: WindowHostFaultInjector;
   readonly #projection: WindowHistoryProjection;
   readonly #writerId: string;
-  /** windowId -> 窗账。 */
+  /** `(residentId, windowId)` 复合键 -> 窗账（见 windowKeyOf 注）。 */
   readonly #windows = new Map<string, HostWindow>();
   #closed = false;
 
@@ -121,7 +133,9 @@ export class WindowHistoryHost implements MistWindowHistoryPort {
     const host = this;
     const lifecycle: WindowLifecycleView = {
       windowExists(input) {
-        return host.#windows.has(input.windowId);
+        // 按复合键查：住户 A 有 `w` 不代表住户 B 也有 `w`（否则 B 读 A 的 `w`
+        // 会拿到 OK 空页而非 window-not-found —— 串房）。
+        return host.#windows.has(windowKeyOf(input.residentId, input.windowId));
       },
       formatVersion(input) {
         return host.#storage.formatVersionOf(input);
@@ -131,7 +145,7 @@ export class WindowHistoryHost implements MistWindowHistoryPort {
         return host.#storage.migrationStatus() as WindowStorageMigrationStatus;
       },
       isRunning(input) {
-        const window = host.#windows.get(input.windowId);
+        const window = host.#windows.get(windowKeyOf(input.residentId, input.windowId));
         return window !== undefined && !window.archived;
       },
     };
@@ -146,12 +160,13 @@ export class WindowHistoryHost implements MistWindowHistoryPort {
     this.#rebuildWindowLedger();
   }
 
-  /** 只凭落盘事实重建 windowId -> 窗账（冷启动路径）。 */
+  /** 只凭落盘事实重建 `(residentId, windowId)` -> 窗账（冷启动路径）。 */
   #rebuildWindowLedger(): void {
     for (const known of this.#storage.knownWindows()) {
-      if (this.#windows.has(known.windowId)) continue;
+      const key = windowKeyOf(known.residentId, known.windowId);
+      if (this.#windows.has(key)) continue;
       const generation = this.#durableGenerationOf(known);
-      this.#windows.set(known.windowId, {
+      this.#windows.set(key, {
         residentId: known.residentId,
         windowId: known.windowId,
         // 无事件的空窗回落到第 1 代（与 openWindow 一致）。
@@ -188,7 +203,10 @@ export class WindowHistoryHost implements MistWindowHistoryPort {
 
   openWindow(input: { residentId: string; windowId: string }): Result<WindowDescriptor> {
     if (this.#closed) return fail(writerUnavailable());
-    let window = this.#windows.get(input.windowId);
+    // 复合键查：`(B, w)` 与 `(A, w)` 是两扇不同的窗。命中只可能是本住户自己的窗，
+    // 绝不会返回别的住户同名窗的 descriptor（那会泄露对方的 residentId 与代际）。
+    const key = windowKeyOf(input.residentId, input.windowId);
+    let window = this.#windows.get(key);
     if (window === undefined) {
       if (!this.#store.has(input.residentId)) this.#store.createStream(input.residentId);
       // SessionRegistry 开一扇窗承载换气语义；windowId 用判卷给的显式值另账管理。
@@ -199,7 +217,7 @@ export class WindowHistoryHost implements MistWindowHistoryPort {
         generation: 1,
         archived: false,
       };
-      this.#windows.set(input.windowId, window);
+      this.#windows.set(key, window);
       this.#storage.ensureWindow(input);
     }
     return ok({
@@ -212,7 +230,8 @@ export class WindowHistoryHost implements MistWindowHistoryPort {
 
   async appendWindowEvent(input: AppendWindowEventInput): Promise<Result<AppendReceipt>> {
     if (this.#closed) return fail(writerUnavailable());
-    const window = this.#windows.get(input.windowId);
+    // 复合键查：只能写本住户自己的窗，写不到别的住户的同名窗（串房）。
+    const window = this.#windows.get(windowKeyOf(input.residentId, input.windowId));
     if (window === undefined) {
       return fail(
         structuredError("window-not-found", `no such window: ${input.windowId}`, input.windowId),
@@ -224,6 +243,22 @@ export class WindowHistoryHost implements MistWindowHistoryPort {
         structuredError(
           "stale-generation",
           `generation ${input.generation} is behind window generation ${window.generation}`,
+          input.windowId,
+        ),
+      );
+    }
+    // 未来/未开代际 fail-closed：写请求代际高于窗当前代际，说明这个
+    // `(windowId, generation)` 切片还不存在 —— 推进代际的唯一合法路径是
+    // rotateGeneration（换气），绝不能靠一次写就凭空跳代。若放行，#draftFor 会把这个
+    // 伪造代际逐字写进 provenance，重启后 #durableGenerationOf 取事件里最大代际当水位，
+    // 一次未来写就把窗永久顶到 99、正常当代写反被判成旧代。这个切片不存在，用
+    // window-not-found（(windowId, generation) 目标缺失，语义比 stale-generation 准；
+    // stale-generation 契约上专指旧代迟到写），fail-closed 不落流、不抬水位。
+    if (input.generation > window.generation) {
+      return fail(
+        structuredError(
+          "window-not-found",
+          `generation ${input.generation} is ahead of window generation ${window.generation}; advance via rotateGeneration, not by writing a future generation`,
           input.windowId,
         ),
       );
@@ -258,7 +293,8 @@ export class WindowHistoryHost implements MistWindowHistoryPort {
 
   rotateGeneration(input: { residentId: string; windowId: string }): Result<WindowDescriptor> {
     if (this.#closed) return fail(writerUnavailable());
-    const window = this.#windows.get(input.windowId);
+    // 复合键查：只能给本住户自己的窗换气。
+    const window = this.#windows.get(windowKeyOf(input.residentId, input.windowId));
     if (window === undefined) {
       return fail(
         structuredError("window-not-found", `no such window: ${input.windowId}`, input.windowId),
@@ -278,7 +314,8 @@ export class WindowHistoryHost implements MistWindowHistoryPort {
 
   archiveWindow(input: { residentId: string; windowId: string }): Result<WindowDescriptor> {
     if (this.#closed) return fail(writerUnavailable());
-    const window = this.#windows.get(input.windowId);
+    // 复合键查：只能归档本住户自己的窗。
+    const window = this.#windows.get(windowKeyOf(input.residentId, input.windowId));
     if (window === undefined) {
       return fail(
         structuredError("window-not-found", `no such window: ${input.windowId}`, input.windowId),
@@ -317,8 +354,10 @@ export class WindowHistoryHost implements MistWindowHistoryPort {
    * 与「读到是空」。窗的存在权威在格式记录 + 窗账；抹掉这两处，windowExists() 即转假。
    */
   deleteDurableWindowData(input: { residentId: string; windowId: string }): void {
+    // storage.forgetWindow 本就按复合键删；内存窗账也必须按复合键删，否则会误删
+    // 别的住户的同名窗（storage-format 侧安然无恙，内存账却把对方的窗抹了）。
     this.#storage.forgetWindow(input);
-    this.#windows.delete(input.windowId);
+    this.#windows.delete(windowKeyOf(input.residentId, input.windowId));
   }
 
   corruptDurableEntry(input: { residentId: string; windowId: string; streamSeq: number }): void {

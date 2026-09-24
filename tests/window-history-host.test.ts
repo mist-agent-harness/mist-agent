@@ -281,6 +281,231 @@ describe("WindowHistoryHost composition", () => {
   });
 });
 
+// P1-①（审核意见）：窗账按 `(residentId, windowId)` 复合键，跨住户同名窗是两扇不同的
+// 窗。壳共享魂私有；串房是本项目性质上最严重的事故。这些负向用例把洞钉死：住户 B 不得
+// 读到、开到、写到、换气到、归档到、删到住户 A 的同名窗。每个负向断言都配一个正向对照
+// （真主人能读/写/换气），确保不是空断言。
+describe("WindowHistoryHost cross-resident isolation (P1-①)", () => {
+  const SHARED = "shared-window";
+  // residentId 必须匹配 ^[a-z0-9-]+$（底座 store 的流文件名校验）。
+  const A = "res-a";
+  const B = "res-b";
+
+  async function seedTwoResidentSameWindow(): Promise<void> {
+    // A 拥有 shared-window 并写了两条；B 各自持有自己的流（写到自己的另一扇窗）。
+    await seedWindow(A, SHARED, 1, 2);
+    await seedWindow(B, "b-own", 1, 1);
+  }
+
+  it("B's read/summarize of A's window fail-closed with window-not-found (not an OK empty page, not A's events)", async () => {
+    await seedTwoResidentSameWindow();
+
+    // 负向：B 读/摘要 A 的同名窗 => window-not-found（不是 OK 空页，也不是 A 的事件）。
+    const bRef: WindowHistoryRef = { residentId: B, windowId: SHARED, generation: null };
+    const bRead = await host.read(bRef, FULL_PAGE);
+    const bSummarize = await host.summarize(bRef);
+    expect(bRead.ok).toBe(false);
+    if (!bRead.ok) expect(bRead.error.code).toBe("window-not-found");
+    expect(bSummarize.ok).toBe(false);
+    if (!bSummarize.ok) expect(bSummarize.error.code).toBe("window-not-found");
+
+    // 正向对照：A（真主人）能读到自己的两条。
+    const aRef: WindowHistoryRef = { residentId: A, windowId: SHARED, generation: null };
+    const aPage = unwrap(await host.read(aRef, FULL_PAGE));
+    expect(aPage.entries.map((entry) => entry.payload.mark)).toEqual([
+      `${SHARED}-0`,
+      `${SHARED}-1`,
+    ]);
+  });
+
+  it("B's openWindow(sameWindowId) returns B's own independent window, never A's residentId", async () => {
+    await seedTwoResidentSameWindow();
+
+    // 负向：B 开同名窗拿到的是 B 自己的独立窗（residentId=B、第 1 代、空），绝不是 A 的。
+    const bDescriptor = unwrap(host.openWindow({ residentId: B, windowId: SHARED }));
+    expect(bDescriptor.residentId).toBe(B);
+    expect(bDescriptor.windowId).toBe(SHARED);
+    expect(bDescriptor.generation).toBe(1);
+
+    // B 现在能读自己的 shared-window，且它是空的（没有 A 的事件）。
+    const bRef: WindowHistoryRef = { residentId: B, windowId: SHARED, generation: null };
+    const bPage = unwrap(await host.read(bRef, FULL_PAGE));
+    expect(bPage.entries).toHaveLength(0);
+
+    // 正向对照：A 的 shared-window 完好无损。
+    const aRef: WindowHistoryRef = { residentId: A, windowId: SHARED, generation: null };
+    const aPage = unwrap(await host.read(aRef, FULL_PAGE));
+    expect(aPage.entries.map((entry) => entry.payload.mark)).toEqual([
+      `${SHARED}-0`,
+      `${SHARED}-1`,
+    ]);
+  });
+
+  it("B cannot write/rotate/archive/delete A's window; A's window and history stay unchanged", async () => {
+    await seedTwoResidentSameWindow();
+    const aRef: WindowHistoryRef = { residentId: A, windowId: SHARED, generation: null };
+
+    // B 从未 openWindow(shared-window)：对 B 而言这扇窗不存在，全部写侧操作 fail-closed。
+    const bWrite = await host.appendWindowEvent({
+      residentId: B,
+      windowId: SHARED,
+      generation: 1,
+      idempotencyKey: "b-intrusion",
+      payload: { mark: "b-intrusion" },
+    });
+    expect(bWrite.ok).toBe(false);
+    if (!bWrite.ok) expect(bWrite.error.code).toBe("window-not-found");
+
+    const bRotate = host.rotateGeneration({ residentId: B, windowId: SHARED });
+    expect(bRotate.ok).toBe(false);
+    if (!bRotate.ok) expect(bRotate.error.code).toBe("window-not-found");
+
+    const bArchive = host.archiveWindow({ residentId: B, windowId: SHARED });
+    expect(bArchive.ok).toBe(false);
+    if (!bArchive.ok) expect(bArchive.error.code).toBe("window-not-found");
+
+    // B 删「A 的窗」：只应影响 (B, shared-window)（此刻不存在），绝不动 A 的窗。
+    host.deleteDurableWindowData({ residentId: B, windowId: SHARED });
+
+    // A 的窗与历史全程不变。
+    const aSummary = unwrap(await host.summarize(aRef));
+    expect(aSummary.blank).toBe(false);
+    const aPage = unwrap(await host.read(aRef, FULL_PAGE));
+    expect(aPage.entries.map((entry) => entry.payload.mark)).toEqual([
+      `${SHARED}-0`,
+      `${SHARED}-1`,
+    ]);
+
+    // 正向对照：A（真主人）能写自己的窗、能换气。
+    unwrap(
+      await host.appendWindowEvent({
+        residentId: A,
+        windowId: SHARED,
+        generation: 1,
+        idempotencyKey: "a-legit",
+        payload: { mark: "a-legit" },
+      }),
+    );
+    const rotated = unwrap(host.rotateGeneration({ residentId: A, windowId: SHARED }));
+    expect(rotated.generation).toBe(2);
+  });
+
+  it("composite ownership survives a cold restart: B still cannot read A's window", async () => {
+    await seedTwoResidentSameWindow();
+    await host.close();
+
+    // 冷启动：新宿主只凭落盘事实重建窗账，复合键归属必须存活。
+    const restarted = makeHost(join(root, "data"));
+    try {
+      const bRead = await restarted.read(
+        { residentId: B, windowId: SHARED, generation: null },
+        FULL_PAGE,
+      );
+      expect(bRead.ok).toBe(false);
+      if (!bRead.ok) expect(bRead.error.code).toBe("window-not-found");
+
+      // 正向对照：重启后 A 仍能读到自己的两条。
+      const aPage = unwrap(
+        await restarted.read({ residentId: A, windowId: SHARED, generation: null }, FULL_PAGE),
+      );
+      expect(aPage.entries.map((entry) => entry.payload.mark)).toEqual([
+        `${SHARED}-0`,
+        `${SHARED}-1`,
+      ]);
+    } finally {
+      await restarted.close();
+    }
+  });
+});
+
+// P1-②（审核意见）：写的代际必须**严格等于**窗当前代际。旧代 => stale-generation；
+// 未来/未开代际 => fail-closed（不入流、不抬重启水位）。推进代际的唯一合法路径是换气。
+describe("WindowHistoryHost future-generation writes (P1-②)", () => {
+  it("rejects a future-generation write fail-closed, absent from projection, without raising the restart watermark", async () => {
+    unwrap(host.openWindow({ residentId: "r", windowId: "w" }));
+    // 先写一条合法的当代（gen 1）事件作正向对照的底子。
+    unwrap(
+      await host.appendWindowEvent({
+        residentId: "r",
+        windowId: "w",
+        generation: 1,
+        idempotencyKey: "gen1-a",
+        payload: { mark: "gen1-a" },
+      }),
+    );
+
+    // 负向：窗在第 1 代，写 gen 99 未来代际必须 fail-closed，且不进流。
+    const future = await host.appendWindowEvent({
+      residentId: "r",
+      windowId: "w",
+      generation: 99,
+      idempotencyKey: "future",
+      payload: { mark: "future" },
+    });
+    expect(future.ok).toBe(false);
+    if (!future.ok) expect(future.error.code).toBe("window-not-found");
+
+    const ref: WindowHistoryRef = { residentId: "r", windowId: "w", generation: null };
+    const page = unwrap(await host.read(ref, FULL_PAGE));
+    expect(page.entries.map((entry) => entry.payload.mark)).not.toContain("future");
+    expect(page.entries.map((entry) => entry.payload.mark)).toEqual(["gen1-a"]);
+    // provenance 里也不该出现代际 99。
+    expect(page.entries.every((entry) => entry.generation === 1)).toBe(true);
+
+    // 冷启动：未来写没抬水位，重启后窗仍在第 1 代，正常 gen-1 写照样成功、不被判旧代。
+    // 用独立 eventId 前缀，避免与重启前落盘事件（event-1..）撞号。
+    await host.close();
+    let restartSeed = 0;
+    const restarted = new WindowHistoryHost({
+      dataDir: join(root, "data"),
+      writerId: "test-writer",
+      newEventId: () => {
+        restartSeed += 1;
+        return `restart-event-${restartSeed}`;
+      },
+    });
+    try {
+      const legit = await restarted.appendWindowEvent({
+        residentId: "r",
+        windowId: "w",
+        generation: 1,
+        idempotencyKey: "gen1-b",
+        payload: { mark: "gen1-b" },
+      });
+      expect(legit.ok).toBe(true);
+      const after = unwrap(await restarted.read(ref, FULL_PAGE));
+      expect(after.entries.map((entry) => entry.payload.mark)).toEqual(["gen1-a", "gen1-b"]);
+    } finally {
+      await restarted.close();
+    }
+  });
+
+  it("still advances legitimately via rotateGeneration, then accepts the new current generation", async () => {
+    // 正向对照：合法推进代际的唯一路径是换气；换气后当代写成功。
+    unwrap(host.openWindow({ residentId: "r", windowId: "w" }));
+    unwrap(host.rotateGeneration({ residentId: "r", windowId: "w" }));
+    const write = await host.appendWindowEvent({
+      residentId: "r",
+      windowId: "w",
+      generation: 2,
+      idempotencyKey: "gen2",
+      payload: { mark: "gen2" },
+    });
+    expect(write.ok).toBe(true);
+
+    // 换气到第 2 代后，写第 3 代（又一次未来）仍 fail-closed。
+    const future = await host.appendWindowEvent({
+      residentId: "r",
+      windowId: "w",
+      generation: 3,
+      idempotencyKey: "gen3",
+      payload: { mark: "gen3" },
+    });
+    expect(future.ok).toBe(false);
+    if (!future.ok) expect(future.error.code).toBe("window-not-found");
+  });
+});
+
 function snapshotShape(snapshot: {
   records: readonly { relativePath: string; byteHash: string; byteLength: number }[];
 }): string {
