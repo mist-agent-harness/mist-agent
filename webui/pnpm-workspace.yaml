@@ -15,6 +15,9 @@ linkWorkspacePackages: true
 overrides:
   '@deepseek-ai/cosmokit': 'link:vendor/cosmokit'
   '@deepseek-ai/schemastery': 'link:vendor/schemastery'
+  # CVE-2026-13149: only the 5.x line (minimatch 10) needs lifting; 2.1.2 is already patched
+  # and minimatch 9 default-imports brace-expansion, which 5.x no longer exports.
+  'brace-expansion@5': '^5.0.12'
 
 peerDependencyRules:
   allowedVersions:
