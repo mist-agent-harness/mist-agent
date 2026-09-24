@@ -58,6 +58,9 @@ type Fault =
   | "forget-on-restart"
   | "same-process-restart"
   | "ignore-pagination"
+  | "paginate-head-slice"
+  | "paginate-ignore-before-seq"
+  | "paginate-inclusive-before-seq"
   | "drop-payload-on-restart"
   // WH-02
   | "accept-stale-generation"
@@ -81,6 +84,7 @@ type Fault =
   | "silent-field-retirement"
   | "mixed-page-after-interrupt"
   | "unrecoverable-interrupt"
+  | "no-op-interrupt"
   | "migration-drops-entry";
 
 const RECORD_FILE = "window-stream.json";
@@ -389,7 +393,17 @@ class SyntheticWindowHistoryDriver implements WindowHistoryDriver {
   async appendWindowEventsConcurrently(
     inputs: readonly AppendWindowEventInput[],
   ): Promise<ReadonlyArray<Result<AppendReceipt>>> {
-    return Promise.all(inputs.map((input) => this.appendWindowEvent(input)));
+    // 底座串行发号，调用方不控制先后。合规驱动**故意反着发号**（后提交的先拿到
+    // 更小的 seq），以此当 WH-02「不写死提交顺序」的正对照：即便 wh02-a-2 拿到更
+    // 小的 seq，WH-02 仍须点绿。发号仍逐个串行，返回结果按原入参位置对齐。
+    const order = [...inputs.keys()].reverse();
+    const results: Array<Result<AppendReceipt>> = new Array(inputs.length);
+    for (const index of order) {
+      const input = inputs[index];
+      if (input === undefined) continue;
+      results[index] = await this.appendWindowEvent(input);
+    }
+    return results;
   }
 
   async rotateGeneration(input: {
@@ -550,7 +564,28 @@ class SyntheticWindowHistoryDriver implements WindowHistoryDriver {
 
     let selected = healthy;
     let hasMore = false;
-    if (this.fault !== "ignore-pagination") {
+    if (this.fault === "paginate-head-slice") {
+      // 错法 (a)：忽略 beforeSeq，从**头部**切 maxMessages 条（取 s0、s1 而非尾页）。
+      if (page.maxMessages !== null && selected.length > page.maxMessages) {
+        hasMore = true;
+        selected = selected.slice(0, page.maxMessages);
+      }
+    } else if (this.fault === "paginate-ignore-before-seq") {
+      // 错法 (b)：无视 beforeSeq，只对整窗取末尾 maxMessages 条（取 s3、s4）。
+      if (page.maxMessages !== null && selected.length > page.maxMessages) {
+        hasMore = true;
+        selected = selected.slice(-page.maxMessages);
+      }
+    } else if (this.fault === "paginate-inclusive-before-seq") {
+      // 错法 (c)：beforeSeq 用 <=（含界），过滤集变成 s0..s4，尾页取到 s3、s4。
+      if (page.beforeSeq !== null) {
+        selected = selected.filter((event) => event.streamSeq <= (page.beforeSeq ?? 0));
+      }
+      if (page.maxMessages !== null && selected.length > page.maxMessages) {
+        hasMore = true;
+        selected = selected.slice(-page.maxMessages);
+      }
+    } else if (this.fault !== "ignore-pagination") {
       if (page.beforeSeq !== null) {
         selected = selected.filter((event) => event.streamSeq < (page.beforeSeq ?? 0));
       }
@@ -699,6 +734,12 @@ class SyntheticWindowHistoryDriver implements WindowHistoryDriver {
     targetFormatVersion: number;
     fault: "host-killed" | "disk-full";
   }): Promise<void> {
+    if (this.fault === "no-op-interrupt") {
+      // 空转中断：既不杀宿主也不动任何状态，直接返回。宿主仍然活着、状态仍是
+      // 上一步回滚留下的干净原子 v1——WH-05 若不钉「中断确实发生」就会白送绿。
+      void input;
+      return;
+    }
     const record = this.mustRecord();
     const control = this.mustControl();
     copyFileSync(this.recordPath(), join(this.backupDir, RECORD_FILE));
@@ -750,6 +791,9 @@ const adversarialCases: ReadonlyArray<{ checkId: string; fault: Fault }> = [
   { checkId: "WH-01", fault: "forget-on-restart" },
   { checkId: "WH-01", fault: "same-process-restart" },
   { checkId: "WH-01", fault: "ignore-pagination" },
+  { checkId: "WH-01", fault: "paginate-head-slice" },
+  { checkId: "WH-01", fault: "paginate-ignore-before-seq" },
+  { checkId: "WH-01", fault: "paginate-inclusive-before-seq" },
   { checkId: "WH-01", fault: "drop-payload-on-restart" },
   { checkId: "WH-02", fault: "accept-stale-generation" },
   { checkId: "WH-02", fault: "backfill-rejected-write" },
@@ -770,6 +814,7 @@ const adversarialCases: ReadonlyArray<{ checkId: string; fault: Fault }> = [
   { checkId: "WH-05", fault: "silent-field-retirement" },
   { checkId: "WH-05", fault: "mixed-page-after-interrupt" },
   { checkId: "WH-05", fault: "unrecoverable-interrupt" },
+  { checkId: "WH-05", fault: "no-op-interrupt" },
   { checkId: "WH-05", fault: "migration-drops-entry" },
 ];
 

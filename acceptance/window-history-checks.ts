@@ -280,15 +280,42 @@ const wh01: WindowHistoryCheck = {
       fatal(`死前 payload 顺序不对：${marksOf(before).join(",")}`);
     }
 
+    // 分页语义按 window-history-driver.ts 的契约钉死，别只比条数：
+    //   beforeSeq = s4 → 过滤集是 s0..s3（严格 <）；maxMessages=2 → 取末尾两条 = s2、s3；
+    //   丢掉的头部 s0、s1 让 hasMore 为真。
+    // 用 seedWindow 发回的真实收据推出期望的 (streamSeq, eventId)，不假设发号值，
+    // 这样一个「取头两条」/「忽略 beforeSeq 只取末两条」/「beforeSeq 用 <=」的分页器都点不绿。
+    const s3 = requireAt(seeded.receipts, 3, "写入收据");
+    const s4 = requireAt(seeded.receipts, 4, "写入收据");
     const pagedRequest: WindowHistoryPageRequest = {
-      beforeSeq: requireAt(seeded.receipts, 4, "写入收据").streamSeq,
+      beforeSeq: s4.streamSeq,
       maxMessages: 2,
     };
+    const expectedPaged = [requireAt(seeded.receipts, 2, "写入收据"), s3];
+    const assertPagedExact = (page: WindowHistoryPage, when: string): void => {
+      if (page.entries.length !== 2) {
+        fatal(`${when}分页应回 2 条，实到 ${page.entries.length} 条——分页语义没生效`);
+      }
+      assertAscending(page, `${when}分页页`);
+      for (const [index, receipt] of expectedPaged.entries()) {
+        const entry = requireAt(page.entries, index, `${when}分页页`);
+        if (entry.streamSeq !== receipt.streamSeq) {
+          fatal(
+            `${when}分页第 ${index + 1} 条 streamSeq 不对：期望 ${receipt.streamSeq}（尾页 s2、s3），实到 ${entry.streamSeq}——${page.entries
+              .map((candidate) => candidate.streamSeq)
+              .join(",")}`,
+          );
+        }
+        if (entry.eventId !== receipt.eventId) {
+          fatal(
+            `${when}分页第 ${index + 1} 条 eventId 不对：期望 ${receipt.eventId}，实到 ${entry.eventId}——分页取错了条目`,
+          );
+        }
+      }
+      if (!page.hasMore) fatal(`${when}分页丢了头部条目 s0、s1 却没报 hasMore`);
+    };
     const pagedBefore = expectOk(await driver.read(seeded.ref, pagedRequest), "死前分页读");
-    if (pagedBefore.entries.length !== 2) {
-      fatal(`死前分页应回 2 条，实到 ${pagedBefore.entries.length} 条——分页语义没生效`);
-    }
-    if (!pagedBefore.hasMore) fatal("死前分页丢了头部条目却没报 hasMore");
+    assertPagedExact(pagedBefore, "死前");
     const summaryBefore = expectOk(await driver.summarize(seeded.ref), "死前 summarize");
     if (summaryBefore.blank) fatal("写过 5 条的窗被 summarize 报成 blank");
 
@@ -315,6 +342,8 @@ const wh01: WindowHistoryCheck = {
     assertAscending(after, "重启后整窗页");
 
     const pagedAfter = expectOk(await driver.read(seeded.ref, pagedRequest), "重启后分页读");
+    // 重启后不仅结构要一致，取回的还必须逐条是同一批 (streamSeq、eventId) = s2、s3。
+    assertPagedExact(pagedAfter, "重启后");
     if (pageShape(pagedAfter) !== pageShape(pagedBefore)) {
       fatal(
         `分页语义重启前后不一致：\n  前 ${pageShape(pagedBefore)}\n  后 ${pageShape(pagedAfter)}`,
@@ -329,7 +358,7 @@ const wh01: WindowHistoryCheck = {
     }
 
     return pass(
-      `5 条事件跨真实进程重启（pid ${first.pid}→${second.pid}，落盘 ${bytesBefore} 字节）逐项等价，分页语义前后一致`,
+      `5 条事件跨真实进程重启（pid ${first.pid}→${second.pid}，落盘 ${bytesBefore} 字节）逐项等价；分页 beforeSeq=s4/maxMessages=2 前后都精确取到尾页 s2、s3 且报 hasMore`,
     );
   }),
 };
@@ -381,9 +410,21 @@ const wh02: WindowHistoryCheck = {
     if (new Set(seqs).size !== seqs.length) {
       fatal(`底座给同一窗的两个并发写发了重号：${seqs.join(",")}`);
     }
-    const issuedOrder = [...issued]
-      .sort((left, right) => left.streamSeq - right.streamSeq)
-      .map((receipt) => receipt.eventId);
+    // 并发写由底座串行发号，调用方不控制也不排序谁先谁后——所以「哪条并发写拿到
+    // 更小的 seq」是底座的合法自由，不能钉成提交顺序。真正的不变量是：
+    //   ① projection 复读顺序 == store 发号顺序（按 seq 升序的 eventId 序列）；
+    //   ② 窗隔离用集合相等判，不用序列相等。
+    // 期望值全部由收据推出，不写死 wh02-a-1 在前。
+    const sortedIssued = [...issued].sort((left, right) => left.streamSeq - right.streamSeq);
+    const issuedOrder = sortedIssued.map((receipt) => receipt.eventId);
+    const concurrentMarksInIssueOrder = sortedIssued.map((receipt) => {
+      const eventIdToMark = new Map<string, string>([
+        [issued[0]?.eventId ?? "", "wh02-a-1"],
+        [issued[1]?.eventId ?? "", "wh02-a-2"],
+      ]);
+      return eventIdToMark.get(receipt.eventId) ?? `<未知 eventId:${receipt.eventId}>`;
+    });
+    const concurrentMarkSet = new Set(["wh02-a-1", "wh02-a-2"]);
 
     const pageA1 = expectOk(await driver.read(refA, FULL_PAGE), "并发后读窗 A");
     if (pageA1.entries.length !== 2) {
@@ -396,6 +437,11 @@ const wh02: WindowHistoryCheck = {
           .join(",")}`,
       );
     }
+    if (
+      stableJson([...new Set(marksOf(pageA1))].sort()) !== stableJson([...concurrentMarkSet].sort())
+    ) {
+      fatal(`窗 A 并发后不是恰好 {wh02-a-1, wh02-a-2} 这两条：${marksOf(pageA1).join(",")}`);
+    }
 
     expectOk(
       await driver.appendWindowEvent({
@@ -407,14 +453,22 @@ const wh02: WindowHistoryCheck = {
       }),
       "写窗 B",
     );
+    // 窗隔离用集合相等：窗 B 恰好 {wh02-b-1} 且不含 A 的 mark；窗 A 恰好 {wh02-a-1,
+    // wh02-a-2} 且不含 wh02-b-1。顺序在这里无关（并发写顺序由底座定）。
     const pageB = expectOk(await driver.read(refB, FULL_PAGE), "读窗 B");
-    if (stableJson(marksOf(pageB)) !== stableJson(["wh02-b-1"])) {
-      fatal(`窗 B 串进了别的窗的事件：${marksOf(pageB).join(",")}`);
+    const marksB = marksOf(pageB);
+    if (stableJson([...new Set(marksB)].sort()) !== stableJson(["wh02-b-1"])) {
+      fatal(`窗 B 不是恰好 {wh02-b-1}：${marksB.join(",")}`);
+    }
+    for (const mark of marksB) {
+      if (concurrentMarkSet.has(mark)) fatal(`窗 A 的事件 ${mark} 串进了窗 B`);
     }
     const pageA2 = expectOk(await driver.read(refA, FULL_PAGE), "写过 B 之后再读窗 A");
-    if (stableJson(marksOf(pageA2)) !== stableJson(["wh02-a-1", "wh02-a-2"])) {
-      fatal(`窗 A 串进了窗 B 的事件：${marksOf(pageA2).join(",")}`);
+    const marksA2 = marksOf(pageA2);
+    if (stableJson([...new Set(marksA2)].sort()) !== stableJson([...concurrentMarkSet].sort())) {
+      fatal(`窗 A 不是恰好 {wh02-a-1, wh02-a-2}：${marksA2.join(",")}`);
     }
+    if (marksA2.includes("wh02-b-1")) fatal("窗 B 的事件 wh02-b-1 串进了窗 A");
 
     const writerBefore = expectOk(await driver.writerIdentity(), "换气前读 writer 身份");
     const rotated = expectOk(
@@ -482,10 +536,15 @@ const wh02: WindowHistoryCheck = {
     if (marks.includes("wh02-a-rewritten")) {
       fatal("被拒的幂等冲突内容出现在 projection 里：投影被静默改写了");
     }
-    if (stableJson(marks) !== stableJson(["wh02-a-1", "wh02-a-2", "wh02-a-fresh"])) {
-      fatal(`窗 A 的最终流水不是「两条并发 + 一条新代」：${marks.join(",")}`);
+    // 最终页 = 两条并发（按 store 发号顺序，不写死提交顺序）+ 一条新代 wh02-a-fresh。
+    const expectedFinalMarks = [...concurrentMarksInIssueOrder, "wh02-a-fresh"];
+    if (stableJson(marks) !== stableJson(expectedFinalMarks)) {
+      fatal(
+        `窗 A 的最终流水不是「两条并发（发号序 ${concurrentMarksInIssueOrder.join(",")}）+ 一条新代」：${marks.join(",")}`,
+      );
     }
     assertAscending(pageA3, "冲突写之后的窗 A 页");
+    // 已落地的并发两条不许在后续写入后被重排或改写：拿 pageA1（发号序）当前缀比。
     for (const [index, expected] of pageFingerprints(pageA1).entries()) {
       if (requireAt(pageFingerprints(pageA3), index, "窗 A 最终页") !== expected) {
         fatal(`已落地的第 ${index + 1} 条在冲突写之后被重排或改写了`);
@@ -810,10 +869,43 @@ const wh05: WindowHistoryCheck = {
     assertSameEntries(v1Page, rolledBackPage, "回滚前后的 port 读数");
 
     // —— 迁移中断态单判 ——
+    // 前置事实：此刻存储已回滚回一个原子 v1（status=rolled-back，formatVersion=1）。
+    // 若 interruptMigration 是空转（既不杀宿主也不动状态），后面的「原子」分支会被
+    // 这个既存的干净 v1 白送点绿。所以先钉死「中断确实发生并被持久化」，再进
+    // 原子/可识别分支。
+    const preInterruptState = await driver.migrationState();
     await driver.interruptMigration({ targetFormatVersion: 2, fault: "host-killed" });
+
+    // 契约：interruptMigration 返回时宿主已经死了。空转的实现不会真的杀宿主，
+    // 于是唯一写方仍然可用——用它当反证据把空转打红。
+    const writerWhileDown = await driver.writerIdentity();
+    if (writerWhileDown.ok) {
+      fatal(
+        "interruptMigration 返回后宿主还活着（writerIdentity 仍可用）：中断根本没发生，是个空转",
+      );
+    }
+
     await bootHost(driver, "迁移被打断后重启的宿主");
     const interruptedState = await driver.migrationState();
     const interruptedRead = await driver.read(ref, FULL_PAGE);
+
+    // 中断必须在重启后的状态里留下「v1→v2 迁移确实被发起过」的证据，而不是
+    // 原封不动的前置态。可识别未完成态本身就是证据；原子分支则要求相对前置态
+    // 有可观察的推进（formatVersion 曾到过 target 或状态从 rolled-back 变成别的）。
+    const attempted =
+      interruptedState.status === "incomplete" ||
+      interruptedState.status === "complete" ||
+      interruptedState.formatVersion === 2 ||
+      interruptedState.status !== preInterruptState.status ||
+      interruptedState.formatVersion !== preInterruptState.formatVersion;
+    if (!attempted) {
+      fatal(
+        `中断后 migrationState 与中断前逐字段相同（${stableJson({
+          status: interruptedState.status,
+          formatVersion: interruptedState.formatVersion,
+        })}）：没有任何证据表明 v1→v2 迁移被真正发起过，这是空转中断被当成「原子」白送绿`,
+      );
+    }
 
     const recognizable =
       interruptedState.status === "incomplete" &&
