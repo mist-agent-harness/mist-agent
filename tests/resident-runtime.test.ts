@@ -213,6 +213,8 @@ describe("住户运行时循环（RT-01 / RT-02）", () => {
     const broken: ModelTransport = {
       async *complete(request: ModelCompletionRequest): AsyncIterable<string> {
         void request;
+        // useYield 要求生成器里有 yield：吐一个空增量后断流，语义同「上游跑了半截」。
+        yield "";
         throw new Error("上游断了");
       },
     };
