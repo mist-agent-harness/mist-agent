@@ -306,6 +306,19 @@ export interface ResidentRuntimeDriver {
   /** 猝死：没来得及写信就杀。用于判「原始流水不自动进继任者上下文」。 */
   suddenDeath(input: { residentId: string }): Promise<void>;
 
+  /**
+   * 按 `(residentId, generation)` 读某一代的**原始流水归档**（只读）。
+   *
+   * D8 三是双面判据：猝死那代的原始流水**不自动进**继任者上下文，但也**不许无声消失**——
+   * 它进归档、按代可查。只断言「不在继任者上下文」而不验归档可查，等于允许把那代直接
+   * 抹掉（丢史）。这个只读入口让「可查」这一面成为机器可核事实。查不到就 fail-closed，
+   * 不拿空快照冒充「这代没有流水」。
+   */
+  archivedTranscript(input: {
+    residentId: string;
+    generation: number;
+  }): Promise<Result<StreamSnapshot>>;
+
   // —— TUI ——
   tuiTranscript(input: {
     residentId: string;

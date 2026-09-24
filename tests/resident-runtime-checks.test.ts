@@ -112,6 +112,14 @@ interface Faults {
   secretLeaksIntoStream: boolean;
   /** 检索根里多一份 `buildBootPack` 定义（pi 扩展另起副本，#200 审读第 2 条假绿）。 */
   secondBootPackDefinition: boolean;
+  /** 代际原点写成 0（现役栈是 1 起点）——#200 技术门第 1 条。 */
+  generationZeroOrigin: boolean;
+  /** 窗改线的锁在回合起之前就合上（比现役 turn-gate 严）——#200 技术门第 2 条。 */
+  windowRefusesBeforeTurn: boolean;
+  /** suddenDeath 是空操作：不换继任者——#200 技术门第 3 条。 */
+  suddenDeathNoSuccessor: boolean;
+  /** suddenDeath 把那代原始流水直接丢了，归档查不到——#200 技术门第 3 条正面。 */
+  suddenDeathDropsArchive: boolean;
 }
 
 const NO_FAULTS: Faults = {
@@ -146,6 +154,10 @@ const NO_FAULTS: Faults = {
   scannerAlwaysEmpty: false,
   secretLeaksIntoStream: false,
   secondBootPackDefinition: false,
+  generationZeroOrigin: false,
+  windowRefusesBeforeTurn: false,
+  suddenDeathNoSuccessor: false,
+  suddenDeathDropsArchive: false,
 };
 
 interface SynthCredential {
@@ -162,6 +174,10 @@ interface SynthResident {
   letters: LetterView[];
   credential: SynthCredential | null;
   generation: number;
+  /** 当代是否已经起过回合（起了之后窗才无权给自己改线，对齐现役 turn-gate）。 */
+  turnStarted: boolean;
+  /** 按代归档的原始流水：换代/猝死时把当代流水封存进来，供 archivedTranscript 按代查。 */
+  archive: Map<number, StreamEventView[]>;
   windowId: string;
   windowOpen: boolean;
   /** 当前这一代生效的触发线（开工时定死）。 */
@@ -315,6 +331,11 @@ class SyntheticDriver implements ResidentRuntimeDriver {
 
     this.#append(input.residentId, "user", input.text);
     resident.tokensSinceBreath += TOKENS_PER_SAY;
+    // 回合已起：从这一刻起窗无权给自己改线（对齐现役 turn-gate 的 beforeTurn 锁点）。
+    resident.turnStarted = true;
+
+    // 回复落在的那一代（换代发生在这句之后：D8 补记一，撞线回合先跑完，信在其后）。
+    const generationOfReply = resident.generation;
 
     const crossed =
       !this.faults.thresholdNotEnforced &&
@@ -332,7 +353,9 @@ class SyntheticDriver implements ResidentRuntimeDriver {
     return ok({
       residentId: resident.effectiveId ?? input.residentId,
       model: resident.channel?.model ?? "model-alpha",
-      generation: resident.generation,
+      // 正确实现报「回复落在的那一代」；generationZeroOrigin 故障把它整体减 1，
+      // 模拟一个 0 起点/差一错的驱动——判卷的 1 起点断言应当把它判红。
+      generation: this.faults.generationZeroOrigin ? generationOfReply - 1 : generationOfReply,
       reply,
       streamed: true,
     });
@@ -380,6 +403,20 @@ class SyntheticDriver implements ResidentRuntimeDriver {
     authority: "window" | "owner";
   }): Promise<Result<void>> {
     const resident = this.#ensure(input.residentId);
+    // windowRefusesBeforeTurn 故障：把锁点提前到「回合起之前」——开工阶段窗自己配线就被拒。
+    // 这比现役 turn-gate 严（现役只在 beforeTurn 之后锁），会误伤正确实现（#200 技术门第 2 条）。
+    if (
+      input.authority === "window" &&
+      this.faults.windowRefusesBeforeTurn &&
+      !resident.turnStarted
+    ) {
+      return err(
+        "breath-refused",
+        "（故障）回合还没起就拒了窗改线",
+        "这是比现役 turn-gate 更严的错误行为",
+        input.residentId,
+      );
+    }
     if (!resident.windowOpen) {
       resident.windowOpen = true;
       resident.windowId = input.windowId;
@@ -387,14 +424,28 @@ class SyntheticDriver implements ResidentRuntimeDriver {
       resident.pendingThreshold = null;
       return ok(undefined);
     }
-    if (input.authority === "window" && !this.faults.windowCanRetune) {
-      return err(
-        "breath-refused",
-        "运行中的窗无权改自己的触发线",
-        "要改成员配置请从主人侧发起，改动从下一代生效",
-        input.residentId,
-      );
+    if (input.authority === "window") {
+      // 现役 turn-gate：窗无权给自己续命的锁在**回合起了之后**才合上（beforeTurn / MV-D02：
+      // 开工 configure 成功、先 say、再改才 CONFIG_INVALID）。所以回合未起时窗改线应当被
+      // 接受（当代生效）；回合已起才 fail-closed。
+      //   windowRefusesBeforeTurn 故障：回合未起就拒——比现役严，判卷该判红。
+      //   windowCanRetune 故障：回合已起还放行——D8 给自己续命，判卷该判红。
+      const turnStarted = resident.turnStarted;
+      const shouldRefuse = this.faults.windowRefusesBeforeTurn ? true : turnStarted;
+      if (shouldRefuse && !this.faults.windowCanRetune) {
+        return err(
+          "breath-refused",
+          "运行中的窗无权改自己的触发线",
+          "要改成员配置请从主人侧发起，改动从下一代生效",
+          input.residentId,
+        );
+      }
+      // 回合未起、窗自己改线：当代即可生效（不是续命，是开工阶段的配置）。
+      resident.threshold = input.thresholdTokens;
+      resident.pendingThreshold = null;
+      return ok(undefined);
     }
+    // authority === "owner"：主人改成员配置，从下一代生效（除非故障当刻生效）。
     if (this.faults.ownerRetuneAppliesImmediately) {
       resident.threshold = input.thresholdTokens;
     } else {
@@ -424,6 +475,16 @@ class SyntheticDriver implements ResidentRuntimeDriver {
 
   async suddenDeath(input: { residentId: string }): Promise<void> {
     const resident = this.#ensure(input.residentId);
+    const dead = resident.generation;
+    // 猝死那代没来得及写信，但原始流水不许无声消失：封存进归档，按代可查（D8 三正面）。
+    // suddenDeathDropsArchive 故障把这一步跳过——判卷的归档可查断言应当把它判红。
+    if (!this.faults.suddenDeathDropsArchive) {
+      resident.archive.set(
+        dead,
+        resident.events.map((event) => ({ ...event })),
+      );
+    }
+    // 故障：把猝死那代的原始流水塞进继任者的记忆（D8 三反面，判卷该判红）。
     if (this.faults.suddenDeathCarriesStream) {
       resident.memories.push({
         id: `mem-${resident.memories.length}`,
@@ -431,6 +492,36 @@ class SyntheticDriver implements ResidentRuntimeDriver {
         supersededBy: null,
       });
     }
+    // 真的换继任者：代际 +1、当代流水清空（原始流水不自动进继任者上下文）。
+    // suddenDeathNoSuccessor 故障跳过换代——判卷的「继任者代际必须更高」应当把它判红。
+    if (!this.faults.suddenDeathNoSuccessor) {
+      resident.generation = dead + 1;
+      resident.turnStarted = false;
+      resident.tokensSinceBreath = 0;
+      resident.events = [];
+    }
+  }
+
+  async archivedTranscript(input: {
+    residentId: string;
+    generation: number;
+  }): Promise<Result<StreamSnapshot>> {
+    const resident = this.#ensure(input.residentId);
+    const archived = resident.archive.get(input.generation);
+    if (archived === undefined) {
+      // 归档里查不到这代流水，用 stream-not-found（契约里「这条流不存在，区别于流是空的」），
+      // fail-closed，不拿空快照冒充「这代没有流水」。
+      return err(
+        "stream-not-found",
+        `第 ${input.generation} 代没有归档流水`,
+        "只有换过代或猝死封存过的代际才查得到",
+        input.residentId,
+      );
+    }
+    return ok({
+      residentId: input.residentId,
+      events: archived.map((event) => ({ ...event })),
+    });
   }
 
   async tuiTranscript(input: {
@@ -551,7 +642,10 @@ class SyntheticDriver implements ResidentRuntimeDriver {
       commitments: [],
       letters: [],
       credential: null,
-      generation: 0,
+      // 代际 1 起点：对齐现役 SessionRegistry.open（第一代 (last ?? 0)+1）。
+      generation: 1,
+      turnStarted: false,
+      archive: new Map(),
       windowId: `window-${residentId}`,
       windowOpen: false,
       threshold: null,
@@ -629,7 +723,13 @@ class SyntheticDriver implements ResidentRuntimeDriver {
     const from = resident.generation;
     const letter = this.#sealFor(resident, residentId);
     resident.letters.push(letter);
+    // 封存这一代的原始流水进归档（换代不丢史），再开新一代。
+    resident.archive.set(
+      from,
+      resident.events.map((event) => ({ ...event })),
+    );
     resident.generation = from + 1;
+    resident.turnStarted = false;
     resident.tokensSinceBreath = 0;
     // 主人改的线从这一代开始生效。
     if (resident.pendingThreshold !== null) {
@@ -791,9 +891,35 @@ describe("判卷反对照：改坏必须变红", () => {
 
   // —— RT-03 ——
 
-  it("窗开工后还能给自己改线 → RT-03 红（D8 给自己续命）", async () => {
+  it("回合已起后窗还能给自己改线 → RT-03 红（D8 给自己续命）", async () => {
     driver.faults.windowCanRetune = true;
     expect(lampById(await runAllLamps(driver), "RT-03").passed).toBe(false);
+  });
+
+  // —— #200 技术门（复审 ca2ec60）三条 oracle 洞，各钉一个方向 ——
+
+  it("代际写成 0 起点 / 差一 → RT-03 红（#200 技术门第 1 条）", async () => {
+    driver.faults.generationZeroOrigin = true;
+    const lamp = lampById(await runAllLamps(driver), "RT-03");
+    expect(lamp.passed, lamp.detail).toBe(false);
+  });
+
+  it("窗改线的锁在回合起之前就合上 → RT-03 红（#200 技术门第 2 条：比现役 turn-gate 严，误伤正确实现）", async () => {
+    driver.faults.windowRefusesBeforeTurn = true;
+    const lamp = lampById(await runAllLamps(driver), "RT-03");
+    expect(lamp.passed, lamp.detail).toBe(false);
+  });
+
+  it("suddenDeath 是空操作、不换继任者 → RT-03 红（#200 技术门第 3 条）", async () => {
+    driver.faults.suddenDeathNoSuccessor = true;
+    const lamp = lampById(await runAllLamps(driver), "RT-03");
+    expect(lamp.passed, lamp.detail).toBe(false);
+  });
+
+  it("suddenDeath 把那代原始流水直接丢了、归档查不到 → RT-03 红（#200 技术门第 3 条正面：丢史）", async () => {
+    driver.faults.suddenDeathDropsArchive = true;
+    const lamp = lampById(await runAllLamps(driver), "RT-03");
+    expect(lamp.passed, lamp.detail).toBe(false);
   });
 
   it("主人改线当刻生效 → RT-03 红（应当从下一代生效）", async () => {

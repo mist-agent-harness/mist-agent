@@ -400,6 +400,7 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
       "bootPack",
       "readStream",
       "suddenDeath",
+      "archivedTranscript",
     ],
     async run(driver) {
       const RESIDENT = residentFor("RT-03");
@@ -411,37 +412,121 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
       });
       if (!provisioned.ok) fatal(`配通道失败：${provisioned.error.code}`);
 
-      // —— 正对照：触发线是开工时真的设得进去的 ——
+      // 代际是 1 起点：现役栈 SessionRegistry.open 的第一代是 (last ?? 0)+1 = 1，
+      // journal 拒 generation < 1，formatAuthor 是 `${id}#${generation}`。判卷按这套
+      // 1 起点算，任何接真实栈的正确实现才不会被判红（#200 技术门第 1 条）。
+      const OPEN_GENERATION = 1;
+
+      // —— 子判卷 A：触发线真的被 say 执行（另起一个住户，隔离于主流程） ——
+      // 线设成 1：任何一句 say（token 数 ≥ 1）都必须到线、自动换代。这判死两件事：
+      //   · say 根本不看触发线、永不换代（thresholdNotEnforced 故障）；
+      //   · 主人改的线当刻就生效而不是从下一代（ownerRetuneAppliesImmediately 故障）——
+      //     主人把线从「够高」压到 1，若当刻生效则这句就到线换代（错），从下一代生效才对。
+      const CROSSER = residentFor("RT-03-crosser");
+      const CROSSER_WINDOW = windowFor("RT-03-crosser");
+      const crosserChannel = await driver.provisionChannel({
+        residentId: CROSSER,
+        channel: CHANNEL_A,
+        canarySecret: CANARY_SECRET,
+      });
+      if (!crosserChannel.ok) fatal(`配通道失败：${crosserChannel.error.code}`);
+      // 开工线设得够高：主人随后压低，用来判「当刻不生效、下一代才生效」。
+      const crosserOpen = await driver.setBreathThreshold({
+        residentId: CROSSER,
+        windowId: CROSSER_WINDOW,
+        generation: OPEN_GENERATION,
+        thresholdTokens: Number.MAX_SAFE_INTEGER,
+        authority: "window",
+      });
+      if (!crosserOpen.ok) fatal(`crosser 开工设线被拒：${crosserOpen.error.code}`);
+      const ownerLower = await driver.setBreathThreshold({
+        residentId: CROSSER,
+        windowId: CROSSER_WINDOW,
+        generation: OPEN_GENERATION,
+        thresholdTokens: 1,
+        authority: "owner",
+      });
+      if (!ownerLower.ok) fatal(`crosser 主人压低线被拒：${ownerLower.error.code}`);
+      // 主人压低的线从下一代才生效：这一句仍按开工的高线走，不到线、不换代。
+      // 用「时间线里还没有信」判——若主人的低线当刻就生效，这句会到线换代、落下一封信。
+      const crosserFirst = await driver.say({
+        residentId: CROSSER,
+        text: markerFor("RT-03", "c1"),
+      });
+      if (!crosserFirst.ok) fatal(`crosser say 失败：${crosserFirst.error.code}`);
+      const afterFirst = await driver.letterTimeline({ residentId: CROSSER });
+      if (!afterFirst.ok) fatal(`读 crosser 时间线失败：${afterFirst.error.code}`);
+      expect(
+        afterFirst.value.letters.length === 0,
+        `主人压低的线当刻就生效了（这句已落下 ${afterFirst.value.letters.length} 封信换了代）——应从下一代才生效`,
+      );
+      // 用显式 breathe 进到下一代，让主人那条低线（=1）生效。
+      const crosserBreathe = await driver.breathe({ residentId: CROSSER, via: "new" });
+      if (!crosserBreathe.ok) fatal(`crosser 换气失败：${crosserBreathe.error.code}`);
+      // 现在低线（1）已生效：下一句 say 必须到线、自动再换一代。判死 thresholdNotEnforced。
+      const crosserSecond = await driver.say({
+        residentId: CROSSER,
+        text: markerFor("RT-03", "c2"),
+      });
+      if (!crosserSecond.ok) fatal(`crosser say 失败：${crosserSecond.error.code}`);
+      const crosserTimeline = await driver.letterTimeline({ residentId: CROSSER });
+      if (!crosserTimeline.ok) fatal(`读 crosser 时间线失败：${crosserTimeline.error.code}`);
+      expect(
+        crosserTimeline.value.letters.length >= 2,
+        `低线生效后 say 没有到线换代（时间线只有 ${crosserTimeline.value.letters.length} 封信）——say 不看触发线`,
+      );
+
+      // 开工阈值设成够高，单句 say 到不了线：这样第一句只起回合、不自动换代，正好用来判
+      // 「回合已起后窗无权改自己的线」。代际的确定性推进用 D8 的显式入口 breathe()，
+      // 不靠猜驱动的每句 token 数（那是驱动内部实现，判卷不该耦合）。
+      const OPEN_THRESHOLD = Number.MAX_SAFE_INTEGER;
+
+      // —— 正对照：触发线是开工时（第一代、尚未起回合）窗自己真的设得进去的 ——
       const opened = await driver.setBreathThreshold({
         residentId: RESIDENT,
         windowId: WINDOW,
-        generation: 0,
-        thresholdTokens: 1,
+        generation: OPEN_GENERATION,
+        thresholdTokens: OPEN_THRESHOLD,
         authority: "window",
       });
       if (!opened.ok) fatal(`开工设阈值被拒：${opened.error.code} ${opened.error.message}`);
 
-      // —— 窗改不了自己的线（D8 明文禁的「给自己续命」） ——
+      // —— 第一句：起了回合但没到线（不换代） ——
+      const firstSay = await driver.say({
+        residentId: RESIDENT,
+        text: markerFor("RT-03", "warmup"),
+      });
+      if (!firstSay.ok) fatal(`say 失败：${firstSay.error.code}`);
+      expect(
+        firstSay.value.generation === OPEN_GENERATION,
+        `第一句的代际是 ${firstSay.value.generation}，应为 ${OPEN_GENERATION}——线设得够高，这句不该到线换代`,
+      );
+
+      // —— 窗改不了自己的线：D8 禁的是「运行中的窗给自己续命」。现役 turn-gate 的锁在
+      // 回合起了之后才合上（#markTurnStarted 在 beforeTurn；MV-D02 宿主测试是开工
+      // configure 成功、先 say、再改才 CONFIG_INVALID）。所以这条拒绝断言放在第一句
+      // **之后**——放在起回合之前会把「开工阶段窗还能配线」的正确实现判红（#200 技术门
+      // 第 2 条）。——
       const rethreshold = await driver.setBreathThreshold({
         residentId: RESIDENT,
         windowId: WINDOW,
-        generation: 0,
-        thresholdTokens: 1_000_000,
+        generation: firstSay.value.generation,
+        thresholdTokens: 1_000,
         authority: "window",
       });
-      expect(!rethreshold.ok, "窗开工后还能给自己改触发线——D8 明文禁止「给自己续命」");
-      if (rethreshold.ok) fatal("窗开工后还能给自己改触发线");
+      expect(!rethreshold.ok, "回合已起，窗还能给自己改触发线——D8 禁止运行中的窗给自己续命");
+      if (rethreshold.ok) fatal("回合已起，窗还能给自己改触发线");
       expect(
         rethreshold.error.code === "breath-refused",
-        `临线改阈值应报 breath-refused，实得 ${rethreshold.error.code}`,
+        `运行中的窗改阈值应报 breath-refused，实得 ${rethreshold.error.code}`,
       );
 
-      // —— 主人能改成员配置；D8 禁的是窗给自己续命，不是主人不能改 ——
+      // —— 主人能改成员配置；D8 禁的是窗给自己续命，不是主人不能改（从下一代生效）。 ——
       const ownerRetune = await driver.setBreathThreshold({
         residentId: RESIDENT,
         windowId: WINDOW,
-        generation: 0,
-        thresholdTokens: 1_000_000,
+        generation: firstSay.value.generation,
+        thresholdTokens: 1_000_000_000,
         authority: "owner",
       });
       if (!ownerRetune.ok) {
@@ -450,12 +535,13 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
         );
       }
 
-      // —— 到线换代：当前这一代仍按开工时那条线走 ——
-      const said = await driver.say({ residentId: RESIDENT, text: markerFor("RT-03", "cross") });
-      if (!said.ok) fatal(`say 失败：${said.error.code}`);
+      // —— 换代走 D8 的显式入口：第一代亲笔写信 → 换到第二代。回执报换代前那代（补记一）。 ——
+      const crossed = await driver.breathe({ residentId: RESIDENT, via: "new" });
+      if (!crossed.ok) fatal(`换气失败：${crossed.error.code} ${crossed.error.message}`);
       expect(
-        said.value.generation === 1,
-        `主人改线后这一代的代际是 ${said.value.generation}，应为 1——主人的改动从下一代生效，不给当前这一代续命`,
+        crossed.value.fromGeneration === OPEN_GENERATION &&
+          crossed.value.toGeneration === OPEN_GENERATION + 1,
+        `换代增量是 ${crossed.value.fromGeneration}→${crossed.value.toGeneration}，应为 ${OPEN_GENERATION}→${OPEN_GENERATION + 1}`,
       );
 
       const timeline = await driver.letterTimeline({ residentId: RESIDENT });
@@ -468,8 +554,8 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
       if (firstLetter === undefined) fatal("时间线里没有信");
       assertLetterWellFormed(firstLetter, "第一封");
       expect(
-        firstLetter.author === `${RESIDENT}#0`,
-        `第一封信签名是 ${firstLetter.author}——应为 ${RESIDENT}#0（写下这封信的是换代前那代）`,
+        firstLetter.author === `${RESIDENT}#${OPEN_GENERATION}`,
+        `第一封信签名是 ${firstLetter.author}——应为 ${RESIDENT}#${OPEN_GENERATION}（写下这封信的是换代前那代）`,
       );
 
       // —— 新一代读得到交接信：醒来即已读，注入的是原件不是转抄 ——
@@ -493,9 +579,12 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
         text: markerFor("RT-03", "nextgen"),
       });
       if (!nextGen.ok) fatal(`say 失败：${nextGen.error.code}`);
+      // 触发那句 say 到线换了一代（OPEN_GENERATION → +1），所以新一代是 OPEN_GENERATION+1；
+      // 且主人的线（1_000_000）已在这一代生效，这句不再自动换气，代际停在 +1。
+      const nextGeneration = OPEN_GENERATION + 1;
       expect(
-        nextGen.value.generation === 1,
-        `新一代代际是 ${nextGen.value.generation}，应为 1——主人改的线没在新一代生效`,
+        nextGen.value.generation === nextGeneration,
+        `新一代代际是 ${nextGen.value.generation}，应为 ${nextGeneration}——主人改的线没在新一代生效（否则又被自动换气顶走）`,
       );
 
       // —— 三个入口同流程。判结构不变量，不判信的内容（D8「当刻亲笔」） ——
@@ -503,7 +592,7 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
       if (!streamBeforeTriggers.ok) fatal(`读流失败：${streamBeforeTriggers.error.code}`);
       const streamBefore = snapshotFingerprint(streamBeforeTriggers.value);
 
-      let expectedFrom = 1;
+      let expectedFrom = nextGeneration;
       for (const via of ["new", "clear", "compact"] as const) {
         const breathed = await driver.breathe({ residentId: RESIDENT, via });
         if (!breathed.ok)
@@ -542,18 +631,45 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
         );
       }
 
+      // 每代一封信：从触发那代（OPEN_GENERATION）到最后一次换气，一共换了
+      // (expectedFrom - OPEN_GENERATION) 次，就该有这么多封信。用换代次数算，不用
+      // 代际号——1 起点下代际号比信数大 1，写死代际号会假红。
+      const expectedLetters = expectedFrom - OPEN_GENERATION;
       const finalTimeline = await driver.letterTimeline({ residentId: RESIDENT });
       if (!finalTimeline.ok) fatal(`读交接信时间线失败：${finalTimeline.error.code}`);
       expect(
-        finalTimeline.value.letters.length === expectedFrom,
-        `代际走到 ${expectedFrom}，时间线却有 ${finalTimeline.value.letters.length} 封信——每代一封，不多不少`,
+        finalTimeline.value.letters.length === expectedLetters,
+        `换了 ${expectedLetters} 代，时间线却有 ${finalTimeline.value.letters.length} 封信——每代一封，不多不少`,
       );
 
-      // —— 猝死：原始流水不自动进继任者上下文 ——
+      // —— 猝死：原始流水不自动进继任者上下文，但归档里查得到（D8 三双面） ——
       const suddenMarker = markerFor("RT-03", "sudden");
       const suddenSaid = await driver.say({ residentId: RESIDENT, text: suddenMarker });
       if (!suddenSaid.ok) fatal(`say 失败：${suddenSaid.error.code}`);
+      const deadGeneration = suddenSaid.value.generation;
+
+      // 正对照：猝死前这条标记确实落进了当代流水——否则「猝死后不在继任者上下文」是空断言
+      // （一个空的 suddenDeath 也能让它「不在」）。
+      const streamBeforeDeath = await driver.readStream({ residentId: RESIDENT });
+      if (!streamBeforeDeath.ok) fatal(`读流失败：${streamBeforeDeath.error.code}`);
+      expect(
+        streamBeforeDeath.value.events.some((event) => event.text.includes(suddenMarker)),
+        "猝死前这条标记根本没落进流水——后面的「不进继任者」成了空断言",
+      );
+
       await driver.suddenDeath({ residentId: RESIDENT });
+
+      // 真的死了、真换了继任者：新一代代际必须比猝死那代更高（不是空操作）。
+      const successorSaid = await driver.say({
+        residentId: RESIDENT,
+        text: markerFor("RT-03", "successor"),
+      });
+      if (!successorSaid.ok) fatal(`继任者 say 失败：${successorSaid.error.code}`);
+      expect(
+        successorSaid.value.generation > deadGeneration,
+        `猝死后继任者代际是 ${successorSaid.value.generation}，未超过猝死那代 ${deadGeneration}——suddenDeath 是空操作，根本没换代`,
+      );
+
       const afterDeath = await driver.bootPack({ residentId: RESIDENT });
       if (!afterDeath.ok) fatal(`猝死后读启动包失败：${afterDeath.error.code}`);
       const carried = afterDeath.value.memories.filter((memory) =>
@@ -568,8 +684,25 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
         "猝死那代的内容混进了承诺栏——继任者不该继承没写进信的东西",
       );
 
+      // D8 三的正面：原始流水没有无声消失，归档里按 (residentId, generation) 查得到。
+      // 只断言「不在继任者上下文」而不验归档可查，等于允许把猝死那代直接抹掉——那是丢史，
+      // 不是 D8 要的「不自动进、但可查」。
+      const archived = await driver.archivedTranscript({
+        residentId: RESIDENT,
+        generation: deadGeneration,
+      });
+      if (!archived.ok) {
+        fatal(
+          `猝死那代（第 ${deadGeneration} 代）的原始流水在归档里查不到：${archived.error.code}——D8 三要求原始流水进归档可查，不是无声消失`,
+        );
+      }
+      expect(
+        archived.value.events.some((event) => event.text.includes(suddenMarker)),
+        `归档里第 ${deadGeneration} 代的流水没有那条标记——原始流水被丢了，不是「不自动进但可查」`,
+      );
+
       return pass(
-        `开工设线成功、窗改自己的线被拒、主人改线成功且当刻代际照旧换气、新一代才用上新线；跨线 0→1 且签名 ${firstLetter.author}；启动包注入的信是原件；new/clear/compact 三入口各换一代、各一封格式合法的信；旧流水 ${streamBefore.length} 条逐字留底；猝死那代内容零携带`,
+        `开工（第 ${OPEN_GENERATION} 代）设线成功、回合已起后窗改自己的线被拒、主人改线成功且当刻代际照旧换气、新一代才用上新线；跨线换代签名 ${firstLetter.author}；启动包注入的信是原件；new/clear/compact 三入口各换一代、各一封格式合法的信；旧流水 ${streamBefore.length} 条逐字留底；猝死那代内容不进继任者上下文但归档第 ${deadGeneration} 代可查`,
       );
     },
   },
