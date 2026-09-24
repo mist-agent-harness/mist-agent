@@ -13,17 +13,37 @@ import { createHash } from "node:crypto";
  * 这些格式记录文件；回滚就是把迁移前备份的字节整份换回来。canonical stream 文件在
  * 迁移/回滚全程逐字节不变，所以退回后 durableSnapshot() 与迁移前字节等价。
  *
- * 迁移策略：**原子（single atomic rename swap）+ 显式中断态**。
- *   - 正常 migrate/rollback：先把每份格式记录写到 `*.tmp` 再 rename 换上，rename 在
- *     同目录内是原子的——要么全是旧字节要么全是新字节，读端口永远看不到半写文件。
- *   - interruptMigration：故意把控制账落成 `status='incomplete'`、`resumable=true`、
- *     `rollbackAvailable=true`，并把迁移前字节备份留在 backup/ 下，然后宿主进程被杀。
- *     重启后 migrationState() 报 incomplete，投影 read/summarize fail-closed 到
- *     'migration-incomplete'（绝不呈现 v1/v2 混合页）；resumeMigration() 续跑到
- *     complete，或 rollbackStorageFormat() 用备份整体退回。
- *   代价（明写）：原子重写要为每扇窗多写一份格式记录 + 一次全量备份拷贝，落盘量约为
- *   窗数的两倍；换来的是「读端永不见半写页」「退回字节可复原」这两条硬保证。相较
- *   「就地增量改写」省内存但费磁盘，本层选磁盘换正确性。
+ * 迁移策略：**逐份原子 rename + 先落「未完成」再动字节**。
+ *
+ * 单份格式记录的写是原子的（tmp + fchmod + fsync + rename，同目录内 rename 原子），
+ * 所以任何一扇窗的那一页永远不会混版本、永远不会半写。但**多份记录的重写不是一次
+ * 原子操作**：宿主死在重写循环中间（或某次写失败），盘上就会前几份 v2、后几份 v1。
+ * 独立验收席（2026-09-24）钉的缺陷二就是这一段以前既不可识别也不可修复：控制账要等
+ * 循环全部跑完才落盘，死在中间时它仍报旧状态 —— 一次既没完成、又看不出没完成的操作。
+ *
+ * 所以本层的次序纪律是（migrate 与 rollback 同构）：
+ *   1. 先把迁移前的每份格式记录字节整份备份到 backup/（这是唯一的回滚素材）；
+ *   2. **先把 `status='incomplete'` + `target` + `operation` 落盘**——读闸自此关上，
+ *      投影 read/summarize 一律 fail-closed 到 'migration-incomplete'；
+ *   3. 才开始逐份原子重写（migrate）或逐份从备份还原（rollback）；
+ *   4. 只有终态（`complete` / `rolled-back`）落盘之后，读闸才放开。
+ * 于是任何中途猝死都留在第 2 步之后、第 4 步之前：重启后 migrationState() 报
+ * incomplete、resumable/rollbackAvailable 为真，绝不把混版本的盘当正常数据呈现。
+ *
+ * 续跑（resume）两条纪律：
+ *   - **不重新备份**：备份里是迁移前的原始字节，中断时盘上已经版本混杂，再备份一次
+ *     就把唯一的回滚素材覆盖掉了；
+ *   - **未完成的回滚只能继续从备份还原**，绝不走 `#rewriteRecords(1)` —— 那条路会把
+ *     `legacyMark` 写成 null，等于把要还原的旧信号点亲手销毁。
+ *
+ * interruptMigration 是同一条真实路径的**前缀**（备份 + 落 incomplete，然后由调用方
+ * 杀宿主），不是另一条旁路实现。重写循环中途的故障由 `onRecordPersisted` 钩子注入
+ * （见 WindowStorageFormatAdminOptions），所以「死在重写中间」也走真实 migrate/rollback。
+ *
+ * 代价（明写）：原子重写要为每扇窗多写一份格式记录 + 一次全量备份拷贝，落盘量约为窗数
+ * 的两倍，并且每次 migrate/rollback 多一次控制账落盘（关闸）；换来的是「读端永不见
+ * 半写页」「中途猝死可识别、可续跑、可退回」「退回字节可复原」这三条硬保证。相较
+ * 「就地增量改写」省内存但费磁盘，本层选磁盘换正确性。
  */
 import {
   closeSync,
@@ -71,13 +91,36 @@ interface WindowFormatRecord {
   readonly legacyMark: string | null;
 }
 
+/** 未完成操作的方向。续跑必须知道它，否则会把「回滚跑一半」当「迁移跑一半」续错方向。 */
+type StorageOperation = "migrate" | "rollback";
+
 interface ControlFileShape {
   status: MigrationStatus;
   formatVersion: number;
   resumable: boolean;
   rollbackAvailable: boolean;
   target: number | null;
+  /** 仅在 status='incomplete' 时有意义：这半截操作是迁移还是回滚。 */
+  operation: StorageOperation | null;
   tombstones: Tombstone[];
+}
+
+export interface WindowStorageFormatAdminOptions {
+  /**
+   * 重写/还原循环的故障注入钩：每**成功落盘一份**记录后调用一次，抛出即模拟
+   * 「盘满 / 写失败」，在钩子里 `process.kill` 即模拟「宿主死在重写中间」。
+   *
+   * 为什么要这个缝（代价明写）：缺陷二要求故障必须走**真实** migrate/rollback 路径，
+   * 而不是只走 interrupt 那个独立入口；而「死在循环第 k 份」在外部是注入不进去的。
+   * 代价是生产类型上多一个只有测试/演练会传的可选项；不传时零开销、行为完全不变。
+   */
+  readonly onRecordPersisted?: (progress: {
+    readonly operation: StorageOperation;
+    readonly windowKey: string;
+    /** 从 1 开始的已落盘份数。 */
+    readonly persisted: number;
+    readonly total: number;
+  }) => void;
 }
 
 function sha256(value: Buffer | string): string {
@@ -91,6 +134,7 @@ function freshControl(): ControlFileShape {
     resumable: false,
     rollbackAvailable: false,
     target: null,
+    operation: null,
     tombstones: [],
   };
 }
@@ -149,15 +193,17 @@ export class WindowStorageFormatAdmin {
   readonly #dataDir: string;
   readonly #controlPath: string;
   readonly #backupDir: string;
+  readonly #onRecordPersisted: WindowStorageFormatAdminOptions["onRecordPersisted"];
   #control: ControlFileShape;
   /** 内存镜像的窗集合：windowKey -> 该窗当前 legacyMark（用于写格式记录）。 */
   readonly #windows = new Map<string, WindowFormatRecord>();
 
-  constructor(dataDir: string) {
+  constructor(dataDir: string, options: WindowStorageFormatAdminOptions = {}) {
     this.#dataDir = resolve(dataDir);
     mkdirSync(this.#dataDir, { recursive: true });
     this.#controlPath = join(this.#dataDir, CONTROL_FILE);
     this.#backupDir = join(this.#dataDir, BACKUP_DIR);
+    this.#onRecordPersisted = options.onRecordPersisted;
     this.#control = this.#restoreControl();
     this.#restoreWindows();
   }
@@ -165,7 +211,14 @@ export class WindowStorageFormatAdmin {
   #restoreControl(): ControlFileShape {
     if (!existsSync(this.#controlPath)) return freshControl();
     const parsed = JSON.parse(readFileSync(this.#controlPath, "utf8")) as ControlFileShape;
-    return parsed;
+    // 兼容本次改造前落下的控制账（没有 operation 字段）：未完成的只可能是迁移。
+    const operation =
+      parsed.operation === "migrate" || parsed.operation === "rollback"
+        ? parsed.operation
+        : parsed.status === "incomplete" && parsed.target !== null
+          ? "migrate"
+          : null;
+    return { ...parsed, operation };
   }
 
   #restoreWindows(): void {
@@ -283,7 +336,9 @@ export class WindowStorageFormatAdmin {
 
   /** 把所有窗的格式记录重写到目标版本（原子逐份 rename），退役 legacyMark。 */
   #rewriteRecords(targetFormatVersion: number): void {
-    for (const record of [...this.#windows.values()]) {
+    const records = [...this.#windows.values()];
+    let persisted = 0;
+    for (const record of records) {
       const migrated: WindowFormatRecord = {
         formatVersion: targetFormatVersion,
         windowKey: record.windowKey,
@@ -291,39 +346,26 @@ export class WindowStorageFormatAdmin {
       };
       this.#windows.set(record.windowKey, migrated);
       this.#persistWindow(migrated);
+      persisted += 1;
+      this.#onRecordPersisted?.({
+        operation: "migrate",
+        windowKey: record.windowKey,
+        persisted,
+        total: records.length,
+      });
     }
   }
 
   /**
-   * v1->v2 迁移：先备份 -> 原子重写记录 -> 落墓碑 -> 控制账 complete。
-   * 返回目标版本与墓碑 id。
+   * 从 backup/ 里把每份格式记录的字节整份换回落盘文件（逐字节复原）。
+   * 这是回滚与「续跑一个未完成的回滚」唯一允许的还原路径：绝不用
+   * `#rewriteRecords(1)` 假装回滚——那条路写出的 `legacyMark` 是 null，会把要还原的
+   * 旧信号点亲手销毁。
    */
-  migrate(targetFormatVersion: number): { formatVersion: number; tombstoneIds: string[] } {
-    this.#assertTarget(targetFormatVersion);
-    this.#backupFormatRecords();
-    this.#rewriteRecords(targetFormatVersion);
-    const tombstones = this.#tombstonesFor(targetFormatVersion);
-    this.#control = {
-      status: "complete",
-      formatVersion: targetFormatVersion,
-      resumable: false,
-      rollbackAvailable: true,
-      target: null,
-      tombstones,
-    };
-    this.#persistControl();
-    return {
-      formatVersion: targetFormatVersion,
-      tombstoneIds: tombstones.map((t) => t.tombstoneId),
-    };
-  }
-
-  /** 回滚：把备份字节整份换回来（逐字节复原），控制账 rolled-back。 */
-  rollback(targetFormatVersion: number): { formatVersion: number; tombstoneIds: string[] } {
-    if (!existsSync(this.#backupDir)) {
-      throw new WindowStorageInterrupted("no pre-migration backup to restore");
-    }
-    for (const record of [...this.#windows.values()]) {
+  #restoreFromBackup(): void {
+    const records = [...this.#windows.values()];
+    let persisted = 0;
+    for (const record of records) {
       const fileName = formatFileName(record.windowKey);
       const backup = this.#backupPathFor(fileName);
       if (!existsSync(backup)) continue;
@@ -331,56 +373,140 @@ export class WindowStorageFormatAdmin {
       const restoredContents = readFileSync(backup, "utf8");
       atomicWrite(this.#formatPath(record.windowKey), restoredContents);
       this.#windows.set(record.windowKey, JSON.parse(restoredContents) as WindowFormatRecord);
+      persisted += 1;
+      this.#onRecordPersisted?.({
+        operation: "rollback",
+        windowKey: record.windowKey,
+        persisted,
+        total: records.length,
+      });
     }
-    const tombstoneIds = this.#control.tombstones.map((t) => t.tombstoneId);
+  }
+
+  /**
+   * 关闸：先把「未完成 + 方向 + 目标」落盘，之后才允许动记录字节。
+   * 控制账一落成 incomplete，投影 read/summarize 就 fail-closed 到 migration-incomplete，
+   * 所以整个重写/还原窗口期内读端绝不会看到 v1/v2 混合页。
+   */
+  #beginOperation(operation: StorageOperation, targetFormatVersion: number): void {
+    this.#control = {
+      status: "incomplete",
+      // 未完成期间不谎报目标版本：声称的仍是操作前的版本。
+      formatVersion: this.#control.formatVersion,
+      resumable: true,
+      rollbackAvailable: existsSync(this.#backupDir),
+      target: targetFormatVersion,
+      operation,
+      tombstones: [],
+    };
+    this.#persistControl();
+  }
+
+  /** 开闸（迁移终态）：记录字节已全部就位，才把 complete + 墓碑落盘。 */
+  #completeMigration(targetFormatVersion: number): Tombstone[] {
+    const tombstones = this.#tombstonesFor(targetFormatVersion);
+    this.#control = {
+      status: "complete",
+      formatVersion: targetFormatVersion,
+      resumable: false,
+      rollbackAvailable: true,
+      target: null,
+      operation: null,
+      tombstones,
+    };
+    this.#persistControl();
+    return tombstones;
+  }
+
+  /** 开闸（回滚终态）：备份字节已全部换回，才把 rolled-back 落盘。 */
+  #completeRollback(targetFormatVersion: number): void {
     this.#control = {
       status: "rolled-back",
       formatVersion: targetFormatVersion,
       resumable: false,
       rollbackAvailable: false,
       target: null,
+      operation: null,
       tombstones: [],
     };
     this.#persistControl();
+  }
+
+  /**
+   * v1->v2 迁移：备份 -> **先落 incomplete（关闸）** -> 逐份原子重写 -> 落墓碑 + complete。
+   * 已有未完成操作时拒绝开新的：否则会拿版本混杂的盘再备份一次，把唯一的回滚素材覆盖掉。
+   */
+  migrate(targetFormatVersion: number): { formatVersion: number; tombstoneIds: string[] } {
+    this.#assertTarget(targetFormatVersion);
+    this.#assertNoUnfinishedOperation("migration");
+    this.#backupFormatRecords();
+    this.#beginOperation("migrate", targetFormatVersion);
+    this.#rewriteRecords(targetFormatVersion);
+    const tombstones = this.#completeMigration(targetFormatVersion);
+    return {
+      formatVersion: targetFormatVersion,
+      tombstoneIds: tombstones.map((t) => t.tombstoneId),
+    };
+  }
+
+  /**
+   * 回滚：**先落 incomplete（关闸）** -> 逐份从备份还原 -> rolled-back。
+   * 全程不再备份：backup/ 里的迁移前字节就是唯一的回滚素材，再备份一次就等于销毁它。
+   */
+  rollback(targetFormatVersion: number): { formatVersion: number; tombstoneIds: string[] } {
+    this.#assertTarget(targetFormatVersion);
+    if (!existsSync(this.#backupDir)) {
+      throw new WindowStorageInterrupted("no pre-migration backup to restore");
+    }
+    // 墓碑 id 要在关闸（清空控制账墓碑）之前取：回滚回报的是被退掉的那批墓碑。
+    const tombstoneIds = this.#control.tombstones.map((t) => t.tombstoneId);
+    this.#beginOperation("rollback", targetFormatVersion);
+    this.#restoreFromBackup();
+    this.#completeRollback(targetFormatVersion);
     return { formatVersion: targetFormatVersion, tombstoneIds };
   }
 
   /**
-   * 中断迁移：留下可识别的 incomplete 状态 + 迁移前备份，然后由调用方杀宿主。
-   * 不重写任何格式记录（保持原子——盘上要么全旧字节，要么等 resume 才全新字节）。
+   * 中断迁移：真实迁移路径的**前缀**——备份 + 落下可识别的 incomplete（关闸），
+   * 然后由调用方杀宿主。不重写任何格式记录，所以盘上此刻全是旧字节。
    */
   interrupt(targetFormatVersion: number): void {
     this.#assertTarget(targetFormatVersion);
+    this.#assertNoUnfinishedOperation("migration");
     this.#backupFormatRecords();
-    this.#control = {
-      status: "incomplete",
-      formatVersion: this.#control.formatVersion,
-      resumable: true,
-      rollbackAvailable: true,
-      target: targetFormatVersion,
-      tombstones: [],
-    };
-    this.#persistControl();
+    this.#beginOperation("migrate", targetFormatVersion);
   }
 
-  /** 续跑：把中断的迁移做完到目标版本。 */
+  /**
+   * 续跑一个未完成的操作。
+   *   - 未完成的**迁移**：继续逐份重写到目标版本（**不重新备份**）；
+   *   - 未完成的**回滚**：继续从备份还原（**绝不** `#rewriteRecords(1)`）。
+   */
   resume(): { formatVersion: number; tombstoneIds: string[] } {
     const target = this.#control.target;
     if (this.#control.status !== "incomplete" || target === null) {
       throw new WindowStorageInterrupted("there is no unfinished migration to resume");
     }
+    if (this.#control.operation === "rollback") {
+      if (!existsSync(this.#backupDir)) {
+        throw new WindowStorageInterrupted("no pre-migration backup to finish the rollback with");
+      }
+      this.#restoreFromBackup();
+      this.#completeRollback(target);
+      return { formatVersion: target, tombstoneIds: [] };
+    }
     this.#rewriteRecords(target);
-    const tombstones = this.#tombstonesFor(target);
-    this.#control = {
-      status: "complete",
-      formatVersion: target,
-      resumable: false,
-      rollbackAvailable: true,
-      target: null,
-      tombstones,
-    };
-    this.#persistControl();
+    const tombstones = this.#completeMigration(target);
     return { formatVersion: target, tombstoneIds: tombstones.map((t) => t.tombstoneId) };
+  }
+
+  #assertNoUnfinishedOperation(what: string): void {
+    if (this.#control.status !== "incomplete") return;
+    throw new WindowStorageInterrupted(
+      `refusing to start a ${what}: a ${this.#control.operation ?? "storage"} operation to v${String(
+        this.#control.target,
+      )} is unfinished; resume it or roll back first`,
+    );
   }
 
   /**
