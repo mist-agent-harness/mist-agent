@@ -40,7 +40,10 @@ import type { CanonicalEventDraft, EventActor, JsonObject } from "../one-stream/
 import { CanonicalStreamStore, StreamNotFoundError } from "../one-stream/index.ts";
 import { SessionRegistry, WindowReopenError } from "../session/session-registry.ts";
 import { ResidentNotFoundError, ResidentStore } from "../store/resident-store.ts";
-import { openCanonicalStreamWriter } from "../window-host/window-history-host.ts";
+import {
+  WINDOW_EVENT_OCCURRED_AT,
+  openCanonicalStreamWriter,
+} from "../window-host/window-history-host.ts";
 import {
   type ChannelRouteLike,
   ChannelSpecError,
@@ -167,7 +170,27 @@ export class ResidentRuntime {
 
   // —— 对话往返（RT-01 / RT-02 的循环本体） ——
 
-  async say(input: { residentId: string; text: string }): Promise<Result<TurnResult>> {
+  async say(input: {
+    residentId: string;
+    text: string;
+    /**
+     * 重试锚（评审意见 1）：幂等键由 turnId 派生（say-user-/say-assistant- 各一份），
+     * 同一回合的重试带同一个 turnId 就不会写重复。缺省自造 = 当新回合。
+     */
+    turnId?: string;
+  }): Promise<Result<TurnResult>> {
+    if (input.text.trim().length === 0) {
+      // runtime 层自己拦（评审意见 4）：IPC 层的形状检查不是实现的防线。
+      // 归 channel-unavailable 是沿用本层先例（specFailure 也把输入不合法归这码）——
+      // 契约的错误码枚举是判卷资产，不为单个校验加码。
+      return fail(
+        "channel-unavailable",
+        "消息文本不许为空",
+        "把要说的话写进 text 再发——空消息不是合法往返",
+        input.residentId,
+      );
+    }
+    const turnId = input.turnId ?? randomUUID();
     const credential = this.#credentials.find(input.residentId);
     if (credential === null) {
       return fail(
@@ -257,7 +280,9 @@ export class ResidentRuntime {
     try {
       await this.#writer.submit({
         residentId: input.residentId,
-        idempotencyKey: `say-user-${randomUUID()}`,
+        // 幂等键由 turnId 派生、草稿确定性（occurredAt 是哨兵）：同回合重试 = 同把手
+        // + 同请求 hash，底座去重返回原回执，不写重复（评审意见 1）。
+        idempotencyKey: `say-user-${turnId}`,
         draft: messageDraft({
           residentId: input.residentId,
           windowId: window.windowId,
@@ -268,7 +293,7 @@ export class ResidentRuntime {
       });
       await this.#writer.submit({
         residentId: input.residentId,
-        idempotencyKey: `say-assistant-${randomUUID()}`,
+        idempotencyKey: `say-assistant-${turnId}`,
         draft: messageDraft({
           residentId: input.residentId,
           windowId: window.windowId,
@@ -281,7 +306,7 @@ export class ResidentRuntime {
       return fail(
         "writer-unavailable",
         `一窗流落账失败：${(error as Error).message}`,
-        "唯一 writer 不可用：确认宿主进程存活、落盘目录可写，然后重试这句话",
+        "唯一 writer 不可用：确认宿主进程存活、落盘目录可写，然后带**同一个 turnId** 重试这句话（幂等补写，不写重）",
         input.residentId,
       );
     }
@@ -443,10 +468,16 @@ export class ResidentRuntime {
       if (isMissingFile(error)) return [];
       throw error;
     }
-    return entries
-      .filter((file) => (residentId === null ? true : file.startsWith(`${residentId}`)))
-      .sort()
-      .map((file) => join(root, file));
+    return (
+      entries
+        // 按户界匹配（评审意见 4）：r-a 的扫描面不含 r-ab 的文件——裸前缀会串户。
+        // 未来交接信文件名也必须带 `.` 边界（如 r-a.letter.md），否则会被漏扫。
+        .filter(
+          (file) => residentId === null || file === residentId || file.startsWith(`${residentId}.`),
+        )
+        .sort()
+        .map((file) => join(root, file))
+    );
   }
 }
 
@@ -476,7 +507,10 @@ function messageDraft(input: MessageDraftInput): CanonicalEventDraft {
   const payload: JsonObject = { role: input.role, text: input.text };
   return {
     purpose: "message",
-    occurredAt: new Date().toISOString(),
+    // occurredAt 是哨兵（同 window-host 的 WINDOW_EVENT_OCCURRED_AT）：它进底座的请求
+    // hash，挂钟时间会让同一 turnId 的重试算出不同 hash、被判 idempotency-conflict。
+    // 排序与「多新」的权威是 streamSeq；这个字段不许当时间读（读到 1970 是预期）。
+    occurredAt: WINDOW_EVENT_OCCURRED_AT,
     workRef: null,
     authoritySource: speaker,
     origin: {
@@ -498,11 +532,16 @@ function toStreamEventView(event: {
 }): StreamEventView {
   const role = event.payload.role;
   const text = event.payload.text;
+  if ((role !== "user" && role !== "assistant") || typeof text !== "string") {
+    // fail-closed（评审意见 4）：读到本层读不懂的事件就地抛错，不猜、不标 assistant——
+    // 宁可读失败，不改写历史。
+    throw new Error(`一窗流里有本层读不懂的事件：${event.eventId}（role=${JSON.stringify(role)}）`);
+  }
   return {
     eventId: event.eventId,
     streamSeq: event.streamSeq,
-    kind: role === "user" ? "user" : "assistant",
-    text: typeof text === "string" ? text : "",
+    kind: role,
+    text,
     payloadHash: event.payloadHash,
   };
 }

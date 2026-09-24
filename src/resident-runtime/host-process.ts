@@ -40,6 +40,8 @@ interface Command {
   readonly input?: {
     readonly residentId?: string;
     readonly text?: string;
+    /** 重试锚：同回合重试带同一 turnId，幂等键由它派生（见 runtime.say）。 */
+    readonly turnId?: string;
     readonly channel?: ChannelSpecLike;
     readonly canarySecret?: string;
     readonly needle?: string;
@@ -85,6 +87,7 @@ async function handle(command: Command): Promise<unknown> {
       return (await runtime.say({
         residentId: required(input.residentId, "residentId"),
         text: required(input.text, "text"),
+        ...(input.turnId === undefined ? {} : { turnId: input.turnId }),
       })) as Result<TurnResult>;
     case "readStream":
       return runtime.readStream({

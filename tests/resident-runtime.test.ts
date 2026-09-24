@@ -6,7 +6,7 @@
  * vs credential-invalid vs channel-unavailable）、住户号显式入口的撞号防线。
  * 端到端判卷归 acceptance/resident-runtime-*.ts，这里只钉单元行为。
  */
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -16,6 +16,7 @@ import type {
   StreamSnapshot,
   TurnResult,
 } from "../acceptance/resident-runtime-driver.ts";
+import { type CanonicalEventDraft, CanonicalStreamStore } from "../src/one-stream/index.ts";
 import {
   ChannelSpecError,
   type ChannelSpecLike,
@@ -27,6 +28,7 @@ import {
 import { CredentialStore } from "../src/resident-runtime/credentials.ts";
 import { ResidentRuntime } from "../src/resident-runtime/runtime.ts";
 import { ResidentStore } from "../src/store/resident-store.ts";
+import { openCanonicalStreamWriter } from "../src/window-host/window-history-host.ts";
 
 const tempDirs: string[] = [];
 
@@ -257,6 +259,129 @@ describe("住户号显式入口（判卷与安装器指定的事实不能换号�
     expect(() => store.createResident("坏号", { residentId: "../escape" })).toThrow(/文件名/);
   });
 });
+
+describe("评审意见修复（wusaki0723 复审：幂等重试 / 凭证读取边界 / fail-closed 读）", () => {
+  it("同一 turnId 重试幂等：不写重复；不同 turnId 是独立回合（意见 1）", async () => {
+    const runtime = new ResidentRuntime({ dataDir: tempDir() });
+    try {
+      runtimeProvision(runtime, "r-retry");
+      const args = { residentId: "r-retry", text: "你好", turnId: "turn-fixed-1" };
+      const first = unwrap<TurnResult>(await runtime.say(args));
+      const second = unwrap<TurnResult>(await runtime.say(args)); // 同回合重试
+      expect(second.reply).toBe(first.reply);
+      expect(
+        unwrap<StreamSnapshot>(runtime.readStream({ residentId: "r-retry" })).events,
+      ).toHaveLength(2);
+      // 换个 turnId = 新回合：同文本也照常各落两条。
+      unwrap<TurnResult>(
+        await runtime.say({ residentId: "r-retry", text: "你好", turnId: "turn-fixed-2" }),
+      );
+      expect(
+        unwrap<StreamSnapshot>(runtime.readStream({ residentId: "r-retry" })).events,
+      ).toHaveLength(4);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("读取边界把状态关死：revoked / 幽灵引用不放密钥原文（意见 2）", () => {
+    const store = new CredentialStore(join(tempDir(), "credentials"));
+    const record = store.provision({
+      residentId: "r-bound",
+      channel: claudeChannel,
+      secret: "sk-bound-1",
+    });
+    store.revoke("r-bound");
+    expect(() => store.readSecret(record.credentialRef)).toThrow(/refusing to release secret/);
+    expect(() => store.readSecret("mist-cred:cred-ghost")).toThrow(/not in manifest/);
+  });
+
+  it("启动清扫孤儿密钥；revoked 档还挂在清单上、不扫（意见 3）", () => {
+    const root = join(tempDir(), "credentials");
+    const store = new CredentialStore(root);
+    store.provision({ residentId: "r-sw", channel: claudeChannel, secret: "sk-sw-1" });
+    // 模拟换凭证死在「清单已换、旧密钥未删」：留一个清单不引用的 key。
+    writeFileSync(join(root, "secrets", "cred-orphan.key"), "sk-orphan", { mode: 0o600 });
+    store.revoke("r-sw");
+    const restarted = new CredentialStore(root); // 重启 = 构造即清扫
+    expect(restarted.find("r-sw")?.status).toBe("revoked");
+    const remaining = readdirSync(join(root, "secrets")).sort();
+    expect(remaining).not.toContain("cred-orphan.key");
+    expect(remaining).toHaveLength(1); // revoked 记录自己的档还在：revoke 不删档
+  });
+
+  it("读到本层读不懂的事件 fail-closed，不猜不标 assistant（意见 4）", async () => {
+    const dataDir = tempDir();
+    const streams = new CanonicalStreamStore({ dataDir: join(dataDir, "streams") });
+    streams.createStream("r-foreign");
+    const writer = openCanonicalStreamWriter(streams);
+    await writer.submit({
+      residentId: "r-foreign",
+      idempotencyKey: "foreign-1",
+      draft: foreignDraft(),
+    });
+    await writer.close();
+    const runtime = new ResidentRuntime({ dataDir });
+    try {
+      expect(() => runtime.readStream({ residentId: "r-foreign" })).toThrow(/读不懂/);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("空文本在 runtime 层也拦，不等 IPC（意见 4）", async () => {
+    const runtime = new ResidentRuntime({ dataDir: tempDir() });
+    try {
+      const result = await runtime.say({ residentId: "r-empty", text: "   " });
+      expect(failureOf(result)).toMatchObject({ code: "channel-unavailable" });
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("secretScan 按户界扫：r-a 的面不含 r-ab，正对照能命中自己的（意见 4）", async () => {
+    const runtime = new ResidentRuntime({ dataDir: tempDir() });
+    try {
+      runtimeProvision(runtime, "r-a");
+      runtime.provisionChannel({
+        residentId: "r-ab",
+        channel: claudeChannel,
+        canarySecret: "sk-r-ab",
+      });
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-a", text: "甲说" }));
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-ab", text: "乙说特有词" }));
+      // 反对照：扫 r-a 不许串到 r-ab 的文件。
+      expect(unwrap(runtime.secretScan({ residentId: "r-a", needle: "乙说特有词" })).hits).toEqual(
+        [],
+      );
+      // 正对照：同一个探针在自己户里真的扫得到，否则上面的空命中是假绿。
+      expect(
+        unwrap(runtime.secretScan({ residentId: "r-ab", needle: "乙说特有词" })).hits.length,
+      ).toBeGreaterThan(0);
+    } finally {
+      await runtime.close();
+    }
+  });
+});
+
+function foreignDraft(): CanonicalEventDraft {
+  // 形状照 messageDraft，role 故意写本层读不懂的 "system"（意见 4 的反对照夹具）。
+  const actor = { kind: "viewport", id: "w-foreign" } as const;
+  return {
+    purpose: "message",
+    occurredAt: new Date(0).toISOString(),
+    workRef: null,
+    authoritySource: actor,
+    origin: {
+      reporter: actor,
+      subject: { kind: "resident", id: "r-foreign" },
+      viewport: { windowId: "w-foreign", generation: 1 },
+    },
+    effect: { state: "not-applicable", requiresUserAction: false, retry: "not-applicable" },
+    artifactRef: null,
+    payload: { role: "system", text: "x" },
+  };
+}
 
 function runtimeProvision(runtime: ResidentRuntime, residentId: string): void {
   runtime.provisionChannel({
