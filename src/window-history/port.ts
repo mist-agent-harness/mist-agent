@@ -90,8 +90,23 @@ export interface WindowHistoryPage {
 /** `session.list` 摘要三字段。 */
 export interface WindowHistorySummary {
   readonly windowId: string;
+  /**
+   * **单调修订号，不是时间戳**（2026-09-24 施工裁定，见
+   * docs/design/window-history-projection.md §6.2）。
+   *
+   * 取该窗健康历史条目里最大的 `streamSeq`（无历史为 0）：越大越新、跨重启稳定、完全由
+   * 落盘事实派生。本层没有可信挂钟（窗事件的 `occurredAt` 是 1970 定值哨兵，理由见
+   * src/window-host/window-history-host.ts 的 `WINDOW_EVENT_OCCURRED_AT`），所以这里返回
+   * 一个诚实的修订号，而不是一个由 1970 派生的假时间。
+   *
+   * 代价（明写）：想显示「最后活动时间」的消费方在本层拿不到，必须另找带时间权威的字段；
+   * 这个数也不等于流水长度 —— 窗账生命周期事实占 `streamSeq` 号但不进条目集合。
+   * 消费方**不许**把它当日期渲染。
+   */
   readonly updatedAt: number;
+  /** 这扇窗此刻是否有活跃住户在跑。归档窗为 false，且该事实跨进程重启有效。 */
   readonly running: boolean;
+  /** 这扇窗确实没有任何历史（与「读不到」是两种不同的返回值，见 WindowHistoryErrorCode）。 */
   readonly blank: boolean;
 }
 

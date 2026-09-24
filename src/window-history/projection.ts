@@ -262,6 +262,10 @@ function paginate(
  * updatedAt 从落盘事件事实确定性派生（不用 wall-clock），重启前后一致。
  * 取健康条目里最大的 streamSeq——它随写入单调增长，且完全由持久化事实决定。
  * 无事件时为 0。
+ *
+ * 语义已钉死为**单调修订号、不是时间戳**（见 port.ts 的 `updatedAt` 注与
+ * docs/design/window-history-projection.md §6.2）：本层没有可信挂钟，返回诚实的修订号
+ * 胜过返回一个由 1970 哨兵派生的假时间。代价是「最后活动时间」要另找带时间权威的面。
  */
 function deriveUpdatedAt(events: readonly CanonicalEvent[]): number {
   let max = 0;

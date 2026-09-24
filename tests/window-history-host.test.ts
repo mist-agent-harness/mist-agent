@@ -60,7 +60,7 @@ async function seedWindow(
   generation: number,
   count: number,
 ): Promise<void> {
-  unwrap(host.openWindow({ residentId, windowId }));
+  unwrap(await host.openWindow({ residentId, windowId }));
   for (let index = 0; index < count; index += 1) {
     unwrap(
       await host.appendWindowEvent({
@@ -76,9 +76,9 @@ async function seedWindow(
 
 describe("WindowHistoryHost composition", () => {
   it("keeps exactly one stable writer identity across rotateGeneration (breath)", async () => {
-    unwrap(host.openWindow({ residentId: "r", windowId: "w" }));
+    unwrap(await host.openWindow({ residentId: "r", windowId: "w" }));
     const before = unwrap(host.writerIdentity());
-    const rotated = unwrap(host.rotateGeneration({ residentId: "r", windowId: "w" }));
+    const rotated = unwrap(await host.rotateGeneration({ residentId: "r", windowId: "w" }));
     expect(rotated.windowId).toBe("w");
     expect(rotated.generation).toBe(2);
     const after = unwrap(host.writerIdentity());
@@ -87,7 +87,7 @@ describe("WindowHistoryHost composition", () => {
 
   it("rejects stale-generation writes fail-closed and keeps them absent from the projection", async () => {
     await seedWindow("r", "w", 1, 1);
-    unwrap(host.rotateGeneration({ residentId: "r", windowId: "w" }));
+    unwrap(await host.rotateGeneration({ residentId: "r", windowId: "w" }));
     const stale = await host.appendWindowEvent({
       residentId: "r",
       windowId: "w",
@@ -105,7 +105,7 @@ describe("WindowHistoryHost composition", () => {
   });
 
   it("rejects idempotency-conflict writes fail-closed and keeps them absent from the projection", async () => {
-    unwrap(host.openWindow({ residentId: "r", windowId: "w" }));
+    unwrap(await host.openWindow({ residentId: "r", windowId: "w" }));
     unwrap(
       await host.appendWindowEvent({
         residentId: "r",
@@ -132,7 +132,7 @@ describe("WindowHistoryHost composition", () => {
   });
 
   it("gives concurrent same-window writes distinct contiguous seqs projected in issued order", async () => {
-    unwrap(host.openWindow({ residentId: "r", windowId: "w" }));
+    unwrap(await host.openWindow({ residentId: "r", windowId: "w" }));
     const results = await host.appendWindowEventsConcurrently([
       {
         residentId: "r",
@@ -244,7 +244,7 @@ describe("WindowHistoryHost composition", () => {
       expect(state.resumable || state.rollbackAvailable).toBe(true);
 
       // While incomplete, read fail-closes to migration-incomplete (window is tracked again after re-open).
-      unwrap(restarted.openWindow({ residentId: "r", windowId: "w" }));
+      unwrap(await restarted.openWindow({ residentId: "r", windowId: "w" }));
       const during = await restarted.read(ref, FULL_PAGE);
       expect(during.ok).toBe(false);
       if (!during.ok) expect(during.error.code).toBe("migration-incomplete");
@@ -272,7 +272,7 @@ describe("WindowHistoryHost composition", () => {
   });
 
   it("returns an OK empty page for an existing window with no events", async () => {
-    unwrap(host.openWindow({ residentId: "r", windowId: "w" }));
+    unwrap(await host.openWindow({ residentId: "r", windowId: "w" }));
     const ref: WindowHistoryRef = { residentId: "r", windowId: "w", generation: null };
     const page = unwrap(await host.read(ref, FULL_PAGE));
     expect(page.entries).toHaveLength(0);
@@ -322,7 +322,7 @@ describe("WindowHistoryHost cross-resident isolation (P1-①)", () => {
     await seedTwoResidentSameWindow();
 
     // 负向：B 开同名窗拿到的是 B 自己的独立窗（residentId=B、第 1 代、空），绝不是 A 的。
-    const bDescriptor = unwrap(host.openWindow({ residentId: B, windowId: SHARED }));
+    const bDescriptor = unwrap(await host.openWindow({ residentId: B, windowId: SHARED }));
     expect(bDescriptor.residentId).toBe(B);
     expect(bDescriptor.windowId).toBe(SHARED);
     expect(bDescriptor.generation).toBe(1);
@@ -356,11 +356,11 @@ describe("WindowHistoryHost cross-resident isolation (P1-①)", () => {
     expect(bWrite.ok).toBe(false);
     if (!bWrite.ok) expect(bWrite.error.code).toBe("window-not-found");
 
-    const bRotate = host.rotateGeneration({ residentId: B, windowId: SHARED });
+    const bRotate = await host.rotateGeneration({ residentId: B, windowId: SHARED });
     expect(bRotate.ok).toBe(false);
     if (!bRotate.ok) expect(bRotate.error.code).toBe("window-not-found");
 
-    const bArchive = host.archiveWindow({ residentId: B, windowId: SHARED });
+    const bArchive = await host.archiveWindow({ residentId: B, windowId: SHARED });
     expect(bArchive.ok).toBe(false);
     if (!bArchive.ok) expect(bArchive.error.code).toBe("window-not-found");
 
@@ -386,7 +386,7 @@ describe("WindowHistoryHost cross-resident isolation (P1-①)", () => {
         payload: { mark: "a-legit" },
       }),
     );
-    const rotated = unwrap(host.rotateGeneration({ residentId: A, windowId: SHARED }));
+    const rotated = unwrap(await host.rotateGeneration({ residentId: A, windowId: SHARED }));
     expect(rotated.generation).toBe(2);
   });
 
@@ -422,7 +422,7 @@ describe("WindowHistoryHost cross-resident isolation (P1-①)", () => {
 // 未来/未开代际 => fail-closed（不入流、不抬重启水位）。推进代际的唯一合法路径是换气。
 describe("WindowHistoryHost future-generation writes (P1-②)", () => {
   it("rejects a future-generation write fail-closed, absent from projection, without raising the restart watermark", async () => {
-    unwrap(host.openWindow({ residentId: "r", windowId: "w" }));
+    unwrap(await host.openWindow({ residentId: "r", windowId: "w" }));
     // 先写一条合法的当代（gen 1）事件作正向对照的底子。
     unwrap(
       await host.appendWindowEvent({
@@ -482,8 +482,8 @@ describe("WindowHistoryHost future-generation writes (P1-②)", () => {
 
   it("still advances legitimately via rotateGeneration, then accepts the new current generation", async () => {
     // 正向对照：合法推进代际的唯一路径是换气；换气后当代写成功。
-    unwrap(host.openWindow({ residentId: "r", windowId: "w" }));
-    unwrap(host.rotateGeneration({ residentId: "r", windowId: "w" }));
+    unwrap(await host.openWindow({ residentId: "r", windowId: "w" }));
+    unwrap(await host.rotateGeneration({ residentId: "r", windowId: "w" }));
     const write = await host.appendWindowEvent({
       residentId: "r",
       windowId: "w",

@@ -17,8 +17,12 @@
  *     字节（真实字节篡改），并记一份损坏标记；命中损坏标记的住户，读端口改为**直接从盘
  *     上原始 JSON** 回读事件（绕开 store 的严格恢复），于是被翻字节的那条 verify 不过、
  *     进 damaged[]（hash-mismatch），健康条目照常返回、绝不静默丢。
- *   - 数据删除（deleteDurableWindowData）：真实删掉该窗的 `*.stream.json` 与格式记录，
- *     窗账里也抹掉；windowExists() 转假 => window-not-found（不是空页）。
+ *   - 数据删除（deleteDurableWindowData，实现在 window-history-host.ts）：真实删掉该窗的
+ *     落盘**呈现记录**（`*.wh-format.json`）并抹掉内存窗账；windowExists() 转假 =>
+ *     window-not-found（不是空页）。**不动**共享住户流水文件 `*.stream.json`：先决①的
+ *     底座是 append-only 的唯一底座，永不删事件（删了还会把同住户其他窗一起毁掉、并破坏
+ *     streamSeq 连续性）。窗的存在权威因此是「底座事实 ∧ 格式记录」，详见
+ *     window-history-host.ts 顶注「窗的存在权威」。
  *
  * chmod 依赖（明写，供文档与验收席）：读屏障用文件标记而非 chmod，是因为 root 会绕过
  * 权限位；本层用「屏障标记文件 + 读路径显式检查」实现，不依赖运行身份。但整套验收仍需
