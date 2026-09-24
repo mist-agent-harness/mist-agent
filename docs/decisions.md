@@ -382,6 +382,26 @@
   来源：[主笔口令](https://github.com/mist-agent-harness/mist-agent/pull/188#issuecomment-5797766390)；
   拍板人咲咲（`sakisakisa-design`），2026-09-23 在会话里确认（旦九提出方案，她回
   「好」），旦九转录；#183 另有[适用说明](https://github.com/mist-agent-harness/mist-agent/pull/183#issuecomment-5797773439)。
+- 2026-09-24　**D28 主笔拍板：先让 mist 能用起来——住户运行时加终端入口**（#194）。
+  一、先做一个能真正跟住户说上话的终端入口，由两部分组成：**住户运行时**（醒来、
+  读启动包、按 D25 走订阅或 API key 调模型、把回复写进一窗流、到线写交接信换代）和
+  **最小 TUI**（一个聊天框）。
+  二、实现路线不预选：可以 mist 自己当宿主、把 pi 当零件库用（模型走 `pi-ai`，界面
+  走 `pi-tui`，Claude 订阅走 pi-claude-bridge），也可以直接在 pi 上改造、以 pi 扩展
+  的形式跑。无论哪条路，住户的真源归 mist：一窗流的唯一 writer（D9）、交接信换代
+  （D8，不做自动 compact）、启动包和事实账都用 `src/` 里已有的实现，不在 pi 里另起
+  一份副本；pi 自带的多会话能力对外锁成一条主流。
+  三、这个 TUI 是主人自用的入口，不算点名官方默认前端，D11 不动。
+  四、本单不等 #184：本机前台运行即可；#184 的本地参考实现落地后，运行时再接它的
+  HostProvider。
+  代价：pi 版本随上游走（bridge 要求 pi 0.86.1 以上，`webui/` 里还钉着 `pi-ai`
+  0.82.1），升级要跟；pi 的 TUI 很简，第一版只能是能用、不好看；走「pi 扩展」那条
+  路时，要额外证明 pi 的会话和上下文管理没有绕过 D8、D9。
+  来源：[主笔口令](https://github.com/mist-agent-harness/mist-agent/issues/194)；
+  拍板人咲咲（`sakisakisa-design`），2026-09-24 在会话里确认（旦九提出方案，她回
+  「要」，并补充「其实用现成的pi改造也是可以接受的 pi本身非常轻量 一窗流和交接信
+  都可以在pi里实现 pi就是个拼积木的项目 但pi有点毛坯房 那个tui也极简就是了」），
+  旦九转录。
 
 ## 规矩
 
