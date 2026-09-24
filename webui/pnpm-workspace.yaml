@@ -15,6 +15,7 @@ linkWorkspacePackages: true
 overrides:
   '@deepseek-ai/cosmokit': 'link:vendor/cosmokit'
   '@deepseek-ai/schemastery': 'link:vendor/schemastery'
+  'brace-expansion': '5.0.9'
 
 peerDependencyRules:
   allowedVersions:
