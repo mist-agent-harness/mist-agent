@@ -873,7 +873,13 @@ const wh05: WindowHistoryCheck = {
     // 若 interruptMigration 是空转（既不杀宿主也不动状态），后面的「原子」分支会被
     // 这个既存的干净 v1 白送点绿。所以先钉死「中断确实发生并被持久化」，再进
     // 原子/可识别分支。
+    //
+    // 关键：中断的「证据」必须是相对前置态的**变化**，不能是任何绝对标签——
+    // 一个把既存 v1 页原封不动端回来、只改个 status 词的实现不算「发起过迁移」。
+    // 所以这里同时钉死前置态与前置读页，后面拿它做「是否真的推进过」的基准。
     const preInterruptState = await driver.migrationState();
+    const preInterruptPage = expectOk(await driver.read(ref, FULL_PAGE), "中断前读");
+    const preInterruptShape = pageShape(preInterruptPage);
     await driver.interruptMigration({ targetFormatVersion: 2, fault: "host-killed" });
 
     // 契约：interruptMigration 返回时宿主已经死了。空转的实现不会真的杀宿主，
@@ -889,15 +895,14 @@ const wh05: WindowHistoryCheck = {
     const interruptedState = await driver.migrationState();
     const interruptedRead = await driver.read(ref, FULL_PAGE);
 
-    // 中断必须在重启后的状态里留下「v1→v2 迁移确实被发起过」的证据，而不是
-    // 原封不动的前置态。可识别未完成态本身就是证据；原子分支则要求相对前置态
-    // 有可观察的推进（formatVersion 曾到过 target 或状态从 rolled-back 变成别的）。
-    const attempted =
-      interruptedState.status === "incomplete" ||
-      interruptedState.status === "complete" ||
-      interruptedState.formatVersion === 2 ||
-      interruptedState.status !== preInterruptState.status ||
-      interruptedState.formatVersion !== preInterruptState.formatVersion;
+    // 中断必须在重启后留下「v1→v2 迁移确实被发起过」的证据，而不是原封不动的前置态。
+    // 证据只认相对前置态的变化，绝对标签（status==="complete"、formatVersion===2）
+    // 一概不认——既存的干净态不能冒充「刚发起过迁移」：
+    //   · 可识别未完成态（incomplete）本身就是新出现的证据；
+    //   · 否则必须相对前置态有可观察的推进：status 变了，或 formatVersion 变了。
+    const statusChanged = interruptedState.status !== preInterruptState.status;
+    const versionChanged = interruptedState.formatVersion !== preInterruptState.formatVersion;
+    const attempted = interruptedState.status === "incomplete" || statusChanged || versionChanged;
     if (!attempted) {
       fatal(
         `中断后 migrationState 与中断前逐字段相同（${stableJson({
@@ -961,6 +966,27 @@ const wh05: WindowHistoryCheck = {
       }
       if (atomicPage.entries.length !== 3) {
         fatal(`原子迁移中断后条目数变了：应 3 条，实到 ${atomicPage.entries.length} 条`);
+      }
+      // 声称的格式版本必须与页里每一条的 formatVersion 一致——与成功迁移路径同样严：
+      // migrationState 报 v2 而条目还是 v1 是「声称 vs 实到」不符，判红。
+      const claimedVersion = interruptedState.formatVersion;
+      for (const entry of atomicPage.entries) {
+        if (entry.formatVersion !== claimedVersion) {
+          fatal(
+            `原子结果 migrationState 声称 v${claimedVersion}，但页里有 v${entry.formatVersion} 条目（eventId=${entry.eventId}）：声称的格式版本与条目实到不符`,
+          );
+        }
+      }
+      // 光换个 status 词、页与前置态逐字节相同、formatVersion 也没动，等于没发起过
+      // 迁移——这不是「原子中断」而是状态改名作弊。真正的原子中断要么整体推进到
+      // 了目标版本（页里全 v2 且相对前置 v1 页字节不同），要么整体退回但确有可观察的
+      // 变化。所以：页与前置态字节相同 ∧ formatVersion 未相对前置态改变时，只有
+      // status 换词不算证据，判红。
+      const pageUnchangedFromPre = pageShape(atomicPage) === preInterruptShape;
+      if (pageUnchangedFromPre && !versionChanged) {
+        fatal(
+          `原子中断只把 status 从 ${preInterruptState.status} 改成 ${interruptedState.status}，页与中断前逐字节相同（formatVersion 仍是 v${interruptedState.formatVersion}）：没有任何真实存储推进，这是状态改名冒充原子迁移`,
+        );
       }
     }
 

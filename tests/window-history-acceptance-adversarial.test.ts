@@ -85,7 +85,12 @@ type Fault =
   | "mixed-page-after-interrupt"
   | "unrecoverable-interrupt"
   | "no-op-interrupt"
-  | "migration-drops-entry";
+  | "migration-drops-entry"
+  // WH-05 中断态：证据必须相对前置态、且声称版本要与条目一致
+  | "interrupt-preexisting-complete"
+  | "interrupt-relabel-only"
+  | "interrupt-version-mismatch"
+  | "interrupt-atomic-complete";
 
 const RECORD_FILE = "window-stream.json";
 const CONTROL_FILE = "migration.json";
@@ -719,7 +724,10 @@ class SyntheticWindowHistoryDriver implements WindowHistoryDriver {
       this.record.migratedOnce = true;
       writeFileSync(this.recordPath(), stableJson(this.record));
     }
-    control.status = "rolled-back";
+    // interrupt-preexisting-complete：想象上一步把状态留在了 complete。记录字节仍是
+    // 干净 v1（与迁移前逐字节等价），只有 status 词留在 complete，供后面的中断作弊
+    // 「既存的 complete 冒充刚发起过迁移」。
+    control.status = this.fault === "interrupt-preexisting-complete" ? "complete" : "rolled-back";
     control.resumable = false;
     control.rollbackAvailable = false;
     control.target = null;
@@ -740,9 +748,58 @@ class SyntheticWindowHistoryDriver implements WindowHistoryDriver {
       void input;
       return;
     }
+    if (this.fault === "interrupt-preexisting-complete") {
+      // 作弊 ①：前置态已是 complete（上一步回滚故意留下的），中断只杀宿主、不动
+      // 任何状态。旧判卷因 status==="complete" 绝对标签把这个既存态当成「刚发起过
+      // 迁移」而白送绿；收紧后证据必须相对前置态变化，此处逐字段不变 → 应判红。
+      await this.killHost();
+      return;
+    }
     const record = this.mustRecord();
     const control = this.mustControl();
     copyFileSync(this.recordPath(), join(this.backupDir, RECORD_FILE));
+    if (this.fault === "interrupt-relabel-only") {
+      // 作弊 ②：只把 status 从 rolled-back 改成 complete，记录一字节不动（仍是 v1 页）。
+      // 旧判卷因 status==="complete" 点绿；收紧后「页与前置态字节相同 ∧ 版本没变 ∧
+      // 只换了 status 词」不算发起过迁移 → 应判红。
+      control.status = "complete";
+      control.resumable = false;
+      control.rollbackAvailable = true;
+      control.target = null;
+      this.persist();
+      await this.killHost();
+      return;
+    }
+    if (this.fault === "interrupt-version-mismatch") {
+      // 作弊 ③：migrationState 声称 v2 + complete（record.formatVersion 拨到 2），但每条
+      // 事件的 formatVersion 仍留在 v1。旧判卷的原子分支只查混合页、从不要求条目版本
+      // 等于声称版本，于是点绿；收紧后要求逐条 formatVersion 等于声称版本 → 应判红。
+      record.formatVersion = input.targetFormatVersion;
+      control.status = "complete";
+      control.resumable = false;
+      control.rollbackAvailable = true;
+      control.target = null;
+      this.persist();
+      await this.killHost();
+      return;
+    }
+    if (this.fault === "interrupt-atomic-complete") {
+      // 正对照（原子分支）：中断时迁移已整体推进到 v2——record 与每条事件都到 v2，
+      // status=complete。相对前置的 v1 页字节不同、声称版本与条目一致 → 应点绿。
+      // 这条正对照让上面三项收紧不是空转断言。
+      record.formatVersion = input.targetFormatVersion;
+      for (const event of record.events) {
+        event.formatVersion = input.targetFormatVersion;
+        event.legacyMark = null;
+      }
+      control.status = "complete";
+      control.resumable = false;
+      control.rollbackAvailable = true;
+      control.target = null;
+      this.persist();
+      await this.killHost();
+      return;
+    }
     // 只转一半：第一条进了 v2，其余留在 v1。
     const first = record.events.at(0);
     if (first !== undefined) first.formatVersion = input.targetFormatVersion;
@@ -816,6 +873,9 @@ const adversarialCases: ReadonlyArray<{ checkId: string; fault: Fault }> = [
   { checkId: "WH-05", fault: "unrecoverable-interrupt" },
   { checkId: "WH-05", fault: "no-op-interrupt" },
   { checkId: "WH-05", fault: "migration-drops-entry" },
+  { checkId: "WH-05", fault: "interrupt-preexisting-complete" },
+  { checkId: "WH-05", fault: "interrupt-relabel-only" },
+  { checkId: "WH-05", fault: "interrupt-version-mismatch" },
 ];
 
 afterEach(() => {
@@ -843,6 +903,15 @@ describe("#120 window-history adversarial acceptance", () => {
   it.each(adversarialCases)("$checkId rejects $fault", async ({ checkId, fault }) => {
     const attacked = await checkById(checkId).run(driverFor(fault));
     expect(attacked, `${checkId} 接受了故障 ${fault}`).toMatchObject({ passed: false });
+  });
+
+  it("WH-05 accepts a genuinely atomic interrupt that advanced to v2", async () => {
+    // 原子分支的正对照：收紧后的原子分支断言（声称版本==条目版本、页相对前置态确有
+    // 推进）不是空转——一个真实原子推进到 v2 的中断仍必须点绿。
+    const result = await checkById("WH-05").run(driverFor("interrupt-atomic-complete"));
+    expect(result, "WH-05 原子分支正对照不成立：真实原子推进也点不亮").toMatchObject({
+      passed: true,
+    });
   });
 
   it("WH-06 stays red against the real src/ tree in this PR", async () => {
