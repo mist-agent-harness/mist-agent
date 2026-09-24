@@ -5,7 +5,8 @@
  *
  * 它就是判卷驱动（src/window-history-acceptance-driver.ts）spawn 起来的那个子进程：
  * 在子进程里读 MIST_WINDOW_HISTORY_DIR，构造 FEAT-002 的 WindowHistoryHost（唯一写方
- * + 底座 store + SessionRegistry + 只读投影 + 存储格式管理 + 真实落盘故障注入），报
+ * + 底座 store + 窗账（代际/归档态都是落在同一条底座上的耐久事实，见
+ * window-history-host.ts 顶注）+ 只读投影 + 存储格式管理 + 真实落盘故障注入），报
  * `{type:'ready', pid, bootId}`（bootId 每次启动新随机），然后按 requestId 收发 IPC 把
  * 每个驱动方法转成宿主调用。所有窗事件写入都经唯一写方真实落盘（非零字节）；进程被
  * SIGKILL 后全部内存态丢光，重启只能从盘上读回来——这正是 WH-01 要的真实耐久证据。
