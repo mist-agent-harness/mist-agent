@@ -43,15 +43,9 @@ import type {
   TurnResult,
 } from "../acceptance/resident-runtime-driver.ts";
 
-/** 还是明桩的方法：依赖它们跑绿的灯会显示为桩灯（🟡），不计入完成。 */
-export const STUBBED: readonly string[] = [
-  "letterTimeline",
-  "setBreathThreshold",
-  "breathe",
-  "suddenDeath",
-  "archivedTranscript",
-  "tuiTranscript",
-];
+/** 还是明桩的方法：依赖它们跑绿的灯会显示为桩灯（🟡），不计入完成。
+ * RT-03 的五个口已接线（BreathCycle + sealLetter + turn 占位），名单收窄到 TUI。 */
+export const STUBBED: readonly string[] = ["tuiTranscript"];
 
 const HOST_PROCESS = fileURLToPath(new URL("./resident-runtime/host-process.ts", import.meta.url));
 const READY_TIMEOUT_MS = 15_000;
@@ -147,35 +141,35 @@ class ResidentRuntimeProductionDriver implements ResidentRuntimeDriver {
     return this.#call("bootPack", { input });
   }
 
-  letterTimeline(_input: { residentId: string }): Promise<Result<LetterTimeline>> {
-    return stub("letterTimeline", "RT-03 换代线接线后才有一窗流之外的交接信时间线");
+  letterTimeline(input: { residentId: string }): Promise<Result<LetterTimeline>> {
+    return this.#call("letterTimeline", { input });
   }
 
   // —— 换气（D8，RT-03 的地盘） ——
 
-  setBreathThreshold(_input: {
+  setBreathThreshold(input: {
     residentId: string;
     windowId: string;
     generation: number;
     thresholdTokens: number;
     authority: "window" | "owner";
   }): Promise<Result<void>> {
-    return stub("setBreathThreshold", "RT-03 接 turn-gate / BreathCycle 后才有触发线");
+    return this.#call("setBreathThreshold", { input });
   }
 
-  breathe(_input: { residentId: string; via: BreathTrigger }): Promise<Result<BreatheOutcome>> {
-    return stub("breathe", "RT-03 接 BreathCycle.breathe() + sealLetter 后才有换代");
+  breathe(input: { residentId: string; via: BreathTrigger }): Promise<Result<BreatheOutcome>> {
+    return this.#call("breathe", { input });
   }
 
-  async suddenDeath(_input: { residentId: string }): Promise<void> {
-    await stub("suddenDeath", "RT-03 接猝死归档后才有");
+  async suddenDeath(input: { residentId: string }): Promise<void> {
+    await this.#call("suddenDeath", { input });
   }
 
-  archivedTranscript(_input: {
+  archivedTranscript(input: {
     residentId: string;
     generation: number;
   }): Promise<Result<StreamSnapshot>> {
-    return stub("archivedTranscript", "RT-03 按代归档原始流水后才有");
+    return this.#call("archivedTranscript", { input });
   }
 
   // —— TUI（RT-05 的地盘） ——

@@ -20,6 +20,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type {
   BootPackView,
+  BreatheOutcome,
+  LetterTimeline,
   Result,
   StreamSnapshot,
   TurnResult,
@@ -587,6 +589,141 @@ describe("回合语义（验收席复核三处 + 两项观察）", () => {
     expect(() => new CredentialStore(root)).toThrow(/manifest missing/);
     // 现场留着等人裁：不静默毁掉可能是唯一的凭证副本。
     expect(existsSync(secretPath)).toBe(true);
+  });
+});
+
+describe("换气与交接信（RT-03 / D8）", () => {
+  function fresh(): ResidentRuntime {
+    return new ResidentRuntime({ dataDir: tempDir(), transport: new SyntheticModelTransport() });
+  }
+
+  it("breathe：每代一封、签名是换代前那代、窗号逐字不变、启动包注入同形原件", async () => {
+    const runtime = fresh();
+    try {
+      runtimeProvision(runtime, "r-air");
+      expect(
+        runtime.setBreathThreshold({
+          residentId: "r-air",
+          windowId: "w-air",
+          generation: 1,
+          thresholdTokens: Number.MAX_SAFE_INTEGER,
+          authority: "window",
+        }).ok,
+      ).toBe(true);
+      const one = unwrap<TurnResult>(await runtime.say({ residentId: "r-air", text: "第一句" }));
+      expect(one.generation).toBe(1);
+      const breathed = unwrap<BreatheOutcome>(
+        await runtime.breathe({ residentId: "r-air", via: "clear" }),
+      );
+      expect(breathed.fromGeneration).toBe(1);
+      expect(breathed.toGeneration).toBe(2);
+      expect(breathed.windowId).toBe("w-air"); // 换气前后逐字不变（MV-D10 同族）
+      expect(breathed.letter.author).toBe("r-air#1"); // 签名是换代前那代
+      const timeline = unwrap<LetterTimeline>(runtime.letterTimeline({ residentId: "r-air" }));
+      expect(timeline.letters).toHaveLength(1); // 每代恰好一封
+      const pack = unwrap<BootPackView>(runtime.bootPack({ residentId: "r-air" }));
+      expect(pack.letter?.title).toBe(breathed.letter.title); // 注入原件同形
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("触发线：回合起后窗无权改线（breath-refused），主人改线从下一代生效", async () => {
+    const runtime = fresh();
+    try {
+      runtimeProvision(runtime, "r-line");
+      runtime.setBreathThreshold({
+        residentId: "r-line",
+        windowId: "w-line",
+        generation: 1,
+        thresholdTokens: Number.MAX_SAFE_INTEGER,
+        authority: "window",
+      });
+      const said = unwrap<TurnResult>(
+        await runtime.say({ residentId: "r-line", text: "开了个头" }),
+      );
+      const refused = runtime.setBreathThreshold({
+        residentId: "r-line",
+        windowId: "w-line",
+        generation: said.generation,
+        thresholdTokens: 500,
+        authority: "window",
+      });
+      expect(failureOf(refused)).toMatchObject({ code: "breath-refused" });
+      // 主人能改；但从下一代生效——这一代的线还是高线，不自动换气。
+      expect(
+        runtime.setBreathThreshold({
+          residentId: "r-line",
+          windowId: "w-line",
+          generation: said.generation,
+          thresholdTokens: 1,
+          authority: "owner",
+        }).ok,
+      ).toBe(true);
+      const second = unwrap<TurnResult>(
+        await runtime.say({ residentId: "r-line", text: "再来一句" }),
+      );
+      expect(second.generation).toBe(1); // 主人的低线还没生效，这代不换
+      const breathed = unwrap<BreatheOutcome>(
+        await runtime.breathe({ residentId: "r-line", via: "new" }),
+      );
+      expect(breathed.toGeneration).toBe(2);
+      // 新一代按主人的低线走：这句到线、自动换气落信。
+      const third = unwrap<TurnResult>(await runtime.say({ residentId: "r-line", text: "到线句" }));
+      expect(third.generation).toBe(2);
+      const timeline = unwrap<LetterTimeline>(runtime.letterTimeline({ residentId: "r-line" }));
+      expect(timeline.letters.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("猝死：不写信换继任者，死代流水归档按代可查、查不到 fail-closed", async () => {
+    const runtime = fresh();
+    try {
+      runtimeProvision(runtime, "r-dead");
+      const dead = unwrap<TurnResult>(
+        await runtime.say({ residentId: "r-dead", text: "临终的话" }),
+      );
+      runtime.suddenDeath({ residentId: "r-dead" });
+      const successor = unwrap<TurnResult>(
+        await runtime.say({ residentId: "r-dead", text: "继任者报到" }),
+      );
+      expect(successor.generation).toBeGreaterThan(dead.generation); // 真换了继任者
+      const archived = unwrap<StreamSnapshot>(
+        runtime.archivedTranscript({ residentId: "r-dead", generation: dead.generation }),
+      );
+      // D8 三的正面：死代流水没有无声消失，归档里按代查得到。
+      expect(archived.events.some((event) => event.text.includes("临终的话"))).toBe(true);
+      // 查不到的代 fail-closed，不拿空快照冒充「这代没有流水」。
+      const missing = runtime.archivedTranscript({ residentId: "r-dead", generation: 99 });
+      expect(failureOf(missing)).toMatchObject({ code: "stream-not-found" });
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("到线自动换气：低线 say 落账后亲笔写信换代，回执报换代前那代", async () => {
+    const runtime = fresh();
+    try {
+      runtimeProvision(runtime, "r-auto");
+      runtime.setBreathThreshold({
+        residentId: "r-auto",
+        windowId: "w-auto",
+        generation: 1,
+        thresholdTokens: 1,
+        authority: "window",
+      });
+      const said = unwrap<TurnResult>(
+        await runtime.say({ residentId: "r-auto", text: "这句就到线" }),
+      );
+      expect(said.generation).toBe(1); // 回执报换代前那代（补记一）
+      const timeline = unwrap<LetterTimeline>(runtime.letterTimeline({ residentId: "r-auto" }));
+      expect(timeline.letters).toHaveLength(1);
+      expect(timeline.letters[0]?.author).toBe("r-auto#1");
+    } finally {
+      await runtime.close();
+    }
   });
 });
 
