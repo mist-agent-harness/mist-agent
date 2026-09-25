@@ -577,8 +577,37 @@ export class ResidentRuntime {
         input.residentId,
       );
     }
-    // 调用方指定的窗身份（住户号同款「指定事实」纪律）：首次设定即认领、即落盘，
-    // 之后不许换号（重启也不许——认领在 window-index 里，不在进程内存里）。
+    // 调用方指定的窗身份（住户号同款「指定事实」纪律）：**校验全过之后**才认领
+    // 落盘（协助审查尾巴）——失败的调用不许把窗号钉死，重启都清不掉。
+    if (!Number.isFinite(input.thresholdTokens) || input.thresholdTokens < 1) {
+      return fail(
+        "breath-refused",
+        `触发线不合法：${input.thresholdTokens}`,
+        "触发线是 ≥1 的 token 数（MAX_SAFE_INTEGER 表示不自动换气）",
+        input.residentId,
+      );
+    }
+    const isOwner = input.authority === "owner";
+    if (!isOwner) {
+      // 窗改自己的线：钉住开工的那一代，且只能在本代还没有回合时。回合起了再改
+      // 就是给自己续命。
+      if (input.generation !== window.generation) {
+        return fail(
+          "breath-refused",
+          `代际对不上：当前是第 ${window.generation} 代，不是第 ${input.generation} 代`,
+          "窗只能钉住开工的那一代设线；按当前代际重发，或找主人（authority: owner）改配置",
+          input.residentId,
+        );
+      }
+      if (this.#turnStarted.has(`${window.windowId}#${window.generation}`)) {
+        return fail(
+          "breath-refused",
+          "回合已起，窗无权给自己改触发线",
+          "D8：临近红线的窗无权给自己续命——要调线找主人（authority: owner），从下一代生效",
+          input.residentId,
+        );
+      }
+    }
     const knownPublic = this.#publicWindowIndex[input.residentId];
     if (knownPublic === undefined) {
       this.#publicWindowIndex = { ...this.#publicWindowIndex, [input.residentId]: input.windowId };
@@ -591,39 +620,13 @@ export class ResidentRuntime {
         input.residentId,
       );
     }
-    if (!Number.isFinite(input.thresholdTokens) || input.thresholdTokens < 1) {
-      return fail(
-        "breath-refused",
-        `触发线不合法：${input.thresholdTokens}`,
-        "触发线是 ≥1 的 token 数（MAX_SAFE_INTEGER 表示不自动换气）",
-        input.residentId,
-      );
-    }
-    if (input.authority === "owner") {
+    if (isOwner) {
       // 主人改成员配置：任何时刻允许（协助审查：主人拿着稍旧代际也照收，
       // generation 参数只是调用方的账面），但从下一代生效——不给当前这一代续命。
       this.#breathState.update(input.residentId, (config) => {
         config.pending = input.thresholdTokens;
       });
       return ok(undefined);
-    }
-    // 窗改自己的线：钉住开工的那一代，且只能在本代还没有回合时。回合起了再改
-    // 就是给自己续命。
-    if (input.generation !== window.generation) {
-      return fail(
-        "breath-refused",
-        `代际对不上：当前是第 ${window.generation} 代，不是第 ${input.generation} 代`,
-        "窗只能钉住开工的那一代设线；按当前代际重发，或找主人（authority: owner）改配置",
-        input.residentId,
-      );
-    }
-    if (this.#turnStarted.has(`${window.windowId}#${window.generation}`)) {
-      return fail(
-        "breath-refused",
-        "回合已起，窗无权给自己改触发线",
-        "D8：临近红线的窗无权给自己续命——要调线找主人（authority: owner），从下一代生效",
-        input.residentId,
-      );
     }
     this.#breathState.update(input.residentId, (config) => {
       config.current = input.thresholdTokens;

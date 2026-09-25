@@ -827,6 +827,33 @@ describe("换气与交接信（RT-03 / D8）", () => {
       await runtime.close();
     }
   });
+
+  it("校验失败的设线不钉窗号：认领只在全过之后（协助审查尾巴）", async () => {
+    const runtime = fresh();
+    try {
+      runtimeProvision(runtime, "r-tail");
+      // 非法触发线：调用失败。
+      const bad = runtime.setBreathThreshold({
+        residentId: "r-tail",
+        windowId: "w-tail-bad",
+        generation: 1,
+        thresholdTokens: 0,
+        authority: "window",
+      });
+      expect(failureOf(bad)).toMatchObject({ code: "breath-refused" });
+      // 失败的调用不许把窗号钉死：换一个窗号重发合法设线，必须收。
+      const good = runtime.setBreathThreshold({
+        residentId: "r-tail",
+        windowId: "w-tail-good",
+        generation: 1,
+        thresholdTokens: Number.MAX_SAFE_INTEGER,
+        authority: "window",
+      });
+      expect(good.ok).toBe(true);
+    } finally {
+      await runtime.close();
+    }
+  });
 });
 
 function foreignDraft(): CanonicalEventDraft {
