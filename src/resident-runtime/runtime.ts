@@ -391,6 +391,7 @@ export class ResidentRuntime {
     try {
       for await (const chunk of this.#transport.complete({
         residentId: input.residentId,
+        adapterId: route.adapterId,
         model: route.model,
         text: input.text,
         bootPack,

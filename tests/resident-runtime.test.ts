@@ -112,6 +112,7 @@ describe("通道映射（D25 三：Claude 订阅是唯一特例）", () => {
     const transport = new SyntheticModelTransport();
     const request: ModelCompletionRequest = {
       residentId: "r-synth",
+      adapterId: "pi-ai",
       model: "model-alpha",
       text: "敏感原文-abc",
       bootPack: { residentId: "r-synth", identity: "r-synth", commitments: [], memories: [] },
@@ -425,6 +426,7 @@ describe("回合语义（验收席复核三处 + 两项观察）", () => {
       unwrap<TurnResult>(await runtime.say({ residentId: "r-full", text: "早安" }));
       // 传输替身上的直接断言（意见 1 的验收口径）：不是在 bootPack() 读口验证。
       const first = stub.requests[0];
+      expect(first?.adapterId).toBe("pi-claude-bridge");
       expect(first?.bootPack.memories.map((entry) => entry.content)).toContain("爱吃苹果");
       expect(first?.bootPack.currentFacts?.map((fact) => fact.body)).toContain("住户偏好短句回复");
       expect(first?.history).toEqual([]);

@@ -1,26 +1,18 @@
 /**
  * pi 通道传输（D25）：把一条消息交给用户 `pi install` 装的模型栈跑一个回合。
  *
- * 分工（「mist 当宿主，pi 当零件库」）：mist 不内置、不 fork、不 submodule 任何
- * pi 扩展——本传输只 spawn 用户机器上的 `pi` 公共 CLI（`--print --mode json`），
- * 由 pi 自己解析它装的 provider（pi-ai 的 anthropic/openai/... 或 pi-claude-bridge）。
- * Claude 订阅是唯一特例：走 pi-claude-bridge 时**没有密钥**（Claude Code 自己的
- * 登录态），其余通道的密钥经**环境变量**进子进程。
+ * mist 不内置、不 fork、不 submodule 任何 pi 扩展；本传输只 spawn 用户机器上的
+ * `pi` 公共 CLI。Claude 订阅按已解析的 adapter 路由到 pi-claude-bridge，其余走 pi-ai。
  *
- * 凭证纪律（RT-06）：密钥原文不进 argv（ps 看得见）、不落盘、不打日志——
- * 只进子进程环境变量；子进程退出即消失。
- *
- * 事件口径（pi `--mode json`，实测样谱）：`message_update.assistantMessageEvent`
- * 是 pi-ai 的助手事件流——`text_start` / `text_delta{delta}` / `text_end{content}`，
- * 本传输只把 `text_delta` 的增量吐给上层；`turn_end` 收尾。上游把认证失败当普通
- * 回复文本吐出来（exit 0），所以按前缀 fail-closed 判失败，不把「登录过期」
- * 当住户的回复落账。
+ * 凭证纪律（RT-06）：密钥原文不进 argv、不落盘、不进入错误文本；API key 只进入
+ * 对应 provider 的子进程环境变量。Claude bridge 不接收任何 provider API key，
+ * 使用 Claude Code 自己的登录态。
  */
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import type { ModelCompletionRequest, ModelTransport } from "./channels.ts";
 
-/** provider → 密钥环境变量名（pi 的 provider 各自认的那把钥匙）。 */
+/** provider → pi-ai 使用的密钥环境变量名。 */
 const PROVIDER_SECRET_ENV: Readonly<Record<string, string>> = {
   anthropic: "ANTHROPIC_API_KEY",
   openai: "OPENAI_API_KEY",
@@ -30,33 +22,87 @@ const PROVIDER_SECRET_ENV: Readonly<Record<string, string>> = {
   groq: "GROQ_API_KEY",
 };
 
-/** 上游把认证失败当普通回复吐出来（实测）：这些前缀是通道故障，不是住户的回复。 */
-const FAILURE_PREFIXES = ["Failed to authenticate", "Error:", "error:", "AuthenticationError"];
+const INHERITED_SECRET_ENV_NAMES = [
+  ...new Set([...Object.values(PROVIDER_SECRET_ENV), "PI_API_KEY"]),
+];
+const DEFAULT_TIMEOUT_MS = 120_000;
+const FORCE_KILL_GRACE_MS = 1_000;
+
+/** 上游会把一部分认证失败当普通回复文本吐出；只判回复开头，避免误判正文引用。 */
+const FAILURE_PREFIXES = [
+  "Failed to authenticate",
+  "Error:",
+  "error:",
+  "AuthenticationError",
+  "401",
+  "403",
+  "HTTP 401",
+  "HTTP 403",
+  "Unauthorized",
+  "Forbidden",
+  "Invalid API key",
+  "Invalid key",
+  "Incorrect API key",
+  "API key is invalid",
+  "API key is incorrect",
+  "API key has expired",
+  "The API key is invalid",
+  "Your API key is invalid",
+  "OAuth",
+  "Authentication",
+  "Authorization",
+];
+
+const FAILURE_PATTERNS = [
+  /^failed to authenticate\b/i,
+  /^error:/i,
+  /^authenticationerror\b/i,
+  /^(?:http\s+)?(?:401|403)\b/i,
+  /^(?:unauthorized|forbidden)\b/i,
+  /^(?:invalid|incorrect)\s+(?:api\s+)?key\b/i,
+  /^(?:the\s+|your\s+)?api[\s_-]*key\b.*\b(?:invalid|incorrect|expired|revoked|rejected|unauthorized|denied)\b/i,
+  /^(?:oauth|authentication|authorization)\b.*\b(?:expired|invalid|failed|error|denied|unauthorized|revoked)\b/i,
+];
 
 export interface PiCliTransportOptions {
   /** pi 可执行文件；测试注入假 pi。缺省 PATH 里的 `pi`。 */
   piBin?: string;
-  /** 子进程附加环境（测试用）。 */
+  /** 子进程附加环境（测试用）；provider 凭证变量仍会按路由清理。 */
   extraEnv?: Readonly<Record<string, string>>;
+  /** 子进程最长运行时间，默认 120 秒。 */
+  timeoutMs?: number;
 }
 
 export class PiCliTransport implements ModelTransport {
   readonly #piBin: string;
   readonly #extraEnv: Readonly<Record<string, string>>;
+  readonly #timeoutMs: number;
 
   constructor(options: PiCliTransportOptions = {}) {
     this.#piBin = options.piBin ?? "pi";
     this.#extraEnv = options.extraEnv ?? {};
+    this.#timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    if (!Number.isFinite(this.#timeoutMs) || this.#timeoutMs <= 0) {
+      throw new RangeError("pi timeoutMs must be a positive finite number");
+    }
   }
 
   async *complete(request: ModelCompletionRequest): AsyncIterable<string> {
-    const { provider, model } = splitModelId(request.model);
-    // 密钥只走环境变量（RT-06）：claude-bridge 走订阅登录、没有密钥，别把
-    // 任何东西塞给它；其余 provider 按各家的环境变量名送。
+    const parsed = splitModelId(request.model);
+    const isClaudeBridge = request.adapterId === "pi-claude-bridge";
+    const provider = isClaudeBridge ? "claude-bridge" : parsed.provider;
+
+    if (!isClaudeBridge && request.credentialSecret.length === 0) {
+      throw new Error("pi API-key transport refused an empty credential");
+    }
+
+    // 不把父进程或测试注入环境里其他通道的 key 带给子进程，只加当前 API 通道所需的一把。
     const env: NodeJS.ProcessEnv = { ...process.env, ...this.#extraEnv };
-    if (provider !== "claude-bridge" && request.credentialSecret.length > 0) {
+    for (const name of INHERITED_SECRET_ENV_NAMES) delete env[name];
+    if (!isClaudeBridge) {
       env[PROVIDER_SECRET_ENV[provider] ?? "PI_API_KEY"] = request.credentialSecret;
     }
+
     const args = [
       "--print",
       "--mode",
@@ -71,7 +117,7 @@ export class PiCliTransport implements ModelTransport {
       "off",
       ...(provider === "" ? [] : ["--provider", provider]),
       "--model",
-      model,
+      parsed.model,
       "--system-prompt",
       renderSystemPrompt(request),
       "--",
@@ -82,50 +128,107 @@ export class PiCliTransport implements ModelTransport {
       stdio: ["ignore", "pipe", "pipe"],
     });
 
-    let stderrTail = "";
-    child.stderr?.on("data", (chunk: Buffer) => {
-      stderrTail = `${stderrTail}${chunk.toString("utf8")}`.slice(-2000);
+    let exitCode: number | null = null;
+    let exitSignal: NodeJS.Signals | null = null;
+    let spawnFailure: Error | null = null;
+    let closed = false;
+    let timedOut = false;
+    let resolveClosed: (() => void) | undefined;
+    const closedPromise = new Promise<void>((resolve) => {
+      resolveClosed = resolve;
+    });
+    child.once("error", (error) => {
+      spawnFailure = error;
+    });
+    child.once("close", (code, signal) => {
+      exitCode = code;
+      exitSignal = signal;
+      closed = true;
+      resolveClosed?.();
     });
 
-    let reply = "";
-    let exitCode: number | null = null;
-    let exitFailure: string | null = null;
-    child.on("error", (error) => {
-      exitFailure = error.message;
-    });
-    child.on("close", (code) => {
-      exitCode = code;
-    });
+    // stderr 只排空，不保留或放进异常：扩展可能回显提示或其他敏感材料。
+    child.stderr?.resume();
+
+    let forceKillTimer: NodeJS.Timeout | undefined;
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGTERM");
+        forceKillTimer = setTimeout(() => {
+          if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        }, FORCE_KILL_GRACE_MS);
+        forceKillTimer.unref();
+      }
+    }, this.#timeoutMs);
+    timeoutTimer.unref();
 
     const lines = createInterface({ input: child.stdout });
-    for await (const line of lines) {
-      const event = parseJsonLine(line);
-      if (event === null) continue;
-      const inner = (event as { assistantMessageEvent?: { type?: string; delta?: unknown } })
-        .assistantMessageEvent;
-      if (inner?.type === "text_delta" && typeof inner.delta === "string") {
-        reply += inner.delta;
-        yield inner.delta;
+    let reply = "";
+    let pendingChunks: string[] = [];
+    let streamingStarted = false;
+    let recognizedFailure = false;
+
+    try {
+      for await (const line of lines) {
+        const event = parseJsonLine(line);
+        if (event === null) continue;
+        const inner = (event as { assistantMessageEvent?: { type?: string; delta?: unknown } })
+          .assistantMessageEvent;
+        if (inner?.type !== "text_delta" || typeof inner.delta !== "string") continue;
+
+        const delta = inner.delta;
+        reply += delta;
+        if (recognizedFailure) continue;
+
+        if (streamingStarted) {
+          yield delta;
+          continue;
+        }
+
+        // 在回复开头仍可能是认证错误前缀时暂存；识别失败后不会把错误文本 yield 出去。
+        pendingChunks.push(delta);
+        if (isChannelFailure(reply)) {
+          recognizedFailure = true;
+          pendingChunks = [];
+          continue;
+        }
+        if (couldBeFailurePrefix(reply)) continue;
+
+        streamingStarted = true;
+        for (const pending of pendingChunks) yield pending;
+        pendingChunks = [];
       }
-    }
-    // 收尾判失败：exit 非 0、进程起不来、上游把认证失败当回复吐——都不算真回复。
-    await new Promise<void>((resolve) => {
-      if (exitCode !== null || exitFailure !== null) resolve();
-      else child.on("close", () => resolve());
-    });
-    if (exitFailure !== null) {
-      throw new Error(`pi 起不来：${String(exitFailure)}`);
-    }
-    if (exitCode !== 0) {
-      throw new Error(`pi 退出码 ${String(exitCode)}：${stderrTail.trim() || "无错误输出"}`);
-    }
-    const trimmed = reply.trim();
-    if (trimmed.length === 0) {
-      throw new Error("pi 没有产出任何文本增量");
-    }
-    for (const prefix of FAILURE_PREFIXES) {
-      if (trimmed.startsWith(prefix)) {
-        throw new Error(`pi 通道故障：${trimmed.slice(0, 200)}`);
+
+      await closedPromise;
+      if (spawnFailure !== null) throw new Error("pi 子进程启动失败");
+      if (timedOut) throw new Error(`pi 运行超时（${this.#timeoutMs} ms）`);
+      if (exitCode !== 0) {
+        const status = exitSignal === null ? `退出码 ${String(exitCode)}` : `信号 ${exitSignal}`;
+        throw new Error(`pi ${status}`);
+      }
+      if (recognizedFailure || isChannelFailure(reply)) {
+        throw new Error("pi 通道认证失败；请检查凭证或订阅登录状态");
+      }
+      if (reply.trim().length === 0) {
+        throw new Error("pi 没有产出任何文本增量");
+      }
+      // 回复较短且一直可能匹配错误前缀时，EOF 后确认不是失败再交付。
+      for (const pending of pendingChunks) yield pending;
+      pendingChunks = [];
+    } finally {
+      clearTimeout(timeoutTimer);
+      if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
+      lines.close();
+      // 消费方提前停止 async iterable 时，不能把 pi 子进程留在后台；忽略 TERM 时升级到 KILL。
+      if (!closed && child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGTERM");
+        const cancellationKillTimer = setTimeout(() => {
+          if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        }, FORCE_KILL_GRACE_MS);
+        cancellationKillTimer.unref();
+        await closedPromise;
+        clearTimeout(cancellationKillTimer);
       }
     }
   }
@@ -139,9 +242,7 @@ export function splitModelId(model: string): { provider: string; model: string }
 }
 
 /**
- * 把完整启动包 + 本代历史渲染进系统提示：身份、承诺、记忆、现行有效事实、
- * 此前对话都随这一条请求进模型（验收席意见 1 的口径；currentFacts 缺席 =
- * 没接账，照旧不编空）。
+ * 把完整启动包 + 本代历史渲染进系统提示。currentFacts 缺席 = 没接账；空数组 = 权威事实账为空。
  */
 export function renderSystemPrompt(request: ModelCompletionRequest): string {
   const parts: string[] = [];
@@ -153,8 +254,12 @@ export function renderSystemPrompt(request: ModelCompletionRequest): string {
   if (pack.memories.length > 0) {
     parts.push(`记忆：\n${pack.memories.map((item) => `- ${item.content}`).join("\n")}`);
   }
-  if (pack.currentFacts !== undefined && pack.currentFacts.length > 0) {
-    parts.push(`现行有效事实：\n${pack.currentFacts.map((item) => `- ${item.body}`).join("\n")}`);
+  if (pack.currentFacts !== undefined) {
+    const facts =
+      pack.currentFacts.length === 0
+        ? "（当前没有现行有效事实）"
+        : pack.currentFacts.map((item) => `- ${item.body}`).join("\n");
+    parts.push(`现行有效事实：\n${facts}`);
   }
   if (request.history.length > 0) {
     parts.push(
@@ -164,6 +269,16 @@ export function renderSystemPrompt(request: ModelCompletionRequest): string {
     );
   }
   return parts.join("\n\n");
+}
+
+function isChannelFailure(reply: string): boolean {
+  const trimmed = reply.trimStart();
+  return FAILURE_PATTERNS.some((pattern) => pattern.test(trimmed));
+}
+
+function couldBeFailurePrefix(reply: string): boolean {
+  const trimmed = reply.trimStart().toLowerCase();
+  return FAILURE_PREFIXES.some((prefix) => prefix.toLowerCase().startsWith(trimmed));
 }
 
 function parseJsonLine(line: string): unknown | null {

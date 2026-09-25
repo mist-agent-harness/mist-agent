@@ -68,6 +68,8 @@ export interface HistoryMessage {
 
 export interface ModelCompletionRequest {
   readonly residentId: string;
+  /** D25 已解析的真实路由；传输层不得从 model 字符串猜订阅特例。 */
+  readonly adapterId: ChannelAdapterId;
   readonly model: string;
   readonly text: string;
   /**

@@ -1,10 +1,6 @@
 /**
- * pi 通道传输的单元测试：假 pi 回放**真实 `pi --mode json` 的事件型谱**
- * （样谱来自本机真通道探测：message_update.assistantMessageEvent 的
- * text_start / text_delta / text_end），零网络、零真实凭据。
- *
- * 钉住：流式增量按序吐、密钥只走环境变量不进 argv、claude-bridge（订阅特例）
- * 不带密钥、上游认证失败不当真回复、启动包与历史进系统提示。
+ * pi 通道传输单元测试：假 pi 回放 `--mode json` 事件形状，零网络、零真实凭据。
+ * 钉住路由、密钥隔离、错误 fail-closed、流式增量、子进程生命周期和启动包渲染。
  */
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,6 +17,15 @@ import {
 } from "../src/resident-runtime/pi-transport.ts";
 
 const tempDirs: string[] = [];
+const RECORDED_SECRET_ENVS = [
+  "ANTHROPIC_API_KEY",
+  "OPENAI_API_KEY",
+  "GEMINI_API_KEY",
+  "OPENROUTER_API_KEY",
+  "MISTRAL_API_KEY",
+  "GROQ_API_KEY",
+  "PI_API_KEY",
+] as const;
 
 function tempDir(): string {
   const dir = mkdtempSync(join(tmpdir(), "mist-pi-transport-test-"));
@@ -35,11 +40,14 @@ afterEach(() => {
   }
 });
 
-/** 假 pi：事件型谱照真通道样谱；把 argv 与密钥环境变量落到记录文件供断言。 */
+/** 假 pi：记录 argv / 环境变量并按模式回放事件或维持挂起。 */
 function fakePi(): { bin: string; recordPath: string } {
   const dir = tempDir();
   const bin = join(dir, "fake-pi.js");
   const recordPath = join(dir, "record.json");
+  const envRecord = RECORDED_SECRET_ENVS.map(
+    (name) => `${JSON.stringify(name)}: process.env[${JSON.stringify(name)}] ?? null`,
+  ).join(",\n");
   writeFileSync(
     bin,
     `#!/usr/bin/env node
@@ -48,29 +56,42 @@ const args = process.argv.slice(2);
 const mode = process.env.FAKE_PI_MODE ?? "ok";
 if (process.env.FAKE_PI_RECORD) {
   fs.writeFileSync(process.env.FAKE_PI_RECORD, JSON.stringify({
+    pid: process.pid,
     args,
-    secretEnvs: {
-      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? null,
-      PI_API_KEY: process.env.PI_API_KEY ?? null,
-    },
+    secretEnvs: { ${envRecord} },
   }));
 }
-if (mode === "crash") { process.stderr.write("boom"); process.exit(3); }
-const deltas = mode === "authfail"
-  ? ["Failed to authenticate: OAuth session expired"]
-  : ["你好", "，世界"];
-const out = [
-  { type: "session", version: 3, id: "fake", timestamp: "2026-01-01T00:00:00.000Z", cwd: "/" },
-  { type: "agent_start" },
-  { type: "turn_start" },
-];
-for (const delta of deltas) {
-  out.push({ type: "message_update", usage: {}, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta } });
+if (mode === "crash") {
+  process.stderr.write("private stderr canary");
+  process.exit(3);
 }
-out.push({ type: "message_update", usage: {}, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: deltas.join("") } });
-out.push({ type: "turn_end", message: { role: "assistant", content: [{ type: "text", text: deltas.join("") }] } });
-out.push({ type: "agent_settled" });
-process.stdout.write(out.map((event) => JSON.stringify(event)).join("\\n") + "\\n");
+if (mode === "hang") {
+  setInterval(() => {}, 1000);
+} else if (mode === "slow") {
+  process.on("SIGTERM", () => {});
+  process.stdout.write(JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "先发一段" } }) + "\\n");
+  setInterval(() => {}, 1000);
+} else {
+  const deltas = mode === "authfail"
+    ? ["Failed to auth", "enticate: OAuth session expired"]
+    : mode === "authfail401"
+      ? ["HTTP ", "401 Unauthorized: token expired"]
+      : mode === "authfail-api-key"
+        ? ["API key is ", "invalid: token revoked"]
+        : ["你好", "，世界"];
+  const out = [
+    { type: "session", version: 3, id: "fake", timestamp: "2026-01-01T00:00:00.000Z", cwd: "/" },
+    { type: "agent_start" },
+    { type: "turn_start" },
+  ];
+  for (const delta of deltas) {
+    out.push({ type: "message_update", usage: {}, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta } });
+  }
+  out.push({ type: "message_update", usage: {}, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: deltas.join("") } });
+  out.push({ type: "turn_end", message: { role: "assistant", content: [{ type: "text", text: deltas.join("") }] } });
+  out.push({ type: "agent_settled" });
+  process.stdout.write(out.map((event) => JSON.stringify(event)).join("\\n") + "\\n");
+}
 `,
     "utf8",
   );
@@ -81,6 +102,7 @@ process.stdout.write(out.map((event) => JSON.stringify(event)).join("\\n") + "\\
 function request(overrides: Partial<ModelCompletionRequest> = {}): ModelCompletionRequest {
   return {
     residentId: "r-pi",
+    adapterId: "pi-ai",
     model: "anthropic/claude-test",
     text: "在吗",
     bootPack: { residentId: "r-pi", identity: "小派", commitments: ["每天写日报"], memories: [] },
@@ -96,18 +118,28 @@ async function collect(stream: AsyncIterable<string>): Promise<string[]> {
   return chunks;
 }
 
+async function waitForExit(pid: number): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`child ${pid} did not exit`);
+}
+
 describe("PiCliTransport", () => {
   it("流式增量按序吐（≥2 段），拼接即完整回复", async () => {
-    const { bin, recordPath } = fakePi();
-    const transport = new PiCliTransport({
-      piBin: bin,
-      extraEnv: { FAKE_PI_RECORD: recordPath },
-    });
+    const { bin } = fakePi();
+    const transport = new PiCliTransport({ piBin: bin });
     const chunks = await collect(transport.complete(request()));
     expect(chunks).toEqual(["你好", "，世界"]);
   });
 
-  it("密钥只走环境变量、不进 argv（RT-06 蜜罐纪律）", async () => {
+  it("API key 只进当前 provider 的环境变量，不进 argv 或其他 provider 环境变量", async () => {
     const { bin, recordPath } = fakePi();
     const transport = new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_RECORD: recordPath } });
     await collect(transport.complete(request()));
@@ -115,33 +147,94 @@ describe("PiCliTransport", () => {
       args: string[];
       secretEnvs: Record<string, string | null>;
     };
-    expect(record.args.join(" ")).not.toContain("sk-canary-pi-1"); // argv 里没有密钥
-    expect(record.secretEnvs.ANTHROPIC_API_KEY).toBe("sk-canary-pi-1"); // 环境变量里有
+    expect(record.args.join(" ")).not.toContain("sk-canary-pi-1");
+    expect(record.secretEnvs.ANTHROPIC_API_KEY).toBe("sk-canary-pi-1");
+    for (const name of RECORDED_SECRET_ENVS.filter((key) => key !== "ANTHROPIC_API_KEY")) {
+      expect(record.secretEnvs[name]).toBeNull();
+    }
   });
 
-  it("claude-bridge 订阅特例：不带任何密钥（Claude Code 自己的登录态）", async () => {
+  it("Claude 订阅按 adapter 路由 bridge，清除父环境里的 provider keys", async () => {
     const { bin, recordPath } = fakePi();
-    const transport = new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_RECORD: recordPath } });
-    await collect(transport.complete(request({ model: "claude-bridge/claude-haiku-4-5" })));
+    const transport = new PiCliTransport({
+      piBin: bin,
+      extraEnv: {
+        FAKE_PI_RECORD: recordPath,
+        ANTHROPIC_API_KEY: "ambient-anthropic-key",
+        OPENAI_API_KEY: "ambient-openai-key",
+        PI_API_KEY: "ambient-generic-key",
+      },
+    });
+    await collect(
+      transport.complete(request({ adapterId: "pi-claude-bridge", model: "claude-sonnet-4-5" })),
+    );
     const record = JSON.parse(readFileSync(recordPath, "utf8")) as {
       args: string[];
       secretEnvs: Record<string, string | null>;
     };
-    expect(record.secretEnvs.ANTHROPIC_API_KEY).toBeNull();
-    expect(record.secretEnvs.PI_API_KEY).toBeNull();
+    expect(record.args[record.args.indexOf("--provider") + 1]).toBe("claude-bridge");
+    expect(record.args[record.args.indexOf("--model") + 1]).toBe("claude-sonnet-4-5");
+    for (const name of RECORDED_SECRET_ENVS) expect(record.secretEnvs[name]).toBeNull();
     expect(record.args.join(" ")).not.toContain("sk-canary-pi-1");
   });
 
-  it("上游把认证失败当回复吐出来：fail-closed 抛错，不当真回复", async () => {
-    const { bin } = fakePi();
-    const transport = new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_MODE: "authfail" } });
-    await expect(collect(transport.complete(request()))).rejects.toThrow(/Failed to authenticate/);
-  });
+  it.each(["authfail", "authfail401", "authfail-api-key"])(
+    "认证失败（%s）不 yield 错误文本且 fail-closed",
+    async (mode) => {
+      const { bin } = fakePi();
+      const transport = new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_MODE: mode } });
+      const emitted: string[] = [];
+      await expect(async () => {
+        for await (const chunk of transport.complete(request())) emitted.push(chunk);
+      }).rejects.toThrow(/认证失败/);
+      expect(emitted).toEqual([]);
+    },
+  );
 
-  it("pi 起不来/退出码非 0：抛错交给 channel-unavailable 口径", async () => {
+  it("非零退出抛安全错误，不把 stderr 原文带进异常", async () => {
     const { bin } = fakePi();
     const transport = new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_MODE: "crash" } });
-    await expect(collect(transport.complete(request()))).rejects.toThrow(/退出码 3/);
+    const result = collect(transport.complete(request()));
+    await expect(result).rejects.toThrow(/退出码 3/);
+    await expect(result).rejects.not.toThrow(/private stderr canary/);
+  });
+
+  it("pi 可执行文件不存在时安全失败", async () => {
+    const transport = new PiCliTransport({ piBin: join(tempDir(), "missing-pi") });
+    await expect(collect(transport.complete(request()))).rejects.toThrow(/子进程启动失败/);
+  });
+  it("空 API 凭证在启动子进程前 fail-closed", async () => {
+    const { bin, recordPath } = fakePi();
+    const transport = new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_RECORD: recordPath } });
+    await expect(collect(transport.complete(request({ credentialSecret: "" })))).rejects.toThrow(
+      /empty credential/,
+    );
+    expect(() => readFileSync(recordPath, "utf8")).toThrow();
+  });
+
+  it("超时后杀掉挂起的 pi 子进程", async () => {
+    const { bin, recordPath } = fakePi();
+    const transport = new PiCliTransport({
+      piBin: bin,
+      timeoutMs: 1_000,
+      extraEnv: { FAKE_PI_MODE: "hang", FAKE_PI_RECORD: recordPath },
+    });
+    await expect(collect(transport.complete(request()))).rejects.toThrow(/运行超时/);
+    const record = JSON.parse(readFileSync(recordPath, "utf8")) as { pid: number };
+    await waitForExit(record.pid);
+  });
+
+  it("消费方提前停止迭代时会杀掉 pi 子进程", async () => {
+    const { bin, recordPath } = fakePi();
+    const transport = new PiCliTransport({
+      piBin: bin,
+      extraEnv: { FAKE_PI_MODE: "slow", FAKE_PI_RECORD: recordPath },
+    });
+    const iterator = transport.complete(request())[Symbol.asyncIterator]();
+    await expect(iterator.next()).resolves.toEqual({ done: false, value: "先发一段" });
+    await iterator.return?.();
+    const record = JSON.parse(readFileSync(recordPath, "utf8")) as { pid: number };
+    await waitForExit(record.pid);
   });
 
   it("完整启动包与本代历史渲染进系统提示", async () => {
@@ -193,14 +286,24 @@ describe("pi 通道的解析件", () => {
     expect(splitModelId("model-alpha")).toEqual({ provider: "", model: "model-alpha" });
   });
 
-  it("renderSystemPrompt：没接账（currentFacts 缺席）不编空事实区", () => {
-    const prompt = renderSystemPrompt(request());
-    expect(prompt).toContain("你是住户 小派（r-pi）");
-    expect(prompt).not.toContain("现行有效事实");
-    expect(prompt).not.toContain("本代此前对话");
+  it("renderSystemPrompt：缺席与空的 currentFacts 明确不同", () => {
+    const absent = renderSystemPrompt(request());
+    const empty = renderSystemPrompt(
+      request({
+        bootPack: {
+          residentId: "r-pi",
+          identity: "小派",
+          commitments: [],
+          memories: [],
+          currentFacts: [],
+        },
+      }),
+    );
+    expect(absent).not.toContain("现行有效事实");
+    expect(empty).toContain("现行有效事实：\n（当前没有现行有效事实）");
   });
 
-  it('createModelTransport("pi") 接真通道，不再抛「随通道 PR 落地」', () => {
+  it('createModelTransport("pi") 接真通道', () => {
     expect(createModelTransport("pi")).toBeInstanceOf(PiCliTransport);
     expect(createModelTransport("synthetic")).not.toBeInstanceOf(PiCliTransport);
   });
