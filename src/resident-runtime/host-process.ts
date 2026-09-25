@@ -15,7 +15,10 @@
 import { randomUUID } from "node:crypto";
 import type {
   BootPackView,
+  BreathTrigger,
+  BreatheOutcome,
   ChannelSpec,
+  LetterTimeline,
   Result,
   SecretScanReport,
   StreamFileInventory,
@@ -46,6 +49,11 @@ interface Command {
     readonly canarySecret?: string;
     readonly needle?: string;
     readonly generation?: number;
+    /** 换气面（RT-03）：窗身份、触发线、入口。 */
+    readonly windowId?: string;
+    readonly thresholdTokens?: number;
+    readonly authority?: "window" | "owner";
+    readonly via?: "new" | "clear" | "compact";
   };
 }
 
@@ -99,6 +107,31 @@ async function handle(command: Command): Promise<unknown> {
       return runtime.bootPack({
         residentId: required(input.residentId, "residentId"),
       }) as Result<BootPackView>;
+    case "letterTimeline":
+      return runtime.letterTimeline({
+        residentId: required(input.residentId, "residentId"),
+      }) as Result<LetterTimeline>;
+    case "setBreathThreshold":
+      return runtime.setBreathThreshold({
+        residentId: required(input.residentId, "residentId"),
+        windowId: required(input.windowId, "windowId"),
+        generation: input.generation ?? 0,
+        thresholdTokens: input.thresholdTokens ?? 0,
+        authority: input.authority ?? "window",
+      }) as Result<void>;
+    case "breathe":
+      return (await runtime.breathe({
+        residentId: required(input.residentId, "residentId"),
+        via: input.via ?? "new",
+      })) as Result<BreatheOutcome>;
+    case "suddenDeath":
+      await runtime.suddenDeath({ residentId: required(input.residentId, "residentId") });
+      return null;
+    case "archivedTranscript":
+      return runtime.archivedTranscript({
+        residentId: required(input.residentId, "residentId"),
+        generation: input.generation ?? 0,
+      }) as Result<StreamSnapshot>;
     case "secretScan":
       return runtime.secretScan({
         residentId: required(input.residentId, "residentId"),
