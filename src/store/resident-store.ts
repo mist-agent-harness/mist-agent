@@ -276,8 +276,19 @@ export class ResidentStore {
     if (Number.isFinite(t) && t > this.#lastStamp) this.#lastStamp = t;
   }
 
-  createResident(name: string): string {
-    const residentId = this.#nextId("resident");
+  /**
+   * 建档。住户号默认由发号器生成；总装层（#194 住户运行时、安装器）带外部身份
+   * 入场时可显式指定——判卷与安装器的住户号是调用方指定的事实，不能换号。
+   * 显式号与自产号走同一字符集校验（可作文件名）、同一撞号 fail-closed。
+   *
+   * 代价：外部可选号意味着撞号从「发号器内部事」变成「调用方也会造」，
+   * 拒绝覆盖就是防线；调用方要自己保证号的稳定性（换号 = 换人）。
+   */
+  createResident(name: string, options: { residentId?: string } = {}): string {
+    const residentId = options.residentId ?? this.#nextId("resident");
+    if (!/^[a-z0-9-]+$/.test(residentId)) {
+      throw new Error(`resident id 不可作为文件名: ${residentId}`);
+    }
     if (this.#rooms.has(residentId)) {
       throw new Error(`resident id collision, refusing to overwrite: ${residentId}`);
     }

@@ -40,6 +40,13 @@ export type ResidentRuntimeErrorCode =
   | "stream-not-found"
   /** 唯一 writer 不可用（宿主未起、写句柄已交还）。 */
   | "writer-unavailable"
+  /**
+   * turnId 锚冲突：同一 turnId 被另一条文本占用（调用方复用锚）。
+   * 机器可分于 channel-unavailable——锚冲突不是通道故障，调用方只看错误码
+   * 就要能分开（验收席 5312646838 裁定：结构化冲突必须独立错误码，
+   * message/remedy 的自由文本不作机器判据）。
+   */
+  | "turn-id-conflict"
   /** 换气被拒：临线改阈值、不写信就想换代、代际不对。 */
   | "breath-refused"
   /** 交接信不合模板：缺标题、超长度上限、tier 非法。 */
