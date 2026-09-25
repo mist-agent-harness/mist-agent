@@ -499,7 +499,7 @@ describe("回合语义（验收席复核三处 + 两项观察）", () => {
     }
   });
 
-  it("同 turnId 不同文本 = 换锚当新回合：不撞幂等冲突、不冒充 writer 故障（意见 3）", async () => {
+  it("同 turnId 不同文本 = 结构化锚冲突 fail-closed：不开新回合、不冒充 writer 故障（协助审查 1）", async () => {
     const stub = countingTransport((n) => `回复-${n}`);
     const runtime = runtimeWith(stub.transport);
     try {
@@ -507,14 +507,45 @@ describe("回合语义（验收席复核三处 + 两项观察）", () => {
       const one = unwrap<TurnResult>(
         await runtime.say({ residentId: "r-anchor", text: "第一条", turnId: "turn-x" }),
       );
-      const two = unwrap<TurnResult>(
-        await runtime.say({ residentId: "r-anchor", text: "第二条", turnId: "turn-x" }),
-      );
       expect(one.reply).toBe("回复-1");
-      expect(two.reply).toBe("回复-2");
-      expect(stub.calls()).toBe(2);
+      // 锚复用于不同文本是调用方 bug：fail-closed 报错，不悄悄换锚开新回合
+      //（静默换锚会让「带同一个 turnId 重试」的 remedy 把调用方越带越偏）。
+      const conflict = await runtime.say({
+        residentId: "r-anchor",
+        text: "第二条",
+        turnId: "turn-x",
+      });
+      expect(failureOf(conflict)).toMatchObject({ code: "channel-unavailable" });
+      expect(failureOf(conflict).remedy).toContain("turnId"); // remedy 指路可操作
+      expect(stub.calls()).toBe(1); // 报错在模型调用之前：「第二条」根本没送进模型
       const events = unwrap<StreamSnapshot>(runtime.readStream({ residentId: "r-anchor" })).events;
-      expect(events.map((event) => event.text)).toEqual(["第一条", "回复-1", "第二条", "回复-2"]);
+      expect(events.map((event) => event.text)).toEqual(["第一条", "回复-1"]); // 不留新孤儿
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("扫描面文件名公约：全等 residentId 或 `residentId.` 开头，否则判红（协助审查 2）", async () => {
+    const stub = countingTransport(() => "好。");
+    const dataDir = tempDir();
+    const runtime = new ResidentRuntime({ dataDir, transport: stub.transport });
+    try {
+      runtimeProvision(runtime, "r-a");
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-a", text: "封面" }));
+      unwrap<BootPackView>(runtime.bootPack({ residentId: "r-a" }));
+      // 扫描面（streams/residents/letters/logs）上的每个文件名都必须能被按户界
+      // 的扫描匹配到：全等 residentId 或以 `residentId.` 开头。不符合的名字会从
+      // 扫描面漏掉 → RT-06 假绿，所以这里判红（钉命名公约，防未来文件名漏扫）。
+      for (const surface of ["streams", "residents", "letters", "logs"]) {
+        const dir = join(dataDir, surface);
+        if (!existsSync(dir)) continue;
+        for (const file of readdirSync(dir)) {
+          expect(
+            file === "r-a" || file.startsWith("r-a."),
+            `扫描面 ${surface}/${file} 不符合命名公约（全等 residentId 或 residentId. 开头），会漏扫`,
+          ).toBe(true);
+        }
+      }
     } finally {
       await runtime.close();
     }

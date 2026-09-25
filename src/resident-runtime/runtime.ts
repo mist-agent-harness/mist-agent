@@ -226,7 +226,7 @@ export class ResidentRuntime {
       );
     }
     const requestedTurnId = input.turnId;
-    let turnId = requestedTurnId ?? randomUUID();
+    const turnId = requestedTurnId ?? randomUUID();
     if (requestedTurnId !== undefined) {
       // 回执先行（验收席意见 3）：同一 turnId 的回合若已完成，直接返回已记录结果，
       // 模型不再被调用第二次——重试的正确姿势是幂等读，不是再生成一遍然后撞
@@ -235,10 +235,15 @@ export class ResidentRuntime {
       const state = this.#turnState(input.residentId, requestedTurnId, input.text);
       if (state.kind === "complete") return ok(state.result);
       if (state.kind === "mismatch") {
-        // 锚被不同内容占用（同 turnId 不同文本、回合未完成）：那是另一条消息——
-        // 换新锚当新回合处理。这条路径根本不进 writer，也就谈不上把「幂等冲突」
-        // 冒充「writer 故障」（意见 3 的分离要求）。
-        turnId = randomUUID();
+        // fail-closed（协助审查 1）：turnId 复用于不同文本本来就是调用方 bug，静默
+        // 换锚会让重试越走越偏（每次重试都新开一回合、写重复内容）。结构化报错把
+        // 「锚已被占用」与 writer 故障分开——这条路径根本不进 writer。
+        return fail(
+          "channel-unavailable",
+          `turnId 已被另一条文本占用：${requestedTurnId}`,
+          "这个 turnId 记着别的文本——换一个 turnId 当新回合重发；若这是同一回合的重试，把原文照抄带回来",
+          input.residentId,
+        );
       }
     }
     const credential = this.#credentials.find(input.residentId);
@@ -477,27 +482,24 @@ export class ResidentRuntime {
 
   // —— 回执与上下文（验收席意见 1 / 3） ——
 
-  /** 一窗流历史：此前回合的 user/assistant 消息按流序，随请求进模型。 */
+  /** 一窗流历史：此前回合的 user/assistant 消息按流序，随请求进模型。
+   * 与 readStream 同一 fail-closed 口径（协助审查 3）：共用 toStreamEventView，
+   * 读不懂的事件宁死不屈、不静默跳过——不给模型喂残缺上下文。全流扫一遍是
+   * O(n)/回合；回合多了再按 turnId 建索引（协助审查 5，不阻塞）。 */
   #streamHistory(residentId: string): { role: "user" | "assistant"; text: string }[] {
     if (!this.#streams.has(residentId)) return [];
-    const history: { role: "user" | "assistant"; text: string }[] = [];
-    for (const event of this.#streams.eventsAfter(residentId, 0)) {
-      const payload = event.payload;
-      if (
-        (payload.role === "user" || payload.role === "assistant") &&
-        typeof payload.text === "string"
-      ) {
-        history.push({ role: payload.role, text: payload.text });
-      }
-    }
-    return history;
+    return this.#streams
+      .eventsAfter(residentId, 0)
+      .map(toStreamEventView)
+      .map((view) => ({ role: view.kind, text: view.text }));
   }
 
   /**
    * 回执查询（验收席意见 3）：turnId 在一窗流里的落账状态。
    * complete = user/assistant 两腿都落了、且 user 文本就是这句话 → 已记录结果可回放；
-   * mismatch = 锚被另一条文本占用（半截或张冠李戴）→ 不许当回执用，换锚当新回合；
-   * open = 还没落账（含「user 落了、assistant 没落」的半截续跑）。
+   * mismatch = 锚被另一条文本占用 → fail-closed 报锚冲突（协助审查 1），不悄悄开新回合；
+   * open = 还没落账（含「user 落了、assistant 没落」的半截——同文本重试续跑补齐，
+   * 不同文本的重试被锚冲突拒绝，不再留新孤儿，协助审查 4）。
    */
   #turnState(
     residentId: string,
