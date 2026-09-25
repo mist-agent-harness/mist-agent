@@ -24,8 +24,12 @@ const RECORDED_SECRET_ENVS = [
   "OPENROUTER_API_KEY",
   "MISTRAL_API_KEY",
   "GROQ_API_KEY",
+  "DEEPSEEK_API_KEY",
+  "XAI_API_KEY",
+  "QWEN_TOKEN_PLAN_API_KEY",
+  "COPILOT_GITHUB_TOKEN",
   "PI_API_KEY",
-] as const;
+];
 
 function tempDir(): string {
   const dir = mkdtempSync(join(tmpdir(), "mist-pi-transport-test-"));
@@ -40,7 +44,7 @@ afterEach(() => {
   }
 });
 
-/** 假 pi：记录 argv / 环境变量并按模式回放事件或维持挂起。 */
+/** 假 pi：读取一条 RPC prompt 命令并按模式回放 JSONL 事件。 */
 function fakePi(): { bin: string; recordPath: string } {
   const dir = tempDir();
   const bin = join(dir, "fake-pi.js");
@@ -54,44 +58,77 @@ function fakePi(): { bin: string; recordPath: string } {
 const fs = require("fs");
 const args = process.argv.slice(2);
 const mode = process.env.FAKE_PI_MODE ?? "ok";
-if (process.env.FAKE_PI_RECORD) {
-  fs.writeFileSync(process.env.FAKE_PI_RECORD, JSON.stringify({
+const emit = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  input += chunk;
+  const newline = input.indexOf("\\n");
+  if (newline === -1) return;
+  const command = JSON.parse(input.slice(0, newline));
+  const promptPath = args[args.indexOf("--system-prompt") + 1];
+  const recordPath = process.env.FAKE_PI_RECORD;
+  if (recordPath) fs.writeFileSync(recordPath, JSON.stringify({
     pid: process.pid,
     args,
+    message: command.message,
+    systemPrompt: fs.readFileSync(promptPath, "utf8"),
+    systemPromptPath: promptPath,
+    systemPromptMode: fs.statSync(promptPath).mode & 0o777,
     secretEnvs: { ${envRecord} },
   }));
-}
-if (mode === "crash") {
-  process.stderr.write("private stderr canary");
-  process.exit(3);
-}
-if (mode === "hang") {
-  setInterval(() => {}, 1000);
-} else if (mode === "slow") {
-  process.on("SIGTERM", () => {});
-  process.stdout.write(JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "先发一段" } }) + "\\n");
-  setInterval(() => {}, 1000);
-} else {
+  if (mode === "crash") {
+    process.stderr.write("private stderr canary");
+    process.exit(3);
+  }
+  if (mode === "hang") {
+    setInterval(() => {}, 1000);
+    return;
+  }
+  if (mode === "slow") {
+    process.on("SIGTERM", () => {});
+    emit({ type: "response", id: "mist-prompt", command: "prompt", success: true });
+    emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "先发一段" } });
+    setInterval(() => {}, 1000);
+    return;
+  }
+  emit({ type: "response", id: "mist-prompt", command: "prompt", success: true });
+  if (mode === "malformed") {
+    process.stdout.write("{\\"type\\":\\"message_update\\"\\n");
+    return;
+  }
+  if (mode === "error-event") {
+    emit({ type: "error", message: "private error details" });
+    return;
+  }
+  if (mode === "incomplete") {
+    emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "部分" } });
+    process.exit(0);
+  }
   const deltas = mode === "authfail"
     ? ["Failed to auth", "enticate: OAuth session expired"]
     : mode === "authfail401"
       ? ["HTTP ", "401 Unauthorized: token expired"]
       : mode === "authfail-api-key"
         ? ["API key is ", "invalid: token revoked"]
-        : ["你好", "，世界"];
-  const out = [
-    { type: "session", version: 3, id: "fake", timestamp: "2026-01-01T00:00:00.000Z", cwd: "/" },
-    { type: "agent_start" },
-    { type: "turn_start" },
-  ];
+        : mode === "ordinary-error"
+          ? ["Error: file not found, try the other path"]
+          : mode === "turn-end-only"
+            ? []
+            : mode === "mismatch"
+              ? ["streamed"]
+              : ["你好", "，世界"];
+  const finalText = mode === "mismatch" ? "different final" : deltas.join("") || "turn-end 完整回复";
   for (const delta of deltas) {
-    out.push({ type: "message_update", usage: {}, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta } });
+    emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta } });
   }
-  out.push({ type: "message_update", usage: {}, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: deltas.join("") } });
-  out.push({ type: "turn_end", message: { role: "assistant", content: [{ type: "text", text: deltas.join("") }] } });
-  out.push({ type: "agent_settled" });
-  process.stdout.write(out.map((event) => JSON.stringify(event)).join("\\n") + "\\n");
-}
+  emit({
+    type: "turn_end",
+    outcome: "completed",
+    message: { role: "assistant", content: [{ type: "text", text: finalText }] },
+  });
+  emit({ type: "agent_settled" });
+});
 `,
     "utf8",
   );
@@ -139,19 +176,64 @@ describe("PiCliTransport", () => {
     expect(chunks).toEqual(["你好", "，世界"]);
   });
 
-  it("API key 只进当前 provider 的环境变量，不进 argv 或其他 provider 环境变量", async () => {
+  it("用户文本走 RPC stdin，argv 不含消息或系统提示正文；临时提示文件限权并清理", async () => {
     const { bin, recordPath } = fakePi();
     const transport = new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_RECORD: recordPath } });
-    await collect(transport.complete(request()));
+    const message = `${"x".repeat(200_000)} @/etc/passwd `;
+    const systemHistory = "历史内容".repeat(40_000);
+    const systemPrompt = renderSystemPrompt(
+      request({ history: [{ role: "user", text: systemHistory }] }),
+    );
+    await collect(
+      transport.complete(
+        request({ text: message, history: [{ role: "user", text: systemHistory }] }),
+      ),
+    );
     const record = JSON.parse(readFileSync(recordPath, "utf8")) as {
       args: string[];
-      secretEnvs: Record<string, string | null>;
+      message: string;
+      systemPrompt: string;
+      systemPromptPath: string;
+      systemPromptMode: number;
     };
-    expect(record.args.join(" ")).not.toContain("sk-canary-pi-1");
-    expect(record.secretEnvs.ANTHROPIC_API_KEY).toBe("sk-canary-pi-1");
-    for (const name of RECORDED_SECRET_ENVS.filter((key) => key !== "ANTHROPIC_API_KEY")) {
-      expect(record.secretEnvs[name]).toBeNull();
+    expect(record.args).toContain("rpc");
+    expect(record.args).not.toContain(message);
+    expect(record.args.join(" ")).not.toContain("@/etc/passwd");
+    expect(record.message).toBe(message);
+    expect(record.systemPrompt).toBe(systemPrompt);
+    expect(record.systemPromptMode).toBe(0o600);
+    expect(() => readFileSync(record.systemPromptPath, "utf8")).toThrow();
+  });
+
+  it("provider 密钥变量映射到 pi-ai 定义的名称，不向未知 provider 回退", async () => {
+    for (const [model, envName] of [
+      ["deepseek/deepseek-chat", "DEEPSEEK_API_KEY"],
+      ["xai/grok-test", "XAI_API_KEY"],
+      ["qwen-token-plan/qwen-test", "QWEN_TOKEN_PLAN_API_KEY"],
+    ] as const) {
+      const { bin, recordPath } = fakePi();
+      await collect(
+        new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_RECORD: recordPath } }).complete(
+          request({ model }),
+        ),
+      );
+      const record = JSON.parse(readFileSync(recordPath, "utf8")) as {
+        secretEnvs: Record<string, string | null>;
+      };
+      expect(record.secretEnvs[envName]).toBe("sk-canary-pi-1");
+      for (const name of RECORDED_SECRET_ENVS.filter((entry) => entry !== envName)) {
+        expect(record.secretEnvs[name]).toBeNull();
+      }
     }
+    const { bin, recordPath } = fakePi();
+    await expect(
+      collect(
+        new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_RECORD: recordPath } }).complete(
+          request({ model: "unknown-provider/model" }),
+        ),
+      ),
+    ).rejects.toThrow(/unsupported provider/);
+    expect(() => readFileSync(recordPath, "utf8")).toThrow();
   });
 
   it("Claude 订阅按 adapter 路由 bridge，清除父环境里的 provider keys", async () => {
@@ -188,6 +270,38 @@ describe("PiCliTransport", () => {
         for await (const chunk of transport.complete(request())) emitted.push(chunk);
       }).rejects.toThrow(/认证失败/);
       expect(emitted).toEqual([]);
+    },
+  );
+
+  it("把普通 Error: 文本当作合法模型回复", async () => {
+    const { bin } = fakePi();
+    const chunks = await collect(
+      new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_MODE: "ordinary-error" } }).complete(
+        request(),
+      ),
+    );
+    expect(chunks).toEqual(["Error: file not found, try the other path"]);
+  });
+
+  it("最终 turn_end 含完整文本时，即使没有 text_delta 也能交付", async () => {
+    const { bin } = fakePi();
+    const chunks = await collect(
+      new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_MODE: "turn-end-only" } }).complete(
+        request(),
+      ),
+    );
+    expect(chunks).toEqual(["turn-end 完整回复"]);
+  });
+
+  it.each(["malformed", "incomplete", "error-event", "mismatch"])(
+    "拒绝不完整或不一致的 JSONL 流（%s）",
+    async (mode) => {
+      const { bin } = fakePi();
+      await expect(
+        collect(
+          new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_MODE: mode } }).complete(request()),
+        ),
+      ).rejects.toThrow();
     },
   );
 
@@ -233,8 +347,12 @@ describe("PiCliTransport", () => {
     const iterator = transport.complete(request())[Symbol.asyncIterator]();
     await expect(iterator.next()).resolves.toEqual({ done: false, value: "先发一段" });
     await iterator.return?.();
-    const record = JSON.parse(readFileSync(recordPath, "utf8")) as { pid: number };
+    const record = JSON.parse(readFileSync(recordPath, "utf8")) as {
+      pid: number;
+      systemPromptPath: string;
+    };
     await waitForExit(record.pid);
+    expect(() => readFileSync(record.systemPromptPath, "utf8")).toThrow();
   });
 
   it("完整启动包与本代历史渲染进系统提示", async () => {
@@ -266,8 +384,8 @@ describe("PiCliTransport", () => {
         }),
       ),
     );
-    const record = JSON.parse(readFileSync(recordPath, "utf8")) as { args: string[] };
-    const prompt = record.args[record.args.indexOf("--system-prompt") + 1] ?? "";
+    const record = JSON.parse(readFileSync(recordPath, "utf8")) as { systemPrompt: string };
+    const prompt = record.systemPrompt;
     expect(prompt).toContain("小派");
     expect(prompt).toContain("每天写日报");
     expect(prompt).toContain("爱吃苹果");
