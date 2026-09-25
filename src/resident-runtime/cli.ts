@@ -63,21 +63,27 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   });
   const input = createInterface({ input: process.stdin, crlfDelay: Number.POSITIVE_INFINITY });
   let interrupted = false;
-  input.on("SIGINT", () => {
+  const onSigint = (): void => {
     interrupted = true;
     input.close();
-  });
+  };
+  process.once("SIGINT", onSigint);
 
   try {
     tui.start();
     process.stdout.write("输入 /exit 结束。\n你> ");
     for await (const line of input) {
       if (line.trim() === "/exit") break;
+      if (line.trim().length === 0) {
+        process.stdout.write("\n你> ");
+        continue;
+      }
       await tui.submit(line);
       process.stdout.write("\n你> ");
     }
   } finally {
     input.close();
+    process.off("SIGINT", onSigint);
     await runtime.close();
     if (interrupted) process.exitCode = 130;
   }

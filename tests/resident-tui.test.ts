@@ -121,7 +121,7 @@ describe("resident CLI", () => {
           });
           child.once("error", reject);
           child.once("close", (code) => resolve({ code, output, error }));
-          child.stdin?.end("从标准输入发出的消息\n/exit\n");
+          child.stdin?.end("\n从标准输入发出的消息\n/exit\n");
         },
       );
 
@@ -129,6 +129,52 @@ describe("resident CLI", () => {
       expect(result.output).toContain(`住户：${residentId}　模型：openai/test-model`);
       expect(result.output).toContain("从标准输入发出的消息");
       expect(result.output).toContain("合成回声已读来信。");
+      expect(result.output).not.toContain("[错误]");
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("handles process SIGINT by closing the CLI and returning exit code 130", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "mist-resident-cli-sigint-test-"));
+    const residentId = "resident-cli-sigint-test";
+    const runtime = new ResidentRuntime({
+      dataDir,
+      transport: new SyntheticModelTransport(),
+    });
+    runtime.provisionChannel({
+      residentId,
+      channel: { claudeSubscription: false, credentialKind: "api-key", model: "openai/test-model" },
+      canarySecret: "test-only-not-a-real-secret",
+    });
+    await runtime.close();
+
+    try {
+      const child = spawn(
+        process.execPath,
+        ["--import", "tsx", cliPath, "--resident", residentId, "--data-dir", dataDir],
+        {
+          env: { ...process.env, MIST_RESIDENT_RUNTIME_TRANSPORT: "synthetic" },
+          stdio: ["pipe", "pipe", "pipe"],
+        },
+      );
+      const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+        (resolve, reject) => {
+          let output = "";
+          let sigintSent = false;
+          child.stdout?.setEncoding("utf8").on("data", (chunk: string) => {
+            output += chunk;
+            if (output.includes("你> ") && !sigintSent) {
+              sigintSent = true;
+              child.kill("SIGINT");
+            }
+          });
+          child.once("error", reject);
+          child.once("close", (code, signal) => resolve({ code, signal }));
+        },
+      );
+
+      expect(result).toEqual({ code: 130, signal: null });
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
     }
