@@ -235,13 +235,14 @@ export class ResidentRuntime {
       const state = this.#turnState(input.residentId, requestedTurnId, input.text);
       if (state.kind === "complete") return ok(state.result);
       if (state.kind === "mismatch") {
-        // fail-closed（协助审查 1）：turnId 复用于不同文本本来就是调用方 bug，静默
-        // 换锚会让重试越走越偏（每次重试都新开一回合、写重复内容）。结构化报错把
-        // 「锚已被占用」与 writer 故障分开——这条路径根本不进 writer。
+        // fail-closed（协助审查 1 / 验收席 5312646838）：turnId 复用于不同文本本来
+        // 就是调用方 bug，静默换锚会让重试越走越偏（每次重试都新开一回合、写重复
+        // 内容）。独立错误码机器可分于通道故障——不调模型、不落账，重复提交同一
+        // 冲突永远得到同一个结构化失败。
         return fail(
-          "channel-unavailable",
+          "turn-id-conflict",
           `turnId 已被另一条文本占用：${requestedTurnId}`,
-          "这个 turnId 记着别的文本——换一个 turnId 当新回合重发；若这是同一回合的重试，把原文照抄带回来",
+          "这个 turnId 记着别的文本——新消息换一个新 turnId 重发；若这是同一回合的重试，把原文照抄带回来",
           input.residentId,
         );
       }
@@ -484,8 +485,10 @@ export class ResidentRuntime {
 
   /** 一窗流历史：此前回合的 user/assistant 消息按流序，随请求进模型。
    * 与 readStream 同一 fail-closed 口径（协助审查 3）：共用 toStreamEventView，
-   * 读不懂的事件宁死不屈、不静默跳过——不给模型喂残缺上下文。全流扫一遍是
-   * O(n)/回合；回合多了再按 turnId 建索引（协助审查 5，不阻塞）。 */
+   * 读不懂的事件宁死不屈、不静默跳过——不给模型喂残缺上下文。代价（协助审查
+   * 观察）：一条坏事件会毒死该住户后续回合；修复路径是错误信息里的 eventId
+   * 定位坏事件，由宿主运维裁定修数据后重启（流 append-only，常规手段不改史）。
+   * 全流扫一遍是 O(n)/回合；回合多了再按 turnId 建索引（协助审查 5，不阻塞）。 */
   #streamHistory(residentId: string): { role: "user" | "assistant"; text: string }[] {
     if (!this.#streams.has(residentId)) return [];
     return this.#streams

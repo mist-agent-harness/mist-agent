@@ -508,18 +508,20 @@ describe("回合语义（验收席复核三处 + 两项观察）", () => {
         await runtime.say({ residentId: "r-anchor", text: "第一条", turnId: "turn-x" }),
       );
       expect(one.reply).toBe("回复-1");
-      // 锚复用于不同文本是调用方 bug：fail-closed 报错，不悄悄换锚开新回合
-      //（静默换锚会让「带同一个 turnId 重试」的 remedy 把调用方越带越偏）。
-      const conflict = await runtime.say({
-        residentId: "r-anchor",
-        text: "第二条",
-        turnId: "turn-x",
-      });
-      expect(failureOf(conflict)).toMatchObject({ code: "channel-unavailable" });
-      expect(failureOf(conflict).remedy).toContain("turnId"); // remedy 指路可操作
-      expect(stub.calls()).toBe(1); // 报错在模型调用之前：「第二条」根本没送进模型
+      // 锚复用于不同文本是调用方 bug：fail-closed 报**独立错误码**（验收席
+      // 5312646838：机器可分判据是 code，自由文本不算），不悄悄换锚开新回合。
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const conflict = await runtime.say({
+          residentId: "r-anchor",
+          text: "第二条",
+          turnId: "turn-x",
+        });
+        expect(failureOf(conflict)).toMatchObject({ code: "turn-id-conflict" });
+        expect(failureOf(conflict).remedy).toContain("turnId"); // remedy 指路可操作
+      }
+      expect(stub.calls()).toBe(1); // 报错在模型调用之前：「第二条」三次都没送进模型
       const events = unwrap<StreamSnapshot>(runtime.readStream({ residentId: "r-anchor" })).events;
-      expect(events.map((event) => event.text)).toEqual(["第一条", "回复-1"]); // 不留新孤儿
+      expect(events.map((event) => event.text)).toEqual(["第一条", "回复-1"]); // 流水不增、不留孤儿
     } finally {
       await runtime.close();
     }
