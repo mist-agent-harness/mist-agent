@@ -20,3 +20,5 @@ export type {
 } from "./credentials.ts";
 export { ResidentRuntime } from "./runtime.ts";
 export type { ResidentRuntimeOptions } from "./runtime.ts";
+export { ResidentChatTui, runResidentTuiScript } from "./tui.ts";
+export type { ChatTurnPort, ResidentChatTuiOptions, ScriptedChatPort } from "./tui.ts";
