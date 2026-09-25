@@ -77,6 +77,8 @@ const WINDOW_INDEX_SCHEMA = 1;
 interface WindowIndex {
   readonly schemaVersion: typeof WINDOW_INDEX_SCHEMA;
   readonly windows: Readonly<Record<string, string>>;
+  /** 调用方认领的对外窗号（住户号同款纪律）：认领即落盘，重启不许换号。 */
+  readonly publicWindows?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -136,14 +138,15 @@ export class ResidentRuntime {
   readonly #breathState: BreathStateStore;
   readonly #letters: LetterStore;
   readonly #breathCycle: BreathCycle<{ letter: SealedLetter | null }>;
-  /** 调用方指定的窗身份（住户号同款「指定事实」纪律）：对外窗号，换气前后逐字不变。 */
-  readonly #publicWindowIds = new Map<string, string>();
+  /** 调用方指定的窗身份（住户号同款「指定事实」纪律）：对外窗号，换气前后逐字不变。
+   * 认领与 window-index 同级落盘（协助审查）：重启也不许换号。 */
+  #publicWindowIndex: Record<string, string> = {};
   /** 已起过回合的 (窗口, 代际)：窗只能在开工（本代还没有回合）时设自己的线（D8 一）。 */
   readonly #turnStarted = new Set<string>();
   /**
-   * 同一住户的完整回合串行（验收席意见 2）：「读上下文 → 调模型 → user/assistant
-   * 落账」全程占坑，后一个 say() 排队等前一回合落完账——writer 只串行单事件，
-   * 回合级的次序由这里保证（user A → assistant A → user B → assistant B）。
+   * 同一住户的操作串行域（验收席意见 2 / 协助审查「换代-回合竞态」）：say 的
+   * 完整回合与 breathe/suddenDeath 的换代动作共用一条队列——「读上下文 → 调
+   * 模型 → 落账」和「封信 → 换代」不许交错。后一个操作排队等前一个落完。
    */
   readonly #turnQueues = new Map<string, Promise<unknown>>();
   readonly #windows = new Map<string, string>();
@@ -188,7 +191,9 @@ export class ResidentRuntime {
       now: () => new Date().toISOString(),
     });
     this.#windowIndexPath = join(dataDir, "sessions", "window-index.json");
-    this.#windowIndex = this.#readWindowIndex();
+    const restoredIndex = this.#readWindowIndex();
+    this.#windowIndex = restoredIndex.windows;
+    this.#publicWindowIndex = restoredIndex.publicWindows;
   }
 
   // —— 通道（D25） ——
@@ -241,16 +246,20 @@ export class ResidentRuntime {
    * 落账」全程占坑，后一个 say() 排队等前一回合落完账——回合不许拆散交错。
    */
   say(input: SayInput): Promise<Result<TurnResult>> {
-    const prior = this.#turnQueues.get(input.residentId) ?? Promise.resolve();
-    const turn = prior.then(() => this.#runTurn(input));
+    return this.#enqueue(input.residentId, () => this.#runTurn(input));
+  }
+
+  #enqueue<T>(residentId: string, task: () => Promise<T>): Promise<T> {
+    const prior = this.#turnQueues.get(residentId) ?? Promise.resolve();
+    const run = prior.then(task);
     this.#turnQueues.set(
-      input.residentId,
-      turn.then(
+      residentId,
+      run.then(
         () => undefined,
         () => undefined,
       ),
     );
-    return turn;
+    return run;
   }
 
   async #runTurn(input: SayInput): Promise<Result<TurnResult>> {
@@ -456,7 +465,8 @@ export class ResidentRuntime {
       state.accumulated += estimateTokens(input.text);
     });
     if (config.accumulated >= config.current) {
-      const breathed = await this.breathe({ residentId: input.residentId, via: "new" });
+      // 直呼内芯：#runTurn 本身就在住户级串行域里，再排队会自锁。
+      const breathed = await this.#breatheNow({ residentId: input.residentId, via: "new" });
       if (!breathed.ok) {
         // 回合已完整落账，但到线没换成代——如实报换气的结构化失败，不粉饰。
         return fail(
@@ -515,7 +525,18 @@ export class ResidentRuntime {
       );
     }
     const pack = buildBootPack(this.#residents, input.residentId);
-    const latestLetter = this.#letters.latest(input.residentId);
+    let latestLetter: SealedLetter | null;
+    try {
+      latestLetter = this.#letters.latest(input.residentId);
+    } catch (error) {
+      // 信档损坏 fail-closed（协助审查）：宁可启动包读不出，也不静默回退旧信。
+      return fail(
+        "letter-invalid",
+        `交接信读不出：${(error as Error).message}`,
+        "信档损坏不许静默降级——修复 letters/ 里的信档后再读启动包",
+        input.residentId,
+      );
+    }
     return ok({
       residentId: pack.residentId,
       identity: pack.identity,
@@ -556,23 +577,17 @@ export class ResidentRuntime {
         input.residentId,
       );
     }
-    // 调用方指定的窗身份（住户号同款「指定事实」纪律）：首次设定即认领，不许换号。
-    const knownPublic = this.#publicWindowIds.get(input.residentId);
+    // 调用方指定的窗身份（住户号同款「指定事实」纪律）：首次设定即认领、即落盘，
+    // 之后不许换号（重启也不许——认领在 window-index 里，不在进程内存里）。
+    const knownPublic = this.#publicWindowIndex[input.residentId];
     if (knownPublic === undefined) {
-      this.#publicWindowIds.set(input.residentId, input.windowId);
+      this.#publicWindowIndex = { ...this.#publicWindowIndex, [input.residentId]: input.windowId };
+      this.#saveWindowIndex();
     } else if (knownPublic !== input.windowId) {
       return fail(
         "breath-refused",
         `窗身份对不上：这位住户的窗是 ${knownPublic}，不是 ${input.windowId}`,
         "一位住户一扇窗；给对的 windowId，或为新住户另开流程",
-        input.residentId,
-      );
-    }
-    if (input.generation !== window.generation) {
-      return fail(
-        "breath-refused",
-        `代际对不上：当前是第 ${window.generation} 代，不是第 ${input.generation} 代`,
-        "按当前代际重发设定；代际以换气回执或回合结果为准",
         input.residentId,
       );
     }
@@ -585,13 +600,23 @@ export class ResidentRuntime {
       );
     }
     if (input.authority === "owner") {
-      // 主人改成员配置：允许，但从下一代生效——不给当前这一代续命（D8 一）。
+      // 主人改成员配置：任何时刻允许（协助审查：主人拿着稍旧代际也照收，
+      // generation 参数只是调用方的账面），但从下一代生效——不给当前这一代续命。
       this.#breathState.update(input.residentId, (config) => {
         config.pending = input.thresholdTokens;
       });
       return ok(undefined);
     }
-    // 窗改自己的线：只能在开工（本代还没有回合）时。回合起了再改就是给自己续命。
+    // 窗改自己的线：钉住开工的那一代，且只能在本代还没有回合时。回合起了再改
+    // 就是给自己续命。
+    if (input.generation !== window.generation) {
+      return fail(
+        "breath-refused",
+        `代际对不上：当前是第 ${window.generation} 代，不是第 ${input.generation} 代`,
+        "窗只能钉住开工的那一代设线；按当前代际重发，或找主人（authority: owner）改配置",
+        input.residentId,
+      );
+    }
     if (this.#turnStarted.has(`${window.windowId}#${window.generation}`)) {
       return fail(
         "breath-refused",
@@ -606,8 +631,14 @@ export class ResidentRuntime {
     return ok(undefined);
   }
 
-  /** 走 D8 的统一流程：亲笔写信 → 换代重生。三个入口（via: new/clear/compact）同义同流程。 */
-  async breathe(input: {
+  /** 走 D8 的统一流程：亲笔写信 → 换代重生。三个入口（via: new/clear/compact）同义同流程。
+   * 与 say() 共用住户级串行域（协助审查）：换代不许插进回合中途。 */
+  breathe(input: { residentId: string; via: BreathTrigger }): Promise<Result<BreatheOutcome>> {
+    return this.#enqueue(input.residentId, () => this.#breatheNow(input));
+  }
+
+  /** 换代内芯：只在住户级串行域里跑（公开 breathe 排队进；say 的到线换气直呼，已在域内）。 */
+  async #breatheNow(input: {
     residentId: string;
     via: BreathTrigger;
   }): Promise<Result<BreatheOutcome>> {
@@ -640,7 +671,7 @@ export class ResidentRuntime {
         fromGeneration,
         toGeneration: breathed.window.generation,
         // 换气前后逐字不变（MV-D10 同族）：对外窗号是调用方认下的那份身份。
-        windowId: this.#publicWindowIds.get(input.residentId) ?? window.windowId,
+        windowId: this.#publicWindowIndex[input.residentId] ?? window.windowId,
         letter: toLetterView(breathed.letter),
       });
     } catch (error) {
@@ -670,11 +701,27 @@ export class ResidentRuntime {
         input.residentId,
       );
     }
-    return ok(toLetterTimeline(input.residentId, this.#letters.timeline(input.residentId)));
+    try {
+      return ok(toLetterTimeline(input.residentId, this.#letters.timeline(input.residentId)));
+    } catch (error) {
+      return fail(
+        "letter-invalid",
+        `交接信时间线读不出：${(error as Error).message}`,
+        "信档损坏不许静默降级——修复 letters/ 里的信档后再读时间线",
+        input.residentId,
+      );
+    }
   }
 
-  /** 猝死：没来得及写信就杀（D8 三）。继任者下次 say 同窗接代，原始流水归档可查。 */
-  suddenDeath(input: { residentId: string }): void {
+  /** 猝死：没来得及写信就杀（D8 三）。继任者下次 say 同窗接代，原始流水归档可查。
+   * 与 say()/breathe() 同一串行域：换代动作不插进回合中途。 */
+  suddenDeath(input: { residentId: string }): Promise<void> {
+    return this.#enqueue(input.residentId, async () => {
+      this.#suddenDeathNow(input);
+    });
+  }
+
+  #suddenDeathNow(input: { residentId: string }): void {
     const knownId = this.#windows.get(input.residentId) ?? this.#windowIndex[input.residentId];
     if (knownId !== undefined) {
       try {
@@ -884,12 +931,7 @@ export class ResidentRuntime {
     const opened = this.#sessions.open(residentId, { context: wakeContext });
     this.#windows.set(residentId, opened.windowId);
     this.#windowIndex = { ...this.#windowIndex, [residentId]: opened.windowId };
-    const index: WindowIndex = {
-      schemaVersion: WINDOW_INDEX_SCHEMA,
-      windows: { ...this.#windowIndex },
-    };
-    mkdirSync(dirname(this.#windowIndexPath), { recursive: true });
-    writeFileSync(this.#windowIndexPath, JSON.stringify(index));
+    this.#saveWindowIndex();
     return { windowId: opened.windowId, generation: opened.generation };
   }
 
@@ -909,17 +951,30 @@ export class ResidentRuntime {
     }
   }
 
-  #readWindowIndex(): Record<string, string> {
+  #readWindowIndex(): { windows: Record<string, string>; publicWindows: Record<string, string> } {
     try {
       const parsed = JSON.parse(readFileSync(this.#windowIndexPath, "utf8")) as WindowIndex;
       if (parsed.schemaVersion !== WINDOW_INDEX_SCHEMA || typeof parsed.windows !== "object") {
         throw new Error("window index has an unsupported shape");
       }
-      return { ...parsed.windows };
+      return {
+        windows: { ...parsed.windows },
+        publicWindows: { ...(parsed.publicWindows ?? {}) },
+      };
     } catch (error) {
-      if (isMissingFile(error)) return {};
+      if (isMissingFile(error)) return { windows: {}, publicWindows: {} };
       throw error;
     }
+  }
+
+  #saveWindowIndex(): void {
+    const index: WindowIndex = {
+      schemaVersion: WINDOW_INDEX_SCHEMA,
+      windows: { ...this.#windowIndex },
+      publicWindows: { ...this.#publicWindowIndex },
+    };
+    mkdirSync(dirname(this.#windowIndexPath), { recursive: true });
+    writeFileSync(this.#windowIndexPath, JSON.stringify(index));
   }
 
   #filesUnder(root: string, residentId: string | null): string[] {

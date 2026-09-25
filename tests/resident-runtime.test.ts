@@ -685,7 +685,7 @@ describe("换气与交接信（RT-03 / D8）", () => {
       const dead = unwrap<TurnResult>(
         await runtime.say({ residentId: "r-dead", text: "临终的话" }),
       );
-      runtime.suddenDeath({ residentId: "r-dead" });
+      await runtime.suddenDeath({ residentId: "r-dead" });
       const successor = unwrap<TurnResult>(
         await runtime.say({ residentId: "r-dead", text: "继任者报到" }),
       );
@@ -721,6 +721,108 @@ describe("换气与交接信（RT-03 / D8）", () => {
       const timeline = unwrap<LetterTimeline>(runtime.letterTimeline({ residentId: "r-auto" }));
       expect(timeline.letters).toHaveLength(1);
       expect(timeline.letters[0]?.author).toBe("r-auto#1");
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("换代不插回合中途：并发 say + breathe 在同一串行域（协助审查严重项）", async () => {
+    // 慢速传输：没有串行域的话，breathe 会插进模型等待的中途，回合拆两代。
+    const runtime = new ResidentRuntime({
+      dataDir: tempDir(),
+      transport: {
+        async *complete(): AsyncIterable<string> {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          yield "慢回复";
+        },
+      },
+    });
+    try {
+      runtimeProvision(runtime, "r-race");
+      const [said, breathed] = await Promise.all([
+        runtime.say({ residentId: "r-race", text: "回合句" }),
+        runtime.breathe({ residentId: "r-race", via: "new" }),
+      ]);
+      const turn = unwrap<TurnResult>(said);
+      const swap = unwrap<BreatheOutcome>(breathed);
+      // 回合完整落在一代里：user/assistant 不许拆在旧代/新代两边。
+      const events = unwrap<StreamSnapshot>(runtime.readStream({ residentId: "r-race" })).events;
+      expect(events.map((event) => event.text)).toEqual(["回合句", "慢回复"]);
+      // say 先排队：换代发生在整个回合之后，fromGeneration 正是回合那代。
+      expect(swap.fromGeneration).toBe(turn.generation);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("主人改线任何时刻可收（哪怕代际是旧账面），pending 从下一代生效（协助审查中等项）", async () => {
+    const runtime = fresh();
+    try {
+      runtimeProvision(runtime, "r-owner");
+      runtime.setBreathThreshold({
+        residentId: "r-owner",
+        windowId: "w-owner",
+        generation: 1,
+        thresholdTokens: Number.MAX_SAFE_INTEGER,
+        authority: "window",
+      });
+      // 代际 999 是调用方的旧账面：主人改配置照收，不校验当前代。
+      const retune = runtime.setBreathThreshold({
+        residentId: "r-owner",
+        windowId: "w-owner",
+        generation: 999,
+        thresholdTokens: 1,
+        authority: "owner",
+      });
+      expect(retune.ok).toBe(true);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("窗号认领落盘：重启后不许换号（协助审查中等项）", async () => {
+    const dataDir = tempDir();
+    const first = new ResidentRuntime({ dataDir, transport: new SyntheticModelTransport() });
+    runtimeProvision(first, "r-pin");
+    expect(
+      first.setBreathThreshold({
+        residentId: "r-pin",
+        windowId: "w-pin-1",
+        generation: 1,
+        thresholdTokens: Number.MAX_SAFE_INTEGER,
+        authority: "window",
+      }).ok,
+    ).toBe(true);
+    await first.close();
+    const second = new ResidentRuntime({ dataDir, transport: new SyntheticModelTransport() });
+    try {
+      const renames = second.setBreathThreshold({
+        residentId: "r-pin",
+        windowId: "w-pin-2",
+        generation: 1,
+        thresholdTokens: Number.MAX_SAFE_INTEGER,
+        authority: "window",
+      });
+      // 认领在盘上，重启也换不了号。
+      expect(failureOf(renames)).toMatchObject({ code: "breath-refused" });
+    } finally {
+      await second.close();
+    }
+  });
+
+  it("信档损坏 fail-closed：不静默回退旧信（协助审查轻微项）", async () => {
+    const dataDir = tempDir();
+    const runtime = new ResidentRuntime({ dataDir, transport: new SyntheticModelTransport() });
+    try {
+      runtimeProvision(runtime, "r-bad");
+      unwrap<BreatheOutcome>(await runtime.breathe({ residentId: "r-bad", via: "new" }));
+      writeFileSync(join(dataDir, "letters", "r-bad.letter-2.json"), "{ broken", "utf8");
+      const timeline = runtime.letterTimeline({ residentId: "r-bad" });
+      // 报损坏，不装作没这封。
+      expect(failureOf(timeline)).toMatchObject({ code: "letter-invalid" });
+      // 启动包同样不静默降级到旧信。
+      const pack = runtime.bootPack({ residentId: "r-bad" });
+      expect(failureOf(pack)).toMatchObject({ code: "letter-invalid" });
     } finally {
       await runtime.close();
     }

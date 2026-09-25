@@ -126,11 +126,22 @@ export class LetterStore {
     for (const file of readdirSync(this.#dir)) {
       // 按户界（命名公约）：r-a 的时间线不含 r-ab 的信。
       if (!file.startsWith(prefix) || !file.endsWith(".json")) continue;
+      let parsed: SealedLetter;
       try {
-        letters.push(JSON.parse(readFileSync(join(this.#dir, file), "utf8")) as SealedLetter);
-      } catch {
-        // 读不懂的信文件跳过并继续：时间线是读口，坏档不楔死别的代。
+        parsed = JSON.parse(readFileSync(join(this.#dir, file), "utf8")) as SealedLetter;
+      } catch (error) {
+        // fail-closed（协助审查）：信档损坏不许静默跳过——那会让「最新信损坏」
+        // 误表现为「上一代信仍是最新」。报出来，让人来修档，不回退到旧信。
+        throw new Error(`交接信档损坏：${file}（${(error as Error).message}）`);
       }
+      if (
+        typeof parsed.title !== "string" ||
+        typeof parsed.residentId !== "string" ||
+        typeof parsed.generation !== "number"
+      ) {
+        throw new Error(`交接信档不合形状：${file}`);
+      }
+      letters.push(parsed);
     }
     return letters.sort((a, b) => a.generation - b.generation);
   }

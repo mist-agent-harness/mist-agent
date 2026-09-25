@@ -125,7 +125,7 @@ async function handle(command: Command): Promise<unknown> {
         via: input.via ?? "new",
       })) as Result<BreatheOutcome>;
     case "suddenDeath":
-      runtime.suddenDeath({ residentId: required(input.residentId, "residentId") });
+      await runtime.suddenDeath({ residentId: required(input.residentId, "residentId") });
       return null;
     case "archivedTranscript":
       return runtime.archivedTranscript({
