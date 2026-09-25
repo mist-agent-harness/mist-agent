@@ -16,6 +16,7 @@
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
+  existsSync,
   fchmodSync,
   fsyncSync,
   mkdirSync,
@@ -197,11 +198,18 @@ export class CredentialStore {
    * revoked 记录还挂在清单上，它的密钥**不**扫——「revoke 只翻状态不删档」不变。
    */
   #sweepOrphanSecrets(): void {
+    const secretFiles = readdirSync(this.#secretsDir).filter((file) => file.endsWith(".key"));
+    if (!existsSync(this.#manifestPath) && secretFiles.length > 0) {
+      // 清单丢了但密钥文件还在（验收席观察 B）：清扫会把密钥判孤儿**删掉**——那可能是
+      // 唯一凭证副本。fail-closed 报警留现场等人裁，不静默破坏。
+      throw new Error(
+        `credential manifest missing while secret files remain: ${this.#manifestPath} — refusing to sweep; restore the manifest before restarting`,
+      );
+    }
     const referenced = new Set(
       this.#readManifest().credentials.map((candidate) => candidate.credentialRef),
     );
-    for (const file of readdirSync(this.#secretsDir)) {
-      if (!file.endsWith(".key")) continue;
+    for (const file of secretFiles) {
       const credentialRef = `mist-cred:${file.slice(0, -".key".length)}`;
       if (!referenced.has(credentialRef)) {
         rmSync(join(this.#secretsDir, file), { force: true });

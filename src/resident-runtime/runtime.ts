@@ -39,6 +39,8 @@ import { buildBootPack } from "../bootpack.ts";
 import type { CanonicalEventDraft, EventActor, JsonObject } from "../one-stream/event-contract.ts";
 import { CanonicalStreamStore, StreamNotFoundError } from "../one-stream/index.ts";
 import { SessionRegistry, WindowReopenError } from "../session/session-registry.ts";
+import { LedgerNotFoundError } from "../store/fact-ledger-errors.ts";
+import type { FactLedger } from "../store/fact-ledger.ts";
 import { ResidentNotFoundError, ResidentStore } from "../store/resident-store.ts";
 import {
   WINDOW_EVENT_OCCURRED_AT,
@@ -61,10 +63,26 @@ interface WindowIndex {
   readonly windows: Readonly<Record<string, string>>;
 }
 
+/**
+ * say() 的入参。turnId 是重试锚（评审意见 1 / 验收席意见 3）：幂等键由它派生
+ * （say-user-/say-assistant- 各一份），同一回合的重试带同一个 turnId 就不写重复、
+ * 已完成的回合直接回放已记录结果；缺省自造 = 当新回合。
+ */
+interface SayInput {
+  residentId: string;
+  text: string;
+  turnId?: string;
+}
+
 export interface ResidentRuntimeOptions {
   readonly dataDir: string;
   /** 模型传输。缺省按 MIST_RESIDENT_RUNTIME_TRANSPORT 选（默认合成通道）。 */
   readonly transport?: ModelTransport;
+  /**
+   * 权威事实账（MV-A05）：接了就把 ledger.currentSet() 注进启动包的 currentFacts
+   * 分区随请求进模型。不传 = 没接账（与「账是空的」不是同一个值，缺席即缺席）。
+   */
+  readonly factLedger?: FactLedger;
 }
 
 function ok<T>(value: T): Result<T> {
@@ -98,6 +116,13 @@ export class ResidentRuntime {
   readonly #sessions: SessionRegistry<null>;
   readonly #credentials: CredentialStore;
   readonly #transport: ModelTransport;
+  readonly #factLedger: FactLedger | undefined;
+  /**
+   * 同一住户的完整回合串行（验收席意见 2）：「读上下文 → 调模型 → user/assistant
+   * 落账」全程占坑，后一个 say() 排队等前一回合落完账——writer 只串行单事件，
+   * 回合级的次序由这里保证（user A → assistant A → user B → assistant B）。
+   */
+  readonly #turnQueues = new Map<string, Promise<unknown>>();
   readonly #windows = new Map<string, string>();
   #windowIndex: Record<string, string> = {};
 
@@ -121,6 +146,7 @@ export class ResidentRuntime {
     });
     this.#credentials = new CredentialStore(join(dataDir, "credentials"));
     this.#transport = options.transport ?? createModelTransport();
+    this.#factLedger = options.factLedger;
     this.#windowIndexPath = join(dataDir, "sessions", "window-index.json");
     this.#windowIndex = this.#readWindowIndex();
   }
@@ -170,15 +196,24 @@ export class ResidentRuntime {
 
   // —— 对话往返（RT-01 / RT-02 的循环本体） ——
 
-  async say(input: {
-    residentId: string;
-    text: string;
-    /**
-     * 重试锚（评审意见 1）：幂等键由 turnId 派生（say-user-/say-assistant- 各一份），
-     * 同一回合的重试带同一个 turnId 就不会写重复。缺省自造 = 当新回合。
-     */
-    turnId?: string;
-  }): Promise<Result<TurnResult>> {
+  /**
+   * 同一住户的回合串行入口（验收席意见 2）：「读上下文 → 调模型 → user/assistant
+   * 落账」全程占坑，后一个 say() 排队等前一回合落完账——回合不许拆散交错。
+   */
+  say(input: SayInput): Promise<Result<TurnResult>> {
+    const prior = this.#turnQueues.get(input.residentId) ?? Promise.resolve();
+    const turn = prior.then(() => this.#runTurn(input));
+    this.#turnQueues.set(
+      input.residentId,
+      turn.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    return turn;
+  }
+
+  async #runTurn(input: SayInput): Promise<Result<TurnResult>> {
     if (input.text.trim().length === 0) {
       // runtime 层自己拦（评审意见 4）：IPC 层的形状检查不是实现的防线。
       // 归 channel-unavailable 是沿用本层先例（specFailure 也把输入不合法归这码）——
@@ -190,7 +225,22 @@ export class ResidentRuntime {
         input.residentId,
       );
     }
-    const turnId = input.turnId ?? randomUUID();
+    const requestedTurnId = input.turnId;
+    let turnId = requestedTurnId ?? randomUUID();
+    if (requestedTurnId !== undefined) {
+      // 回执先行（验收席意见 3）：同一 turnId 的回合若已完成，直接返回已记录结果，
+      // 模型不再被调用第二次——重试的正确姿势是幂等读，不是再生成一遍然后撞
+      // 幂等冲突。回合没完成（user 已落、assistant 没落的半截）则同锚续跑，
+      // user 腿经幂等去重不写重。
+      const state = this.#turnState(input.residentId, requestedTurnId, input.text);
+      if (state.kind === "complete") return ok(state.result);
+      if (state.kind === "mismatch") {
+        // 锚被不同内容占用（同 turnId 不同文本、回合未完成）：那是另一条消息——
+        // 换新锚当新回合处理。这条路径根本不进 writer，也就谈不上把「幂等冲突」
+        // 冒充「writer 故障」（意见 3 的分离要求）。
+        turnId = randomUUID();
+      }
+    }
     const credential = this.#credentials.find(input.residentId);
     if (credential === null) {
       return fail(
@@ -217,10 +267,25 @@ export class ResidentRuntime {
       );
     }
 
-    // 醒来读启动包：身份与记忆随请求进模型（D8 补记三：醒来即已读）。
+    // 醒来读启动包：身份、承诺、记忆、现行有效事实**整包**随请求进模型（D8 补记三：
+    // 醒来即已读；验收席意见 1：记忆与事实不许中途掉队）。
     let bootPack: ReturnType<typeof buildBootPack>;
     try {
-      bootPack = buildBootPack(this.#residents, input.residentId);
+      let currentFacts: ReturnType<FactLedger["currentSet"]> | undefined;
+      if (this.#factLedger !== undefined) {
+        try {
+          currentFacts = this.#factLedger.currentSet(input.residentId);
+        } catch (error) {
+          if (!(error instanceof LedgerNotFoundError)) throw error;
+          // 账接了但这户没开户：对这户仍是「没接账」——currentFacts 缺席即缺席，
+          // 不许跟「账是空的」（空数组）编码成同一个值（MV-A05）。
+        }
+      }
+      bootPack = buildBootPack(
+        this.#residents,
+        input.residentId,
+        currentFacts === undefined ? {} : { currentFacts },
+      );
     } catch (error) {
       return fail(
         "resident-not-found",
@@ -234,8 +299,23 @@ export class ResidentRuntime {
       credentialKind: credential.credentialKind,
       model: credential.model,
     });
+    // 当前一窗流上下文随请求进模型（验收席意见 1）：此前回合的 user/assistant 消息
+    // 按流序送进模型，第二轮起不是失忆的单轮调用。
+    const history = this.#streamHistory(input.residentId);
     // 密钥原文只在这一刻解析、只进传输层；此后任何地方都不许再出现（RT-06）。
-    const credentialSecret = this.#credentials.readSecret(credential.credentialRef);
+    // find 与 readSecret 之间的 revoke 窗口（验收席观察 A）也落成结构化失败，
+    // 不许异常冲出 say()。
+    let credentialSecret: string;
+    try {
+      credentialSecret = this.#credentials.readSecret(credential.credentialRef);
+    } catch (error) {
+      return fail(
+        "credential-invalid",
+        `凭证原文读不出（可能刚被吊销或密钥文件损坏）：${(error as Error).message}`,
+        "重新配一条有效凭证（provisionChannel / npm run setup）后重试",
+        input.residentId,
+      );
+    }
 
     let reply = "";
     let chunks = 0;
@@ -244,11 +324,8 @@ export class ResidentRuntime {
         residentId: input.residentId,
         model: route.model,
         text: input.text,
-        bootPack: {
-          residentId: bootPack.residentId,
-          identity: bootPack.identity,
-          commitments: bootPack.commitments,
-        },
+        bootPack,
+        history,
         credentialSecret,
       })) {
         reply += chunk;
@@ -289,6 +366,7 @@ export class ResidentRuntime {
           generation: window.generation,
           role: "user",
           text: input.text,
+          turnId,
         }),
       });
       await this.#writer.submit({
@@ -300,6 +378,9 @@ export class ResidentRuntime {
           generation: window.generation,
           role: "assistant",
           text: reply,
+          turnId,
+          streamed: chunks >= 2,
+          model: route.model,
         }),
       });
     } catch (error) {
@@ -392,6 +473,70 @@ export class ResidentRuntime {
       }
     }
     return ok({ hits });
+  }
+
+  // —— 回执与上下文（验收席意见 1 / 3） ——
+
+  /** 一窗流历史：此前回合的 user/assistant 消息按流序，随请求进模型。 */
+  #streamHistory(residentId: string): { role: "user" | "assistant"; text: string }[] {
+    if (!this.#streams.has(residentId)) return [];
+    const history: { role: "user" | "assistant"; text: string }[] = [];
+    for (const event of this.#streams.eventsAfter(residentId, 0)) {
+      const payload = event.payload;
+      if (
+        (payload.role === "user" || payload.role === "assistant") &&
+        typeof payload.text === "string"
+      ) {
+        history.push({ role: payload.role, text: payload.text });
+      }
+    }
+    return history;
+  }
+
+  /**
+   * 回执查询（验收席意见 3）：turnId 在一窗流里的落账状态。
+   * complete = user/assistant 两腿都落了、且 user 文本就是这句话 → 已记录结果可回放；
+   * mismatch = 锚被另一条文本占用（半截或张冠李戴）→ 不许当回执用，换锚当新回合；
+   * open = 还没落账（含「user 落了、assistant 没落」的半截续跑）。
+   */
+  #turnState(
+    residentId: string,
+    turnId: string,
+    text: string,
+  ): { kind: "complete"; result: TurnResult } | { kind: "mismatch" } | { kind: "open" } {
+    if (!this.#streams.has(residentId)) return { kind: "open" };
+    let userText: string | null = null;
+    let assistant: { text: string; model: string; streamed: boolean; generation: number } | null =
+      null;
+    for (const event of this.#streams.eventsAfter(residentId, 0)) {
+      const payload = event.payload;
+      if (payload.turnId !== turnId) continue;
+      if (payload.role === "user" && typeof payload.text === "string") {
+        userText = payload.text;
+      }
+      if (payload.role === "assistant" && typeof payload.text === "string") {
+        assistant = {
+          text: payload.text,
+          model: typeof payload.model === "string" ? payload.model : "unknown",
+          streamed: payload.streamed === true,
+          generation: event.origin.viewport?.generation ?? 0,
+        };
+      }
+    }
+    if (assistant !== null && userText === text) {
+      return {
+        kind: "complete",
+        result: {
+          residentId,
+          model: assistant.model,
+          generation: assistant.generation,
+          reply: assistant.text,
+          streamed: assistant.streamed,
+        },
+      };
+    }
+    if (userText !== null && userText !== text) return { kind: "mismatch" };
+    return { kind: "open" };
   }
 
   async close(): Promise<void> {
@@ -497,6 +642,12 @@ interface MessageDraftInput {
   readonly generation: number;
   readonly role: "user" | "assistant";
   readonly text: string;
+  /** 回执锚（验收席意见 3）：让「这回合是否已落账」可查、可回放。 */
+  readonly turnId: string;
+  /** assistant 腿专有：回放「已记录结果」时照实说当时是不是流式。 */
+  readonly streamed?: boolean;
+  /** assistant 腿专有：回放时照实说当时走的哪个模型。 */
+  readonly model?: string;
 }
 
 function messageDraft(input: MessageDraftInput): CanonicalEventDraft {
@@ -504,7 +655,16 @@ function messageDraft(input: MessageDraftInput): CanonicalEventDraft {
     input.role === "user"
       ? { kind: "viewport", id: input.windowId }
       : { kind: "resident", id: input.residentId };
-  const payload: JsonObject = { role: input.role, text: input.text };
+  // 回执字段（验收席意见 3）：turnId 让「这回合是否已落账」可查；assistant 腿再带
+  // streamed/model，重试回放的是已记录事实，不编造没发生过的值。
+  const payload: JsonObject = {
+    role: input.role,
+    text: input.text,
+    turnId: input.turnId,
+    ...(input.role === "assistant"
+      ? { streamed: input.streamed === true, model: input.model ?? "unknown" }
+      : {}),
+  };
   return {
     purpose: "message",
     // occurredAt 是哨兵（同 window-host 的 WINDOW_EVENT_OCCURRED_AT）：它进底座的请求

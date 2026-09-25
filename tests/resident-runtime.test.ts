@@ -6,7 +6,15 @@
  * vs credential-invalid vs channel-unavailable）、住户号显式入口的撞号防线。
  * 端到端判卷归 acceptance/resident-runtime-*.ts，这里只钉单元行为。
  */
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -27,6 +35,7 @@ import {
 } from "../src/resident-runtime/channels.ts";
 import { CredentialStore } from "../src/resident-runtime/credentials.ts";
 import { ResidentRuntime } from "../src/resident-runtime/runtime.ts";
+import { FactLedger } from "../src/store/fact-ledger.ts";
 import { ResidentStore } from "../src/store/resident-store.ts";
 import { openCanonicalStreamWriter } from "../src/window-host/window-history-host.ts";
 
@@ -103,7 +112,8 @@ describe("通道映射（D25 三：Claude 订阅是唯一特例）", () => {
       residentId: "r-synth",
       model: "model-alpha",
       text: "敏感原文-abc",
-      bootPack: { residentId: "r-synth", identity: "r-synth", commitments: [] },
+      bootPack: { residentId: "r-synth", identity: "r-synth", commitments: [], memories: [] },
+      history: [],
       credentialSecret: "sk-canary-1",
     };
     const chunks: string[] = [];
@@ -361,6 +371,189 @@ describe("评审意见修复（wusaki0723 复审：幂等重试 / 凭证读取�
     } finally {
       await runtime.close();
     }
+  });
+});
+
+describe("回合语义（验收席复核三处 + 两项观察）", () => {
+  function runtimeWith(
+    transport: ModelTransport,
+    options: { factLedger?: FactLedger } = {},
+  ): ResidentRuntime {
+    return new ResidentRuntime({ dataDir: tempDir(), transport, ...options });
+  }
+
+  /** 非确定性传输替身：第 n 次调用回「回复-n」——两次调用必不同，专钉回执语义。 */
+  function countingTransport(reply: (n: number, text: string) => string): {
+    transport: ModelTransport;
+    calls: () => number;
+    requests: ModelCompletionRequest[];
+  } {
+    let calls = 0;
+    const requests: ModelCompletionRequest[] = [];
+    return {
+      transport: {
+        async *complete(request: ModelCompletionRequest): AsyncIterable<string> {
+          calls += 1;
+          requests.push(request);
+          yield reply(calls, request.text);
+        },
+      },
+      calls: () => calls,
+      requests,
+    };
+  }
+
+  it("完整启动包与一窗流上下文随请求进模型：记忆、现行事实、上一轮对话可见（意见 1）", async () => {
+    const { ledger, systemWriter } = FactLedger.create();
+    ledger.createLedger("r-full");
+    systemWriter.append(
+      "r-full",
+      { author: "system", kind: "confirmed_preference", body: "住户偏好短句回复" },
+      "测试备账：给请求级核对喂一条现行事实",
+    );
+    const stub = countingTransport(() => "收到。");
+    // 记忆先进住户档案，再开运行时（运行时的住户面从同一个 residents/ 快照读）。
+    const dataDir = tempDir();
+    const stores = new ResidentStore({ dataDir: join(dataDir, "residents") });
+    stores.createResident("小满", { residentId: "r-full" });
+    stores.remember("r-full", "爱吃苹果");
+    const runtime = new ResidentRuntime({ dataDir, transport: stub.transport, factLedger: ledger });
+    try {
+      runtimeProvision(runtime, "r-full");
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-full", text: "早安" }));
+      // 传输替身上的直接断言（意见 1 的验收口径）：不是在 bootPack() 读口验证。
+      const first = stub.requests[0];
+      expect(first?.bootPack.memories.map((entry) => entry.content)).toContain("爱吃苹果");
+      expect(first?.bootPack.currentFacts?.map((fact) => fact.body)).toContain("住户偏好短句回复");
+      expect(first?.history).toEqual([]);
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-full", text: "再聊" }));
+      expect(stub.requests[1]?.history).toEqual([
+        { role: "user", text: "早安" },
+        { role: "assistant", text: "收到。" },
+      ]);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("没接账的运行时：currentFacts 缺席即「没接账」，不编码成空数组（意见 1）", async () => {
+    const stub = countingTransport(() => "好。");
+    const runtime = runtimeWith(stub.transport);
+    try {
+      runtimeProvision(runtime, "r-nofacts");
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-nofacts", text: "在吗" }));
+      expect(stub.requests[0]?.bootPack.currentFacts).toBeUndefined();
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("同一住户的完整回合串行：并发 say() 不拆散、不交错（意见 2）", async () => {
+    let inFlight = 0;
+    const transport: ModelTransport = {
+      async *complete(request: ModelCompletionRequest): AsyncIterable<string> {
+        inFlight += 1;
+        // 同户的模型调用若并发，这里就是 2——直接判红（回合必须串行）。
+        expect(inFlight).toBe(1);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        yield `回复:${request.text}`;
+        inFlight -= 1;
+      },
+    };
+    const runtime = runtimeWith(transport);
+    try {
+      runtimeProvision(runtime, "r-seq");
+      const [first, second] = await Promise.all([
+        runtime.say({ residentId: "r-seq", text: "甲" }),
+        runtime.say({ residentId: "r-seq", text: "乙" }),
+      ]);
+      expect(unwrap<TurnResult>(first).reply).toBe("回复:甲");
+      expect(unwrap<TurnResult>(second).reply).toBe("回复:乙");
+      const events = unwrap<StreamSnapshot>(runtime.readStream({ residentId: "r-seq" })).events;
+      expect(events.map((event) => event.text)).toEqual(["甲", "回复:甲", "乙", "回复:乙"]);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("已完成回合的同 turnId 重试：模型不再调用、回合不重复、回放已记录结果（意见 3）", async () => {
+    const stub = countingTransport((n) => `回复-${n}`);
+    const runtime = runtimeWith(stub.transport);
+    try {
+      runtimeProvision(runtime, "r-receipt");
+      const first = unwrap<TurnResult>(
+        await runtime.say({ residentId: "r-receipt", text: "hi", turnId: "turn-t1" }),
+      );
+      expect(first.reply).toBe("回复-1");
+      expect(stub.calls()).toBe(1);
+      const retry = unwrap<TurnResult>(
+        await runtime.say({ residentId: "r-receipt", text: "hi", turnId: "turn-t1" }),
+      );
+      // 非确定性替身第二次会回「回复-2」：回放必须是已记录原话，不重新生成。
+      expect(retry.reply).toBe("回复-1");
+      expect(stub.calls()).toBe(1);
+      const events = unwrap<StreamSnapshot>(runtime.readStream({ residentId: "r-receipt" })).events;
+      expect(events.length).toBe(2);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("同 turnId 不同文本 = 换锚当新回合：不撞幂等冲突、不冒充 writer 故障（意见 3）", async () => {
+    const stub = countingTransport((n) => `回复-${n}`);
+    const runtime = runtimeWith(stub.transport);
+    try {
+      runtimeProvision(runtime, "r-anchor");
+      const one = unwrap<TurnResult>(
+        await runtime.say({ residentId: "r-anchor", text: "第一条", turnId: "turn-x" }),
+      );
+      const two = unwrap<TurnResult>(
+        await runtime.say({ residentId: "r-anchor", text: "第二条", turnId: "turn-x" }),
+      );
+      expect(one.reply).toBe("回复-1");
+      expect(two.reply).toBe("回复-2");
+      expect(stub.calls()).toBe(2);
+      const events = unwrap<StreamSnapshot>(runtime.readStream({ residentId: "r-anchor" })).events;
+      expect(events.map((event) => event.text)).toEqual(["第一条", "回复-1", "第二条", "回复-2"]);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("凭证吊销后：结构化 credential-invalid、模型零调用（观察 A 收口）", async () => {
+    const stub = countingTransport(() => "不该出现");
+    const runtime = runtimeWith(stub.transport);
+    try {
+      runtimeProvision(runtime, "r-rvk");
+      runtime.revokeCredential({ residentId: "r-rvk" });
+      const result = await runtime.say({ residentId: "r-rvk", text: "还听得见吗" });
+      expect(failureOf(result)).toMatchObject({ code: "credential-invalid" });
+      // 密钥闸在模型之前：零调用，不是「调了被拒」。find/readSecret 之间的 revoke
+      // 竞态由 say() 的读取兜底落同一结构化码（窗口太小没法单测，结构上收口）。
+      expect(stub.calls()).toBe(0);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("清单丢失而密钥还在：fail-closed 拒绝清扫、密钥文件不被删（观察 B）", () => {
+    const root = join(tempDir(), "credentials");
+    const store = new CredentialStore(root);
+    const record = store.provision({
+      residentId: "r-keep",
+      channel: claudeChannel,
+      secret: "sk-keep-1",
+    });
+    const secretPath = join(
+      root,
+      "secrets",
+      `${record.credentialRef.slice("mist-cred:".length)}.key`,
+    );
+    expect(existsSync(secretPath)).toBe(true);
+    rmSync(join(root, "manifest.json"));
+    expect(() => new CredentialStore(root)).toThrow(/manifest missing/);
+    // 现场留着等人裁：不静默毁掉可能是唯一的凭证副本。
+    expect(existsSync(secretPath)).toBe(true);
   });
 });
 

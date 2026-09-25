@@ -59,16 +59,42 @@ export function resolveChannelRoute(channel: ChannelSpecLike): ChannelRouteLike 
   };
 }
 
+/** 一窗流历史消息（本轮之前的对话上下文，按流序）。 */
+export interface HistoryMessage {
+  readonly role: "user" | "assistant";
+  readonly text: string;
+}
+
 export interface ModelCompletionRequest {
   readonly residentId: string;
   readonly model: string;
   readonly text: string;
-  /** 醒来读到的启动包——身份与记忆随请求进模型，不发第二次工具调用去读。 */
+  /**
+   * 醒来读到的**完整启动包**（P3 BootPack 契约口径）：身份、承诺、记忆、现行
+   * 有效事实整包随请求进模型，不发第二次工具调用去读（验收席意见 1）。
+   * currentFacts 的在场与缺席是两个值：缺席 = 没接权威事实账，空数组 = 账是空的
+   * （MV-A05 口径，不许编码成同一个值）。
+   */
   readonly bootPack: {
     readonly residentId: string;
     readonly identity: string;
     readonly commitments: readonly string[];
+    readonly memories: readonly {
+      readonly id: string;
+      readonly content: string;
+      readonly supersededBy: string | null;
+    }[];
+    readonly currentFacts?: readonly {
+      readonly seq: number;
+      readonly ts: string;
+      readonly author: string;
+      readonly kind: string;
+      readonly body: string;
+      readonly supersedesSeq: number | null;
+    }[];
   };
+  /** 当前一窗流上下文：此前回合的 user/assistant 消息按流序送进模型（验收席意见 1）。 */
+  readonly history: readonly HistoryMessage[];
   /** 调用时刻从凭证面解析出的密钥原文。唯一去处是上游适配器，不许落任何盘。 */
   readonly credentialSecret: string;
 }
