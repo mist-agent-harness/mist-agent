@@ -80,6 +80,9 @@ const MAX_JSON_LINE_BYTES = 8 * 1024 * 1024;
 const MAX_REPLY_BYTES = 32 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 120_000;
 const FORCE_KILL_GRACE_MS = 1_000;
+const STDERR_ERROR_LINE = /^(?:error|fatal|uncaught exception)$/i;
+const STDERR_ERROR_PREFIX = /^(?:error|fatal|uncaught exception)[^a-z0-9_]/i;
+const MAX_STDERR_PREFIX_CHARS = 32;
 
 export interface PiCliTransportOptions {
   /** pi 可执行文件；测试注入假 pi。缺省 PATH 里的 `pi`。 */
@@ -196,8 +199,9 @@ export class PiCliTransport implements ModelTransport {
     let spawnFailure = false;
     let stdinFailure = false;
     let stderrHadError = false;
-    let stderrTail = "";
     let closed = false;
+    let stderrLineStart = true;
+    let stderrLinePrefix = "";
     let timedOut = false;
     let resolveClosed: (() => void) | undefined;
     const closedPromise = new Promise<void>((resolve) => {
@@ -216,17 +220,27 @@ export class PiCliTransport implements ModelTransport {
     child.once("close", (code, signal) => {
       exitCode = code;
       exitSignal = signal;
+      if (STDERR_ERROR_LINE.test(stderrLinePrefix)) stderrHadError = true;
       closed = true;
       resolveClosed?.();
     });
 
     child.stderr?.setEncoding("utf8");
     child.stderr?.on("data", (chunk: string) => {
-      const text = stderrTail + chunk;
-      if (/(?:^|\r?\n)\s*(?:error|fatal|uncaught exception)\b/i.test(text)) {
-        stderrHadError = true;
+      for (const character of chunk) {
+        if (character === "\r" || character === "\n") {
+          if (STDERR_ERROR_LINE.test(stderrLinePrefix)) stderrHadError = true;
+          stderrLineStart = true;
+          stderrLinePrefix = "";
+          continue;
+        }
+        if (stderrLineStart && /\s/u.test(character)) continue;
+        stderrLineStart = false;
+        if (stderrLinePrefix.length < MAX_STDERR_PREFIX_CHARS) {
+          stderrLinePrefix += character;
+          if (STDERR_ERROR_PREFIX.test(stderrLinePrefix)) stderrHadError = true;
+        }
       }
-      stderrTail = text.slice(-128);
     });
 
     let forceKillTimer: NodeJS.Timeout | undefined;

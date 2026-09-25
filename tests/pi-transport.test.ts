@@ -110,6 +110,14 @@ process.stdin.on("data", (chunk) => {
     return;
   }
   if (mode === "stderr-error") process.stderr.write("Error: something on stderr\\n");
+  if (mode === "stderr-inline-error") {
+    process.stderr.write("prefix ".repeat(32));
+    setTimeout(() => {
+      const inline = "error was mentioned mid-line";
+      process.stderr.write(inline + "x".repeat(128 - inline.length));
+      setTimeout(() => process.stderr.write("\\ncontinuation\\n"), 20);
+    }, 20);
+  }
   if (mode === "incomplete") {
     emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "部分" } });
     process.exit(0);
@@ -352,6 +360,17 @@ describe("PiCliTransport", () => {
         ),
       ),
     ).rejects.toThrow(/stderr 报告错误/);
+  });
+
+  it("不把分块 stderr 中行中间的 error 误判为行首错误", async () => {
+    const { bin } = fakePi();
+    const chunks = await collect(
+      new PiCliTransport({
+        piBin: bin,
+        extraEnv: { FAKE_PI_MODE: "stderr-inline-error" },
+      }).complete(request()),
+    );
+    expect(chunks).toEqual(["你好", "，世界"]);
   });
 
   it("pi 可执行文件不存在时安全失败", async () => {
