@@ -101,31 +101,40 @@ process.stdin.on("data", (chunk) => {
     emit({ type: "error", message: "private error details" });
     return;
   }
+  if (mode === "assistant-error-event") {
+    emit({ type: "message_update", assistantMessageEvent: {
+      type: "error",
+      reason: "error",
+      error: { role: "assistant", stopReason: "error", errorMessage: "private error details" },
+    } });
+    return;
+  }
+  if (mode === "stderr-error") process.stderr.write("Error: something on stderr\\n");
   if (mode === "incomplete") {
     emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "部分" } });
     process.exit(0);
   }
-  const deltas = mode === "authfail"
-    ? ["Failed to auth", "enticate: OAuth session expired"]
-    : mode === "authfail401"
-      ? ["HTTP ", "401 Unauthorized: token expired"]
-      : mode === "authfail-api-key"
-        ? ["API key is ", "invalid: token revoked"]
-        : mode === "ordinary-error"
-          ? ["Error: file not found, try the other path"]
-          : mode === "turn-end-only"
-            ? []
-            : mode === "mismatch"
-              ? ["streamed"]
-              : ["你好", "，世界"];
+  const deltas = process.env.FAKE_PI_TEXT !== undefined
+    ? [process.env.FAKE_PI_TEXT]
+    : mode === "ordinary-error"
+      ? ["Error: file not found, try the other path"]
+      : mode === "turn-end-only"
+        ? []
+        : mode === "mismatch"
+          ? ["streamed"]
+          : ["你好", "，世界"];
   const finalText = mode === "mismatch" ? "different final" : deltas.join("") || "turn-end 完整回复";
   for (const delta of deltas) {
     emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta } });
   }
   emit({
     type: "turn_end",
-    outcome: "completed",
-    message: { role: "assistant", content: [{ type: "text", text: finalText }] },
+    message: {
+      role: "assistant",
+      stopReason: mode === "turn-error" ? "error" : mode === "turn-aborted" ? "aborted" : "stop",
+      errorMessage: mode === "turn-error" ? "private auth details" : undefined,
+      content: [{ type: "text", text: finalText }],
+    },
   });
   emit({ type: "agent_settled" });
 });
@@ -168,6 +177,18 @@ async function waitForExit(pid: number): Promise<void> {
   throw new Error(`child ${pid} did not exit`);
 }
 
+async function waitForRecord(path: string): Promise<{ pid: number }> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    try {
+      return JSON.parse(readFileSync(path, "utf8")) as { pid: number };
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  throw new Error("fake pi did not write its process record");
+}
+
 describe("PiCliTransport", () => {
   it("流式增量按序吐（≥2 段），拼接即完整回复", async () => {
     const { bin } = fakePi();
@@ -197,6 +218,7 @@ describe("PiCliTransport", () => {
       systemPromptMode: number;
     };
     expect(record.args).toContain("rpc");
+    expect(record.args).toContain("--no-extensions");
     expect(record.args).not.toContain(message);
     expect(record.args.join(" ")).not.toContain("@/etc/passwd");
     expect(record.message).toBe(message);
@@ -260,16 +282,14 @@ describe("PiCliTransport", () => {
     expect(record.args.join(" ")).not.toContain("sk-canary-pi-1");
   });
 
-  it.each(["authfail", "authfail401", "authfail-api-key"])(
-    "认证失败（%s）不 yield 错误文本且 fail-closed",
+  it.each(["turn-error", "turn-aborted", "assistant-error-event"])(
+    "依照 pi 结构化错误事件 fail-closed（%s）且不泄露错误原文",
     async (mode) => {
       const { bin } = fakePi();
       const transport = new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_MODE: mode } });
-      const emitted: string[] = [];
-      await expect(async () => {
-        for await (const chunk of transport.complete(request())) emitted.push(chunk);
-      }).rejects.toThrow(/认证失败/);
-      expect(emitted).toEqual([]);
+      const completion = collect(transport.complete(request()));
+      await expect(completion).rejects.toThrow(/回合未正常完成|assistant 回合失败/);
+      await expect(completion).rejects.not.toThrow(/private auth details|private error details/);
     },
   );
 
@@ -281,6 +301,17 @@ describe("PiCliTransport", () => {
       ),
     );
     expect(chunks).toEqual(["Error: file not found, try the other path"]);
+  });
+  it.each([
+    "401 ways to cook rice",
+    "The API key rotation policy is invalid for this tenant",
+    "Unauthorized access requests should be logged",
+  ])("合法回复文本不按认证错误误判：%s", async (text) => {
+    const { bin } = fakePi();
+    const chunks = await collect(
+      new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_TEXT: text } }).complete(request()),
+    );
+    expect(chunks.join("")).toBe(text);
   });
 
   it("最终 turn_end 含完整文本时，即使没有 text_delta 也能交付", async () => {
@@ -311,6 +342,16 @@ describe("PiCliTransport", () => {
     const result = collect(transport.complete(request()));
     await expect(result).rejects.toThrow(/退出码 3/);
     await expect(result).rejects.not.toThrow(/private stderr canary/);
+  });
+  it("协议成功但 stderr 报错时 fail-closed 且不暴露 stderr 原文", async () => {
+    const { bin } = fakePi();
+    await expect(
+      collect(
+        new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_MODE: "stderr-error" } }).complete(
+          request(),
+        ),
+      ),
+    ).rejects.toThrow(/stderr 报告错误/);
   });
 
   it("pi 可执行文件不存在时安全失败", async () => {
@@ -353,6 +394,35 @@ describe("PiCliTransport", () => {
     };
     await waitForExit(record.pid);
     expect(() => readFileSync(record.systemPromptPath, "utf8")).toThrow();
+  });
+  it("首个增量到达前调用 return 立即终止 pi 子进程", async () => {
+    const { bin, recordPath } = fakePi();
+    const transport = new PiCliTransport({
+      piBin: bin,
+      timeoutMs: 5_000,
+      extraEnv: { FAKE_PI_MODE: "hang", FAKE_PI_RECORD: recordPath },
+    });
+    const iterator = transport.complete(request())[Symbol.asyncIterator]();
+    const pendingNext = iterator.next().then(
+      () => ({ status: "fulfilled" as const }),
+      () => ({ status: "rejected" as const }),
+    );
+    const record = await waitForRecord(recordPath);
+    const returnPromise = iterator.return?.();
+    if (returnPromise === undefined) throw new Error("transport iterator has no return method");
+    let deadline: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        returnPromise,
+        new Promise<never>((_resolve, reject) => {
+          deadline = setTimeout(() => reject(new Error("iterator.return() timed out")), 1_500);
+        }),
+      ]);
+    } finally {
+      if (deadline !== undefined) clearTimeout(deadline);
+    }
+    await waitForExit(record.pid);
+    await expect(pendingNext).resolves.toEqual({ status: "rejected" });
   });
 
   it("完整启动包与本代历史渲染进系统提示", async () => {

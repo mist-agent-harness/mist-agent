@@ -81,40 +81,6 @@ const MAX_REPLY_BYTES = 32 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 120_000;
 const FORCE_KILL_GRACE_MS = 1_000;
 
-/** 上游会把一部分认证失败当普通回复文本吐出；只判具体认证错误，避免误判普通 Error 回复。 */
-const FAILURE_PREFIXES = [
-  "Failed to authenticate",
-  "Error: ",
-  "AuthenticationError",
-  "401",
-  "403",
-  "HTTP 401",
-  "HTTP 403",
-  "Unauthorized",
-  "Forbidden",
-  "Invalid API key",
-  "Invalid key",
-  "Incorrect API key",
-  "API key is invalid",
-  "API key is incorrect",
-  "API key has expired",
-  "The API key is invalid",
-  "Your API key is invalid",
-  "OAuth",
-  "Authentication",
-  "Authorization",
-];
-
-const FAILURE_PATTERNS = [
-  /^(?:error:\s*)?failed to authenticate\b/i,
-  /^(?:error:\s*)?authenticationerror\b/i,
-  /^(?:error:\s*)?(?:http\s+)?(?:401|403)\b/i,
-  /^(?:error:\s*)?(?:unauthorized|forbidden)\b/i,
-  /^(?:error:\s*)?(?:invalid|incorrect)\s+(?:api\s+)?key\b/i,
-  /^(?:error:\s*)?(?:the\s+|your\s+)?api[\s_-]*key\b.*\b(?:invalid|incorrect|expired|revoked|rejected|unauthorized|denied)\b/i,
-  /^(?:error:\s*)?(?:oauth|authentication|authorization)\b.*\b(?:expired|invalid|failed|error|denied|unauthorized|revoked)\b/i,
-];
-
 export interface PiCliTransportOptions {
   /** pi 可执行文件；测试注入假 pi。缺省 PATH 里的 `pi`。 */
   piBin?: string;
@@ -138,7 +104,29 @@ export class PiCliTransport implements ModelTransport {
     }
   }
 
-  async *complete(request: ModelCompletionRequest): AsyncIterable<string> {
+  complete(request: ModelCompletionRequest): AsyncIterable<string> {
+    const controller = new AbortController();
+    const source = this.#complete(request, controller.signal);
+    return {
+      [Symbol.asyncIterator](): AsyncIterator<string, void, unknown> {
+        const iterator = source[Symbol.asyncIterator]();
+        return {
+          next: (value?: unknown) => iterator.next(value),
+          return: (value?: void | PromiseLike<void>) => {
+            controller.abort();
+            return iterator.return?.(value) ?? Promise.resolve({ done: true, value: undefined });
+          },
+          throw: (error?: unknown) => {
+            controller.abort();
+            return iterator.throw?.(error) ?? Promise.reject(error);
+          },
+        };
+      },
+    };
+  }
+
+  async *#complete(request: ModelCompletionRequest, signal: AbortSignal): AsyncGenerator<string> {
+    if (signal.aborted) throw new Error("pi 请求已取消");
     const parsed = splitModelId(request.model);
     const isClaudeBridge = request.adapterId === "pi-claude-bridge";
     const provider = isClaudeBridge ? "claude-bridge" : parsed.provider;
@@ -175,6 +163,7 @@ export class PiCliTransport implements ModelTransport {
     const args = [
       "--mode",
       "rpc",
+      "--no-extensions",
       "--no-tools",
       "--no-session",
       "--no-context-files",
@@ -206,6 +195,8 @@ export class PiCliTransport implements ModelTransport {
     let exitSignal: NodeJS.Signals | null = null;
     let spawnFailure = false;
     let stdinFailure = false;
+    let stderrHadError = false;
+    let stderrTail = "";
     let closed = false;
     let timedOut = false;
     let resolveClosed: (() => void) | undefined;
@@ -229,28 +220,48 @@ export class PiCliTransport implements ModelTransport {
       resolveClosed?.();
     });
 
-    // stderr 只排空，不保留或放进异常：扩展可能回显提示或其他敏感材料。
-    child.stderr?.resume();
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      const text = stderrTail + chunk;
+      if (/(?:^|\r?\n)\s*(?:error|fatal|uncaught exception)\b/i.test(text)) {
+        stderrHadError = true;
+      }
+      stderrTail = text.slice(-128);
+    });
 
     let forceKillTimer: NodeJS.Timeout | undefined;
-    const timeoutTimer = setTimeout(() => {
-      timedOut = true;
-      if (child.exitCode === null && child.signalCode === null) {
-        child.kill("SIGTERM");
+    const killChild = (): void => {
+      if (closed || child.exitCode !== null || child.signalCode !== null) return;
+      child.kill("SIGTERM");
+      if (forceKillTimer === undefined) {
         forceKillTimer = setTimeout(() => {
-          if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+          if (!closed && child.exitCode === null && child.signalCode === null) {
+            child.kill("SIGKILL");
+          }
         }, FORCE_KILL_GRACE_MS);
         forceKillTimer.unref();
       }
+    };
+    let resolveAborted: (() => void) | undefined;
+    const abortedPromise = new Promise<void>((resolve) => {
+      resolveAborted = resolve;
+    });
+    const onAbort = (): void => {
+      killChild();
+      resolveAborted?.();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      killChild();
     }, this.#timeoutMs);
     timeoutTimer.unref();
 
     const commandId = "mist-prompt";
     const command = `${JSON.stringify({ type: "prompt", id: commandId, message: request.text })}\n`;
     let reply = "";
-    let pendingChunks: string[] = [];
-    let streamingStarted = false;
-    let recognizedFailure = false;
     let promptAcknowledged = false;
     let finalTurnSeen = false;
     let finalText: string | null = null;
@@ -293,10 +304,14 @@ export class PiCliTransport implements ModelTransport {
         return [];
       }
       if (parsedEvent.type === "turn_end") {
-        if (parsedEvent.outcome !== "completed") {
+        const message = parsedEvent.message;
+        if (
+          !isRecord(message) ||
+          (message.stopReason !== "stop" && message.stopReason !== "length")
+        ) {
           throw new Error("pi 回合未正常完成");
         }
-        finalText = extractAssistantText(parsedEvent.message);
+        finalText = extractAssistantText(message);
         if (finalText === null) throw new Error("pi 最终消息结构无效");
         finalTurnSeen = true;
         return [];
@@ -306,6 +321,7 @@ export class PiCliTransport implements ModelTransport {
           throw new Error("pi 消息更新结构无效");
         }
         const messageEvent = parsedEvent.assistantMessageEvent;
+        if (messageEvent.type === "error") throw new Error("pi assistant 回合失败");
         if (messageEvent.type !== "text_delta") return [];
         if (typeof messageEvent.delta !== "string") {
           throw new Error("pi 文本增量结构无效");
@@ -315,21 +331,7 @@ export class PiCliTransport implements ModelTransport {
         if (Buffer.byteLength(reply, "utf8") > MAX_REPLY_BYTES) {
           throw new Error("pi 回复超过安全上限");
         }
-        if (recognizedFailure) return [];
-        if (streamingStarted) return [delta];
-
-        // 先暂存可能属于认证错误的前缀；普通的 `Error: ...` 仍是合法回复。
-        pendingChunks.push(delta);
-        if (isChannelFailure(reply)) {
-          recognizedFailure = true;
-          pendingChunks = [];
-          return [];
-        }
-        if (couldBeFailurePrefix(reply)) return [];
-        streamingStarted = true;
-        const ready = pendingChunks;
-        pendingChunks = [];
-        return ready;
+        return delta.length === 0 ? [] : [delta];
       }
       if (parsedEvent.type === "extension_ui_request") {
         throw new Error("pi 通道请求了不支持的交互");
@@ -337,8 +339,10 @@ export class PiCliTransport implements ModelTransport {
       return [];
     };
 
+    const readFinalText = (): string | null => finalText;
     try {
-      await spawnReady;
+      await Promise.race([spawnReady, abortedPromise]);
+      if (signal.aborted) throw new Error("pi 请求已取消");
       const stdin = child.stdin;
       if (stdin === null || child.stdout === null) {
         throw new Error("pi 子进程管道不可用");
@@ -349,6 +353,7 @@ export class PiCliTransport implements ModelTransport {
           else resolve();
         });
       }).catch(() => {
+        if (signal.aborted) throw new Error("pi 请求已取消");
         throw new Error("pi prompt 发送失败");
       });
 
@@ -367,11 +372,12 @@ export class PiCliTransport implements ModelTransport {
           throw new Error("pi 输出行超过安全上限");
         }
       }
-      if (lineBuffer.length > 0) {
+      if (!signal.aborted && lineBuffer.length > 0) {
         for (const ready of processLine(lineBuffer.replace(/\r$/, ""))) yield ready;
       }
 
       await closedPromise;
+      if (signal.aborted) throw new Error("pi 请求已取消");
       if (spawnFailure) throw new Error("pi 子进程启动失败");
       if (stdinFailure) throw new Error("pi 子进程通信失败");
       if (timedOut) throw new Error(`pi 运行超时（${this.#timeoutMs} ms）`);
@@ -379,33 +385,24 @@ export class PiCliTransport implements ModelTransport {
         const status = exitSignal === null ? `退出码 ${String(exitCode)}` : `信号 ${exitSignal}`;
         throw new Error(`pi ${status}`);
       }
-      if (!promptAcknowledged || !finalTurnSeen || !agentSettled || finalText === null) {
+      if (stderrHadError) throw new Error("pi 子进程在 stderr 报告错误");
+      const completedText = readFinalText();
+      if (!promptAcknowledged || !finalTurnSeen || !agentSettled || completedText === null) {
         throw new Error("pi JSONL 流未完整结束");
       }
-      if (recognizedFailure || isChannelFailure(reply) || isChannelFailure(finalText)) {
-        throw new Error("pi 通道认证失败；请检查凭证或订阅登录状态");
-      }
-      if (reply.length === 0) {
-        reply = finalText;
-        if (reply.length > 0) pendingChunks = [reply];
-      } else if (reply !== finalText) {
+      if (reply.length > 0 && reply !== completedText) {
         throw new Error("pi 增量与最终消息不一致");
       }
-      if (reply.trim().length === 0) throw new Error("pi 没有产出任何文本");
-      for (const pending of pendingChunks) yield pending;
-      pendingChunks = [];
+      if (completedText.trim().length === 0) throw new Error("pi 没有产出任何文本");
+      if (reply.length === 0) yield completedText;
     } finally {
       clearTimeout(timeoutTimer);
-      if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
+      signal.removeEventListener("abort", onAbort);
       if (!closed && child.exitCode === null && child.signalCode === null) {
-        child.kill("SIGTERM");
-        const cancellationKillTimer = setTimeout(() => {
-          if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-        }, FORCE_KILL_GRACE_MS);
-        cancellationKillTimer.unref();
+        killChild();
         await closedPromise;
-        clearTimeout(cancellationKillTimer);
       }
+      if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
       rmSync(promptDir, { recursive: true, force: true });
     }
   }
@@ -446,16 +443,6 @@ export function renderSystemPrompt(request: ModelCompletionRequest): string {
     );
   }
   return parts.join("\n\n");
-}
-
-function isChannelFailure(reply: string): boolean {
-  const trimmed = reply.trimStart();
-  return FAILURE_PATTERNS.some((pattern) => pattern.test(trimmed));
-}
-
-function couldBeFailurePrefix(reply: string): boolean {
-  const trimmed = reply.trimStart().toLowerCase();
-  return FAILURE_PREFIXES.some((prefix) => prefix.toLowerCase().startsWith(trimmed));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
