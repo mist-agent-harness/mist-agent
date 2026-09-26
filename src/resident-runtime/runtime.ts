@@ -90,6 +90,8 @@ interface SayInput {
   residentId: string;
   text: string;
   turnId?: string;
+  /** 真实模型增量的观察口；TUI 可逐段绘制，不影响唯一 writer 的回合语义。 */
+  onChunk?: (chunk: string) => void;
 }
 
 export interface ResidentRuntimeOptions {
@@ -391,6 +393,7 @@ export class ResidentRuntime {
     try {
       for await (const chunk of this.#transport.complete({
         residentId: input.residentId,
+        adapterId: route.adapterId,
         model: route.model,
         text: input.text,
         bootPack,
@@ -399,6 +402,7 @@ export class ResidentRuntime {
       })) {
         reply += chunk;
         chunks += 1;
+        input.onChunk?.(chunk);
       }
     } catch (error) {
       // 通道跑不起来：不落账、不伪造回复（RT-01 失败分支）。

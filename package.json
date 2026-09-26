@@ -8,6 +8,7 @@
   },
   "scripts": {
     "setup": "tsx src/installer/cli.ts",
+    "resident": "tsx src/resident-runtime/cli.ts",
     "eval:resident-self-repair": "tsx src/eval/resident-self-repair/cli.ts",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",

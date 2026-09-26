@@ -23,10 +23,12 @@ import type {
   SecretScanReport,
   StreamFileInventory,
   StreamSnapshot,
+  TuiStep,
   TurnResult,
 } from "../../acceptance/resident-runtime-driver.ts";
 import type { ChannelSpecLike } from "./channels.ts";
 import { ResidentRuntime } from "./runtime.ts";
+import { runResidentTuiScript } from "./tui.ts";
 
 const dataDir = process.env.MIST_RESIDENT_RUNTIME_DIR;
 if (dataDir === undefined || dataDir.length === 0) {
@@ -54,6 +56,7 @@ interface Command {
     readonly thresholdTokens?: number;
     readonly authority?: "window" | "owner";
     readonly via?: "new" | "clear" | "compact";
+    readonly script?: readonly TuiStep[];
   };
 }
 
@@ -97,6 +100,14 @@ async function handle(command: Command): Promise<unknown> {
         text: required(input.text, "text"),
         ...(input.turnId === undefined ? {} : { turnId: input.turnId }),
       })) as Result<TurnResult>;
+    case "tuiTranscript": {
+      if (input.script === undefined) throw new Error("script is required");
+      return runResidentTuiScript(runtime, {
+        residentId: required(input.residentId, "residentId"),
+        channel: requiredChannel(input.channel),
+        script: input.script,
+      });
+    }
     case "readStream":
       return runtime.readStream({
         residentId: required(input.residentId, "residentId"),

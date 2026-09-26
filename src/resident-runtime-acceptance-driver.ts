@@ -12,13 +12,8 @@
  *     src/resident-runtime/channels.ts 顶注：公开 CI 不带密钥；真实 pi 传输随 RT-04）。
  *
  * 出处归结构（清单「真灯与桩灯」）：真实现住在 src/resident-runtime/ 各模块，
- * 本文件只准 import 和接线；这里连一行实现都没有，桩是明桩（见 STUBBED）。
- *
- * STUBBED：换代与 TUI 两条线的方法还没接线（RT-03 / RT-05 的地盘）——
- *   letterTimeline / setBreathThreshold / breathe / suddenDeath / archivedTranscript
- *   （换代线，接 BreathCycle + sealLetter + turn-gate）
- *   tuiTranscript（终端入口，接 pi-tui 画框）
- * 其余方法全部真实经过宿主子进程 + 真实落盘，无桩。
+ * 本文件只准 import 和接线；所有 RT-01～RT-07 方法均经真实宿主，无桩。
+ * STUBBED 为空，验收灯色全部由生产实现决定。
  */
 import { type ChildProcess, spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
@@ -43,9 +38,8 @@ import type {
   TurnResult,
 } from "../acceptance/resident-runtime-driver.ts";
 
-/** 还是明桩的方法：依赖它们跑绿的灯会显示为桩灯（🟡），不计入完成。
- * RT-03 的五个口已接线（BreathCycle + sealLetter + turn 占位），名单收窄到 TUI。 */
-export const STUBBED: readonly string[] = ["tuiTranscript"];
+/** 生产验收驱动没有桩方法；所有调用均转发给真实宿主子进程。 */
+export const STUBBED: readonly string[] = [];
 
 const HOST_PROCESS = fileURLToPath(new URL("./resident-runtime/host-process.ts", import.meta.url));
 const READY_TIMEOUT_MS = 15_000;
@@ -174,12 +168,12 @@ class ResidentRuntimeProductionDriver implements ResidentRuntimeDriver {
 
   // —— TUI（RT-05 的地盘） ——
 
-  tuiTranscript(_input: {
+  tuiTranscript(input: {
     residentId: string;
     channel: ChannelSpec;
     script: readonly TuiStep[];
   }): Promise<Result<TuiTranscript>> {
-    return stub("tuiTranscript", "RT-05 接 pi-tui 画框后才有终端入口 transcript");
+    return this.#call("tuiTranscript", { input });
   }
 
   // —— 静态审计的检索根（RT-07） ——

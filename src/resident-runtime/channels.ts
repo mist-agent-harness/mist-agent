@@ -17,6 +17,7 @@
  * 证据是本机真实通道的往返记录，归 RT-04 的通道 PR 与验收席，不进合成灯。
  */
 import { createHash } from "node:crypto";
+import { PiCliTransport } from "./pi-transport.ts";
 
 export type ChannelAdapterId = "pi-claude-bridge" | "pi-ai";
 export type ChannelCredentialKind = "subscription" | "api-key";
@@ -67,6 +68,8 @@ export interface HistoryMessage {
 
 export interface ModelCompletionRequest {
   readonly residentId: string;
+  /** D25 已解析的真实路由；传输层不得从 model 字符串猜订阅特例。 */
+  readonly adapterId: ChannelAdapterId;
   readonly model: string;
   readonly text: string;
   /**
@@ -137,10 +140,9 @@ export function createModelTransport(
     case "synthetic":
       return new SyntheticModelTransport();
     case "pi":
-      // pi-ai / pi-claude-bridge 的真实上游适配器随 RT-04 通道 PR 落地。
-      throw new Error(
-        "pi model transport lands with the RT-04 channel work; use synthetic for now",
-      );
+      // 真实上游（通道 PR）：用户 `pi install` 装的模型栈——pi-ai 的 provider 或
+      // pi-claude-bridge（订阅特例），经 pi 公共 CLI 进子进程。密钥只走环境变量。
+      return new PiCliTransport();
     default:
       throw new Error(`unknown MIST_RESIDENT_RUNTIME_TRANSPORT: ${String(mode)}`);
   }
