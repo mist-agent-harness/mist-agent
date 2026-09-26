@@ -1,9 +1,23 @@
 # 群聊 v0：Phase 0 验收规格
 
 对应 [#157](https://github.com/mist-agent-harness/mist-agent/issues/157) 和
-[设计图](../docs/design/group-chat-phase-0.md)。全部未勾选：这是未实现、未运行的语义
-规格，不是已经执行失败的测试，不接现有第一里程碑 runner。实现单先补可执行红测试，
-再由真实宿主、bridge 和存储路径给出逐条证据。
+[设计图](../docs/design/group-chat-phase-0.md)。全部未勾选：这是未实现的语义规格。
+PR1 已接入可复跑判卷器：`npm run acceptance:group-chat`；严格模式为
+`npm run acceptance:group-chat:strict`。在真实宿主 adapter 尚不存在时，七灯报告
+`real-host driver missing` 红灯；这只证明验收入口和基线，不代表宿主行为已运行或失败。
+
+PR1 冻结 GC-01～05、GC-09、GC-15 的合成场景与证据判据，不实现群聊写口，也不使用
+stub/mock 冒充宿主正向对照。真实宿主的身份、授权、提交路径及正向对照必须由首个包含
+群聊写口的功能 PR 提供 adapter 后运行；GC-03/GC-09 的完整三本账/投递阶段验收也留在
+投递账实现阶段，不能因 PR1 runner 自检或预期红灯而提前点绿。
+
+## PR1 一轮预期红测（2026-09-24）
+
+命令：`npm run acceptance:group-chat`。报告模式退出码为 0；GC-01、GC-02、GC-03、GC-04、
+GC-05、GC-09、GC-15 均因 `real-host driver missing` 报预期红，真实宿主通过 `0/7`。
+这证明新验收入口能显式报告缺驱动基线，不证明宿主行为已运行或失败。正向形状的单测
+只是判卷器自检，既不算宿主正向对照，也不点亮任何 GC 灯。首个群聊写口 PR 仍须补真实
+宿主 adapter，并通过授权正向和拒绝负例；GC-03/GC-09 的完整账本/投递结论继续留后。
 
 ## 判卷方式
 
