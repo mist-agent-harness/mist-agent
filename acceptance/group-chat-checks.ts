@@ -7,10 +7,12 @@ import {
   type GroupChatCommand,
   type GroupChatEvidenceById,
   type GroupChatHostDriver,
+  type GroupChatHostRun,
   type GroupChatMentionExpectation,
   type GroupChatMentionOperation,
   type GroupChatNewcomerHistoryEvidence,
   type GroupChatRosterWorldEvidence,
+  type PluginBridgeState,
   type ResidentId,
   type RoomEvent,
   type RosterPath,
@@ -28,10 +30,14 @@ export interface GroupChatCheck {
 /**
  * Judge-side facts that do not come from the host adapter. GC-04 needs the static half of
  * "no member hard-wiring": the runner scans src/ and returns the non-test files that spell
- * out one of the given member ids.
+ * out one of the given member ids. GC-11/GC-14 need the crash-recovery half: relaunch a fresh
+ * host after a crash-during-* command and verify it is a genuine process replacement, not the
+ * same process still answering or an unrelated one — see `relaunchAfterCrash` in
+ * `group-chat-run.ts`.
  */
 export interface GroupChatJudgeContext {
   readonly findSourceLiterals: (terms: readonly string[]) => Promise<readonly string[]>;
+  readonly relaunchAfterCrash: () => Promise<GroupChatHostRun>;
 }
 
 const groupChatCheckDefinitions: Omit<GroupChatCheck, "uses">[] = [
@@ -90,6 +96,33 @@ const groupChatCheckDefinitions: Omit<GroupChatCheck, "uses">[] = [
     ],
   },
   {
+    id: "GC-11",
+    title: "同键幂等、变内容冲突与崩溃恢复不假成功",
+    scenario: [
+      "同一发布键重试相同载荷，核读回的是同一原始结果且原账、投递账不重复",
+      "同键分别改正文、mentions、房间、根触发，核每种改动都报冲突且改动内容零落地",
+      "分别在提交前、房间提交后回执前、外部调用结果不明时让宿主进程真实死掉再换进程重启",
+    ],
+  },
+  {
+    id: "GC-13",
+    title: "插件未就绪无可达入口，撤权后不再调用，故障不拖住其他住户",
+    scenario: [
+      "bridge 分别处于未 active、缺服务、版本不符、权限不足四态，核每态都没有可达入口",
+      "就绪态下留一条排队消息和一次在途调用，撤代理后核不再投递/完成，资源失败沿 quarantined 留痕",
+      "核房间原账与未决项不被擦掉，未播种的终端/私有文件 canary 不因故障处理旁路泄漏，其他住户和人类控制仍可用",
+    ],
+  },
+  {
+    id: "GC-14",
+    title: "房间界面与个人主流同一发布身份，两笔提交之间崩溃不假成功",
+    scenario: [
+      "住户公开发言：核房间事件与主流条目引用同一操作身份，且不复制其他成员的房间史",
+      "对主流尝试一次绕开唯一 writer 的直接 append，核被拒绝",
+      "在房间提交与主流提交之间让宿主进程真实死掉再换进程重启，核缺提交回执不发布成功、待协调记录保留",
+    ],
+  },
+  {
     id: "GC-15",
     title: "隐藏房间对未授权方不泄露存在及跨域内容",
     scenario: [
@@ -132,6 +165,33 @@ const methodsByCheck: Record<GroupChatCheckId, readonly (keyof GroupChatHostDriv
     "readContextCommits",
     "readReactions",
     "readMemories",
+  ],
+  "GC-11": [
+    "startHost",
+    "resetScenario",
+    "perform",
+    "readRoomEvents",
+    "readDeliveries",
+    "readPublishOutcomes",
+    "readExternalCallAttempts",
+  ],
+  "GC-13": [
+    "startHost",
+    "resetScenario",
+    "perform",
+    "readRoomEvents",
+    "readResidentContext",
+    "readPluginEntryAttempts",
+    "readQuarantineLog",
+    "readPendingPluginItems",
+  ],
+  "GC-14": [
+    "startHost",
+    "resetScenario",
+    "perform",
+    "readRoomEvents",
+    "readMainstream",
+    "readDualCommitStatus",
   ],
   "GC-15": [
     "startHost",
@@ -588,6 +648,105 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
       return {
         passed: true,
         detail: "收据署名系统且阶段准确；未代发 reaction；装入不写记忆；本人 reaction 保留作者",
+      };
+    }
+    case "GC-11": {
+      const e = evidence as GroupChatEvidenceById["GC-11"];
+      const { sameKeyRetry: retry } = e;
+      if (retry.roomEventCount !== 1) return fail("同键同内容重试后房间原账出现了重复事件");
+      if (retry.firstOutcome === null || retry.firstOutcome.status !== "committed")
+        return fail("同键同内容首次发布没有读回已提交结果");
+      if (
+        retry.secondOutcome === null ||
+        retry.secondOutcome.status !== "committed" ||
+        retry.secondOutcome.eventId !== retry.firstOutcome.eventId
+      )
+        return fail("同键同内容重试读回的不是同一个原始结果");
+      if (retry.deliveryRowCountAfterReplay !== retry.deliveryRowCountBeforeReplay)
+        return fail("投递账因回放重复增长");
+      const badConflict = e.contentConflicts.find(
+        (item) => item.outcome === null || item.outcome.status !== "conflict" || item.leaked,
+      );
+      if (badConflict !== undefined)
+        return fail(`改动${badConflict.variant}后同键请求未报冲突，或改动内容仍落进了房间原账`);
+      const { beforeCommitCrash, afterCommitCrash, unknownExternalCrash } = e;
+      if (!beforeCommitCrash.hostRestarted)
+        return fail("提交前崩溃场景没有验证到宿主进程被真实换掉");
+      if (beforeCommitCrash.eventExists)
+        return fail("提交前崩溃后房间原账却出现了该事件（假成功）");
+      if (beforeCommitCrash.outcomeAfterRestart?.status === "committed")
+        return fail("提交前崩溃后幂等结果被错误地读回为已提交");
+      if (!afterCommitCrash.hostRestarted)
+        return fail("房间提交后崩溃场景没有验证到宿主进程被真实换掉");
+      if (!afterCommitCrash.eventExists)
+        return fail("房间提交后崩溃后原账丢失了已提交事件，恢复没有先核账");
+      if (afterCommitCrash.outcomeAfterRestart?.status !== "committed")
+        return fail("房间提交后崩溃恢复后按同一操作身份查账未能读回已提交结果");
+      if (afterCommitCrash.deliveryRowCount > 1) return fail("提交后崩溃恢复后投递账重复");
+      if (!unknownExternalCrash.hostRestarted)
+        return fail("外部结果不明时崩溃场景没有验证到宿主进程被真实换掉");
+      if (unknownExternalCrash.outcomeAfterRestart?.status !== "pending")
+        return fail("外部调用结果不明时崩溃恢复后没有保留未决状态");
+      if (unknownExternalCrash.attemptCountAfterRestart > 1)
+        return fail("外部结果不明时恢复没有先核账，径直盲重发了外部调用");
+      if (unknownExternalCrash.attemptCountAfterRestart < 1)
+        return fail("外部结果不明时崩溃前的那次外部调用尝试没有留痕");
+      return {
+        passed: true,
+        detail:
+          "同键同内容读回原结果且不重复；变内容报冲突且零落地；三种崩溃点换进程恢复后无假成功、原账不丢、不盲重发",
+      };
+    }
+    case "GC-13": {
+      const e = evidence as GroupChatEvidenceById["GC-13"];
+      const badNotReady = e.notReadyAttempts.find((item) => item.reachable || item.invoked);
+      if (badNotReady !== undefined)
+        return fail(`bridge 处于 ${badNotReady.state} 时仍出现了可达入口或实际调用`);
+      const queued = e.pendingAfterRevoke.find((item) => item.kind === "queued-message");
+      const inFlight = e.pendingAfterRevoke.find((item) => item.kind === "in-flight-call");
+      if (queued === undefined || inFlight === undefined)
+        return fail("撤代理后读不回排队消息或在途调用各一条");
+      if (queued.delivered) return fail("撤代理后排队消息仍被投递");
+      if (inFlight.completedAsSuccess) return fail("撤代理后在途调用仍被当成功完成");
+      if (e.quarantineRecords.length === 0) return fail("资源失败没有沿 quarantined 留痕");
+      if (e.fallbackCanaryLeaked) return fail("插件故障处理旁路读取了终端/私有文件类 canary");
+      if (!e.preexistingRoomEventSurvived) return fail("插件故障处理擦掉了已有房间原账或未决项");
+      if (!e.otherResidentStillPosts) return fail("一位成员的插件故障拖住了其他住户");
+      if (!e.humanStillPosts) return fail("插件故障期间人类控制面不可用");
+      return {
+        passed: true,
+        detail:
+          "四种未就绪态零可达入口；撤代理后排队/在途不再完成；资源失败留 quarantined 痕迹；不旁路、不擦账、其他住户与控制面仍可用",
+      };
+    }
+    case "GC-14": {
+      const e = evidence as GroupChatEvidenceById["GC-14"];
+      const { normalPublish } = e;
+      if (normalPublish.roomEventId === null || normalPublish.mainstreamEntry === null)
+        return fail("正常发言没有同时读回房间事件与主流条目");
+      if (normalPublish.mainstreamEntry.roomEventId !== normalPublish.roomEventId)
+        return fail("主流条目没有引用同一房间事件，发布身份不一致");
+      if (normalPublish.mainstreamEntry.authorId !== normalPublish.roomAuthorId)
+        return fail("房间界面与个人主流的发布身份不一致");
+      if (normalPublish.otherResidentLeakedIntoMainstream)
+        return fail("个人主流复制了其他成员的房间事件，像长出了分身");
+      if (!e.arbitraryAppendRejected) return fail("绕开唯一 writer 的直接 append 没有被拒绝");
+      const { crashedCommit } = e;
+      if (!crashedCommit.hostRestarted)
+        return fail("房间提交与主流提交之间的崩溃场景没有验证到宿主进程被真实换掉");
+      if (!crashedCommit.roomEventExists) return fail("崩溃后房间侧已提交的事件丢失");
+      if (crashedCommit.mainstreamEntryExists)
+        return fail("主流侧提交回执缺失时，主流却出现了这条条目");
+      if (crashedCommit.status?.publishedAsSuccess === true)
+        return fail("两笔提交只完成一半却对外发布了成功");
+      if (crashedCommit.status?.reconciliationPending !== true)
+        return fail("跨账提交中断后没有保留待协调记录");
+      if (crashedCommit.claimsExternalDelivery)
+        return fail("待协调状态下声称了外部送达，stream delivered 冒充了外部送达");
+      return {
+        passed: true,
+        detail:
+          "两面同一发布身份，不复制他人房间史；直接 append 被拒；两笔提交间崩溃换进程后不假成功、待协调记录保留、不冒充外部送达",
       };
     }
     case "GC-15": {
@@ -1079,6 +1238,373 @@ export async function runGroupChatCheck(
         reactionAuthorsBeforeResidentReacted: reactionsBefore,
         reactionAuthorsAfterResidentReacted: reactionsAfter,
         memoryRecordsAddedByContextCommit: memoriesAfterCommit - memoriesAtStart,
+      });
+    }
+    case "GC-11": {
+      if (context === undefined)
+        throw new Error(
+          "GC-11 needs the judge-side crash-recovery relaunch helper (relaunchAfterCrash)",
+        );
+      const run = randomUUID().slice(0, 8);
+      const roomId = fixture.roomId;
+      const principalId = fixture.residentIds.a;
+      const relaunch = async (): Promise<boolean> => {
+        try {
+          await context.relaunchAfterCrash();
+          return true;
+        } catch {
+          return false;
+        }
+      };
+
+      // 1. Same key, same content retried: same original result, no duplicate.
+      const sameKey = `test-op:gc11:same:${run}`;
+      await act({
+        kind: "publish-idempotent",
+        operationKey: sameKey,
+        roomId,
+        principalId,
+        body: "TEST-GC11-SAME",
+      });
+      const firstOutcome = (await driver.readPublishOutcomes(sameKey))[0] ?? null;
+      const deliveryRowCountBeforeReplay = firstOutcome?.eventId
+        ? (await driver.readDeliveries(firstOutcome.eventId)).length
+        : 0;
+      await act({
+        kind: "publish-idempotent",
+        operationKey: sameKey,
+        roomId,
+        principalId,
+        body: "TEST-GC11-SAME",
+      });
+      const secondOutcome = (await driver.readPublishOutcomes(sameKey))[0] ?? null;
+      const deliveryRowCountAfterReplay = firstOutcome?.eventId
+        ? (await driver.readDeliveries(firstOutcome.eventId)).length
+        : -1;
+      const roomEventCount = (await driver.readRoomEvents(roomId)).filter((event) =>
+        event.body.includes("TEST-GC11-SAME"),
+      ).length;
+
+      // 2. Same key, changed content: body / mentions / room / root trigger each must conflict.
+      const conflictKey = `test-op:gc11:conflict:${run}`;
+      const baselineBody = "TEST-GC11-CONFLICT-BASE";
+      const altRoomId = `${roomId}-gc11-alt`;
+      await act({
+        kind: "publish-idempotent",
+        operationKey: conflictKey,
+        roomId,
+        principalId,
+        body: baselineBody,
+      });
+      const variants: readonly { readonly variant: string; readonly command: GroupChatCommand }[] =
+        [
+          {
+            variant: "正文",
+            command: {
+              kind: "publish-idempotent",
+              operationKey: conflictKey,
+              roomId,
+              principalId,
+              body: "TEST-GC11-CONFLICT-CHANGED-BODY",
+            },
+          },
+          {
+            variant: "mentions",
+            command: {
+              kind: "publish-idempotent",
+              operationKey: conflictKey,
+              roomId,
+              principalId,
+              body: baselineBody,
+              mentions: [fixture.residentIds.b],
+            },
+          },
+          {
+            variant: "房间",
+            command: {
+              kind: "publish-idempotent",
+              operationKey: conflictKey,
+              roomId: altRoomId,
+              principalId,
+              body: baselineBody,
+            },
+          },
+          {
+            variant: "根触发",
+            command: {
+              kind: "publish-idempotent",
+              operationKey: conflictKey,
+              roomId,
+              principalId,
+              body: baselineBody,
+              rootEventMarker: "test-root:gc11-alt",
+            },
+          },
+        ];
+      const contentConflicts: {
+        readonly variant: string;
+        readonly outcome: GroupChatEvidenceById["GC-11"]["sameKeyRetry"]["firstOutcome"];
+        readonly leaked: boolean;
+      }[] = [];
+      for (const { variant, command } of variants) {
+        await act(command);
+        const outcome = (await driver.readPublishOutcomes(conflictKey))[0] ?? null;
+        const events = await driver.readRoomEvents();
+        const baselineCount = events.filter((event) => event.body === baselineBody).length;
+        const alteredLanded = events.some(
+          (event) =>
+            event.body === "TEST-GC11-CONFLICT-CHANGED-BODY" ||
+            (event.roomId === altRoomId && event.body === baselineBody),
+        );
+        contentConflicts.push({ variant, outcome, leaked: baselineCount !== 1 || alteredLanded });
+      }
+
+      // 3. Crash before the room commit: must never surface a false success.
+      const beforeKey = `test-op:gc11:before:${run}`;
+      await act({
+        kind: "crash-during-publish",
+        operationKey: beforeKey,
+        roomId,
+        principalId,
+        body: "TEST-GC11-BEFORE-COMMIT",
+        crashPoint: "before-room-commit",
+      });
+      const beforeCommitCrash = {
+        hostRestarted: await relaunch(),
+        eventExists: (await driver.readRoomEvents(roomId)).some((event) =>
+          event.body.includes("TEST-GC11-BEFORE-COMMIT"),
+        ),
+        outcomeAfterRestart: (await driver.readPublishOutcomes(beforeKey))[0] ?? null,
+      };
+
+      // 4. Crash after the room commit, before the ack: recovery must find it by key.
+      const afterKey = `test-op:gc11:after:${run}`;
+      await act({
+        kind: "crash-during-publish",
+        operationKey: afterKey,
+        roomId,
+        principalId,
+        body: "TEST-GC11-AFTER-COMMIT",
+        crashPoint: "after-room-commit-before-ack",
+      });
+      const afterRestarted = await relaunch();
+      const afterOutcome = (await driver.readPublishOutcomes(afterKey))[0] ?? null;
+      const afterCommitCrash = {
+        hostRestarted: afterRestarted,
+        eventExists: (await driver.readRoomEvents(roomId)).some((event) =>
+          event.body.includes("TEST-GC11-AFTER-COMMIT"),
+        ),
+        outcomeAfterRestart: afterOutcome,
+        deliveryRowCount: afterOutcome?.eventId
+          ? (await driver.readDeliveries(afterOutcome.eventId)).length
+          : 0,
+      };
+
+      // 5. Crash while an external call's result is unknown: stay pending, no blind resend.
+      const unknownKey = `test-op:gc11:unknown:${run}`;
+      await act({
+        kind: "crash-during-publish",
+        operationKey: unknownKey,
+        roomId,
+        principalId,
+        body: "TEST-GC11-UNKNOWN-EXTERNAL",
+        crashPoint: "external-result-unknown",
+      });
+      const unknownExternalCrash = {
+        hostRestarted: await relaunch(),
+        outcomeAfterRestart: (await driver.readPublishOutcomes(unknownKey))[0] ?? null,
+        attemptCountAfterRestart: (await driver.readExternalCallAttempts(unknownKey)).length,
+      };
+
+      return evaluateGroupChatEvidence(id, {
+        sameKeyRetry: {
+          firstOutcome,
+          secondOutcome,
+          roomEventCount,
+          deliveryRowCountBeforeReplay,
+          deliveryRowCountAfterReplay,
+        },
+        contentConflicts,
+        beforeCommitCrash,
+        afterCommitCrash,
+        unknownExternalCrash,
+      });
+    }
+    case "GC-13": {
+      const { a: residentA, b: residentB } = fixture.residentIds;
+      const notReadyStates: readonly PluginBridgeState[] = [
+        "inactive",
+        "missing-service",
+        "version-mismatch",
+        "insufficient-permission",
+      ];
+      const notReadyAttempts: GroupChatEvidenceById["GC-13"]["notReadyAttempts"][number][] = [];
+      for (const state of notReadyStates) {
+        await act({ kind: "seed-plugin-bridge", residentId: residentA, state });
+        const marker = `TEST-GC13-NOT-READY-${state}`;
+        await act({ kind: "attempt-plugin-entry", residentId: residentA, marker });
+        const attempts = await driver.readPluginEntryAttempts();
+        const found = attempts.find((item) => item.marker === marker) ?? null;
+        notReadyAttempts.push(
+          found ?? { residentId: residentA, marker, state, reachable: true, invoked: true },
+        );
+      }
+
+      // Preexisting room traffic and a fallback canary must survive the plugin chaos below.
+      // Posted by resident C, who is not one of the "other resident"/"human" probes below, so
+      // this stays a distinct signal from either of them.
+      const preexistingMarker = "TEST-GC13-PREEXISTING-ROOM-EVENT";
+      await act({
+        kind: "post",
+        roomId: fixture.roomId,
+        principalId: fixture.residentIds.c,
+        visibility: "public",
+        binding: "test-binding:owner",
+        body: preexistingMarker,
+      });
+      const fallbackCanary = fixture.canaries.tool;
+      await act({ kind: "seed-fallback-canary", residentId: residentA, canary: fallbackCanary });
+
+      await act({ kind: "seed-plugin-bridge", residentId: residentA, state: "active" });
+      const queueMarker = "TEST-GC13-QUEUED-MESSAGE";
+      const inFlightMarker = "TEST-GC13-IN-FLIGHT-CALL";
+      await act({ kind: "queue-plugin-message", residentId: residentA, marker: queueMarker });
+      await act({
+        kind: "start-in-flight-plugin-call",
+        residentId: residentA,
+        marker: inFlightMarker,
+      });
+      const pendingBeforeRevoke = await driver.readPendingPluginItems(residentA);
+      await act({ kind: "revoke-plugin-agent", residentId: residentA });
+      const pendingAfterRevoke = await driver.readPendingPluginItems(residentA);
+      const quarantineRecords = await driver.readQuarantineLog();
+
+      const otherPostMarker = "TEST-GC13-OTHER-RESIDENT-STILL-POSTS";
+      await act({
+        kind: "post",
+        roomId: fixture.roomId,
+        principalId: residentB,
+        visibility: "public",
+        binding: "test-binding:owner",
+        body: otherPostMarker,
+      });
+      const humanPostMarker = "TEST-GC13-HUMAN-CONTROL-STILL-WORKS";
+      await act({
+        kind: "post",
+        roomId: fixture.roomId,
+        principalId: fixture.humanId,
+        visibility: "public",
+        binding: "test-binding:owner",
+        body: humanPostMarker,
+      });
+
+      const events = await driver.readRoomEvents(fixture.roomId);
+      const contexts = await Promise.all(
+        [fixture.residentIds.b, fixture.residentIds.c].map((residentId) =>
+          driver.readResidentContext(residentId),
+        ),
+      );
+      const visibleText = [
+        ...events.map((event) => event.body),
+        ...contexts,
+        ...quarantineRecords.map((record) => record.reason),
+      ].join("\n");
+
+      return evaluateGroupChatEvidence(id, {
+        notReadyAttempts,
+        pendingBeforeRevoke,
+        pendingAfterRevoke,
+        quarantineRecords,
+        fallbackCanaryLeaked: visibleText.includes(fallbackCanary),
+        preexistingRoomEventSurvived: hasMarker(events, preexistingMarker),
+        otherResidentStillPosts: hasMarker(events, otherPostMarker),
+        humanStillPosts: hasMarker(events, humanPostMarker),
+      });
+    }
+    case "GC-14": {
+      if (context === undefined)
+        throw new Error(
+          "GC-14 needs the judge-side crash-recovery relaunch helper (relaunchAfterCrash)",
+        );
+      const resident = fixture.residentIds.a;
+      const other = fixture.residentIds.b;
+      const run = randomUUID().slice(0, 8);
+
+      const normalKey = `test-op:gc14:normal:${run}`;
+      await act({
+        kind: "publish-dual-account",
+        operationKey: normalKey,
+        roomId: fixture.roomId,
+        residentId: resident,
+        body: "TEST-GC14-NORMAL",
+      });
+      // A different resident's own room post must never show up in this resident's mainstream.
+      await act({
+        kind: "post",
+        roomId: fixture.roomId,
+        principalId: other,
+        visibility: "public",
+        binding: "test-binding:owner",
+        body: "TEST-GC14-OTHER-RESIDENT-ROOM-POST",
+      });
+      const roomEvents = await driver.readRoomEvents(fixture.roomId);
+      const roomEvent = roomEvents.find((event) => event.body === "TEST-GC14-NORMAL") ?? null;
+      const mainstream = await driver.readMainstream(resident);
+      const mainstreamEntry = mainstream.find((entry) => entry.operationKey === normalKey) ?? null;
+      const otherResidentLeakedIntoMainstream = mainstream.some(
+        (entry) => entry.authorId === other || entry.body.includes("TEST-GC14-OTHER-RESIDENT"),
+      );
+
+      const arbitraryAppendBody = "TEST-GC14-ARBITRARY-APPEND";
+      await act({
+        kind: "attempt-arbitrary-mainstream-append",
+        residentId: resident,
+        body: arbitraryAppendBody,
+      });
+      const mainstreamAfterAppendAttempt = await driver.readMainstream(resident);
+      const arbitraryAppendRejected = !mainstreamAfterAppendAttempt.some((entry) =>
+        entry.body.includes(arbitraryAppendBody),
+      );
+
+      const crashKey = `test-op:gc14:crash:${run}`;
+      await act({
+        kind: "crash-during-dual-commit",
+        operationKey: crashKey,
+        roomId: fixture.roomId,
+        residentId: resident,
+        body: "TEST-GC14-CRASH-BETWEEN-COMMITS",
+        crashPoint: "between-room-and-mainstream-commit",
+      });
+      let hostRestarted = false;
+      try {
+        await context.relaunchAfterCrash();
+        hostRestarted = true;
+      } catch {
+        hostRestarted = false;
+      }
+      const status = (await driver.readDualCommitStatus(crashKey))[0] ?? null;
+      const roomEventExists = (await driver.readRoomEvents(fixture.roomId)).some((event) =>
+        event.body.includes("TEST-GC14-CRASH-BETWEEN-COMMITS"),
+      );
+      const mainstreamAfterCrash = await driver.readMainstream(resident);
+      const crashedMainstreamEntry =
+        mainstreamAfterCrash.find((entry) => entry.operationKey === crashKey) ?? null;
+
+      return evaluateGroupChatEvidence(id, {
+        normalPublish: {
+          roomEventId: roomEvent?.id ?? null,
+          roomAuthorId: roomEvent?.authorId ?? null,
+          mainstreamEntry,
+          otherResidentLeakedIntoMainstream,
+        },
+        arbitraryAppendRejected,
+        crashedCommit: {
+          hostRestarted,
+          status,
+          roomEventExists,
+          mainstreamEntryExists: crashedMainstreamEntry !== null,
+          claimsExternalDelivery: status?.claimsExternalDelivery ?? false,
+        },
       });
     }
     case "GC-15": {

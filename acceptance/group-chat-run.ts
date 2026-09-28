@@ -1,5 +1,7 @@
 /**
  * #191 PR1: executable contract for GC-01..05, GC-09 and GC-15.
+ * #193 PR1 (unit C): adds GC-11, GC-13 and GC-14 to the same runner/fixture/provenance
+ * machinery — one evolving judge for the whole group-chat spec, not a second script.
  *
  *   npm run acceptance:group-chat        # report expected reds if no host adapter
  *   npm run acceptance:group-chat:strict # nonzero unless all real-host checks pass
@@ -11,9 +13,13 @@
  * commit is the checked-out HEAD. After stopHost() the process must be gone and readbacks must
  * reject. These checks stop lazy stand-ins; a judge-written durable challenge proving that
  * readbacks come from the host's own ledger waits for the #191 adapter's data-root contract.
- * A host that fails these checks gets seven red lamps naming the reason and a nonzero exit in
+ * A host that fails these checks gets every lamp red naming the reason and a nonzero exit in
  * both modes: it is a broken adapter, not the missing-driver baseline.
  * STUBBED follows the repo's acceptance convention: declared methods turn a lamp yellow.
+ *
+ * GC-11/GC-14 additionally crash the host mid-scenario (see `relaunchAfterCrash` below) and
+ * relaunch it: each restart is re-verified against the same provenance facts, and the pid the
+ * final stopHost() check watches follows the latest live process, not the one that died first.
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
@@ -69,7 +75,7 @@ export class HostProvenanceError extends Error {
 
 /**
  * A host that fails provenance leaves no lamp judged: readbacks cannot be attributed to it.
- * All seven report red with the reason; this is a broken adapter, not the missing-driver
+ * Every lamp reports red with the reason; this is a broken adapter, not the missing-driver
  * baseline, so the runner exits nonzero in report mode too.
  */
 export function provenanceFailedResults(reason: string): GroupChatRunResult[] {
@@ -148,6 +154,25 @@ export function hostProvenanceProblem(
   if (!facts.headCommit.trim().toLowerCase().startsWith(commit))
     return `host source ${run.commit} is not the checked-out HEAD ${facts.headCommit.trim()}`;
   return null;
+}
+
+/**
+ * GC-11/GC-14: what a post-crash relaunch must additionally satisfy beyond
+ * hostProvenanceProblem() — the process that supposedly crashed must actually be dead, and the
+ * relaunched one must be a genuinely different process, not the same pid still answering or a
+ * fresh pid that otherwise fails the ordinary provenance facts.
+ */
+export function restartedHostProblem(
+  previous: GroupChatHostRun,
+  next: GroupChatHostRun,
+  facts: HostProvenanceFacts,
+): string | null {
+  const oldInfo = facts.readProcess(previous.pid);
+  if (oldInfo?.alive)
+    return `host process ${previous.pid} is still alive; the crash-during-* command did not actually terminate it`;
+  if (next.pid === previous.pid)
+    return `startHost() after a crash reported the same pid ${next.pid}: not a genuine process replacement`;
+  return hostProvenanceProblem(next, facts);
 }
 
 /**
@@ -329,9 +354,27 @@ async function runHostChecks(loaded: LoadedDriver): Promise<GroupChatRunResult[]
     throw new HostProvenanceError(`real-host provenance check failed: ${problem}`);
   }
 
+  // GC-11/GC-14 crash the host mid-scenario and relaunch it against the same durable store;
+  // this tracks whichever process is actually live so the final stopHost() check below (and
+  // the log line) look at the real current host, not the one that already died on purpose.
+  let currentHost = host;
+  let restartCount = 0;
+  const relaunchAfterCrash = async (): Promise<GroupChatHostRun> => {
+    const run = await driver.startHost();
+    const restartProblem = restartedHostProblem(currentHost, run, facts);
+    if (restartProblem !== null)
+      throw new HostProvenanceError(
+        `post-crash restart provenance check failed: ${restartProblem}`,
+      );
+    currentHost = run;
+    restartCount += 1;
+    return run;
+  };
+
   const context = {
     findSourceLiterals: (terms: readonly string[]) =>
       findSourceLiterals(SOURCE_ROOT, terms, REPO_ROOT),
+    relaunchAfterCrash,
   };
   const results: GroupChatRunResult[] = [];
   try {
@@ -358,12 +401,14 @@ async function runHostChecks(loaded: LoadedDriver): Promise<GroupChatRunResult[]
   } finally {
     await driver.stopHost();
   }
-  const stopProblem = await hostStopProblem(driver, host.pid, facts.readProcess);
+  const stopProblem = await hostStopProblem(driver, currentHost.pid, facts.readProcess);
   if (stopProblem !== null)
     throw new HostProvenanceError(
       `real-host provenance check failed after stopHost(): ${stopProblem}`,
     );
-  console.log(`真实宿主进程 PID ${host.pid}；代码 ${host.commit}`);
+  console.log(`真实宿主进程 PID ${currentHost.pid}；代码 ${currentHost.commit}`);
+  if (restartCount > 0)
+    console.log(`GC-11/GC-14 期间宿主被真实换过 ${restartCount} 次进程，每次都重新核对过来源`);
   console.log(
     "宿主来源已由判卷核对：判卷子进程、同一 node、src/ 入口、当前 HEAD、停机后进程退出且读回拒绝。判卷绕过 adapter 直写原账再读回的挑战，待 #191 adapter 定下数据根后补。",
   );
@@ -372,7 +417,7 @@ async function runHostChecks(loaded: LoadedDriver): Promise<GroupChatRunResult[]
 
 async function main(): Promise<void> {
   const driver = await loadDriver();
-  console.log("Mist #191 群聊验收：GC-01～05、GC-09、GC-15");
+  console.log("Mist 群聊验收（#191 单 A / #193 单 C）：GC-01～05、09、11、13、14、15");
   console.log(`合成夹具：${groupChatSyntheticFixture.roomId}；不读取真实聊天/记忆/凭据`);
   console.log("");
 

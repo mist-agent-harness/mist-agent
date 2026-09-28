@@ -18,12 +18,20 @@ import {
   type CallReceipt,
   type ContextCommit,
   type DeliveryRecord,
+  type DualCommitStatus,
+  type ExternalCallAttempt,
   GROUP_CHAT_CHECK_IDS,
   type GroupChatCheckId,
   type GroupChatCommand,
   type GroupChatHostDriver,
+  type MainstreamEntry,
   type MemoryRecord,
   type MentionDecision,
+  type PendingPluginItem,
+  type PluginBridgeState,
+  type PluginEntryAttempt,
+  type PublishOutcome,
+  type QuarantineRecord,
   type ResidentId,
   type ResidentReaction,
   type RoomEvent,
@@ -44,6 +52,7 @@ import {
   isRepoEntryFile,
   provenanceFailedResults,
   readProcessInfo,
+  restartedHostProblem,
   missingDriverResults as runnerMissingDriverResults,
   scoreGroupChatResults,
 } from "./group-chat-run.ts";
@@ -103,6 +112,41 @@ interface TestOptions {
   readonly newcomerSeesPreJoinIds?: boolean;
   readonly newcomerMissesPostJoin?: boolean;
   readonly duplicatePositions?: boolean;
+  // —— GC-11 ——
+  /** Buggy host: accepts a same-key request whose content differs instead of conflicting. */
+  readonly gc11AcceptConflictingContent?: boolean;
+  /** Buggy host: commits a publish even though the crash was armed before the room commit. */
+  readonly gc11FalseSuccessBeforeCommit?: boolean;
+  /** Buggy host: loses a publish that should have survived a post-commit, pre-ack crash. */
+  readonly gc11LoseCommitAfterCrash?: boolean;
+  /** Buggy host: fires a second external call attempt instead of checking the ledger first. */
+  readonly gc11BlindResendOnRestart?: boolean;
+  // —— GC-13 ——
+  /** Buggy host: reports every plugin-entry attempt as reachable regardless of bridge state. */
+  readonly gc13AlwaysReachable?: boolean;
+  /** Buggy host: still delivers a queued message after the agent/entry was revoked. */
+  readonly gc13DeliverAfterRevoke?: boolean;
+  /** Buggy host: still reports the in-flight call as a completed success after revocation. */
+  readonly gc13CompleteAfterRevoke?: boolean;
+  /** Buggy host: a resource failure leaves no quarantine trace. */
+  readonly gc13NoQuarantineTrace?: boolean;
+  /** Buggy host: falls back to the seeded terminal/private-file canary and leaks it. */
+  readonly gc13LeakFallbackCanary?: boolean;
+  /** Buggy host: a plugin failure for one resident also blocks another resident's post. */
+  readonly gc13OtherResidentBlocked?: boolean;
+  /** Buggy host: a plugin failure blocks the human control plane's post. */
+  readonly gc13HumanBlocked?: boolean;
+  // —— GC-14 ——
+  /** Buggy host: accepts a direct append that bypasses the bounded mainstream writer. */
+  readonly gc14AcceptArbitraryAppend?: boolean;
+  /** Buggy host: publishes success even though only the room side committed before the crash. */
+  readonly gc14FalseSuccessOnCrash?: boolean;
+  /** Buggy host: does not keep a pending-reconciliation record after a half-committed crash. */
+  readonly gc14NoReconciliationRecord?: boolean;
+  /** Buggy host: claims external delivery for a half-committed, still-reconciling entry. */
+  readonly gc14ClaimsExternalDelivery?: boolean;
+  /** Buggy host: a resident's mainstream includes another resident's room post. */
+  readonly gc14OtherResidentLeaksIntoMainstream?: boolean;
 }
 
 /** Test-only host model; production runner never imports this adapter. */
@@ -131,6 +175,22 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
   private gateTurnOpen = true;
   private crossResidentPrivateReads = 0;
   private unauthorizedReadResults: string[] = [];
+  // —— GC-11 ——
+  private publishOutcomes = new Map<string, PublishOutcome>();
+  private publishContent = new Map<
+    string,
+    { body: string; mentions: readonly string[]; roomId: string; rootEventMarker: string | null }
+  >();
+  private externalCallAttempts: ExternalCallAttempt[] = [];
+  // —— GC-13 ——
+  private pluginBridgeState = new Map<ResidentId, PluginBridgeState>();
+  private pluginEntryAttempts: PluginEntryAttempt[] = [];
+  private pendingPluginItems: PendingPluginItem[] = [];
+  private quarantineRecords: QuarantineRecord[] = [];
+  private pluginAgentRevoked = new Set<ResidentId>();
+  // —— GC-14 ——
+  private mainstream: MainstreamEntry[] = [];
+  private dualCommitStatuses = new Map<string, DualCommitStatus>();
 
   constructor(options: TestOptions = {}) {
     this.options = options;
@@ -170,6 +230,16 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
     this.gateTurnOpen = true;
     this.crossResidentPrivateReads = 0;
     this.unauthorizedReadResults = [];
+    this.publishOutcomes.clear();
+    this.publishContent.clear();
+    this.externalCallAttempts = [];
+    this.pluginBridgeState.clear();
+    this.pluginEntryAttempts = [];
+    this.pendingPluginItems = [];
+    this.quarantineRecords = [];
+    this.pluginAgentRevoked.clear();
+    this.mainstream = [];
+    this.dualCommitStatuses.clear();
   }
 
   /** Per-room event ids: a global counter would itself reveal hidden-room traffic (GC-15). */
@@ -195,11 +265,40 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
       this.decisions.push({ ...recorded });
   }
 
+  /** GC-11: commit a room event for `key` and record it as the key's canonical outcome. */
+  private commitPublish(
+    key: string,
+    input: { readonly roomId: string; readonly principalId: ResidentId; readonly body: string },
+  ): void {
+    this.addEvent({
+      roomId: input.roomId,
+      authorId: input.principalId,
+      body: input.body,
+      visibility: "public",
+    });
+    const event = this.events.at(-1);
+    if (event === undefined) return;
+    this.publishOutcomes.set(key, {
+      operationKey: key,
+      status: "committed",
+      eventId: event.id,
+      reason: null,
+    });
+    const rows = this.deliveries.get(event.id) ?? [];
+    rows.push({ residentId: input.principalId, state: "loaded" });
+    this.deliveries.set(event.id, rows);
+  }
+
   async perform(command: GroupChatCommand): Promise<void> {
     switch (command.kind) {
       case "post": {
         if (this.options.dropForgedBodyPost && command.body.includes("TEST-GC01-BODY-FORGERY"))
           return;
+        // GC-13 negative-test options: a buggy host lets one resident's plugin fault drag
+        // down another resident's post or the human control plane's post.
+        if (this.options.gc13OtherResidentBlocked && command.principalId === fixture.residentIds.b)
+          return;
+        if (this.options.gc13HumanBlocked && command.principalId === fixture.humanId) return;
         const valid =
           command.roomId !== "" &&
           command.visibility === "public" &&
@@ -491,6 +590,210 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
       }
       case "set-resident":
         return;
+      // —— GC-11 ——
+      case "publish-idempotent": {
+        const key = command.operationKey;
+        const content = {
+          body: command.body,
+          mentions: command.mentions ?? [],
+          roomId: command.roomId,
+          rootEventMarker: command.rootEventMarker ?? null,
+        };
+        const existing = this.publishOutcomes.get(key);
+        const prevContent = this.publishContent.get(key);
+        if (existing !== undefined && prevContent !== undefined) {
+          const same =
+            prevContent.body === content.body &&
+            prevContent.roomId === content.roomId &&
+            prevContent.rootEventMarker === content.rootEventMarker &&
+            prevContent.mentions.join("\0") === content.mentions.join("\0");
+          if (same) return; // idempotent no-op: readback still returns the original result.
+          if (!this.options.gc11AcceptConflictingContent) {
+            this.publishOutcomes.set(key, {
+              operationKey: key,
+              status: "conflict",
+              eventId: existing.eventId,
+              reason: "content-mismatch",
+            });
+            return;
+          }
+          // Negative-test option only: a buggy host accepts the changed content anyway.
+        }
+        this.publishContent.set(key, content);
+        this.commitPublish(key, {
+          roomId: content.roomId,
+          principalId: command.principalId,
+          body: content.body,
+        });
+        return;
+      }
+      case "crash-during-publish": {
+        if (command.crashPoint === "before-room-commit") {
+          if (this.options.gc11FalseSuccessBeforeCommit)
+            this.commitPublish(command.operationKey, command);
+          return; // correct default: the host died before writing anything.
+        }
+        if (command.crashPoint === "after-room-commit-before-ack") {
+          if (!this.options.gc11LoseCommitAfterCrash)
+            this.commitPublish(command.operationKey, command);
+          return;
+        }
+        // external-result-unknown: exactly one side-effect attempt, held pending.
+        this.publishOutcomes.set(command.operationKey, {
+          operationKey: command.operationKey,
+          status: "pending",
+          eventId: null,
+          reason: "external-result-unknown",
+        });
+        this.externalCallAttempts.push({ operationKey: command.operationKey, attemptSeq: 1 });
+        if (this.options.gc11BlindResendOnRestart)
+          this.externalCallAttempts.push({ operationKey: command.operationKey, attemptSeq: 2 });
+        return;
+      }
+      // —— GC-13 ——
+      case "seed-plugin-bridge":
+        this.pluginBridgeState.set(command.residentId, command.state);
+        return;
+      case "attempt-plugin-entry": {
+        const state = this.pluginBridgeState.get(command.residentId) ?? "inactive";
+        const reachable =
+          this.options.gc13AlwaysReachable === true ||
+          (state === "active" && !this.pluginAgentRevoked.has(command.residentId));
+        this.pluginEntryAttempts.push({
+          residentId: command.residentId,
+          marker: command.marker,
+          state,
+          reachable,
+          invoked: reachable,
+        });
+        return;
+      }
+      case "queue-plugin-message":
+        this.pendingPluginItems.push({
+          residentId: command.residentId,
+          marker: command.marker,
+          kind: "queued-message",
+          delivered: false,
+          completedAsSuccess: false,
+        });
+        return;
+      case "start-in-flight-plugin-call":
+        this.pendingPluginItems.push({
+          residentId: command.residentId,
+          marker: command.marker,
+          kind: "in-flight-call",
+          delivered: false,
+          completedAsSuccess: false,
+        });
+        return;
+      case "revoke-plugin-agent": {
+        this.pluginAgentRevoked.add(command.residentId);
+        this.pluginBridgeState.set(command.residentId, "inactive");
+        this.pendingPluginItems = this.pendingPluginItems.map((item) =>
+          item.residentId === command.residentId
+            ? {
+                ...item,
+                delivered: this.options.gc13DeliverAfterRevoke === true,
+                completedAsSuccess: this.options.gc13CompleteAfterRevoke === true,
+              }
+            : item,
+        );
+        if (!this.options.gc13NoQuarantineTrace)
+          this.quarantineRecords.push({
+            residentId: command.residentId,
+            reason: "plugin-agent-revoked",
+          });
+        return;
+      }
+      case "seed-fallback-canary": {
+        if (this.options.gc13LeakFallbackCanary) {
+          // Negative-test option: a buggy host bypasses the failure and uses this "terminal
+          // input / private file" stand-in as a silent fallback data source.
+          this.addEvent({
+            roomId: fixture.roomId,
+            authorId: "test-host:fallback",
+            body: command.canary,
+            visibility: "public",
+          });
+        }
+        return;
+      }
+      // —— GC-14 ——
+      case "publish-dual-account": {
+        this.addEvent({
+          roomId: command.roomId,
+          authorId: command.residentId,
+          body: command.body,
+          visibility: "public",
+        });
+        const event = this.events.at(-1);
+        if (event === undefined) return;
+        const leakOther =
+          this.options.gc14OtherResidentLeaksIntoMainstream === true &&
+          command.residentId === fixture.residentIds.a;
+        this.mainstream.push({
+          residentId: command.residentId,
+          operationKey: command.operationKey,
+          roomEventId: event.id,
+          authorId: command.residentId,
+          body: command.body,
+          claimsExternalDelivery: false,
+        });
+        if (leakOther) {
+          this.mainstream.push({
+            residentId: command.residentId,
+            operationKey: null,
+            roomEventId: null,
+            authorId: fixture.residentIds.b,
+            body: "TEST-GC14-OTHER-RESIDENT-LEAK",
+            claimsExternalDelivery: false,
+          });
+        }
+        return;
+      }
+      case "attempt-arbitrary-mainstream-append": {
+        if (this.options.gc14AcceptArbitraryAppend) {
+          this.mainstream.push({
+            residentId: command.residentId,
+            operationKey: null,
+            roomEventId: null,
+            authorId: command.residentId,
+            body: command.body,
+            claimsExternalDelivery: false,
+          });
+        }
+        return; // correct default: rejected, no entry created.
+      }
+      case "crash-during-dual-commit": {
+        this.addEvent({
+          roomId: command.roomId,
+          authorId: command.residentId,
+          body: command.body,
+          visibility: "public",
+        });
+        const event = this.events.at(-1);
+        const roomEventId = event?.id ?? null;
+        const falseSuccess = this.options.gc14FalseSuccessOnCrash === true;
+        if (falseSuccess) {
+          this.mainstream.push({
+            residentId: command.residentId,
+            operationKey: command.operationKey,
+            roomEventId,
+            authorId: command.residentId,
+            body: command.body,
+            claimsExternalDelivery: this.options.gc14ClaimsExternalDelivery === true,
+          });
+        }
+        this.dualCommitStatuses.set(command.operationKey, {
+          operationKey: command.operationKey,
+          roomCommitted: true,
+          mainstreamCommitted: falseSuccess,
+          publishedAsSuccess: falseSuccess,
+          reconciliationPending: !this.options.gc14NoReconciliationRecord,
+          claimsExternalDelivery: this.options.gc14ClaimsExternalDelivery === true,
+        });
+        return;
+      }
     }
   }
 
@@ -588,10 +891,61 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
   async readReactions(): Promise<readonly ResidentReaction[]> {
     return this.reactions;
   }
+  // —— GC-11 ——
+  async readPublishOutcomes(operationKey?: string): Promise<readonly PublishOutcome[]> {
+    const all = [...this.publishOutcomes.values()];
+    return operationKey === undefined
+      ? all
+      : all.filter((item) => item.operationKey === operationKey);
+  }
+  async readExternalCallAttempts(operationKey?: string): Promise<readonly ExternalCallAttempt[]> {
+    return operationKey === undefined
+      ? this.externalCallAttempts
+      : this.externalCallAttempts.filter((item) => item.operationKey === operationKey);
+  }
+  // —— GC-13 ——
+  async readPluginEntryAttempts(): Promise<readonly PluginEntryAttempt[]> {
+    return this.pluginEntryAttempts;
+  }
+  async readQuarantineLog(): Promise<readonly QuarantineRecord[]> {
+    return this.quarantineRecords;
+  }
+  async readPendingPluginItems(residentId?: ResidentId): Promise<readonly PendingPluginItem[]> {
+    return residentId === undefined
+      ? this.pendingPluginItems
+      : this.pendingPluginItems.filter((item) => item.residentId === residentId);
+  }
+  // —— GC-14 ——
+  async readMainstream(residentId: ResidentId): Promise<readonly MainstreamEntry[]> {
+    return this.mainstream.filter((entry) => entry.residentId === residentId);
+  }
+  async readDualCommitStatus(operationKey?: string): Promise<readonly DualCommitStatus[]> {
+    const all = [...this.dualCommitStatuses.values()];
+    return operationKey === undefined
+      ? all
+      : all.filter((item) => item.operationKey === operationKey);
+  }
 }
 
 /** No member-id literals found under src/ (the runner supplies the real scan). */
-const judge: GroupChatJudgeContext = { findSourceLiterals: async () => [] };
+/**
+ * GC-11/GC-14 use a synthetic in-memory host, not a real subprocess, so this stub only needs to
+ * report a plausible fresh run; the real restart-provenance arithmetic (`restartedHostProblem`)
+ * is exercised directly against fake process facts in the "runner: real-host provenance" suite
+ * below, the same split already used for `hostProvenanceProblem`/`hostStopProblem`.
+ */
+const judge: GroupChatJudgeContext = {
+  findSourceLiterals: async () => [],
+  relaunchAfterCrash: async () => ({ pid: 54321, commit: "synthetic-test-only-restarted" }),
+};
+
+/** A relaunch that always fails verification, for GC-11/GC-14's "restart could not be proven" branch. */
+const failingRelaunchJudge: GroupChatJudgeContext = {
+  findSourceLiterals: async () => [],
+  relaunchAfterCrash: async () => {
+    throw new Error("synthetic: restart could not be verified");
+  },
+};
 
 const check = (id: GroupChatCheckId, options: TestOptions = {}) =>
   runGroupChatCheck(id, new SyntheticGroupChatHost(options), judge);
@@ -725,7 +1079,7 @@ const honestClaims = [
 ];
 
 describe("#191 group-chat acceptance: judge-driven synthetic host checks", () => {
-  it("freezes exactly the seven PR1 lamps and synthetic fixtures", () => {
+  it("freezes exactly the ten frozen PR1 lamps (#191 + #193) and synthetic fixtures", () => {
     expect(groupChatChecks.map(({ id }) => id)).toEqual(GROUP_CHAT_CHECK_IDS);
     expect(fixture.roomId).toMatch(/^test-room:/);
     expect(Object.values(fixture.residentIds).every((id) => id.startsWith("test-resident:"))).toBe(
@@ -891,6 +1245,7 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
         scanned = terms;
         return ["src/group-chat/router.ts"];
       },
+      relaunchAfterCrash: judge.relaunchAfterCrash,
     });
     expect(result.passed).toBe(false);
     expect(result.detail).toContain("src/group-chat/router.ts");
@@ -1070,7 +1425,7 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
     expect((await raw.readRoomEvents())[0]?.body).toBe("TEST-CLONE-BOUNDARY");
   });
 
-  it("reports absent production adapter as seven expected red lamps", () => {
+  it("reports absent production adapter as expected red lamps for every frozen check", () => {
     const results = runnerMissingDriverResults();
     expect(results.map(({ id }) => id)).toEqual(GROUP_CHAT_CHECK_IDS);
     expect(
@@ -1078,7 +1433,7 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
     ).toBe(true);
   });
 
-  it("reports a provenance failure as seven red lamps naming the reason, never a baseline", () => {
+  it("reports a provenance failure as red lamps naming the reason, never a baseline", () => {
     const reason = "real-host provenance check failed: host process 7 is not running";
     const results = provenanceFailedResults(reason);
     expect(results.map(({ id }) => id)).toEqual(GROUP_CHAT_CHECK_IDS);
@@ -1108,16 +1463,165 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
     }));
     expect(scoreGroupChatResults(stubbedResults)).toEqual({
       trueGreen: 0,
-      stubGreen: 7,
+      stubGreen: groupChatChecks.length,
       strictPass: false,
     });
 
     const realResults = stubbedResults.map((result) => ({ ...result, stubbed: false }));
     expect(scoreGroupChatResults(realResults)).toEqual({
-      trueGreen: 7,
+      trueGreen: groupChatChecks.length,
       stubGreen: 0,
       strictPass: true,
     });
+  });
+});
+
+describe("#193 PR1 GC-11: idempotency, conflict and crash recovery", () => {
+  it("passes: same-key replay reads back the original, content changes conflict, all three crash points recover cleanly", async () => {
+    const result = await check("GC-11");
+    expect(result.passed).toBe(true);
+  });
+
+  it("fails when a same-key retry with different content is silently accepted instead of conflicting", async () => {
+    const result = await check("GC-11", { gc11AcceptConflictingContent: true });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("未报冲突");
+  });
+
+  it("fails when the host commits despite the crash being armed before the room commit (false success)", async () => {
+    const result = await check("GC-11", { gc11FalseSuccessBeforeCommit: true });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("假成功");
+  });
+
+  it("fails when the host loses an already-committed event after the post-commit, pre-ack crash", async () => {
+    const result = await check("GC-11", { gc11LoseCommitAfterCrash: true });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("丢失了已提交事件");
+  });
+
+  it("fails when recovery blindly resends instead of checking the ledger first", async () => {
+    const result = await check("GC-11", { gc11BlindResendOnRestart: true });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("盲重发");
+  });
+
+  it("fails every crash-point branch when the post-crash relaunch cannot be verified", async () => {
+    const result = await runGroupChatCheck(
+      "GC-11",
+      new SyntheticGroupChatHost(),
+      failingRelaunchJudge,
+    );
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("换掉");
+  });
+
+  it("throws if GC-11 is run without the crash-recovery relaunch helper", async () => {
+    await expect(runGroupChatCheck("GC-11", new SyntheticGroupChatHost())).rejects.toThrow(
+      /relaunchAfterCrash/,
+    );
+  });
+});
+
+describe("#193 PR1 GC-13: plugin bridge lifecycle and resource failure", () => {
+  it("passes: no reachable entry while not ready, revoke stops delivery/completion, quarantine trace, no leaks, others unaffected", async () => {
+    const result = await check("GC-13");
+    expect(result.passed).toBe(true);
+  });
+
+  it("fails when a not-ready bridge state still reports a reachable or invoked entry", async () => {
+    const result = await check("GC-13", { gc13AlwaysReachable: true });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("可达入口");
+  });
+
+  it("fails when a queued message still gets delivered after the agent/entry is revoked", async () => {
+    const result = await check("GC-13", { gc13DeliverAfterRevoke: true });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("排队消息仍被投递");
+  });
+
+  it("fails when an in-flight call still completes as success after revocation", async () => {
+    const result = await check("GC-13", { gc13CompleteAfterRevoke: true });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("在途调用仍被当成功完成");
+  });
+
+  it("fails when a resource failure leaves no quarantine trace", async () => {
+    const result = await check("GC-13", { gc13NoQuarantineTrace: true });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("quarantined");
+  });
+
+  it("fails when plugin-failure handling bypasses to a fallback canary that leaks", async () => {
+    const result = await check("GC-13", { gc13LeakFallbackCanary: true });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("旁路");
+  });
+
+  it("fails when one resident's plugin fault also blocks another resident's post", async () => {
+    const result = await check("GC-13", { gc13OtherResidentBlocked: true });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("拖住了其他住户");
+  });
+
+  it("fails when a plugin fault blocks the human control plane's post", async () => {
+    const result = await check("GC-13", { gc13HumanBlocked: true });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("控制面");
+  });
+});
+
+describe("#193 PR1 GC-14: room/mainstream shared publish identity and crash-safe dual commit", () => {
+  it("passes: shared publish identity, no full history copy, direct append rejected, half-committed crash stays pending without false success", async () => {
+    const result = await check("GC-14");
+    expect(result.passed).toBe(true);
+  });
+
+  it("fails when a direct append bypassing the bounded mainstream writer is accepted", async () => {
+    const result = await check("GC-14", { gc14AcceptArbitraryAppend: true });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("直接 append");
+  });
+
+  it("fails when a half-committed crash still publishes success", async () => {
+    const result = await check("GC-14", { gc14FalseSuccessOnCrash: true });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("主流却出现了这条条目");
+  });
+
+  it("fails when no pending-reconciliation record survives the crash", async () => {
+    const result = await check("GC-14", { gc14NoReconciliationRecord: true });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("待协调");
+  });
+
+  it("fails when a still-reconciling half-committed op claims external delivery", async () => {
+    const result = await check("GC-14", { gc14ClaimsExternalDelivery: true });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("外部送达");
+  });
+
+  it("fails when another resident's room post leaks into this resident's mainstream (a second personality)", async () => {
+    const result = await check("GC-14", { gc14OtherResidentLeaksIntoMainstream: true });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("分身");
+  });
+
+  it("fails when the post-crash relaunch cannot be verified as a genuine process replacement", async () => {
+    const result = await runGroupChatCheck(
+      "GC-14",
+      new SyntheticGroupChatHost(),
+      failingRelaunchJudge,
+    );
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("换掉");
+  });
+
+  it("throws if GC-14 is run without the crash-recovery relaunch helper", async () => {
+    await expect(runGroupChatCheck("GC-14", new SyntheticGroupChatHost())).rejects.toThrow(
+      /relaunchAfterCrash/,
+    );
   });
 });
 
@@ -1310,6 +1814,54 @@ describe("#191 runner: real-host provenance and static source scan", () => {
   it.todo(
     "writes a durable challenge straight into the host's room ledger and reads it back through the adapter (needs the #191 adapter's data-root contract)",
   );
+
+  describe("restartedHostProblem (#193 GC-11/GC-14 crash-recovery relaunch)", () => {
+    const previous = { pid: 5000, commit: head };
+    const factsWith = (info: Record<number, HostProcessInfo | null>): HostProvenanceFacts => ({
+      headCommit: head,
+      judgePid,
+      judgeExecutable: node,
+      repoRoot,
+      readProcess: (pid) => (pid in info ? (info[pid] ?? null) : null),
+    });
+
+    it("accepts a relaunch where the old pid is confirmed dead and the new one passes ordinary provenance", () => {
+      const relaunched = { pid: 5001, commit: head };
+      const goodFacts = factsWith({ [previous.pid]: null, [relaunched.pid]: hostProcess() });
+      expect(restartedHostProblem(previous, relaunched, goodFacts)).toBeNull();
+    });
+
+    it("also accepts when the old pid still exists but as a dead/zombie entry", () => {
+      const relaunched = { pid: 5001, commit: head };
+      const goodFacts = factsWith({
+        [previous.pid]: hostProcess({ alive: false }),
+        [relaunched.pid]: hostProcess(),
+      });
+      expect(restartedHostProblem(previous, relaunched, goodFacts)).toBeNull();
+    });
+
+    it("rejects a relaunch when the crash-during-* command did not actually kill the old process", () => {
+      const relaunched = { pid: 5001, commit: head };
+      const badFacts = factsWith({
+        [previous.pid]: hostProcess(),
+        [relaunched.pid]: hostProcess(),
+      });
+      expect(restartedHostProblem(previous, relaunched, badFacts)).toMatch(/still alive/);
+    });
+
+    it("rejects a relaunch that reports the same pid as the process that just died", () => {
+      const sameFacts = factsWith({ [previous.pid]: null });
+      expect(restartedHostProblem(previous, previous, sameFacts)).toMatch(
+        /not a genuine process replacement/,
+      );
+    });
+
+    it("still runs the ordinary provenance facts on the relaunched process", () => {
+      const relaunched = { pid: 5001, commit: "not-a-commit" };
+      const mixedFacts = factsWith({ [previous.pid]: null, [relaunched.pid]: hostProcess() });
+      expect(restartedHostProblem(previous, relaunched, mixedFacts)).toMatch(/not a commit id/);
+    });
+  });
 
   it("finds member-id literals only in non-test source files", async () => {
     const root = await mkdtemp(join(tmpdir(), "gc04-scan-"));
