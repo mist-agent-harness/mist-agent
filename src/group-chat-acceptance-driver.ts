@@ -6,10 +6,18 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
   RoomEvent as AcceptanceRoomEvent,
+  ContextCommit,
+  DeliveryRecord,
   GroupChatCheckId,
   GroupChatCommand,
   GroupChatHostDriver,
   GroupChatHostRun,
+  MemoryRecord,
+  ResidentReaction,
+  RosterProjection,
+  RosterSnapshot,
+  SurfaceSnapshot,
+  SystemReceipt,
   groupChatSyntheticFixture,
 } from "../acceptance/group-chat-driver.ts";
 import type {
@@ -17,6 +25,7 @@ import type {
   RoomMessageEnvelope,
   RoomPostResult,
 } from "./group-chat/post-room-message.ts";
+import type { ResidentMemory } from "./group-chat/resident-private-store.ts";
 import type { RoomEvent } from "./group-chat/room-event-store.ts";
 
 export interface RoomPostExchangeObservation {
@@ -265,49 +274,99 @@ export function createGroupChatHostDriver(
               bindingId: trustedBinding,
             }))
           : [];
-      await active().request("reset", { grants });
+      await active().request("reset", {
+        grants,
+        roomId: fixture.roomId,
+        residentIds: [fixture.residentIds.a, fixture.residentIds.b],
+      });
     },
     perform: async (command: GroupChatCommand) => {
-      if (command.kind !== "post")
-        throw new Error(`unsupported group-chat host command: ${command.kind}`);
-      const { kind: _kind, ...rawFields } = command;
-      void _kind;
-      const envelope = { ...rawFields, operationId: randomUUID() } as RoomMessageEnvelope;
-      const principal = { principalId: command.principalId };
-      const result = await active().request<RoomPostResult>(
-        "post",
-        {
-          principal,
-          envelope,
-        },
-        (exchange) => {
-          options.onPostExchange?.({
-            principal: exchange.request.principal as { readonly principalId: string },
-            envelope: exchange.request.envelope as RoomMessageEnvelope,
-            result: exchange.response,
-            childPid: exchange.childPid,
-            requestHash: exchange.requestHash,
-            childRequestHash: exchange.childRequestHash,
+      switch (command.kind) {
+        case "post": {
+          const { kind: _kind, ...rawFields } = command;
+          void _kind;
+          const envelope = { ...rawFields, operationId: randomUUID() } as RoomMessageEnvelope;
+          const principal = { principalId: command.principalId };
+          await active().request<RoomPostResult>("post", { principal, envelope }, (exchange) => {
+            options.onPostExchange?.({
+              principal: exchange.request.principal as { readonly principalId: string },
+              envelope: exchange.request.envelope as RoomMessageEnvelope,
+              result: exchange.response,
+              childPid: exchange.childPid,
+              requestHash: exchange.requestHash,
+              childRequestHash: exchange.childRequestHash,
+            });
           });
-        },
-      );
+          return;
+        }
+        case "seed-resident-private":
+          await active().request("seed-resident-private", command);
+          return;
+        case "save-memory":
+          await active().request("save-memory", command);
+          return;
+        case "set-delivery-state":
+          await active().request("set-delivery-state", command);
+          return;
+        case "register-resident":
+          await active().request("register-resident", command);
+          return;
+        case "exercise-roster-path":
+          await active().request("exercise-roster-path", command);
+          return;
+        case "record-event":
+          await active().request("record-event", command);
+          return;
+        case "dispatch-event":
+          await active().request("dispatch-event", command);
+          return;
+        case "commit-context":
+          await active().request("commit-context", command);
+          return;
+        case "react":
+          await active().request("react", command);
+          return;
+        default:
+          throw new Error(`unsupported group-chat host command: ${command.kind}`);
+      }
     },
     readRoomEvents: async (roomId?: string) => {
       const rows = await active().request<readonly RoomEvent[]>("read-room-events", { roomId });
       return rows.map(toAcceptanceRoomEvent);
     },
-    readSystemReceipts: () => active().request("read-system-receipts"),
-    readDeliveries: unsupported("readDeliveries"),
-    readMemories: unsupported("readMemories"),
-    readResidentContext: unsupported("readResidentContext"),
-    readRoster: unsupported("readRoster"),
-    readRosterPath: unsupported("readRosterPath"),
+    readSystemReceipts: async () => {
+      const rows =
+        await active().request<readonly (SystemReceipt & { readonly roomEventId: string })[]>(
+          "read-system-receipts",
+        );
+      return rows.map(({ roomEventId: _roomEventId, ...receipt }) => {
+        void _roomEventId;
+        return receipt;
+      });
+    },
+    readDeliveries: (eventId: string) =>
+      active().request<readonly DeliveryRecord[]>("read-deliveries", { eventId }),
+    readMemories: async () => {
+      const memories = await active().request<readonly ResidentMemory[]>("read-memories");
+      return memories.map(
+        ({ residentId, sourceEventId, body }): MemoryRecord => ({
+          residentId: residentId as MemoryRecord["residentId"],
+          sourceEventId,
+          body,
+        }),
+      );
+    },
+    readResidentContext: (residentId: string) =>
+      active().request<string>("read-resident-context", { residentId }),
+    readRoster: () => active().request<RosterSnapshot>("read-roster"),
+    readRosterPath: (path) => active().request<RosterProjection>("read-roster-path", { path }),
     readMentionDecisions: unsupported("readMentionDecisions"),
     readCallLedger: unsupported("readCallLedger"),
-    readContextCommits: unsupported("readContextCommits"),
-    readSurface: unsupported("readSurface"),
+    readContextCommits: () => active().request<readonly ContextCommit[]>("read-context-commits"),
+    readSurface: (roomId, viewerId) =>
+      active().request<SurfaceSnapshot>("read-surface", { roomId, viewerId }),
     readAccessAudit: unsupported("readAccessAudit"),
-    readReactions: unsupported("readReactions"),
+    readReactions: () => active().request<readonly ResidentReaction[]>("read-reactions"),
     readRoundRecords: unsupported("readRoundRecords"),
     readScheduler: unsupported("readScheduler"),
     readControlRecords: unsupported("readControlRecords"),

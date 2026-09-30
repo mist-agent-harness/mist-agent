@@ -99,6 +99,74 @@ describe("group-chat acceptance host process", () => {
     expect(readback.find((event) => event.id === direct.event.id)?.body).toBe("judge-direct-write");
   });
 
+  it("reads room, delivery, private, memory and stage ledgers over IPC after host restart", async () => {
+    driver = createGroupChatHostDriver();
+    const fixture = groupChatSyntheticFixture;
+    const firstRun = await driver.startHost();
+    if (firstRun.dataRoot === undefined) throw new Error("host omitted its dataRoot");
+    dataRoot = firstRun.dataRoot;
+    await driver.resetScenario("GC-03", fixture);
+
+    await driver.perform({
+      kind: "seed-resident-private",
+      residentId: fixture.residentIds.a,
+      canary: "restart-private-a",
+    });
+    await driver.perform({ kind: "register-resident", residentId: fixture.residentIds.a });
+    await driver.perform({
+      kind: "record-event",
+      roomId: fixture.roomId,
+      authorId: fixture.humanId,
+      body: "TEST-IPC-DURABLE-EVENT",
+    });
+    const event = (await driver.readRoomEvents(fixture.roomId)).find((row) =>
+      row.body.includes("TEST-IPC-DURABLE-EVENT"),
+    );
+    if (event === undefined) throw new Error("record-event was not visible over host IPC");
+    await driver.perform({
+      kind: "set-delivery-state",
+      eventMarker: "TEST-IPC-DURABLE-EVENT",
+      residentId: fixture.residentIds.a,
+      state: "loaded",
+    });
+    await driver.perform({
+      kind: "save-memory",
+      residentId: fixture.residentIds.a,
+      sourceEventId: event.id,
+    });
+    await driver.perform({ kind: "dispatch-event", eventMarker: "TEST-IPC-DURABLE-EVENT" });
+    await driver.perform({
+      kind: "commit-context",
+      residentId: fixture.residentIds.a,
+      marker: "TEST-IPC-COMMIT",
+    });
+
+    await driver.stopHost();
+    const restartedRun = await driver.startHost();
+    expect(restartedRun.pid).not.toBe(firstRun.pid);
+    expect(restartedRun.dataRoot).toBe(dataRoot);
+    expect((await driver.readRoomEvents(fixture.roomId)).some((row) => row.id === event.id)).toBe(
+      true,
+    );
+    expect(await driver.readDeliveries(event.id)).toEqual([
+      { residentId: fixture.residentIds.a, state: "queued" },
+      { residentId: fixture.residentIds.b, state: "queued" },
+    ]);
+    expect(await driver.readResidentContext(fixture.residentIds.a)).toBe("restart-private-a");
+    expect(await driver.readMemories()).toEqual([
+      {
+        residentId: fixture.residentIds.a,
+        sourceEventId: event.id,
+        body: "TEST-IPC-DURABLE-EVENT",
+      },
+    ]);
+    expect((await driver.readSystemReceipts()).map((receipt) => receipt.phase)).toEqual([
+      "recorded",
+      "dispatched",
+      "context-committed",
+    ]);
+  });
+
   it("returns a wrong-binding rejection to its sender without recording it", async () => {
     const exchanges: RoomPostExchangeObservation[] = [];
     driver = createGroupChatHostDriver({ onPostExchange: (exchange) => exchanges.push(exchange) });
