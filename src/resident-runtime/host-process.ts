@@ -85,6 +85,14 @@ function required(value: string | undefined, name: string): string {
   return value;
 }
 
+/** Resolve an onboarding handle at the host boundary; runtime APIs receive residentId only. */
+function residentId(referenceId: string | undefined): string {
+  const reference = required(referenceId, "residentId");
+  const active = runtime.requireActiveResident(reference);
+  if (!active.ok) throw new Error(active.reason);
+  return active.value.residentId;
+}
+
 async function handle(command: Command): Promise<unknown> {
   const input = command.input ?? {};
   switch (command.op) {
@@ -110,44 +118,44 @@ async function handle(command: Command): Promise<unknown> {
       }) as Result<unknown>;
     case "provisionChannel":
       return runtime.provisionChannel({
-        residentId: required(input.residentId, "residentId"),
+        residentId: residentId(input.residentId),
         channel: requiredChannel(input.channel),
         canarySecret: required(input.canarySecret, "canarySecret"),
       }) as Result<unknown>;
     case "revokeCredential":
-      runtime.revokeCredential({ residentId: required(input.residentId, "residentId") });
+      runtime.revokeCredential({ residentId: residentId(input.residentId) });
       return null;
     case "say":
       return (await runtime.say({
-        residentId: required(input.residentId, "residentId"),
+        residentId: residentId(input.residentId),
         text: required(input.text, "text"),
         ...(input.turnId === undefined ? {} : { turnId: input.turnId }),
       })) as Result<TurnResult>;
     case "tuiTranscript": {
       if (input.script === undefined) throw new Error("script is required");
       return runResidentTuiScript(runtime, {
-        residentId: required(input.residentId, "residentId"),
+        residentId: residentId(input.residentId),
         channel: requiredChannel(input.channel),
         script: input.script,
       });
     }
     case "readStream":
       return runtime.readStream({
-        residentId: required(input.residentId, "residentId"),
+        residentId: residentId(input.residentId),
       }) as Result<StreamSnapshot>;
     case "streamFiles":
       return runtime.streamFiles() as Result<StreamFileInventory>;
     case "bootPack":
       return runtime.bootPack({
-        residentId: required(input.residentId, "residentId"),
+        residentId: residentId(input.residentId),
       }) as Result<BootPackView>;
     case "letterTimeline":
       return runtime.letterTimeline({
-        residentId: required(input.residentId, "residentId"),
+        residentId: residentId(input.residentId),
       }) as Result<LetterTimeline>;
     case "setBreathThreshold":
       return runtime.setBreathThreshold({
-        residentId: required(input.residentId, "residentId"),
+        residentId: residentId(input.residentId),
         windowId: required(input.windowId, "windowId"),
         generation: input.generation ?? 0,
         thresholdTokens: input.thresholdTokens ?? 0,
@@ -155,20 +163,20 @@ async function handle(command: Command): Promise<unknown> {
       }) as Result<void>;
     case "breathe":
       return (await runtime.breathe({
-        residentId: required(input.residentId, "residentId"),
+        residentId: residentId(input.residentId),
         via: input.via ?? "new",
       })) as Result<BreatheOutcome>;
     case "suddenDeath":
-      await runtime.suddenDeath({ residentId: required(input.residentId, "residentId") });
+      await runtime.suddenDeath({ residentId: residentId(input.residentId) });
       return null;
     case "archivedTranscript":
       return runtime.archivedTranscript({
-        residentId: required(input.residentId, "residentId"),
+        residentId: residentId(input.residentId),
         generation: input.generation ?? 0,
       }) as Result<StreamSnapshot>;
     case "secretScan":
       return runtime.secretScan({
-        residentId: required(input.residentId, "residentId"),
+        residentId: residentId(input.residentId),
         needle: required(input.needle, "needle"),
       }) as Result<SecretScanReport>;
     case "stop":

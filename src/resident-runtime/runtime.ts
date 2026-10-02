@@ -293,7 +293,7 @@ export class ResidentRuntime {
     } catch (error) {
       return specFailure(error, input.residentId);
     }
-    const active = this.requireActiveResident(input.residentId);
+    const active = this.#identities.requireResident(input.residentId);
     if (!active.ok) return identityFailure(active.reason, input.residentId);
     const record = this.#credentials.provision({
       residentId: active.value.residentId,
@@ -320,10 +320,9 @@ export class ResidentRuntime {
    */
   say(input: SayInput): Promise<Result<TurnResult>> {
     if (input.text.trim().length === 0) return this.#runTurn(input);
-    const active = this.requireActiveResident(input.residentId);
+    const active = this.#identities.requireResident(input.residentId);
     if (!active.ok) return Promise.resolve(identityFailure(active.reason, input.residentId));
-    const normalized = { ...input, residentId: active.value.residentId };
-    return this.#enqueue(normalized.residentId, () => this.#runTurn(normalized));
+    return this.#enqueue(input.residentId, () => this.#runTurn(input));
   }
 
   #enqueue<T>(residentId: string, task: () => Promise<T>): Promise<T> {
@@ -351,9 +350,9 @@ export class ResidentRuntime {
         request.residentId,
       );
     }
-    const active = this.requireActiveResident(request.residentId);
+    const active = this.#identities.requireResident(request.residentId);
     if (!active.ok) return identityFailure(active.reason, request.residentId);
-    const input = { ...request, residentId: active.value.residentId };
+    const input = request;
     const requestedTurnId = input.turnId;
     const turnId = requestedTurnId ?? randomUUID();
     if (requestedTurnId !== undefined) {

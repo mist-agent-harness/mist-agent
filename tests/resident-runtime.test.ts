@@ -320,13 +320,17 @@ describe("#182 入住读闸", () => {
     }
   });
 
-  it("通道配置不再造人；pending、rejected、missing 三态机器可分", async () => {
+  it("边界读口区分 pending、rejected、missing；运行时入口只接受 canonical residentId", async () => {
     const runtime = new ResidentRuntime({ dataDir: tempDir() });
     try {
       const pending = runtime.createCandidate({
         persona: "persona:pending",
         proposedBy: { kind: "installer", id: "installer" },
         residentId: "r-pending",
+      });
+      expect(runtime.requireActiveResident(pending.candidateId)).toEqual({
+        ok: false,
+        reason: "candidate-pending",
       });
       expect(
         failureOf(
@@ -336,21 +340,16 @@ describe("#182 入住读闸", () => {
             canarySecret: "sk-pending",
           }),
         ).code,
-      ).toBe("candidate-pending");
+      ).toBe("resident-not-found");
       runtime.attestCandidate(
         pending.candidateId,
         { kind: "candidate", candidateId: pending.candidateId },
         "rejected",
       );
-      expect(
-        failureOf(
-          runtime.provisionChannel({
-            residentId: pending.candidateId,
-            channel: claudeChannel,
-            canarySecret: "sk-rejected",
-          }),
-        ).code,
-      ).toBe("candidate-rejected");
+      expect(runtime.requireActiveResident(pending.candidateId)).toEqual({
+        ok: false,
+        reason: "candidate-rejected",
+      });
       expect(
         failureOf(
           runtime.provisionChannel({
@@ -365,7 +364,7 @@ describe("#182 入住读闸", () => {
     }
   });
 
-  it("active candidate materializes its runtime room and every say rechecks identity", async () => {
+  it("active candidate materializes its runtime room and say rechecks the canonical residentId", async () => {
     const runtime = new ResidentRuntime({ dataDir: tempDir() });
     try {
       const candidate = runtime.createCandidate({
@@ -374,13 +373,20 @@ describe("#182 入住读闸", () => {
         residentId: "r-active",
       });
       const before = await runtime.say({ residentId: candidate.candidateId, text: "不能提前聊" });
-      expect(failureOf(before).code).toBe("candidate-pending");
+      expect(failureOf(before).code).toBe("resident-not-found");
       const active = runtime.attestCandidate(
         candidate.candidateId,
         { kind: "candidate", candidateId: candidate.candidateId },
         "accepted",
       );
       expect(active).toMatchObject({ ok: true, value: { residentId: "r-active" } });
+      expect(runtime.requireActiveResident(candidate.candidateId)).toMatchObject({
+        ok: true,
+        value: { residentId: "r-active" },
+      });
+      expect(
+        failureOf(await runtime.say({ residentId: candidate.candidateId, text: "别名" })).code,
+      ).toBe("resident-not-found");
       expect(
         runtime.provisionChannel({
           residentId: "r-active",

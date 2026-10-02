@@ -113,7 +113,7 @@ describe("resident CLI", () => {
     try {
       const child = spawn(
         process.execPath,
-        ["--import", "tsx", cliPath, "--resident", residentId, "--data-dir", dataDir],
+        ["--import", "tsx", cliPath, "--resident", candidate.candidateId, "--data-dir", dataDir],
         {
           env: { ...process.env, MIST_RESIDENT_RUNTIME_TRANSPORT: "synthetic" },
           stdio: ["pipe", "pipe", "pipe"],

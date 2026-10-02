@@ -136,6 +136,51 @@ describe("ResidentIdentityStore", () => {
     });
   });
 
+  it("releases a requested residentId after rejection while pending and active candidates keep it reserved", () => {
+    const dataDir = temporaryDirectory();
+    const store = new ResidentIdentityStore({ dataDir });
+    const rejected = store.createCandidate({
+      persona: "persona:first",
+      proposedBy: { kind: "installer", id: "installer" },
+      residentId: "resident-retry",
+    });
+    expect(() =>
+      store.createCandidate({
+        persona: "persona:blocked-while-pending",
+        proposedBy: { kind: "installer", id: "installer" },
+        residentId: "resident-retry",
+      }),
+    ).toThrow(/already reserved/);
+    expect(
+      store.attestCandidate(
+        rejected.candidateId,
+        { kind: "candidate", candidateId: rejected.candidateId },
+        "rejected",
+      ),
+    ).toMatchObject({ ok: true, value: { state: "rejected", residentId: null } });
+
+    const restarted = new ResidentIdentityStore({ dataDir });
+    const replacement = restarted.createCandidate({
+      persona: "persona:replacement",
+      proposedBy: { kind: "installer", id: "installer" },
+      residentId: "resident-retry",
+    });
+    expect(
+      restarted.attestCandidate(
+        replacement.candidateId,
+        { kind: "candidate", candidateId: replacement.candidateId },
+        "accepted",
+      ),
+    ).toMatchObject({ ok: true, value: { residentId: "resident-retry" } });
+    expect(() =>
+      restarted.createCandidate({
+        persona: "persona:blocked-while-active",
+        proposedBy: { kind: "installer", id: "installer" },
+        residentId: "resident-retry",
+      }),
+    ).toThrow(/already reserved/);
+  });
+
   it("fails closed when the durable candidate-resident mapping is inconsistent", () => {
     const dataDir = temporaryDirectory();
     const store = new ResidentIdentityStore({ dataDir });

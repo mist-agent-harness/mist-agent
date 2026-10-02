@@ -172,7 +172,9 @@ export class ResidentIdentityStore {
     if (
       input.residentId !== undefined &&
       (this.#registry.residents.some((entry) => entry.residentId === input.residentId) ||
-        this.#registry.candidates.some((entry) => entry.requestedResidentId === input.residentId))
+        this.#registry.candidates.some(
+          (entry) => entry.state !== "rejected" && entry.requestedResidentId === input.residentId,
+        ))
     ) {
       throw new Error(`requested resident id is already reserved: ${input.residentId}`);
     }
@@ -271,6 +273,35 @@ export class ResidentIdentityStore {
     if (resident === undefined || !resident.active) return fail("resident-not-found");
     const persona = resident.persona.find(
       (version) => version.id === candidate?.personaVersionId && version.supersededBy === null,
+    );
+    if (persona === undefined) throw new Error("active resident has no current candidate persona");
+    return {
+      ok: true,
+      value: {
+        candidateId: candidate.candidateId,
+        residentId: resident.residentId,
+        personaVersionId: persona.id,
+        persona: persona.content,
+      },
+    };
+  }
+
+  /**
+   * Runtime-internal gate: unlike the terminal/host reference resolver above, this accepts only
+   * the canonical residentId. candidateId is an onboarding handle and must not become a second
+   * runtime name for the same resident.
+   */
+  requireResident(residentId: string): ResidentIdentityResult<ActiveResidentIdentity> {
+    const resident = this.#registry.residents.find((entry) => entry.residentId === residentId);
+    if (resident === undefined || !resident.active) return fail("resident-not-found");
+    const candidate = this.#registry.candidates.find(
+      (entry) => entry.candidateId === resident.candidateId,
+    );
+    if (candidate === undefined || candidate.state !== "active") {
+      return fail("resident-not-found");
+    }
+    const persona = resident.persona.find(
+      (version) => version.id === candidate.personaVersionId && version.supersededBy === null,
     );
     if (persona === undefined) throw new Error("active resident has no current candidate persona");
     return {
