@@ -23,11 +23,16 @@
   逐条施工证据仍见
   [复验附注](../acceptance/multi-viewport.md#2026-09-10-逐条复验附注148)）；one-stream 六灯实现已合 main，2026-09-10 主笔授权勾
   （见 [acceptance/one-stream.md](../acceptance/one-stream.md)），独立复验同样尚未落章；
-  window-history 判卷仍红——地基还在动，
-  现在「定稿」等于给推翻自己留账。改为两步：**先出 v0 工作稿**（从 driver、账、
+  2026-09-09 当时 window-history 判卷仍红，主笔认为地基还在动、
+  现在「定稿」等于给推翻自己留账，故改为两步：**先出 v0 工作稿**（从 driver、账、
   换气、一窗流的实战接口反推，允许带保留项）；OS/WH 交卷且地基落章后，再升
   「定稿」。原「立刻定稿」口径作废。**2026-09-17：两步走里的「地基落章」那半已由
-  #148 补齐；另半 OS/WH 交卷仍缺，H1 暂不升「定稿」。**
+  #148 补齐；当时另半 OS/WH 交卷仍缺，H1 暂不升「定稿」。**
+  **实现状态补记（2026-10-01）**：window-history 的生产驱动与宿主已在 main，
+  `npm run acceptance:window-history:strict` 本机复跑为 6/6 真绿（见
+  [window-history 清单](../acceptance/window-history.md)）；「判卷仍红」不再是当前实现状态。
+  本机复跑不代替未参与施工的验收席落章，OS/WH 的未勾独立复验与 H1 定稿口径仍保留，
+  不据此替主笔升格。
 
 ## 已决
 

@@ -11,6 +11,30 @@ npm run acceptance          # 报告模式：打红绿灯，看板用
 npm run acceptance:strict   # 验收模式：有一盏不绿就退出 1
 ```
 
+## 后续验收入口
+
+本页保留第一里程碑 C1–C6 的判据与历史；后续套件各有自己的清单与证据边界。
+命令以根目录 `package.json` 为准。报告模式可能在红灯时仍退出 0；要拦失败，使用
+该套件的 `:strict`。脚本存在、机器跑绿、独立复验落章是三件事，不互相代替。
+
+| 套件 | 人话清单 | npm 入口（在名称前加 `npm run`） |
+| --- | --- | --- |
+| 第一里程碑 | 本页 C1–C6 | `acceptance` / `acceptance:strict` |
+| Intentional isolation | [隔离判卷](intentional-isolation.md) | `acceptance:isolation` / `acceptance:isolation:strict` |
+| 外部信道绑定 | [绑定与入站语义](external-channel-bindings.md) | `acceptance:external-channel`（断言失败即非零，无另一个 strict 脚本） |
+| Telegram | [Telegram 信道](telegram-channel.md) | `acceptance:telegram-channel` / `acceptance:telegram-channel:strict` |
+| HostProvider | [常驻宿主](host-provider.md) | `acceptance:host-provider` / `acceptance:host-provider:strict` |
+| 入住与跨模型连续性 | [D22 / D23 判卷](resident-continuity.md) | `acceptance:resident-continuity` / `acceptance:resident-continuity:strict` |
+| Window history | [历史只读投影](window-history.md) | `acceptance:window-history` / `acceptance:window-history:strict` |
+| Resident runtime | [住户运行时](resident-runtime.md) | `acceptance:resident-runtime` / `acceptance:resident-runtime:strict` |
+| 群聊 v0 | [群聊判卷](group-chat.md) | `acceptance:group-chat` / `acceptance:group-chat:strict` |
+
+多 viewport 与 one-stream 的判据、复验记录分别见 [multi-viewport.md](multi-viewport.md)
+和 [one-stream.md](one-stream.md)，相关实现回归归 `npm test`。其余尚未列出独立 npm
+runner 的契约清单见 [能力注册表](capability-registry-v0.md)、[插件协议](plugin-protocol-v0.md)、
+[隔离 v0](intentional-isolation-v0.md)、[窗导航](window-navigation.md) 与
+[历史检索](history-search.md)。清单不是已支持能力的宣传页，支持状态看各自实现与证据。
+
 ## 判卷纪律
 
 - 只做确定性断言：查存储内容、比 hash、验集合关系。**不判模型说话的措辞**——
