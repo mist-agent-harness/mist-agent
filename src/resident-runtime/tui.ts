@@ -5,6 +5,8 @@
  * 不把最终回复切片伪装成流式输出。终端 CLI 与宿主验收脚本共用本控制器。
  */
 import type {
+  BreathTrigger,
+  BreatheOutcome,
   ChannelSpec,
   Result,
   TuiFrame,
@@ -19,6 +21,15 @@ export interface ChatTurnPort {
     readonly text: string;
     readonly onChunk?: (chunk: string) => void;
   }): Promise<Result<TurnResult>>;
+  /**
+   * 换气口（D8）。`/new`、`/clear`、`/compact` 从真实 CLI 敲进来时走这里——
+   * 命令不是发言，不能经 `say()` 落成一窗流里的用户消息。可选：只做聊天的
+   * 脚本化嵌入方不必实现它。
+   */
+  breathe?(input: {
+    readonly residentId: string;
+    readonly via: BreathTrigger;
+  }): Promise<Result<BreatheOutcome>>;
 }
 
 export interface ScriptedChatPort extends ChatTurnPort {
@@ -118,6 +129,68 @@ export class ResidentChatTui {
       this.#draw();
       return mismatch;
     }
+    return result;
+  }
+
+  /**
+   * 换气（D8）：调现役 `breathe` 走写信与换代的统一流程。
+   *
+   * 这里**不**把命令文本当发言记——命令是一次动作，不是住户说的话；成功时
+   * 在画面里给出可见的换代回执（哪一代换到哪一代、交接信标题），失败时把
+   * 结构化错误照进 `errorText` 与画面，且**不抛**——CLI 得能继续用。
+   */
+  async breathe(via: BreathTrigger): Promise<Result<BreatheOutcome>> {
+    this.start();
+    this.#errorText = null;
+    const messageIndex = this.#messages.length;
+    this.#messages.push(`⟳ /${via} 换气中……`);
+    this.#draw();
+
+    const breathePort = this.#runtime.breathe;
+    if (breathePort === undefined) {
+      const failure: Result<BreatheOutcome> = {
+        ok: false,
+        error: {
+          code: "tui-unavailable",
+          message: "终端运行时没有接换气口，无法执行换代命令",
+          remedy: "给终端运行时提供 breathe 口后重试",
+          residentId: this.#residentId,
+        },
+      };
+      this.#errorText = `${failure.error.code}：${failure.error.message}\n处理建议：${failure.error.remedy}`;
+      this.#messages[messageIndex] = `⟳ /${via}\n[错误]\n${this.#errorText}`;
+      this.#draw();
+      return failure;
+    }
+
+    let result: Result<BreatheOutcome>;
+    try {
+      result = await breathePort.call(this.#runtime, { residentId: this.#residentId, via });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "未知终端错误";
+      result = {
+        ok: false,
+        error: {
+          code: "breath-refused",
+          message: `换气执行失败：${message}`,
+          remedy: "检查住户运行时与代际账后重试",
+          residentId: this.#residentId,
+        },
+      };
+    }
+
+    if (!result.ok) {
+      // 失败不改史：画面如实呈现拒绝，进程继续可用。
+      this.#errorText = `${result.error.code}：${result.error.message}\n处理建议：${result.error.remedy}`;
+      this.#messages[messageIndex] = `⟳ /${via}\n[错误]\n${this.#errorText}`;
+      this.#draw();
+      return result;
+    }
+
+    this.#messages[messageIndex] =
+      `⟳ /${via} 换气完成：第 ${result.value.fromGeneration} 代 → ` +
+      `第 ${result.value.toGeneration} 代，交接信《${result.value.letter.title}》`;
+    this.#draw();
     return result;
   }
 

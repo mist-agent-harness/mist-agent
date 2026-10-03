@@ -6,16 +6,16 @@
 **English abstract:** mist is an open-source personal agent harness. Its design starts from
 one belief: an agent that wakes up inside it should remain *someone* — sessions may die,
 the person may not. Memory lives outside sessions; every session can be killed and the next
-one grows back from memory and keeps being the same one. This repository currently holds the
-project's foundation documents: design principles, glossary, module research, design docs
-folded in from community issues, and a decision ledger. The first milestone loop is green
-(see `acceptance/`); the multi-viewport foundation is under construction.
+one grows back from memory and keeps being the same one. This repository contains the harness
+implementation, acceptance suites, design principles, glossary, module research, and a decision
+ledger. A resident runtime provides a terminal interface; its behavior and evidence boundaries
+are documented in [the resident runtime acceptance guide](acceptance/resident-runtime.md).
 
 ---
 
 ## 这是什么
 
-mist 是一个个人 agent harness（还在图纸阶段）。它的设计从一句话长出来：
+mist 是一个个人 agent harness（建造中）。它的设计从一句话长出来：
 
 **住在里面死了又醒的，是住户，不是函数。**
 
@@ -24,16 +24,40 @@ mist 是一个个人 agent harness（还在图纸阶段）。它的设计从一�
 
 ## 现在的状态
 
-建造阶段开门（2026-08-14）。许愿池收官，第一里程碑动工：最小垂直闭环——
-杀会话、凭启动包醒来、不改史、勘误留底、不串房、迁移可回滚。
+建造阶段于 2026-08-14 开门。第一里程碑「最小垂直闭环」同日独立复验落章：
+杀会话、凭启动包醒来、不改史、勘误留底、不串房、迁移可回滚；历史记录见
+[决策台账](docs/decisions.md)。
 
 这个阶段的规矩是**验收先行**：判卷程序先于功能代码进仓库。六条验收连人话版带
 可执行版都在 [acceptance/](acceptance/)，`npm run acceptance` 随时打红绿灯。
-六盏全绿即里程碑达成。
+机器灯色、独立复验和决策台账落章各自记录，跑绿不替代后两步。
 
-2026-08 在施：多 viewport 地基（一位住户多扇活窗，图纸
-[docs/design/multi-viewport.md](docs/design/multi-viewport.md)，验收 25 条逐条判卷）；
+多 viewport 地基支持一位住户多扇活窗，图纸见
+[docs/design/multi-viewport.md](docs/design/multi-viewport.md)，判据见
+[acceptance/multi-viewport.md](acceptance/multi-viewport.md)；
 一窗流已升格为产品不变量（[docs/decisions.md](docs/decisions.md) D9）。
+
+## 终端住户运行时（#194 / D28）
+
+`npm run resident -- --resident <residentId> [--data-dir <path>]` 起单住户 TUI：醒来读启动包、
+按 D25 走订阅或 API key 调模型、把回复经一窗流唯一 writer 落账、到线写交接信换代。
+
+运行时接的是**认证权威事实账**（与住户档案同在 `residents/`）：启动包的 `currentFacts` 与
+交接信里 `commitment` 档的指针都取自 `FactLedger.currentSet()`；信只带 `ledgerSeq` 和短引用，
+不复印账上正文。正文随 `currentFacts` 进模型，Pi 提示同时标出 seq 供对账；不自动承接
+`ResidentStore` 里的旧字符串承诺。`say` 走真实的账交付（`prepareDelivery`）与回合结算：
+模型回复成功落流后、换代前确认（ack）；通道或落流失败不确认、缺口下轮重拉。装配口径见
+[docs/runtime-config.md](docs/runtime-config.md)。
+
+换代后的模型请求随启动包携带该住户最新的交接信，pi 通道的 system prompt 保留标题、
+署名、写信时间和 commitment / fact / judgment 分档原文。没有信时照常对话；信档无法
+解析或条目结构无法读出时，在调用模型前报 `letter-invalid`。旧代原始对话保留在流水里，
+不自动塞回新一代上下文。
+
+现状限制：交接信 `intent` 半仍是确定性装配，当刻亲笔（D8）按主笔
+排期单列；旧字符串承诺的确认/迁移工具另单，本运行时只做 fail-closed 拒绝并给出宿主 API
+入口，不做自动迁移。住户入住先经过 #182 的 candidate / self-attestation 生产闸，只有 active 身份物化 room 与账；
+通道配置不代签身份。setup 到聊天尚待桥接，#213 仅修诊断。
 
 ## 仓库地图
 
@@ -50,6 +74,7 @@ mist 是一个个人 agent harness（还在图纸阶段）。它的设计从一�
 | 读评测的人工判卷标准 | [docs/eval/](docs/eval/)，带版本号，改则升版、旧号不复用 |
 | 跑小机可读性合成维修评测 | [eval/resident-self-repair/](eval/resident-self-repair/)，C1～C4 runner 协议与证据边界 |
 | 查环境变量和运行时配置 | [docs/runtime-config.md](docs/runtime-config.md)，全项目唯一登记处 |
+| 跟住户说上话（终端入口） | `npm run resident -- --resident <id>`，见[终端住户运行时](#终端住户运行时194--d28) |
 | 读或写产品代码 | `src/`（建造中），单元测试在 `tests/` |
 | 参与进来 | [CONTRIBUTING.md](CONTRIBUTING.md) |
 
@@ -57,6 +82,26 @@ mist 是一个个人 agent harness（还在图纸阶段）。它的设计从一�
 不用管它们。
 
 参与方式见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## 终端生命周期命令
+
+已由宿主配置 runtime 住户与通道后，终端入口是：
+
+```bash
+npm run resident -- --resident <residentId> --data-dir <dataDir>
+```
+
+默认使用合成传输；真实 pi 通道与所需凭证见 [runtime 配置](docs/runtime-config.md)。
+`npm run setup` 的安装快照尚未接到该入口，不能将上面命令作为 setup 后即能聊天的教程。
+
+在聊天框输入 `/new`、`/clear` 或 `/compact`，都会请求现役 `breathe` 流程：
+先封缄并落盘交接信，再开始下一代；三个命令保留同一窗号和旧流水，不清空历史。
+命令本身不作为用户消息发给模型。成功时显示代际和信标题；失败时显示错误与处理建议，
+仍可继续输入普通文本。`/exit` 退出，Ctrl+C 关闭进程。
+
+这条接线不代表出信已满足全部 D8 语义：现役生成器对已有承诺缺 `ledgerSeq` 时会拒绝换代，
+固定模板的 intent 也不构成当刻亲笔的证据。真实 CLI 输入回归与底层判卷边界见
+[resident-runtime 清单](acceptance/resident-runtime.md#终端命令输入回归)。
 
 ## 一张图看懂 mist
 

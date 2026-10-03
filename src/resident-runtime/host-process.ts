@@ -27,8 +27,8 @@ import type {
   TuiStep,
   TurnResult,
 } from "../../acceptance/resident-runtime-driver.ts";
+import { assembleResidentRuntime } from "./assembly.ts";
 import type { ChannelSpecLike } from "./channels.ts";
-import { ResidentRuntime } from "./runtime.ts";
 import { runResidentTuiScript } from "./tui.ts";
 
 const dataDir = process.env.MIST_RESIDENT_RUNTIME_DIR;
@@ -38,7 +38,9 @@ if (dataDir === undefined || dataDir.length === 0) {
 
 /** 每次 boot 新随机；判卷靠它 + pid 断言「确实换了一个进程」。 */
 const bootId = randomUUID();
-const runtime = new ResidentRuntime({ dataDir });
+// 宿主装配走与 CLI 共用的 seam：接上认证权威事实账（与住户档案同在 residents/），
+// currentFacts 与信里 commitment 档实际来自 ledger.currentSet()，say 走真实交付/回执。
+const runtime = assembleResidentRuntime({ dataDir });
 
 interface Command {
   readonly requestId?: string;

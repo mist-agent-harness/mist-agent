@@ -181,19 +181,31 @@ export function toLetterTimeline(
 }
 
 /**
- * 亲笔信草稿：从这**一**代自己的状态里写（承诺 = commitment 档、记忆/事实 = fact 档、
- * 接续判断 = judgment 档）。判卷明文「判结构不变量，不判信的内容」（D8 当刻亲笔），
- * 所以内容是确定性装配，不需要模型代笔——住户状态里的东西就是住户的笔迹。
+ * 交接信草稿：承诺只带权威事实账 currentSet 的 seq 指针，不复印正文；记忆与
+ * 本代流计数装为 fact。调用方不从旧字符串、正文匹配或数组序号伪造 ledgerSeq。
+ * intent/judgment 沿用现有确定性装配，按主笔 #194 的分工另行讨论当刻亲笔；
+ * 这一笔只修账绑定，不声称完成模型写信。
  */
+export interface LetterCommitment {
+  /** 权威事实账上这条现行 entry 的 seq。 */
+  readonly ledgerSeq: number;
+}
+
 export function composeLetterDraft(input: {
   residentId: string;
   generation: number;
-  commitments: readonly string[];
+  commitments: readonly LetterCommitment[];
   memories: readonly string[];
   streamEvents: number;
 }): LetterDraft {
   const state: LetterItem[] = [
-    ...input.commitments.map((body): LetterItem => ({ tier: "commitment", body })),
+    ...input.commitments.map(
+      (commitment): LetterItem => ({
+        tier: "commitment",
+        body: `账上第 ${commitment.ledgerSeq} 条`,
+        ledgerSeq: commitment.ledgerSeq,
+      }),
+    ),
     ...input.memories.map((body): LetterItem => ({ tier: "fact", body })),
     {
       tier: "fact",

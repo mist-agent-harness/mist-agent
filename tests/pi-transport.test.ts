@@ -478,7 +478,7 @@ describe("PiCliTransport", () => {
     expect(prompt).toContain("小派");
     expect(prompt).toContain("每天写日报");
     expect(prompt).toContain("爱吃苹果");
-    expect(prompt).toContain("偏好短句");
+    expect(prompt).toContain("- [#1] 偏好短句");
     expect(prompt).toContain("早安");
     expect(prompt).toContain("早");
   });
@@ -508,6 +508,47 @@ describe("pi 通道的解析件", () => {
     );
     expect(absent).not.toContain("现行有效事实");
     expect(empty).toContain("现行有效事实：\n（当前没有现行有效事实）");
+  });
+
+  it("renderSystemPrompt：交接信随启动包渲染，保留标题 / 署名 / 时间 / 三档原文", () => {
+    const prompt = renderSystemPrompt(
+      request({
+        bootPack: {
+          residentId: "r-pi",
+          identity: "小派",
+          commitments: [],
+          memories: [],
+          letter: {
+            title: "第 1 代交接信（r-pi）",
+            author: "r-pi#1",
+            writtenAt: "2026-09-30T12:00:00.000Z",
+            state: [
+              { tier: "commitment", body: "承诺每天写日报" },
+              { tier: "fact", body: "上代在做迁移" },
+            ],
+            intent: [{ tier: "judgment", body: "接续以本信为锚" }],
+          },
+        },
+      }),
+    );
+    // 标题是召回锚点、署名是写信那一代、writtenAt 是当刻时间。
+    expect(prompt).toContain("上一代交接信：第 1 代交接信（r-pi）");
+    expect(prompt).toContain("r-pi#1");
+    expect(prompt).toContain("2026-09-30T12:00:00.000Z");
+    expect(prompt).toContain("必须继承，只能按正常流程解除");
+    expect(prompt).toContain("以现实为准，可查证，不必尊重前任");
+    expect(prompt).toContain("你有权不同意，且不续写前任对自己行为的事后分析");
+    // 条目正文与 tier 原样呈现，不转写。
+    expect(prompt).toContain("- [commitment] 承诺每天写日报");
+    expect(prompt).toContain("- [fact] 上代在做迁移");
+    expect(prompt).toContain("- [judgment] 接续以本信为锚");
+  });
+
+  it("renderSystemPrompt：没有信就不出现交接信分区（缺席即缺席）", () => {
+    expect(renderSystemPrompt(request())).not.toContain("上一代交接信");
+    expect(
+      renderSystemPrompt(request({ bootPack: { ...request().bootPack, letter: null } })),
+    ).not.toContain("上一代交接信");
   });
 
   it('createModelTransport("pi") 接真通道', () => {

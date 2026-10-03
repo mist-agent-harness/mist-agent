@@ -53,14 +53,22 @@ import {
   ResidentIdentityStore,
 } from "../resident-continuity/identity-store.ts";
 import { BreathCycle, BreathCycleError } from "../session/breath-cycle.ts";
+import type { DispatchSettlement } from "../session/dispatch-authority.ts";
 import {
   LetterSchemaError,
   type SealedLetter,
   estimateTokens,
 } from "../session/handover-letter.ts";
 import { SessionRegistry, WindowReopenError } from "../session/session-registry.ts";
+import type { DispatchReceipt } from "../session/session-registry.ts";
 import { LedgerNotFoundError } from "../store/fact-ledger-errors.ts";
-import type { FactLedger } from "../store/fact-ledger.ts";
+import {
+  type AuthenticatedLedgerHost,
+  FactLedger,
+  type LedgerDelivery,
+  type LedgerDispatchAuthority,
+  type LedgerEntry,
+} from "../store/fact-ledger.ts";
 import { ResidentNotFoundError, ResidentStore } from "../store/resident-store.ts";
 import {
   WINDOW_EVENT_OCCURRED_AT,
@@ -85,6 +93,8 @@ import { CredentialStore } from "./credentials.ts";
 
 const WINDOW_INDEX_SCHEMA = 1;
 
+type RuntimeBootPack = ReturnType<typeof buildBootPack> & Pick<BootPackView, "letter">;
+
 interface WindowIndex {
   readonly schemaVersion: typeof WINDOW_INDEX_SCHEMA;
   readonly windows: Readonly<Record<string, string>>;
@@ -105,6 +115,16 @@ interface SayInput {
   onChunk?: (chunk: string) => void;
 }
 
+/**
+ * 一个认证回合的回执上下文（接账时才有）：回执由本运行时 SessionRegistry 签发，
+ * 交付口由账的 prepareDelivery 给出。成功回合 settle + commit ack；失败回合 revoke。
+ * 「已 settle」不靠额外布尔记，`revokeDispatch` 对已消费回执是幂等 no-op。
+ */
+interface AuthenticatedTurnContext {
+  readonly receipt: DispatchReceipt;
+  readonly delivery: LedgerDelivery;
+}
+
 export interface ResidentRuntimeOptions {
   readonly dataDir: string;
   /** 模型传输。缺省按 MIST_RESIDENT_RUNTIME_TRANSPORT 选（默认合成通道）。 */
@@ -112,8 +132,23 @@ export interface ResidentRuntimeOptions {
   /**
    * 权威事实账（MV-A05）：接了就把 ledger.currentSet() 注进启动包的 currentFacts
    * 分区随请求进模型。不传 = 没接账（与「账是空的」不是同一个值，缺席即缺席）。
+   * **只读嵌入**——本运行时不在这本账上写一个字。
    */
   readonly factLedger?: FactLedger;
+  /**
+   * 认证权威事实账装配（#163 seam）：给了就在本运行时**自己的**派发权威
+   * （SessionRegistry）上开一本认证账，返回值里的 host 是真宿主口。commitment 档
+   * 从 ledger.currentSet() 现取，新承诺经 host 写。
+   *
+   * 与 `factLedger` 的关系：`ledger` 是宿主装配（可读 + 认证交付），`factLedger` 是
+   * 无账嵌入的只读接法。两者**互斥**——同时给会构造失败（不许无证据地让一本静默顶掉
+   * 另一本）；只选一个。都没给 = 没接账。
+   *
+   * 代价：窗一开就要在账上登记确认位（`<dataDir>/<residentId>.facts.json` 与住户档案
+   * 同目录、各认各的后缀）；登记失败要把相关动作 fail-closed，不许把「账不可用」静默
+   * 降级成「账是空的」。
+   */
+  readonly ledger?: { readonly dataDir: string };
 }
 
 function ok<T>(value: T): Result<T> {
@@ -155,6 +190,21 @@ function identityFailure<T>(reason: ResidentIdentityFailureReason, referenceId: 
   );
 }
 
+/**
+ * 交接信草稿组装期的结构化拒绝（换气内部用）：带上判卷契约里的错误码与 remedy，
+ * 由 #breatheNow 收敛成 Result——草稿组装失败不许异常冲出，必须可判、且失败不改史。
+ */
+class LetterDraftRefusalError extends Error {
+  readonly code: ResidentRuntimeErrorCode;
+  readonly remedy: string;
+  constructor(input: { code: ResidentRuntimeErrorCode; message: string; remedy: string }) {
+    super(input.message);
+    this.name = "LetterDraftRefusalError";
+    this.code = input.code;
+    this.remedy = input.remedy;
+  }
+}
+
 function isMissingFile(error: unknown): boolean {
   return (error as NodeJS.ErrnoException).code === "ENOENT";
 }
@@ -173,6 +223,15 @@ export class ResidentRuntime {
   readonly #sessions: SessionRegistry<{ letter: SealedLetter | null }>;
   readonly #credentials: CredentialStore;
   readonly #transport: ModelTransport;
+  /**
+   * 认证账的组给（`ledger` 选项接上时才有）：账与真宿主口都绑在本运行时**自己的**
+   * SessionRegistry 上——authority 是真的（不是恒 true 的伪认证），receipt 由同一个
+   * registry 签发。`#factLedger` 是它的只读别名（含只读嵌入的无账接法）。
+   */
+  readonly #ledgerAuthority: {
+    readonly ledger: FactLedger;
+    readonly host: AuthenticatedLedgerHost;
+  } | null;
   readonly #factLedger: FactLedger | undefined;
   readonly #breathState: BreathStateStore;
   readonly #letters: LetterStore;
@@ -192,6 +251,13 @@ export class ResidentRuntime {
   #windowIndex: Record<string, string> = {};
 
   constructor(options: ResidentRuntimeOptions) {
+    if (options.ledger !== undefined && options.factLedger !== undefined) {
+      // 两种接法是同一本账的两个模式：认证宿主装配 vs 无账只读嵌入。同时给会
+      // 让其中一本被静默忽略，「账到底是哪本」不可判——这里显式拒绝。
+      throw new Error(
+        "ResidentRuntimeOptions 只接一种账模式：要么 ledger（认证宿主装配），要么 factLedger（只读嵌入），不许同时给",
+      );
+    }
     const dataDir = options.dataDir;
     this.#streamsDir = join(dataDir, "streams");
     this.#residentsDir = join(dataDir, "residents");
@@ -201,9 +267,6 @@ export class ResidentRuntime {
     mkdirSync(this.#residentsDir, { recursive: true });
     this.#residents = new ResidentStore({ dataDir: this.#residentsDir });
     this.#identities = new ResidentIdentityStore({ dataDir: join(dataDir, "identities") });
-    for (const identity of this.#identities.activeResidents()) {
-      this.#materializeResidentRoom(identity);
-    }
     this.#streams = new CanonicalStreamStore({ dataDir: this.#streamsDir });
     // 写句柄经先决①的唯一开把手拿（构造点全仓唯一，在 window-host/window-history-host.ts
     // 的 openCanonicalStreamWriter 里）：WH-06 的唯一写方判据与 resident-runtime.md
@@ -215,7 +278,23 @@ export class ResidentRuntime {
     });
     this.#credentials = new CredentialStore(join(dataDir, "credentials"));
     this.#transport = options.transport ?? createModelTransport();
-    this.#factLedger = options.factLedger;
+    // 认证账装配：authority 是本运行时自己的 SessionRegistry（真实回执权威）——
+    // 复用 #163 的 createAuthenticated seam，不另开第三个 writer、不造伪认证。
+    if (options.ledger !== undefined) {
+      const authority: LedgerDispatchAuthority = this.#sessions;
+      const bound = FactLedger.createAuthenticated({
+        dataDir: options.ledger.dataDir,
+        dispatchAuthority: authority,
+      });
+      this.#ledgerAuthority = bound;
+      this.#factLedger = bound.ledger;
+    } else {
+      this.#ledgerAuthority = null;
+      this.#factLedger = options.factLedger;
+    }
+    for (const identity of this.#identities.activeResidents()) {
+      this.#materializeResidentRoom(identity);
+    }
     this.#breathState = new BreathStateStore(join(dataDir, "sessions", "breath.json"));
     this.#letters = new LetterStore(this.#lettersDir);
     // 换气编排走现役 BreathCycle（封信 sealLetter → 落时间线 → kill+open 换代 → 注入）。
@@ -414,33 +493,42 @@ export class ResidentRuntime {
     }
     this.#turnStarted.add(`${window.windowId}#${window.generation}`);
 
-    // 醒来读启动包：身份、承诺、记忆、现行有效事实**整包**随请求进模型（D8 补记三：
-    // 醒来即已读；验收席意见 1：记忆与事实不许中途掉队）。
-    let bootPack: ReturnType<typeof buildBootPack>;
+    // 认证账开工闸（#163 接法）：接账时在**模型调用之前**签发一枚真回执并开交付。
+    // 本回合正文在 #runTurnForWindow 里跑；回执生命周期在这里收口：
+    // 模型回复落流后、换代前 settle + commit ack；失败/中断 revoke 未消费的回执。
+    let ledgerTurn: AuthenticatedTurnContext | null;
     try {
-      let currentFacts: ReturnType<FactLedger["currentSet"]> | undefined;
-      if (this.#factLedger !== undefined) {
-        try {
-          currentFacts = this.#factLedger.currentSet(input.residentId);
-        } catch (error) {
-          if (!(error instanceof LedgerNotFoundError)) throw error;
-          // 账接了但这户没开户：对这户仍是「没接账」——currentFacts 缺席即缺席，
-          // 不许跟「账是空的」（空数组）编码成同一个值（MV-A05）。
-        }
-      }
-      bootPack = buildBootPack(
-        this.#residents,
-        input.residentId,
-        currentFacts === undefined ? {} : { currentFacts },
-      );
+      ledgerTurn = this.#beginAuthenticatedTurn(window);
     } catch (error) {
       return fail(
-        "resident-not-found",
-        `启动包装配失败：${(error as Error).message}`,
-        "检查住户档案是否完整（residents/ 快照），损坏就从迁移包恢复",
+        "writer-unavailable",
+        `权威账开工闸不可用：${(error as Error).message}`,
+        "账查不出缺口时裁定级动作 fail-closed：核对权威事实账落盘目录与窗确认位是否完好，修复后重试",
         input.residentId,
       );
     }
+    try {
+      const result = await this.#runTurnForWindow(input, window, turnId, credential, ledgerTurn);
+      return result;
+    } finally {
+      if (ledgerTurn !== null) this.#revokeAuthenticatedTurn(ledgerTurn);
+    }
+  }
+
+  /** #runTurn 的正文（窗已解析、回执已签发）：从启动包到落账、到线换气。 */
+  async #runTurnForWindow(
+    input: SayInput,
+    window: { windowId: string; generation: number },
+    turnId: string,
+    credential: NonNullable<ReturnType<CredentialStore["find"]>>,
+    ledgerTurn: AuthenticatedTurnContext | null,
+  ): Promise<Result<TurnResult>> {
+    // 醒来读启动包：身份、承诺、记忆、现行有效事实、**交接信**整包随请求进模型
+    // （D8 补记三：醒来即已读，不让住户醒来再发一次工具调用去读；验收席意见 1：
+    // 记忆与事实不许中途掉队）。信直接从 letters/ 时间线读原件，不转抄。
+    const assembled = this.#assembleBootPack(input.residentId);
+    if (!assembled.ok) return assembled;
+    const bootPack = assembled.value;
     const route = resolveChannelRoute({
       claudeSubscription: credential.claudeSubscription,
       credentialKind: credential.credentialKind,
@@ -540,6 +628,19 @@ export class ResidentRuntime {
         input.residentId,
       );
     }
+    // 回复已交付且落流后确认账；必须在换代前消费旧代回执。
+    if (ledgerTurn !== null) {
+      try {
+        this.#settleAuthenticatedTurn(ledgerTurn);
+      } catch (error) {
+        return fail(
+          "writer-unavailable",
+          `回复已落流，但事实账交付确认失败：${(error as Error).message}`,
+          "修复权威事实账的落盘目录后再说话；未确认的账缺口会在下一回合重新交付，已落流的回复保留",
+          input.residentId,
+        );
+      }
+    }
     // 到线换气（D8 一）：本回合落账后按累积 token 判线，到线就亲笔写信换代。
     // 累积按 estimateTokens（handover-letter 的保守估算，同尺子量到底）。
     const config = this.#breathState.update(input.residentId, (state) => {
@@ -568,8 +669,11 @@ export class ResidentRuntime {
   }
 
   #materializeResidentRoom(identity: ActiveResidentIdentity): void {
-    if (this.#residents.has(identity.residentId)) return;
-    this.#residents.createResident(identity.persona, { residentId: identity.residentId });
+    if (!this.#residents.has(identity.residentId)) {
+      this.#residents.createResident(identity.persona, { residentId: identity.residentId });
+    }
+    // active 身份的 room 与账在同一物化边界出生；已有 room 启动时补齐账，查询与配通道不开户。
+    this.#ensureLedgerBook(identity.residentId);
   }
 
   // —— 一窗流只读 ——
@@ -610,29 +714,60 @@ export class ResidentRuntime {
         input.residentId,
       );
     }
-    const pack = buildBootPack(this.#residents, input.residentId);
-    let latestLetter: SealedLetter | null;
+    const assembled = this.#assembleBootPack(input.residentId);
+    if (!assembled.ok) return assembled;
+    const pack = assembled.value;
+    return ok({
+      residentId: pack.residentId,
+      identity: pack.identity,
+      commitments: [...pack.commitments],
+      memories: pack.memories.map(toMemoryEntryView),
+      letter: pack.letter,
+    });
+  }
+
+  /** 诊断读口与模型请求共用装配：事实和交接信从各自真源读，不另造启动包。 */
+  #assembleBootPack(residentId: string): Result<RuntimeBootPack> {
+    let letter: BootPackView["letter"];
     try {
-      latestLetter = this.#letters.latest(input.residentId);
+      const latest = this.#letters.latest(residentId);
+      letter = latest === null ? null : toLetterView(latest);
     } catch (error) {
       // 信档损坏 fail-closed（协助审查）：宁可启动包读不出，也不静默回退旧信。
       return fail(
         "letter-invalid",
         `交接信读不出：${(error as Error).message}`,
         "信档损坏不许静默降级——修复 letters/ 里的信档后再读启动包",
-        input.residentId,
+        residentId,
       );
     }
-    return ok({
-      residentId: pack.residentId,
-      identity: pack.identity,
-      commitments: [...pack.commitments],
-      memories: pack.memories.map(toMemoryEntryView),
-      // 交接信随换代产生（D8）。没换过代 = 没有信，契约里就是 null——
-      // 不拿空信占位（「没有」与「有封空的」不许塌成同一个值）。注入的是
-      // 时间线里的原件（副本等价性 letterShape 同形），不是转抄。
-      letter: latestLetter === null ? null : toLetterView(latestLetter),
-    });
+    try {
+      let currentFacts: ReturnType<FactLedger["currentSet"]> | undefined;
+      if (this.#factLedger !== undefined) {
+        try {
+          currentFacts = this.#factLedger.currentSet(residentId);
+        } catch (error) {
+          if (!(error instanceof LedgerNotFoundError)) throw error;
+          // 接了账但这户未开户：分区缺席，与账是空的（空数组）区分，MV-A05。
+        }
+      }
+      return ok({
+        ...buildBootPack(
+          this.#residents,
+          residentId,
+          currentFacts === undefined ? {} : { currentFacts },
+        ),
+        // 未换过代 = null；有信时使用同一封原件的现役视图，不重新生成。
+        letter,
+      });
+    } catch (error) {
+      return fail(
+        "resident-not-found",
+        `启动包装配失败：${(error as Error).message}`,
+        "检查住户档案是否完整（residents/ 快照），损坏就从迁移包恢复",
+        residentId,
+      );
+    }
   }
 
   // —— 换气与交接信（RT-03 / D8） ——
@@ -751,7 +886,23 @@ export class ResidentRuntime {
       );
     }
     const fromGeneration = window.generation;
-    const draft = this.#composeLetterDraft(input.residentId, window);
+    // 草稿组装也在这道 Result 边界里：账读不出、旧字符串未入账都在这里收敛成
+    // breath-refused 的结构化失败，不许异常冲出 #breatheNow（换气失败必须可判、
+    // 且失败不改史）。
+    let draft: ReturnType<typeof composeLetterDraft>;
+    try {
+      draft = this.#composeLetterDraft(input.residentId, window);
+    } catch (error) {
+      if (error instanceof LetterDraftRefusalError) {
+        return fail(error.code, error.message, error.remedy, input.residentId);
+      }
+      return fail(
+        "breath-refused",
+        `交接信草稿组装失败：${(error as Error).message}`,
+        "账读不出或档案不完整：核对该住户的权威事实账与住户档案后重试",
+        input.residentId,
+      );
+    }
     try {
       const breathed = await this.#breathCycle.breathe(window.windowId, draft);
       // 换代收尾：主人的待定线从下一代生效，累积清零。
@@ -878,19 +1029,75 @@ export class ResidentRuntime {
     return nodes;
   }
 
-  /** 亲笔信草稿从这**一**代自己的状态装配（D8 当刻亲笔；判卷判结构不判内容）。 */
+  /**
+   * 交接信草稿从这**一**代自己的状态装配（判结构不变量，不判信的内容；intent 半的
+   * 当刻亲笔标记由封缄层盖，本层不声称「亲笔已完成」）。
+   *
+   * 承诺档的真源是权威事实账（图纸 §4.2）：每条现行 entry 一条 commitment，带
+   * `ledgerSeq=entry.seq`、body 只作短引用，不复印账上正文；已 supersede 的不进 currentSet，
+   * 也就不装。
+   *
+   * `ResidentStore` 里的旧 string commitments **不自动迁/签、不降 fact**：它们没有
+   * 账上 seq，无法凭正文或数组下标伪关联。发现尚未入账的旧字符串一律 breath-refused，
+   * 逐条列出、给真实入账入口，绝不静默丢数据，也绝不自动清。
+   */
   #composeLetterDraft(
     residentId: string,
     window: { windowId: string; generation: number },
   ): ReturnType<typeof composeLetterDraft> {
+    const legacy = this.#residents.commitments(residentId);
+    if (legacy.length > 0) {
+      const listed = legacy.map((body, index) => `${index + 1}. ${body}`).join("\n");
+      throw new LetterDraftRefusalError({
+        code: "breath-refused",
+        message: `住户档案里有 ${legacy.length} 条尚未入权威事实账的旧字符串承诺，不许自动承接：\n${listed}`,
+        remedy: this.#legacyCommitmentRemedy(residentId, legacy.length),
+      });
+    }
     const pack = buildBootPack(this.#residents, residentId);
+    const commitments = this.#commitmentsFromLedger(residentId);
     return composeLetterDraft({
       residentId,
       generation: window.generation,
-      commitments: pack.commitments,
+      commitments,
       memories: pack.memories.map((entry) => entry.content),
       streamEvents: this.#flowOfGeneration(residentId, window.generation).length,
     });
+  }
+
+  /** 现行有效集 → 信里 commitment 档的 seq 指针集。没接账 = 空集。 */
+  #commitmentsFromLedger(residentId: string): { ledgerSeq: number }[] {
+    const ledger = this.#factLedger;
+    if (ledger === undefined) return [];
+    let current: LedgerEntry[];
+    try {
+      current = ledger.currentSet(residentId);
+    } catch (error) {
+      if (error instanceof LedgerNotFoundError) {
+        // 接了账但这户没开户：对这户仍是「没有账」——空集，不是「账是空的」的伪装。
+        return [];
+      }
+      throw error;
+    }
+    return current.map((entry) => ({ ledgerSeq: entry.seq }));
+  }
+
+  /** 旧字符串承诺的入账入口说明：指到真实存在的宿主 API，不编不存在的 CLI 命令。 */
+  #legacyCommitmentRemedy(residentId: string, count: number): string {
+    const via =
+      this.#ledgerAuthority === null
+        ? "本运行时没接认证账：先在宿主装配里传 ledger 选项接上权威事实账；"
+        : "";
+    return [
+      `${via}旧字符串承诺不经账，无法自动承接（不凭正文匹配或数组下标伪关联）。`,
+      "请逐条按现行宿主 API 正常入账：住户本窗立承诺走",
+      `AuthenticatedLedgerHost.forDispatch({kind:"resident", senderId:"${residentId}"}, receipt).append({kind:"active_rule", body})`,
+      "（receipt 由该住户当前窗经 SessionRegistry.issueDispatch 签发）；宿主维护动作走",
+      `host.system(senderId).append("${residentId}", {kind:"active_rule", body}, reason)。`,
+      `共 ${count} 条待入账。注意：只要这些旧字符串仍在住户档案里，换气就继续被拒——`,
+      "旧字段的确认/迁移工具另单处理，本路径不做自动迁移、不按正文匹配、也不会自动清掉旧数据，",
+      "因此本提示不承诺「入账后即可恢复换气」。",
+    ].join(" ");
   }
 
   // —— 凭证扫描（RT-06） ——
@@ -991,13 +1198,99 @@ export class ResidentRuntime {
     await this.#writer.close();
   }
 
+  // —— 认证权威事实账（#163 seam / MV-A05） ——
+
+  /**
+   * 认证账的宿主口（组装层用）。没接 `ledger` 选项时为 null——那不代表「账是空的」，
+   * 只代表这个运行时实例没持有可写账。返回的是真宿主 authority 铸出的口：
+   * `forDispatch` 要本运行时 SessionRegistry 签发的回执，`system` 要显式署名的 reason。
+   */
+  ledgerAuthority(): { ledger: FactLedger; host: AuthenticatedLedgerHost } | null {
+    return this.#ledgerAuthority;
+  }
+
+  /** 物化 active room 时对齐账本；没接认证账时不开户。 */
+  #ensureLedgerBook(residentId: string): void {
+    const authority = this.#ledgerAuthority;
+    if (authority === null) return;
+    if (!this.#residents.has(residentId)) return;
+    if (authority.ledger.has(residentId)) return;
+    authority.ledger.createLedger(residentId);
+  }
+
+  /**
+   * 把本窗登记进认证账的确认位（开窗/换代后必做）。登记失败抛——调用方 fail-closed，
+   * 不把「账登记不上」静默降级成「账里没有这扇窗」。
+   */
+  #registerLedgerViewport(residentId: string, windowId: string): void {
+    const authority = this.#ledgerAuthority;
+    if (authority === null) return;
+    const window = this.#sessions.get(windowId);
+    if (window === undefined) {
+      throw new Error(`账登记失败：窗不在活窗表里（${windowId}）`);
+    }
+    authority.host.registerViewport({
+      residentId: window.residentId,
+      scopeId: window.scopeId,
+      scopeGeneration: window.scopeGeneration,
+      windowId: window.windowId,
+      generation: window.generation,
+    });
+  }
+
+  /**
+   * 认证回合开工：签发真回执 → 账侧 prepareDelivery。查账失败/回执不合法抛错，
+   * 由 #runTurn 收敛成结构化失败——裁定级动作在模型调用前 fail-closed。
+   * 没接账返回 null（无账嵌入路径一个字不变）。
+   */
+  #beginAuthenticatedTurn(window: {
+    windowId: string;
+    generation: number;
+  }): AuthenticatedTurnContext | null {
+    const authority = this.#ledgerAuthority;
+    if (authority === null) return null;
+    // 窗登记的唯一边界是 #windowFor（开窗/换代的真实生命周期点）；这里只消费。
+    // 若窗没登记上，prepareDelivery 会以 alignment 错误 fail-closed。
+    const receipt = this.#sessions.issueDispatch(window.windowId);
+    try {
+      const delivery = authority.host.prepareDelivery(receipt);
+      return { receipt, delivery };
+    } catch (error) {
+      // prepareDelivery 失败时不留下悬空回执。
+      this.#sessions.revokeDispatch(receipt);
+      throw error;
+    }
+  }
+
+  /** 成功回合的确认：宿主 settle（消费回执、铸结算）→ 账侧 commit ack。 */
+  #settleAuthenticatedTurn(context: AuthenticatedTurnContext): void {
+    const settlement: DispatchSettlement | null = this.#sessions.settleDispatch(context.receipt);
+    if (settlement === null) throw new Error("当前回合的账交付回执已失效，不能确认");
+    context.delivery.commit(settlement);
+  }
+
+  /**
+   * 回合未成功时的回执作废（幂等）。已 settle 的回执不在这里——`revokeDispatch`
+   * 对已消费回执返回 false，不会把成功回合的确认位回退。
+   */
+  #revokeAuthenticatedTurn(context: AuthenticatedTurnContext): void {
+    this.#sessions.revokeDispatch(context.receipt);
+  }
+
   // —— 窗口与代际（SessionRegistry 是代际真源） ——
 
   #windowFor(residentId: string): { windowId: string; generation: number } {
     const cachedId = this.#windows.get(residentId);
     if (cachedId !== undefined) {
       const active = this.#activeWindow(cachedId);
-      if (active !== null) return { windowId: active.windowId, generation: active.generation };
+      if (active !== null) {
+        // 换代由 BreathCycle 在账外经 registry.kill+open 完成（换气不改 windowId、
+        // 只 +1 代），缓存命中的这扇窗可能是**新代**——账侧的确认位还停在旧代的
+        // 登记上，不重登记会让后续认证写报「alignment belongs to another activation」。
+        // 这里每次命中都按当前活窗身份重登记：同身份是幂等返回，新代则冻结新快照。
+        this.#registerLedgerViewport(residentId, active.windowId);
+        return { windowId: active.windowId, generation: active.generation };
+      }
       this.#windows.delete(residentId);
     }
     const knownId = this.#windowIndex[residentId];
@@ -1011,6 +1304,8 @@ export class ResidentRuntime {
           windowId: knownId,
         });
         this.#windows.set(residentId, reopened.windowId);
+        // 认证账：按同一身份重开 = 新一代，账侧重登记确认位（冻结新的现行有效集快照）。
+        this.#registerLedgerViewport(residentId, reopened.windowId);
         return { windowId: reopened.windowId, generation: reopened.generation };
       } catch (error) {
         if (!(error instanceof WindowReopenError)) throw error;
@@ -1021,6 +1316,7 @@ export class ResidentRuntime {
     this.#windows.set(residentId, opened.windowId);
     this.#windowIndex = { ...this.#windowIndex, [residentId]: opened.windowId };
     this.#saveWindowIndex();
+    this.#registerLedgerViewport(residentId, opened.windowId);
     return { windowId: opened.windowId, generation: opened.generation };
   }
 

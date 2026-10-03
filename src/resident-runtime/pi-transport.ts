@@ -12,7 +12,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ModelCompletionRequest, ModelTransport } from "./channels.ts";
+import type { BootPackLetter, ModelCompletionRequest, ModelTransport } from "./channels.ts";
 /** provider → pi-ai 使用的密钥环境变量名。 */
 const PROVIDER_SECRET_ENV: Readonly<Record<string, string>> = {
   anthropic: "ANTHROPIC_API_KEY",
@@ -431,6 +431,9 @@ export function splitModelId(model: string): { provider: string; model: string }
 
 /**
  * 把完整启动包 + 本代历史渲染进系统提示。currentFacts 缺席 = 没接账；空数组 = 权威事实账为空。
+ * 交接信（D8 补记三）：null 或既有请求省略字段时没有交接信分区；
+ * 三条 tier 语义（承诺必须继承 / 事实以现实为准 / 判断可不同意）逐档标注，
+ * 标题、署名与写信时间保留，正文照抄不转写。
  */
 export function renderSystemPrompt(request: ModelCompletionRequest): string {
   const parts: string[] = [];
@@ -446,8 +449,11 @@ export function renderSystemPrompt(request: ModelCompletionRequest): string {
     const facts =
       pack.currentFacts.length === 0
         ? "（当前没有现行有效事实）"
-        : pack.currentFacts.map((item) => `- ${item.body}`).join("\n");
+        : pack.currentFacts.map((item) => `- [#${item.seq}] ${item.body}`).join("\n");
     parts.push(`现行有效事实：\n${facts}`);
+  }
+  if (pack.letter != null) {
+    parts.push(renderLetter(pack.letter));
   }
   if (request.history.length > 0) {
     parts.push(
@@ -457,6 +463,24 @@ export function renderSystemPrompt(request: ModelCompletionRequest): string {
     );
   }
   return parts.join("\n\n");
+}
+
+/**
+ * D8 补记三的启动包信分区：内容按三档标注，档与档的约束语义显式写进提示，
+ * 不让「承诺 / 事实 / 判断」三个词自己扛解释。
+ */
+function renderLetter(letter: BootPackLetter): string {
+  const lines = [
+    `上一代交接信：${letter.title}`,
+    `（作者 ${letter.author}，写于 ${letter.writtenAt}）`,
+    "条目分三档——commitment 承诺与生效中的约束：必须继承，只能按正常流程解除；" +
+      "fact 事实与状态：以现实为准，可查证，不必尊重前任；" +
+      "judgment 判断与意图：你有权不同意，且不续写前任对自己行为的事后分析。",
+  ];
+  for (const item of [...letter.state, ...letter.intent]) {
+    lines.push(`- [${item.tier}] ${item.body}`);
+  }
+  return lines.join("\n");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -62,6 +62,42 @@ RT-06 才能证明「存了但没漏出」；一个干脆不落凭证的空实�
 RT-05 判的是渲染输入的结构（帧、增量、状态栏字段、错误文本），不判观感——观感留给
 验收席的真实观察记录，附在 PR 里，不进灯。这是「不判措辞」纪律在界面上的延伸。
 
+## 模型输入的补充回归
+
+`bootPack()` 诊断读口和 `say()` 的模型请求共用 runtime 装配路径：从现役存储读身份、
+承诺、记忆、可选现行事实和最新交接信。无信为 `null`；信档无法解析或条目结构无法读出
+时，两处均报 `letter-invalid`，模型不被调用、既有一窗流不变。
+
+消费端回归在 `tests/resident-runtime.test.ts`：用 recording transport 捕获真正由
+`say()` 发出的请求，核对手动换代、阈值自动换代、runtime 关闭后从同一目录重建、无信、
+坏信和住户隔离。捕获的请求还交给现役 `renderSystemPrompt()`，检查标题、作者代际、
+写信时间、三档原文；承诺必须继承、事实可核对、判断可不同意的语义由
+`tests/pi-transport.test.ts` 核对。旧代原始对话不会随换代自动进入本代历史，现行事实与
+本代正常历史继续保留。
+
+```bash
+npm test -- tests/resident-runtime.test.ts tests/pi-transport.test.ts
+```
+
+这些回归使用临时目录、合成凭证与本地 transport；重建覆盖的是同进程里的新 runtime
+实例读盘。独立宿主进程的持久化由 RT-02 的子进程判卷另行检查，真实 provider 往返仍需
+本机证据。合法三档信的消费 fixture 用现役 `sealLetter()` 与 `LetterStore` 预存原件；
+当前 `composeLetterDraft()` 确定性装配草稿；commitment 从权威账 `currentSet()` 取 `ledgerSeq`
+及短引用，旧字符串承诺仍 fail-closed 拒绝。上述检查证明已有信被送入模型，
+不判信的内容质量，也不替代 D8「当刻亲笔」的语义核对或正式独立验收落章。
+
+## 终端命令输入回归
+
+`tests/resident-tui.test.ts` 从真实 `src/resident-runtime/cli.ts` 子进程的 stdin 输入
+`/new`、`/clear`、`/compact`，观察落盘信、代际、同一窗号与主流正文；命令不得成为聊天
+回合。另注入信文件落盘失败，验证错误可见、代际未推进、拒绝后普通对话仍可进行。
+空行、普通输入、`/exit` 与 SIGINT 的既有回归继续保留。
+
+这些测试用临时目录和 synthetic 通道：身份先由 synthetic candidate 本人显式自认，
+再经 `provisionChannel()` 配通道。不覆盖安装器正式提交到 CLI 的交接，也不证明
+真实 provider 往返或 intent 当刻亲笔成立。
+原 RT-03 判据与未勾独立复验状态保持不变。
+
 ## 七盏灯
 
 每条带主证据形式。标 [集成] 的由 Vitest 集成测试或验收驱动提供（真实宿主子进程、

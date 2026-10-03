@@ -28,6 +28,7 @@ import type {
 } from "../acceptance/resident-runtime-driver.ts";
 import { type CanonicalEventDraft, CanonicalStreamStore } from "../src/one-stream/index.ts";
 import { ResidentIdentityStore } from "../src/resident-continuity/identity-store.ts";
+import { LetterStore } from "../src/resident-runtime/breath.ts";
 import {
   ChannelSpecError,
   type ChannelSpecLike,
@@ -37,7 +38,9 @@ import {
   resolveChannelRoute,
 } from "../src/resident-runtime/channels.ts";
 import { CredentialStore } from "../src/resident-runtime/credentials.ts";
+import { renderSystemPrompt } from "../src/resident-runtime/pi-transport.ts";
 import { ResidentRuntime } from "../src/resident-runtime/runtime.ts";
+import { sealLetter } from "../src/session/handover-letter.ts";
 import { FactLedger } from "../src/store/fact-ledger.ts";
 import { ResidentStore } from "../src/store/resident-store.ts";
 import { openCanonicalStreamWriter } from "../src/window-host/window-history-host.ts";
@@ -980,6 +983,292 @@ describe("换气与交接信（RT-03 / D8）", () => {
         authority: "window",
       });
       expect(good.ok).toBe(true);
+    } finally {
+      await runtime.close();
+    }
+  });
+});
+
+/**
+ * D8 补记三 —— 交接信真正随启动包到达换代后 say() 的模型请求。
+ *
+ * 这组回归钉的是**消费端**：不是在 `bootPack()` 只读口或 `letterTimeline()` 上验证
+ * 信在不在，而是录下 say() 实际喂给 transport 的 `ModelCompletionRequest`，证明信
+ * 进了发送面，并渲染捕获的真实请求核对 pi system prompt。此前 runtime 的
+ * 启动包在 #runTurn 里另走一遍基础 `buildBootPack`、把信丢了，所以这些断言在修复前
+ * 红、修复后绿。
+ */
+describe("交接信随启动包进模型请求（D8 补记三：醒来即已读）", () => {
+  /** 录音传输：只录请求、确定性回一个非空回复，不碰网络。 */
+  function recordingTransport(): {
+    transport: ModelTransport;
+    requests: ModelCompletionRequest[];
+  } {
+    const requests: ModelCompletionRequest[] = [];
+    return {
+      transport: {
+        async *complete(request: ModelCompletionRequest): AsyncIterable<string> {
+          requests.push(request);
+          yield "已读来信。";
+        },
+      },
+      requests,
+    };
+  }
+
+  it("手动换代后下一次 say 的请求带正确原信（标题 / 作者代际 / writtenAt / 条目原文）", async () => {
+    const recorder = recordingTransport();
+    const dataDir = tempDir();
+    const prep = new ResidentRuntime({ dataDir, transport: recorder.transport });
+    activateResident(prep, "r-ho");
+    await prep.close();
+    const stores = new ResidentStore({ dataDir: join(dataDir, "residents") });
+    stores.remember("r-ho", "上代在做迁移");
+    const runtime = new ResidentRuntime({ dataDir, transport: recorder.transport });
+    try {
+      runtimeProvision(runtime, "r-ho");
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-ho", text: "第一代的话" }));
+      // 手动换代，复用已有的信草稿与封缄流程。
+      const breathed = unwrap<BreatheOutcome>(
+        await runtime.breathe({ residentId: "r-ho", via: "clear" }),
+      );
+      // 换代后下一次 say：请求里必须带上那封信的原件。
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-ho", text: "第二代报到" }));
+      const second = recorder.requests[1];
+      if (second === undefined) throw new Error("下一代没有调用 transport");
+      expect(second?.bootPack.letter).toBeDefined();
+      const letter = second?.bootPack.letter;
+      expect(letter?.title).toBe(breathed.letter.title);
+      expect(letter?.author).toBe("r-ho#1"); // 写信的是换代前那代
+      expect(letter?.writtenAt).toBe(breathed.letter.writtenAt);
+      // 条目 tier 与原文照抄，不重写、不丢档。
+      expect(letter?.state.map((item) => item.tier)).toEqual(
+        breathed.letter.state.map((item) => item.tier),
+      );
+      expect(letter?.state.map((item) => item.body)).toEqual(
+        breathed.letter.state.map((item) => item.body),
+      );
+      expect(letter?.intent.map((item) => item.body)).toEqual(
+        breathed.letter.intent.map((item) => item.body),
+      );
+      expect(letter).toEqual(breathed.letter);
+      expect(unwrap<BootPackView>(runtime.bootPack({ residentId: "r-ho" })).letter).toEqual(letter);
+      const prompt = renderSystemPrompt(second);
+      expect(prompt).toContain(`上一代交接信：${breathed.letter.title}`);
+      expect(prompt).toContain(`作者 r-ho#1，写于 ${breathed.letter.writtenAt}`);
+      for (const item of [...breathed.letter.state, ...breathed.letter.intent]) {
+        expect(prompt).toContain(`- [${item.tier}] ${item.body}`);
+      }
+      expect(second.history).toEqual([]);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("已有合法三档信从磁盘进入下一代的请求与最终 prompt", async () => {
+    const dataDir = tempDir();
+    const first = new ResidentRuntime({ dataDir, transport: new SyntheticModelTransport() });
+    const state = [
+      { tier: "commitment", body: "承诺每天写日报", ledgerSeq: 1 },
+      { tier: "fact", body: "上代在做迁移" },
+    ] as const;
+    const intent = [{ tier: "judgment", body: "先核对迁移结果" }] as const;
+    const writtenAt = "2026-09-30T12:00:00.000Z";
+    try {
+      runtimeProvision(first, "r-three");
+      unwrap<TurnResult>(await first.say({ residentId: "r-three", text: "前代回合" }));
+      const stream = new CanonicalStreamStore({ dataDir: join(dataDir, "streams") });
+      const viewport = stream.eventsAfter("r-three", 0)[0]?.origin.viewport;
+      if (viewport == null) throw new Error("前代回合没有落下 viewport 身份");
+      // 独立输入 fixture 使用现役封缄与信存储，验证已有合法信的消费；不调用草稿生成器。
+      const sealed = sealLetter(
+        { title: "三档交接信", state: [...state], intent: [...intent] },
+        {
+          residentId: "r-three",
+          windowId: viewport.windowId,
+          generation: viewport.generation,
+          now: writtenAt,
+        },
+      );
+      new LetterStore(join(dataDir, "letters")).append(sealed);
+    } finally {
+      await first.close();
+    }
+    const recorder = recordingTransport();
+    const second = new ResidentRuntime({ dataDir, transport: recorder.transport });
+    try {
+      const turn = unwrap<TurnResult>(await second.say({ residentId: "r-three", text: "接续" }));
+      expect(turn.generation).toBe(2);
+      const request = recorder.requests[0];
+      if (request === undefined) throw new Error("继任者没有调用 transport");
+      expect(request.bootPack.letter).toEqual({
+        title: "三档交接信",
+        author: "r-three#1",
+        writtenAt,
+        state: [
+          { tier: "commitment", body: "承诺每天写日报" },
+          { tier: "fact", body: "上代在做迁移" },
+        ],
+        intent,
+      });
+      const prompt = renderSystemPrompt(request);
+      for (const item of [...state, ...intent]) {
+        expect(prompt).toContain(`- [${item.tier}] ${item.body}`);
+      }
+    } finally {
+      await second.close();
+    }
+  });
+
+  it("阈值换代后下一次 say 的请求带新一封原信", async () => {
+    const recorder = recordingTransport();
+    const runtime = new ResidentRuntime({ dataDir: tempDir(), transport: recorder.transport });
+    try {
+      runtimeProvision(runtime, "r-th");
+      unwrap<void>(
+        runtime.setBreathThreshold({
+          residentId: "r-th",
+          windowId: "w-th",
+          generation: 1,
+          thresholdTokens: 1,
+          authority: "window",
+        }),
+      );
+      // 第一句就到线：回合落账后自动写信换代。
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-th", text: "这句到线" }));
+      const timeline = unwrap<LetterTimeline>(runtime.letterTimeline({ residentId: "r-th" }));
+      expect(timeline.letters).toHaveLength(1);
+      const letter = timeline.letters[0];
+      expect(letter?.author).toBe("r-th#1");
+      const successor = unwrap<TurnResult>(
+        await runtime.say({ residentId: "r-th", text: "新一代的话" }),
+      );
+      expect(successor.generation).toBe(2);
+      expect(recorder.requests[1]?.bootPack.letter).toEqual(letter);
+      expect(recorder.requests[1]?.history).toEqual([]);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("runtime 关闭后重建：重启后的 say 仍消费盘上那封信", async () => {
+    const dataDir = tempDir();
+    const first = new ResidentRuntime({ dataDir, transport: new SyntheticModelTransport() });
+    let breathed: BreatheOutcome;
+    try {
+      runtimeProvision(first, "r-restart");
+      unwrap<TurnResult>(await first.say({ residentId: "r-restart", text: "写封信再走" }));
+      breathed = unwrap<BreatheOutcome>(
+        await first.breathe({ residentId: "r-restart", via: "new" }),
+      );
+    } finally {
+      await first.close();
+    }
+    // 同进程中销毁并重建 runtime；新实例从磁盘读信，不宣称独立进程验证。
+    const recorder = recordingTransport();
+    const second = new ResidentRuntime({ dataDir, transport: recorder.transport });
+    try {
+      unwrap<TurnResult>(await second.say({ residentId: "r-restart", text: "重启后报到" }));
+      expect(recorder.requests[0]?.bootPack.letter).toEqual(breathed.letter);
+    } finally {
+      await second.close();
+    }
+  });
+
+  it("没换过代：模型请求与诊断读口的 letter 都是 null", async () => {
+    const recorder = recordingTransport();
+    const runtime = new ResidentRuntime({ dataDir: tempDir(), transport: recorder.transport });
+    try {
+      runtimeProvision(runtime, "r-noletters");
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-noletters", text: "第一次开口" }));
+      expect(recorder.requests[0]?.bootPack.letter).toBeNull();
+      expect(
+        unwrap<BootPackView>(runtime.bootPack({ residentId: "r-noletters" })).letter,
+      ).toBeNull();
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it.each([
+    { name: "JSON 不可解析", bytes: "{ broken" },
+    {
+      name: "条目结构不完整",
+      bytes: JSON.stringify({ title: "坏信", residentId: "r-corrupt", generation: 1 }),
+    },
+  ])("坏信（$name）在调用 transport 之前报 letter-invalid，保留旧流", async ({ bytes }) => {
+    const dataDir = tempDir();
+    const recorder = recordingTransport();
+    const runtime = new ResidentRuntime({ dataDir, transport: recorder.transport });
+    try {
+      runtimeProvision(runtime, "r-corrupt");
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-corrupt", text: "保留的旧流" }));
+      const before = unwrap<StreamSnapshot>(runtime.readStream({ residentId: "r-corrupt" }));
+      unwrap<BreatheOutcome>(await runtime.breathe({ residentId: "r-corrupt", via: "new" }));
+      // 把落下的信档写坏。
+      writeFileSync(join(dataDir, "letters", "r-corrupt.letter-1.json"), bytes, "utf8");
+      const said = await runtime.say({ residentId: "r-corrupt", text: "带着坏信说话" });
+      expect(failureOf(said)).toMatchObject({ code: "letter-invalid" });
+      // 模型没被调用，也没有伪造回复落进流。
+      expect(recorder.requests).toHaveLength(1);
+      expect(unwrap<StreamSnapshot>(runtime.readStream({ residentId: "r-corrupt" }))).toEqual(
+        before,
+      );
+      expect(failureOf(runtime.bootPack({ residentId: "r-corrupt" })).code).toBe("letter-invalid");
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("不同住户不串信：各自的请求只带自己的那封", async () => {
+    const recorder = recordingTransport();
+    const runtime = new ResidentRuntime({ dataDir: tempDir(), transport: recorder.transport });
+    try {
+      runtimeProvision(runtime, "r-one");
+      runtimeProvision(runtime, "r-two");
+      unwrap<BreatheOutcome>(await runtime.breathe({ residentId: "r-one", via: "new" }));
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-one", text: "一户说完" }));
+      // r-two 从没换过代：它的请求里不该出现任何信，更不该出现 r-one 的信。
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-two", text: "另一户开口" }));
+      const one = recorder.requests.find((request) => request.residentId === "r-one");
+      const two = recorder.requests.find((request) => request.residentId === "r-two");
+      expect(one?.bootPack.letter?.author).toBe("r-one#1");
+      expect(two?.bootPack.letter).toBeNull();
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("旧代原始聊天不自动塞回历史来掩盖信缺失；currentFacts 与本代正常历史保持", async () => {
+    const { ledger, systemWriter } = FactLedger.create();
+    ledger.createLedger("r-hy");
+    systemWriter.append(
+      "r-hy",
+      { author: "system", kind: "confirmed_preference", body: "偏好短句" },
+      "回归备账：核对 currentFacts 与信同请求在场",
+    );
+    const recorder = recordingTransport();
+    const runtime = new ResidentRuntime({
+      dataDir: tempDir(),
+      transport: recorder.transport,
+      factLedger: ledger,
+    });
+    try {
+      runtimeProvision(runtime, "r-hy");
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-hy", text: "旧代的第一句" }));
+      // 猝死：旧代流水进归档，但不自动进继任者上下文（D8 三）。
+      await runtime.suddenDeath({ residentId: "r-hy" });
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-hy", text: "继任者的话" }));
+      const successor = recorder.requests[1];
+      // 旧代那句不在历史里；继任者自己本代的历史照常。
+      expect(successor?.history.map((item) => item.text)).not.toContain("旧代的第一句");
+      expect(successor?.bootPack.currentFacts?.map((fact) => fact.body)).toContain("偏好短句");
+      expect(successor?.bootPack.letter).toBeNull(); // 猝死没写信：不能凭空冒出一封
+      // 本代正常历史保留：再问一句，上一句在历史里。
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-hy", text: "再问一句" }));
+      const third = recorder.requests[2];
+      expect(third?.history.map((item) => item.text)).toContain("继任者的话");
+      expect(third?.history.map((item) => item.text)).not.toContain("旧代的第一句");
     } finally {
       await runtime.close();
     }

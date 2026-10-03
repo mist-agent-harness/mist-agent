@@ -17,6 +17,7 @@
  * 证据是本机真实通道的往返记录，归 RT-04 的通道 PR 与验收席，不进合成灯。
  */
 import { createHash } from "node:crypto";
+import type { LetterView } from "../../acceptance/resident-runtime-driver.ts";
 import { PiCliTransport } from "./pi-transport.ts";
 
 export type ChannelAdapterId = "pi-claude-bridge" | "pi-ai";
@@ -66,6 +67,14 @@ export interface HistoryMessage {
   readonly text: string;
 }
 
+/**
+ * 随启动包进模型的交接信（D8 补记三「醒来即已读」）。
+ *
+ * 复用现役 `LetterView`：标题、作者代际、writtenAt、条目 tier 与原文都保留。
+ * 真源仍是 letters/ 时间线里的封缄原件。
+ */
+export type BootPackLetter = LetterView;
+
 export interface ModelCompletionRequest {
   readonly residentId: string;
   /** D25 已解析的真实路由；传输层不得从 model 字符串猜订阅特例。 */
@@ -95,6 +104,11 @@ export interface ModelCompletionRequest {
       readonly body: string;
       readonly supersedesSeq: number | null;
     }[];
+    /**
+     * runtime 总是附上此字段；无信为 null，与 BootPackView 同形。
+     * 允许既有直接构造模型请求的调用方省略此新增字段。信档损坏在装配处拒绝。
+     */
+    readonly letter?: BootPackLetter | null;
   };
   /** 当前一窗流上下文：此前回合的 user/assistant 消息按流序送进模型（验收席意见 1）。 */
   readonly history: readonly HistoryMessage[];
