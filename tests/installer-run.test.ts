@@ -1,6 +1,8 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { InstallerController } from "../src/installer/controller.ts";
 import { FileMemoryLibrary } from "../src/installer/memory-library.ts";
@@ -9,6 +11,8 @@ import type { PromptPort } from "../src/installer/prompt-port.ts";
 import { PROVIDERS } from "../src/installer/providers.ts";
 import { runInstaller } from "../src/installer/run.ts";
 import { InstallerStateStore } from "../src/installer/state-store.ts";
+import { ResidentIdentityStore } from "../src/resident-continuity/identity-store.ts";
+import { ResidentRuntime } from "../src/resident-runtime/runtime.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -84,6 +88,31 @@ const noOAuth: OAuthLoginPort = {
     throw new Error("OAuth was not expected in this test");
   },
 };
+
+/**
+ * 安装器只提交 config/current.json/快照，不做 D22 住户自认（#182）。安装器集成
+ * 测试用这个帮手显式构造一个 synthetic accepted candidate，让 runtime 真的走到
+ * 凭证面。这不是安装路径的一部分，也不代表安装器会替住户签「我是谁」——只是把
+ * 判卷夹具推过身份闸，使 credential-missing / invalid / secret-read 分支确实
+ * 有机会发生（否则测试会被 resident-not-found 提前挡住，测不到真正要看的行为）。
+ */
+function activateSyntheticResident(dataDir: string, residentId: string): { candidateId: string } {
+  const identities = new ResidentIdentityStore({ dataDir: join(dataDir, "identities") });
+  const candidate = identities.createCandidate({
+    persona: `persona:${residentId}`,
+    proposedBy: { kind: "installer", id: "installer-run-test" },
+    residentId,
+  });
+  const attested = identities.attestCandidate(
+    candidate.candidateId,
+    { kind: "candidate", candidateId: candidate.candidateId },
+    "accepted",
+  );
+  if (!attested.ok || attested.value.residentId !== residentId) {
+    throw new Error(`failed to activate synthetic resident ${residentId}`);
+  }
+  return { candidateId: candidate.candidateId };
+}
 
 function apiKeyRef(id: string) {
   return { id, type: "api_key" as const, issuerId: "mist-installer-api-key" };
@@ -909,4 +938,128 @@ it("a second occupied memory path is caught at the memory step instead of crashi
   expect(existsSync(join(occupiedA, "data"))).toBe(true);
   expect(existsSync(join(occupiedB, "data"))).toBe(true);
   prompt.expectExhausted();
+});
+
+it("does not send a committed installer user back through setup or silently activate a resident", async () => {
+  const directory = freshDirectory();
+  const memoryPath = join(directory, "memory");
+  mkdirSync(memoryPath);
+  const store = new InstallerStateStore(directory);
+  const residentId = "resident-install-boundary";
+  const secret = "synthetic-install-boundary-secret";
+  const prompt = new ScriptedPrompt({
+    selects: ["codex", "api-key", "codex-key", "external", "existing"],
+    inputs: ["codex-key", memoryPath],
+    secrets: [secret],
+    confirms: [false, false, true],
+  });
+  const installed = await runInstaller({
+    residentId,
+    dataDir: directory,
+    controller: new InstallerController(store),
+    store,
+    prompt,
+    oauth: noOAuth,
+    memoryLibraries: new FileMemoryLibrary(),
+  });
+  if (installed.status !== "committed") throw new Error("installer did not commit");
+  prompt.expectExhausted();
+  expect(store.loadCurrentConfig()?.residentId).toBe(residentId);
+  expect(store.readCredentialSecret("codex-key")).toBe(secret);
+  const currentBefore = readFileSync(join(directory, "current.json"), "utf8");
+  const configPath = join(directory, "snapshots", installed.receipt.snapshotId, "config.json");
+  const configBefore = readFileSync(configPath, "utf8");
+
+  const credentialsDir = join(directory, "credentials");
+  const residentsDir = join(directory, "residents");
+  const identitiesDir = join(directory, "identities");
+  const streamPath = join(directory, "streams", `${residentId}.stream.json`);
+
+  const runCli = (reference: string) =>
+    spawnSync(
+      process.execPath,
+      [
+        "--import",
+        "tsx",
+        fileURLToPath(new URL("../src/resident-runtime/cli.ts", import.meta.url)),
+        "--resident",
+        reference,
+        "--data-dir",
+        directory,
+      ],
+      {
+        input: "hello-from-installer\n/exit\n",
+        encoding: "utf8",
+        env: { ...process.env, MIST_RESIDENT_RUNTIME_TRANSPORT: "synthetic" },
+        timeout: 15_000,
+      },
+    );
+
+  // —— 第一段：真实安装后的状态，不创建、不自签任何 candidate ——
+  // 安装器只提交 config/current.json/快照，不做 D22 住户自认（#182）。真实负例必须
+  // 证明「安装提交本身没有激活住户」：CLI 以真实 residentId 启动，身份闸 resident-not-found。
+  const beforeActivation = runCli(residentId);
+  expect(beforeActivation.error).toBeUndefined();
+  expect(beforeActivation.status, beforeActivation.stderr).toBe(1);
+  expect(beforeActivation.stderr).toContain("resident-not-found");
+  expect(beforeActivation.stderr).toContain("处理建议：");
+  expect(beforeActivation.stderr).toContain("persona candidate");
+  // 身份账未被安装器或 CLI 自动创建 resident：residents/ 为空，身份注册表里没有住户。
+  // （CLI 构造运行时会在 identities/ 下建目录，但空账不等于「已激活住户」。）
+  expect(readdirSync(residentsDir)).toEqual([]);
+  const registryPath = join(identitiesDir, "registry.json");
+  if (existsSync(registryPath)) {
+    expect(readFileSync(registryPath, "utf8")).not.toContain(residentId);
+  }
+  // runtime 凭证面缺席：安装的凭证没有被复制进门；无流、无模型回声。
+  expect(existsSync(join(credentialsDir, "manifest.json"))).toBe(false);
+  expect(readdirSync(join(credentialsDir, "secrets"))).toEqual([]);
+  expect(existsSync(streamPath)).toBe(false);
+  expect(beforeActivation.stdout).not.toContain("合成回声已读来信。");
+  expect(beforeActivation.stdout + beforeActivation.stderr).not.toContain(secret);
+  // 安装负例：原 config/snapshot/secret 字节保持。
+  expect(readFileSync(join(directory, "current.json"), "utf8")).toBe(currentBefore);
+  expect(readFileSync(configPath, "utf8")).toBe(configBefore);
+  expect(store.readCredentialSecret("codex-key")).toBe(secret);
+
+  // —— 第二段：显式 synthetic self-attestation 后走 candidateId 到 credential-missing ——
+  // 明确造一个 accepted candidate 把住户推过身份闸，才能确实到达 credential-missing
+  // 分支——否则只会停在 resident-not-found，测不到 runtime 凭证面的诊断。
+  const { candidateId } = activateSyntheticResident(directory, residentId);
+  // 落盘档案由 runtime 构造时从身份账 materialize；先建一次拿基线字节。
+  const seed = new ResidentRuntime({ dataDir: directory });
+  await seed.close();
+  const roomBefore = readFileSync(join(directory, "residents", `${residentId}.json`), "utf8");
+
+  // Prompt IO is scripted, but commit, storage and the fresh CLI process are production paths.
+  const child = runCli(candidateId); // CLI 边界 resolve 一次；runtime 只认 canonical residentId。
+  expect(child.error).toBeUndefined();
+  expect(child.status, child.stderr).toBe(0);
+  expect(child.stdout).toContain("credential-missing");
+  expect(child.stdout).toContain("尚未接到");
+  expect(child.stdout).toContain("重复运行 setup");
+  expect(child.stdout).not.toContain("安装器 npm run setup，或 provisionChannel");
+  expect(child.stdout + child.stderr).not.toContain(secret);
+  expect(child.stdout).not.toContain("合成回声已读来信。");
+  // 安装负例：凭证面未被安装快照复制或自签。
+  expect(existsSync(join(credentialsDir, "manifest.json"))).toBe(false);
+  expect(readdirSync(join(credentialsDir, "secrets"))).toEqual([]);
+  // 第二段只物化这次显式自认的同一户：档案字节稳定；认证账装配可另建同户 .facts.json。
+  // 账文件不是第二位住户，不应把 room+账的合法物化误判为自动激活；其他文件仍拒绝。
+  expect(readdirSync(residentsDir).filter((file) => file !== `${residentId}.facts.json`)).toEqual([
+    `${residentId}.json`,
+  ]);
+  expect(readFileSync(join(residentsDir, `${residentId}.json`), "utf8")).toBe(roomBefore);
+  // 身份闸真在跑：candidateId 不是 runtime 别名，runtime 只认 canonical residentId。
+  const identities = new ResidentIdentityStore({ dataDir: identitiesDir });
+  expect(identities.requireResident(candidateId).ok).toBe(false);
+  expect(identities.requireResident(residentId)).toMatchObject({
+    ok: true,
+    value: { residentId },
+  });
+  expect(existsSync(streamPath)).toBe(false);
+  // 安装负例：原 config/snapshot/secret 字节保持。
+  expect(readFileSync(join(directory, "current.json"), "utf8")).toBe(currentBefore);
+  expect(readFileSync(configPath, "utf8")).toBe(configBefore);
+  expect(store.readCredentialSecret("codex-key")).toBe(secret);
 });

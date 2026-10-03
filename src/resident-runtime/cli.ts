@@ -2,9 +2,31 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
+import type { ResidentIdentityFailureReason } from "../resident-continuity/identity-store.ts";
 import { CredentialStore } from "./credentials.ts";
 import { ResidentRuntime } from "./runtime.ts";
 import { ResidentChatTui } from "./tui.ts";
+
+/** 身份闸拒绝在终端边界的人话 message：保持与 runtime identityFailure 同一口径。 */
+function identityFailureMessage(
+  reason: ResidentIdentityFailureReason,
+  referenceId: string,
+): string {
+  if (reason === "candidate-pending") return `候选住户尚未自认：${referenceId}`;
+  if (reason === "candidate-rejected") return `候选住户已拒绝这份人格：${referenceId}`;
+  return `没有 active resident：${referenceId}`;
+}
+
+/** 可操作 remedy；pending/rejected/missing 各给一条，不把三种塌成一句。 */
+function identityFailureRemedy(reason: ResidentIdentityFailureReason): string {
+  if (reason === "candidate-pending") {
+    return "先完成这位 candidate 的 self-attestation；接受后再用返回的 residentId 进入运行时";
+  }
+  if (reason === "candidate-rejected") {
+    return "停止普通聊天入口；如要重提，创建新的 persona candidate 并重新自认";
+  }
+  return "先创建 persona candidate，并由 candidate 本人接受后使用返回的 residentId（入住流程见 #182）";
+}
 
 interface ResidentCliOptions {
   readonly residentId: string;
@@ -51,8 +73,23 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 
   const runtime = new ResidentRuntime({ dataDir: options.dataDir });
   try {
+    // CLI 是宿主边界：candidateId 只在这里 resolve 一次，之后一律用 canonical
+    // residentId。身份闸（D22 / #182）先于凭证面成立——安装器只保存了配置，没有
+    // 住户自认，所以没有 active 住户时按 reason 机器可分地拒绝，不假装凭证问题：
+    // candidate-pending / candidate-rejected / resident-not-found 三码各自成对。
+    // 不 throw 崩溃：把 code/message/remedy 写进 stderr 后 return exitCode=1。
     const active = runtime.requireActiveResident(options.residentId);
-    if (!active.ok) throw new Error(active.reason);
+    if (!active.ok) {
+      const failure = {
+        code: active.reason,
+        message: identityFailureMessage(active.reason, options.residentId),
+        remedy: identityFailureRemedy(active.reason),
+        residentId: options.residentId,
+      };
+      process.stderr.write(`${failure.code}：${failure.message}\n处理建议：${failure.remedy}\n`);
+      process.exitCode = 1;
+      return;
+    }
     const residentId = active.value.residentId;
     const credential = new CredentialStore(join(options.dataDir, "credentials")).find(residentId);
     const tui = new ResidentChatTui(runtime, {

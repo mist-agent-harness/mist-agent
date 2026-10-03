@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 /**
  * #194 住户运行时的单元测试：测试跟着功能走（仓规六）。
  *
@@ -17,6 +18,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   BootPackView,
@@ -403,7 +405,175 @@ describe("#182 入住读闸", () => {
   });
 });
 
+describe("#182 CLI 入住边界（真实 CLI 子进程）", () => {
+  const cliPath = fileURLToPath(new URL("../src/resident-runtime/cli.ts", import.meta.url));
+
+  function runCli(dataDir: string, reference: string) {
+    return spawnSync(
+      process.execPath,
+      ["--import", "tsx", cliPath, "--resident", reference, "--data-dir", dataDir],
+      {
+        input: "hello\n/exit\n",
+        encoding: "utf8",
+        env: { ...process.env, MIST_RESIDENT_RUNTIME_TRANSPORT: "synthetic" },
+        timeout: 15_000,
+      },
+    );
+  }
+
+  it("pending candidate：CLI 报 candidate-pending 与本人自认建议，不自动接受、不造 room", () => {
+    const dataDir = tempDir();
+    const identities = new ResidentIdentityStore({ dataDir: join(dataDir, "identities") });
+    const candidate = identities.createCandidate({
+      persona: "persona:pending-cli",
+      proposedBy: { kind: "installer", id: "cli-boundary-test" },
+      residentId: "resident-pending-cli",
+    });
+    const child = runCli(dataDir, candidate.candidateId);
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(1);
+    expect(child.stderr).toContain("candidate-pending");
+    expect(child.stderr).toContain("self-attestation");
+    expect(child.stderr).toContain("处理建议：");
+    expect(child.stderr).not.toContain("没有 active resident");
+    // 不自动接受：candidate 仍 pending，未落 resident，未 materialize room。
+    expect(
+      new ResidentIdentityStore({ dataDir: join(dataDir, "identities") }).readCandidate(
+        candidate.candidateId,
+      ).state,
+    ).toBe("inactive");
+    expect(existsSync(join(dataDir, "residents", "resident-pending-cli.json"))).toBe(false);
+    // 不复制凭证、不落流。
+    expect(existsSync(join(dataDir, "credentials", "manifest.json"))).toBe(false);
+    expect(existsSync(join(dataDir, "streams", "resident-pending-cli.stream.json"))).toBe(false);
+  });
+
+  it("rejected candidate：CLI 报 candidate-rejected 与重提建议，不自动接受、不造 room", () => {
+    const dataDir = tempDir();
+    const identities = new ResidentIdentityStore({ dataDir: join(dataDir, "identities") });
+    const candidate = identities.createCandidate({
+      persona: "persona:rejected-cli",
+      proposedBy: { kind: "installer", id: "cli-boundary-test" },
+      residentId: "resident-rejected-cli",
+    });
+    identities.attestCandidate(
+      candidate.candidateId,
+      { kind: "candidate", candidateId: candidate.candidateId },
+      "rejected",
+    );
+    const child = runCli(dataDir, candidate.candidateId);
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(1);
+    expect(child.stderr).toContain("candidate-rejected");
+    expect(child.stderr).toContain("新的 persona candidate");
+    expect(
+      new ResidentIdentityStore({ dataDir: join(dataDir, "identities") }).readCandidate(
+        candidate.candidateId,
+      ).state,
+    ).toBe("rejected");
+    expect(existsSync(join(dataDir, "residents", "resident-rejected-cli.json"))).toBe(false);
+    expect(existsSync(join(dataDir, "credentials", "manifest.json"))).toBe(false);
+    expect(existsSync(join(dataDir, "streams", "resident-rejected-cli.stream.json"))).toBe(false);
+  });
+});
+
 describe("评审意见修复（wusaki0723 复审：幂等重试 / 凭证读取边界 / fail-closed 读）", () => {
+  it("ready 清单但密钥文件缺失：结构化拒绝且提示宿主修复，不把用户送回 setup", async () => {
+    const dataDir = tempDir();
+    let calls = 0;
+    const runtime = new ResidentRuntime({
+      dataDir,
+      transport: {
+        async *complete() {
+          calls += 1;
+          yield "不该发生的回复";
+        },
+      },
+    });
+    try {
+      runtimeProvision(runtime, "r-secret-missing");
+      const root = join(dataDir, "credentials");
+      const credentials = new CredentialStore(root);
+      const record = credentials.find("r-secret-missing");
+      expect(record?.status).toBe("ready");
+      if (record === null) throw new Error("fixture 没有配好凭证");
+      const manifest = readFileSync(join(root, "manifest.json"), "utf8");
+      const secretPath = join(
+        root,
+        "secrets",
+        `${record.credentialRef.slice("mist-cred:".length)}.key`,
+      );
+      rmSync(secretPath);
+
+      const result = await runtime.say({ residentId: "r-secret-missing", text: "试读" });
+      expect(failureOf(result).code).toBe("credential-invalid");
+      expect(failureOf(result).remedy).toContain("provisionChannel");
+      expect(failureOf(result).remedy).toContain("重复 setup 不会修复");
+      expect(calls).toBe(0);
+      expect(failureOf(runtime.readStream({ residentId: "r-secret-missing" })).code).toBe(
+        "stream-not-found",
+      );
+      expect(readFileSync(join(root, "manifest.json"), "utf8")).toBe(manifest);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("各缺住户读口与触发线入口给出同一入住边界，不声称 setup 会建人", async () => {
+    const runtime = new ResidentRuntime({ dataDir: tempDir() });
+    try {
+      const results: Result<unknown>[] = [
+        runtime.bootPack({ residentId: "r-absent" }),
+        runtime.setBreathThreshold({
+          residentId: "r-absent",
+          windowId: "w-absent",
+          generation: 1,
+          thresholdTokens: 10,
+          authority: "owner",
+        }),
+        runtime.letterTimeline({ residentId: "r-absent" }),
+      ];
+      for (const result of results) {
+        expect(failureOf(result).code).toBe("resident-not-found");
+        expect(failureOf(result).remedy).toContain("不代替 D22 住户自认");
+      }
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("synthetic accepted candidate 到达 credential-missing：身份闸不把安装负例挡在闸外", async () => {
+    // 正对照先行：没有任何凭证的 active 住户，say 必须走到 credential-missing，
+    // 而不是被身份闸的 resident-not-found 提前挡住——否则 credential-missing /
+    // secret-read 这些诊断分支根本没机会发生，是一盏断言空转的假绿灯。
+    const dataDir = tempDir();
+    let calls = 0;
+    const runtime = new ResidentRuntime({
+      dataDir,
+      transport: {
+        async *complete() {
+          calls += 1;
+          yield "不该发生的回复";
+        },
+      },
+    });
+    try {
+      activateResident(runtime, "r-install-boundary");
+      expect(runtime.requireActiveResident("r-install-boundary").ok).toBe(true);
+      const missing = await runtime.say({ residentId: "r-install-boundary", text: "试读" });
+      expect(failureOf(missing).code).toBe("credential-missing");
+      expect(failureOf(missing).remedy).toContain("尚未接到");
+      expect(failureOf(missing).remedy).toContain("重复运行 setup");
+      // 失败不伪造回复、不落账。
+      expect(calls).toBe(0);
+      expect(failureOf(runtime.readStream({ residentId: "r-install-boundary" })).code).toBe(
+        "stream-not-found",
+      );
+    } finally {
+      await runtime.close();
+    }
+  });
+
   it("同一 turnId 重试幂等：不写重复；不同 turnId 是独立回合（意见 1）", async () => {
     const runtime = new ResidentRuntime({ dataDir: tempDir() });
     try {

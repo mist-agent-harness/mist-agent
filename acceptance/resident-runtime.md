@@ -12,6 +12,35 @@ npm run acceptance:resident-runtime
 npm run acceptance:resident-runtime:strict
 ```
 
+## 安装快照与 runtime 的边界
+
+RT-01 的 `provisionChannel()` 正对照直接准备 runtime 住户和凭证，不经过安装器正式
+提交，不能证明 `npm run setup → npm run resident` 已接通。当前安装器提交
+`current.json → snapshots/<install-id>/config.json` 与专属私有凭证；runtime 使用
+`credentials/` 与 `residents/`，缺凭证时不能再把用户送回 setup 当成修复办法。
+
+`tests/installer-run.test.ts` 用 scripted PromptPort 驱动真实 `runInstaller()` 完成正式
+提交，再从相同临时数据根启动独立 CLI 进程，分两道边界验证：**第一段真实负例**——
+不创建、不自签任何 candidate，CLI 以真实 residentId 启动，退出码 1、stderr 报
+`resident-not-found` 及处理建议，identity registry 未被自动创建 resident、`residents/`
+为空、runtime 凭证清单缺席、无流、无模型回声，安装快照与原凭证字节保持；**第二段诊断
+正对照**——显式构造一个 synthetic accepted candidate 把住户推过身份闸，CLI 以 candidateId
+启动才能确实到达 `credential-missing` 分支（否则只会停在 `resident-not-found`，测不到要
+看的诊断），同时复核没有复制凭证、没有伪造回复、原字节仍保持。身份闸（D22 / #182）先于
+凭证面成立；CLI 从 candidateId 在边界 resolve 一次，运行时只认 canonical residentId。
+模型传输仅 synthetic，无真实用户数据。身份闸的 pending/rejected 两码与「不自动接受、
+不造 room、不复制凭证、无流」的 CLI 回归钉在 `tests/resident-runtime.test.ts`。
+
+`tests/resident-runtime.test.ts` 另覆盖 ready 清单引用的密钥文件缺失：返回
+`credential-invalid`，给出 runtime 私有凭证修复建议，模型零调用、一窗流不写入、
+清单不变；启动包、触发线和信时间线的缺住户入口同样说明 D22 入住边界。
+
+这项交付修正诊断与证据边界，不宣称完成安装交接。完整接线需补 committed config 的
+模型/provider 选择，以及 [D22 入住实现](resident-continuity.md) 的住户自认激活路径；
+不能用 `provisionChannel()` 自动生成档案替代该权威。接线实现后，需按新入口更新本段
+未接线断言，并新增激活成功到聊天的端到端正对照，保留不代签与不泄露的负例。
+原 RT 判据与未勾独立复验状态不变。
+
 ## 路线选边（#194 要求开工第一步说清楚）
 
 **走「mist 当宿主，pi 当零件库」**，不走「在 pi 上改造、以 pi 扩展形式跑」。

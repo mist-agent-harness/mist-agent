@@ -90,6 +90,26 @@ mist 是一个个人 agent harness（还在图纸阶段）。它的设计从一�
 
 全量版带代价和推论，见 `docs/principles.md`。
 
+## 安装状态与终端入口的边界
+
+`npm run setup -- --resident <residentId> --data-dir <dataDir>` 保存安装器配置与私有凭证，
+通过 `current.json` 指向安装快照。`npm run resident -- --resident <residentId> --data-dir <dataDir>`
+读取另一个 runtime 凭证面与住户档案；当前尚未消费安装快照。因此 setup 成功后，
+即使使用同一个数据根，终端仍不能据此直接开始对话，重复 setup 也不会补齐 runtime 状态。
+
+runtime 会明确显示这条边界，保留 `credential-missing` / `credential-invalid` /
+`resident-not-found` 的机器区分。已有宿主嵌入路径可通过 `provisionChannel()` 显式配置模型
+和通道；这不是终端首次入住的替代流程。完整交接还需接入 D22 的住户自认（[#182](https://github.com/mist-agent-harness/mist-agent/issues/182)）
+与明确的模型/provider 路由；安装器不能自动激活默认身份。隔离复现和验证范围见
+[resident-runtime 安装边界](acceptance/resident-runtime.md#安装快照与-runtime-的边界)。
+
+终端还会先过 D22 住户自认这道身份闸：`--resident` 接受 candidateId 并在 CLI 边界
+resolve 一次，运行时只认 canonical residentId。身份闸按原因机器可分地拒绝，各给一条
+处理建议，不冒充 `credential-*`，也不在终端里替住户建人：`candidate-pending`（候选
+尚未自认——引导本人完成 self-attestation）、`candidate-rejected`（候选拒了这份人格
+——引导新建 persona candidate 重提）、`resident-not-found`（查无此住户——引导创建
+persona candidate）。三种都以退出码 1 结束，不崩溃。
+
 ## License
 
 AGPL-3.0。你在网络上向别人提供基于 mist 的服务，也必须开源你的修改。
