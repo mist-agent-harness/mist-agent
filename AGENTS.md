@@ -18,6 +18,16 @@
 - 类型严格（tsconfig strict）。不许用 `any` 把类型系统糊弄过去，宁可来问。
 - 测试跟着功能走，新功能没有测试的 PR 会被打回。
 
+## 运行时恢复的真源
+
+- 正文与原交付 target 归 `src/resident-runtime/runtime.ts` 写入的 canonical assistant 事件；
+  `src/resident-runtime/turn-receipts.ts` 只在真实 ACK 后记录确认元数据，不复制回复或复活旧 authority。
+- 认证回合不能仅凭两条正文、当前 latestSeq 或新代 baseline 宣称完成。缺确认与跨代孤立 user
+  在模型调用前报 `reconciliation-needed`；兼容边界与代价见
+  [回合恢复补充回归](acceptance/resident-runtime.md#回合恢复补充回归)。
+- 改动 `say()`、账确认或 TUI 重试时跑 `tests/resident-turn-recovery.test.ts`、
+  `tests/resident-tui.test.ts`、`tests/resident-runtime-host-boundary.test.ts`，并同步该说明与 README。
+
 ## 写文档的规矩
 
 - 「实证」二字只给验收清单跑出来的东西用。读过源码 ≠ 验过。

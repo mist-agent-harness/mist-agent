@@ -121,7 +121,7 @@ class ResidentRuntimeProductionDriver implements ResidentRuntimeDriver {
 
   // —— 对话往返 ——
 
-  say(input: { residentId: string; text: string }): Promise<Result<TurnResult>> {
+  say(input: { residentId: string; text: string; turnId?: string }): Promise<Result<TurnResult>> {
     return this.#ensureActiveResident(input.residentId).then(() => this.#call("say", { input }));
   }
 

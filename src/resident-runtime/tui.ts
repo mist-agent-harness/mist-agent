@@ -4,6 +4,7 @@
  * 只画一条主流，不维护会话列表；增量直接取自 ResidentRuntime.say() 的模型流，
  * 不把最终回复切片伪装成流式输出。终端 CLI 与宿主验收脚本共用本控制器。
  */
+import { randomUUID } from "node:crypto";
 import type {
   BreathTrigger,
   BreatheOutcome,
@@ -19,6 +20,8 @@ export interface ChatTurnPort {
   say(input: {
     readonly residentId: string;
     readonly text: string;
+    /** 显式重试复用原锚与原文；普通提交使用新锚。 */
+    readonly turnId?: string;
     readonly onChunk?: (chunk: string) => void;
   }): Promise<Result<TurnResult>>;
   /**
@@ -54,6 +57,11 @@ export class ResidentChatTui {
   #errorText: string | null = null;
   #frameClock = 0;
   #started = false;
+  #failedTurn: {
+    readonly turnId: string;
+    readonly text: string;
+    readonly messageIndex: number;
+  } | null = null;
 
   constructor(runtime: ChatTurnPort, options: ResidentChatTuiOptions) {
     this.#runtime = runtime;
@@ -69,10 +77,38 @@ export class ResidentChatTui {
   }
 
   async submit(text: string): Promise<Result<TurnResult>> {
+    return this.#turn(text, randomUUID());
+  }
+
+  /**
+   * 显式重试：复用上一次失败回合的 turnId 与原文，不把重试当新回合。
+   * 没有可重试的失败回合时如实报 `tui-unavailable`，不静默变成普通提交。
+   */
+  async retry(): Promise<Result<TurnResult>> {
+    const failed = this.#failedTurn;
+    if (failed === null) {
+      this.start();
+      this.#errorText =
+        "tui-unavailable：没有可重试的失败回合\n处理建议：先发一条消息；只有失败的回合才需要重试";
+      this.#draw();
+      return {
+        ok: false,
+        error: {
+          code: "tui-unavailable",
+          message: "没有可重试的失败回合",
+          remedy: "先发一条消息；只有失败的回合才需要重试",
+          residentId: this.#residentId,
+        },
+      };
+    }
+    return this.#turn(failed.text, failed.turnId, failed.messageIndex);
+  }
+
+  async #turn(text: string, turnId: string, previousIndex?: number): Promise<Result<TurnResult>> {
     this.start();
     this.#errorText = null;
-    const messageIndex = this.#messages.length;
-    this.#messages.push(`你：${text}\n住户：`);
+    const messageIndex = previousIndex ?? this.#messages.length;
+    this.#messages[messageIndex] = `你：${text}\n住户：`;
     this.#draw();
 
     let streamedReply = "";
@@ -81,6 +117,7 @@ export class ResidentChatTui {
       result = await this.#runtime.say({
         residentId: this.#residentId,
         text,
+        turnId,
         onChunk: (chunk) => {
           if (chunk.length === 0) return;
           streamedReply += chunk;
@@ -95,6 +132,7 @@ export class ResidentChatTui {
         ok: false,
         error: {
           code: "tui-unavailable",
+          turnId,
           message: `终端回合失败：${message}`,
           remedy: "检查住户运行时与终端输出后重试",
           residentId: this.#residentId,
@@ -103,12 +141,14 @@ export class ResidentChatTui {
     }
 
     if (!result.ok) {
+      this.#failedTurn = { turnId: result.error.turnId ?? turnId, text, messageIndex };
       this.#errorText = `${result.error.code}：${result.error.message}\n处理建议：${result.error.remedy}`;
       this.#messages[messageIndex] = `你：${text}\n[错误]\n${this.#errorText}`;
       this.#draw();
       return result;
     }
 
+    this.#failedTurn = null;
     this.#model = result.value.model;
     if (streamedReply.length === 0) {
       // 幂等回放没有重新调用模型，准确显示已落账结果，但不虚报增量数量。
@@ -119,11 +159,13 @@ export class ResidentChatTui {
         ok: false,
         error: {
           code: "tui-unavailable",
+          turnId: result.value.turnId,
           message: "终端收到的流式片段与已落账回复不一致",
           remedy: "检查模型传输增量与回合最终结果的一致性",
           residentId: this.#residentId,
         },
       };
+      this.#failedTurn = { turnId: result.value.turnId, text, messageIndex };
       this.#errorText = `${mismatch.error.code}：${mismatch.error.message}\n处理建议：${mismatch.error.remedy}`;
       this.#messages[messageIndex] = `你：${text}\n[错误]\n${this.#errorText}`;
       this.#draw();
@@ -235,6 +277,10 @@ export async function runResidentTuiScript(
     for (const step of input.script) {
       if (step.kind === "breakChannel") {
         runtime.revokeCredential({ residentId: input.residentId });
+        continue;
+      }
+      if (step.kind === "retry") {
+        await tui.retry();
         continue;
       }
       await tui.submit(step.text);

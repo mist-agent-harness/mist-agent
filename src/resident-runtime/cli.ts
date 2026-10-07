@@ -43,6 +43,11 @@ interface ResidentCliOptions {
  */
 export type ResidentCliInput =
   | { readonly kind: "exit" }
+  /**
+   * 显式重试：复用上一条失败回合的锚与原文，不是「同文本再发一遍」。
+   * 普通输入（含与失败回合同文本）照常是**新回合**。
+   */
+  | { readonly kind: "retry" }
   | { readonly kind: "breathe"; readonly via: BreathTrigger }
   | { readonly kind: "chat"; readonly text: string };
 
@@ -53,6 +58,7 @@ export type ResidentCliInput =
  */
 export function parseResidentCliInput(line: string): ResidentCliInput {
   if (line.trim() === "/exit") return { kind: "exit" };
+  if (line.trim() === "/retry") return { kind: "retry" };
   const trigger = parseManualBreath(line);
   if (trigger !== null && trigger.command !== null) {
     return { kind: "breathe", via: trigger.command.slice(1) as BreathTrigger };
@@ -100,6 +106,7 @@ export async function main(
     process.stdout.write(
       "Type /new, /clear or /compact to breathe (commit a handover letter, start a new generation).\n",
     );
+    process.stdout.write("Type /retry to retry the last failed turn under its original anchor.\n");
     return;
   }
 
@@ -156,6 +163,9 @@ export async function main(
         if (command.kind === "breathe") {
           // 换气命令不是发言：走 D8 的统一流程，绝不落进 say()。
           await tui.breathe(command.via);
+        } else if (command.kind === "retry") {
+          // 显式重试：复用失败回合的锚与原文，不落成新回合。
+          await tui.retry();
         } else {
           await tui.submit(command.text);
         }

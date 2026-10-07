@@ -49,6 +49,13 @@ mist 是一个个人 agent harness（建造中）。它的设计从一句话长�
 模型回复成功落流后、换代前确认（ack）；通道或落流失败不确认、缺口下轮重拉。装配口径见
 [docs/runtime-config.md](docs/runtime-config.md)。
 
+`say()` 成功与失败都返回本回合的 `turnId`；宿主保存它和原文，显式重试时原样带回。
+认证回合的完成必须有原交付的耐久确认依据，两条正文齐全还不够。回复已落流而 ACK
+或确认记录失败时，原回复保留；同锚重试报 `reconciliation-needed`，不再调用模型。
+同一 scope/window/generation 的后续真实交付覆盖原 target 后，才可回放原回复；新代登记的
+baseline 不能替旧回合确认。完整行为与旧数据边界见
+[回合恢复补充回归](acceptance/resident-runtime.md#回合恢复补充回归)。
+
 换代后的模型请求随启动包携带该住户最新的交接信，pi 通道的 system prompt 保留标题、
 署名、写信时间和 commitment / fact / judgment 分档原文。没有信时照常对话；信档无法
 解析或条目结构无法读出时，在调用模型前报 `letter-invalid`。旧代原始对话保留在流水里，
@@ -98,7 +105,9 @@ npm run resident -- --resident <residentId> --data-dir <dataDir>
 在聊天框输入 `/new`、`/clear` 或 `/compact`，都会请求现役 `breathe` 流程：
 先封缄并落盘交接信，再开始下一代；三个命令保留同一窗号和旧流水，不清空历史。
 命令本身不作为用户消息发给模型。成功时显示代际和信标题；失败时显示错误与处理建议，
-仍可继续输入普通文本。`/exit` 退出，Ctrl+C 关闭进程。
+仍可继续输入普通文本。`/retry` 复用当前 TUI 最近失败回合的锚、原文和显示行；没有失败
+回合时显示错误。普通输入同一句话仍是新回合。这个重试入口只记当前 TUI 的失败锚，
+跨进程恢复由宿主保存的 `turnId` 发起。`/exit` 退出，Ctrl+C 关闭进程。
 
 这条接线不代表出信已满足全部 D8 语义：现役生成器对已有承诺缺 `ledgerSeq` 时会拒绝换代，
 固定模板的 intent 也不构成当刻亲笔的证据。真实 CLI 输入回归与底层判卷边界见

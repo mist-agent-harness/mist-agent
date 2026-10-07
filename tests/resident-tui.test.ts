@@ -18,6 +18,7 @@ const turn: TurnResult = {
   generation: 1,
   reply: "第一段第二段",
   streamed: true,
+  turnId: "test-turn",
 };
 
 describe("ResidentChatTui", () => {
@@ -147,6 +148,10 @@ describe("resident CLI arguments", () => {
 });
 
 describe("resident CLI input dispatch", () => {
+  it("dispatches explicit retry while ordinary same-text input remains chat", () => {
+    expect(parseResidentCliInput("  /retry  ")).toEqual({ kind: "retry" });
+    expect(parseResidentCliInput("/retrying")).toEqual({ kind: "chat", text: "/retrying" });
+  });
   it("maps the three lifecycle commands to the same breathe kind with their own via", () => {
     expect(parseResidentCliInput("/new")).toEqual({ kind: "breathe", via: "new" });
     expect(parseResidentCliInput("/clear")).toEqual({ kind: "breathe", via: "clear" });
@@ -171,6 +176,36 @@ describe("resident CLI input dispatch", () => {
   });
 });
 describe("resident CLI", () => {
+  it("real /retry keeps the failed turn anchor without appending another pair", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "mist-cli-retry-"));
+    const residentId = "r-cli-retry";
+    try {
+      await provisionSyntheticResident({ dataDir, residentId });
+      mkdirSync(join(dataDir, "turns", `${residentId}.turns.json.tmp`));
+      const result = await spawnResidentCli({
+        residentId,
+        dataDir,
+        stdin: "same message\n/retry\n/retry\nsame message\n/exit\n",
+      });
+      expect(result.code, result.error).toBe(0);
+      expect(result.output).toContain("writer-unavailable");
+      expect(result.output).toContain("reconciliation-needed");
+      const persisted = JSON.parse(
+        readFileSync(join(dataDir, "streams", `${residentId}.stream.json`), "utf8"),
+      ) as {
+        events: { payload: { role: string; text: string; turnId: string } }[];
+      };
+      expect(persisted.events).toHaveLength(4);
+      expect(
+        persisted.events
+          .filter((event) => event.payload.role === "user")
+          .map((event) => event.payload.text),
+      ).toEqual(["same message", "same message"]);
+      expect(new Set(persisted.events.map((event) => event.payload.turnId)).size).toBe(2);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
   it("runs an interactive round trip with stdin text outside argv", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "mist-resident-cli-test-"));
     const residentId = "resident-cli-test";

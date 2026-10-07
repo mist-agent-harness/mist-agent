@@ -115,11 +115,51 @@ npm test -- tests/resident-runtime.test.ts tests/pi-transport.test.ts
 及短引用，旧字符串承诺仍 fail-closed 拒绝。上述检查证明已有信被送入模型，
 不判信的内容质量，也不替代 D8「当刻亲笔」的语义核对或正式独立验收落章。
 
+## 回合恢复补充回归
+
+`say({ residentId, text, turnId? })` 成功返回 `value.turnId`，结构化失败返回 `error.turnId`。
+省略时由 runtime 分配；同回合重试必须带原锚与原文，复用锚却换文本仍报
+`turn-id-conflict`。已完成回合回放原 assistant 的 reply/model/generation/streamed，
+不新调模型、不新写 user/assistant。
+
+认证回合按顺序写两条正文、消费 SessionRegistry 的真实 settlement、提交 FactLedger ACK，
+最后发布耐久确认元数据。assistant 的 `ledgerDelivery` 保存原 resident/scope/window/generation、
+dispatchId 与 targetSeq；`turns/<residentId>.turns.json` 只保存确认元数据和原 assistant 指针，
+不复制对话或事实正文，不恢复旧 dispatch authority。原确认回执或**后续**同身份的真实交付
+回执覆盖原 target，才允许成功回放。当前 latestSeq、登记 baseline 或更早的回执都不能代替它。
+新增目录纳入 `secretScan()` 的按户扫描，凭证仍只落专属私有凭证面。
+
+ACK 或确认记录写失败时保留真实正文与已经发生的 ACK，并返回 `writer-unavailable`。
+此后同锚重试在模型调用前返回 `reconciliation-needed`，直到有合法确认依据；它不重开
+已落流回复，也不尝试消费失效的旧回执。修好落盘后，同代后续正常交付可以覆盖原 target；
+跨代未确认回合须宿主协调，新代 baseline 不补确认。
+
+只有 user 腿耐久时，同窗同代修好 writer 后可以重新调用模型，去重 user 并补 assistant；
+原模型输出尚未耐久保存，因此不能保证回复逐字相同。重启、换气或猝死后若已跨窗/跨代，
+保留孤立 user，返回 `reconciliation-needed`，在模型调用前阻断，不冒写旧代。
+旧 assistant 缺少 `ledgerDelivery` 时，认证装配不能重建原交付身份，明确等待协调；
+无认证账的 legacy 嵌入继续按完整正文回放。新回合用 `ledgerDelivery: null` 明示创建时无认证交付，
+以后启用账也不会给它补造 ACK；已有认证 target 则不能通过关闭账选项降级成成功。
+
+代价：认证回合多一次本地原子写入与 fsync，确认文件故障会使已完成正文等待协调；
+恢复材料须随 runtime 数据一起保留。旧认证回合缺材料不会自动迁移或重算，跨代半回合
+本轮只准确阻断，不提供丢失输出的重建或宿主协调工具。
+
+```bash
+npm test -- tests/resident-turn-recovery.test.ts tests/resident-tui.test.ts tests/resident-runtime-host-boundary.test.ts
+```
+
+这些回归用临时目录与 synthetic transport，真实 `EISDIR` 落盘故障分别截断 assistant、
+ACK 和确认记录；同时检查模型调用次数、原 generation/target、最终流条数、回放字节。
+真实 CLI stdin 验证 `/retry` 与普通同文本提交，IPC 子进程验证返回锚、同锚回放与跨宿主
+重启的 pending 状态。它们是恢复补充证据，不替代 RT 七灯、真实 provider 或独立验收落章。
+
 ## 终端命令输入回归
 
 `tests/resident-tui.test.ts` 从真实 `src/resident-runtime/cli.ts` 子进程的 stdin 输入
 `/new`、`/clear`、`/compact`，观察落盘信、代际、同一窗号与主流正文；命令不得成为聊天
 回合。另注入信文件落盘失败，验证错误可见、代际未推进、拒绝后普通对话仍可进行。
+`/retry` 的恢复回归也从真实 stdin 进入：连续重试保留原回合，普通同文本输入仍落独立回合。
 空行、普通输入、`/exit` 与 SIGINT 的既有回归继续保留。
 
 这些测试用临时目录和 synthetic 通道：身份先由 synthetic candidate 本人显式自认，

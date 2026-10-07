@@ -358,6 +358,7 @@ class SyntheticDriver implements ResidentRuntimeDriver {
       generation: this.faults.generationZeroOrigin ? generationOfReply - 1 : generationOfReply,
       reply,
       streamed: true,
+      turnId: `synth-turn-${input.residentId}-${resident.events.length}`,
     });
   }
 
@@ -540,6 +541,15 @@ class SyntheticDriver implements ResidentRuntimeDriver {
       if (step.kind === "breakChannel") {
         broken = true;
         continue;
+      }
+      if (step.kind === "retry") {
+        // 恢复回归使用真实控制器；这个灯色对照只实现 RT-05 的原脚本。
+        return err(
+          "tui-unavailable",
+          "对照驱动不支持恢复脚本",
+          "使用真实 resident runtime 驱动",
+          input.residentId,
+        );
       }
       const said = await this.say({
         residentId: input.residentId,
