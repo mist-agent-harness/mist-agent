@@ -128,6 +128,12 @@ reason code 跨重启保留；重启不能把它洗成 ready。显式清理重�
 把 mist 的统一调用形状翻译给某个执行通道的插件。适配器只负责协议翻译和执行，
 不拥有住户身份、记忆或生命周期；通道可以换，住户不换。
 
+**前端投影决策（SurfaceProjection）**
+D31 adapter 根据 client capability claim 选择的 `native` / `degraded` / `blocked` 响应形态，
+关联本轮 canonical event 与缺失 capability。它是服务器采取哪种投影的事实，不能证明客户端
+实际渲染、用户已经看见或完成控制操作，也不是一窗流提交回执或 runtime readiness receipt。
+图纸与判卷目前是候选，见 [前端适配层](design/openai-compatible-frontend-adapter.md)。
+
 **用途车道（lane）**
 住户选择执行通道时的用途槽，例如 `primary`、`coding`。lane 值必须来自宿主 capability contract，
 并按大小写精确比较；未知、错拼、大小写不同或带空白的 lane 在绑定/dispatch 前返回

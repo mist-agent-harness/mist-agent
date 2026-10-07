@@ -30,7 +30,9 @@
     "acceptance:resident-runtime": "tsx acceptance/resident-runtime-run.ts",
     "acceptance:resident-runtime:strict": "tsx acceptance/resident-runtime-run.ts --strict",
     "acceptance:group-chat": "tsx acceptance/group-chat-run.ts",
-    "acceptance:group-chat:strict": "tsx acceptance/group-chat-run.ts --strict"
+    "acceptance:group-chat:strict": "tsx acceptance/group-chat-run.ts --strict",
+    "acceptance:frontend-adapter": "tsx acceptance/frontend-adapter-run.ts",
+    "acceptance:frontend-adapter:strict": "tsx acceptance/frontend-adapter-run.ts --strict"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",

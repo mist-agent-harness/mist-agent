@@ -75,6 +75,7 @@ mist 是一个个人 agent harness（建造中）。它的设计从一句话长�
 | 跑小机可读性合成维修评测 | [eval/resident-self-repair/](eval/resident-self-repair/)，C1～C4 runner 协议与证据边界 |
 | 查环境变量和运行时配置 | [docs/runtime-config.md](docs/runtime-config.md)，全项目唯一登记处 |
 | 跟住户说上话（终端入口） | `npm run resident -- --resident <id>`，见[终端住户运行时](#终端住户运行时194--d28) |
+| 看可选网页前端的候选契约（D31） | [adapter 图纸](docs/design/openai-compatible-frontend-adapter.md)与[七灯判卷](acceptance/frontend-adapter.md)；生产 endpoint 与 `/webui` 尚未实现，缺驱动仍为 0/7 |
 | 读或写产品代码 | `src/`（建造中），单元测试在 `tests/` |
 | 参与进来 | [CONTRIBUTING.md](CONTRIBUTING.md) |
 

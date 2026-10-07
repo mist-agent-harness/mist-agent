@@ -28,6 +28,7 @@ npm run acceptance:strict   # 验收模式：有一盏不绿就退出 1
 | Window history | [历史只读投影](window-history.md) | `acceptance:window-history` / `acceptance:window-history:strict` |
 | Resident runtime | [住户运行时](resident-runtime.md) | `acceptance:resident-runtime` / `acceptance:resident-runtime:strict` |
 | 群聊 v0 | [群聊判卷](group-chat.md) | `acceptance:group-chat` / `acceptance:group-chat:strict` |
+| 可选网页前端（D31，图纸候选） | [前端适配层判卷](frontend-adapter.md) | `acceptance:frontend-adapter` / `acceptance:frontend-adapter:strict`；缺生产 driver 为 0/7 |
 
 多 viewport 与 one-stream 的判据、复验记录分别见 [multi-viewport.md](multi-viewport.md)
 和 [one-stream.md](one-stream.md)，相关实现回归归 `npm test`。其余尚未列出独立 npm
