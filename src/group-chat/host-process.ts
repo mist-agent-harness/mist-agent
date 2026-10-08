@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { mkdirSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname } from "node:path";
 import {
   GroupChatAcceptanceAdmin,
   type GroupChatAcceptanceAdminCommand,
@@ -71,11 +74,19 @@ type HostResponse =
 const dataRoot = process.env.MIST_GROUP_CHAT_DATA_ROOT;
 if (typeof dataRoot !== "string" || dataRoot.trim() === "")
   throw new Error("MIST_GROUP_CHAT_DATA_ROOT must be set by the host launcher");
+const acceptanceDataRoot = dataRoot;
+const canonicalTempRoot = realpathSync(tmpdir());
+if (
+  realpathSync(acceptanceDataRoot) !== acceptanceDataRoot ||
+  dirname(acceptanceDataRoot) !== canonicalTempRoot ||
+  !basename(acceptanceDataRoot).startsWith("mist-group-chat-")
+)
+  throw new Error("acceptance host dataRoot must be its isolated temporary directory");
 if (typeof process.send !== "function")
   throw new Error("group-chat host must run with an IPC channel");
 
-const host = new RoomMessageHost(dataRoot);
-const acceptanceAdmin = new GroupChatAcceptanceAdmin(dataRoot, host);
+let host = new RoomMessageHost(acceptanceDataRoot);
+let acceptanceAdmin = new GroupChatAcceptanceAdmin(acceptanceDataRoot, host);
 
 process.on("message", (message: unknown) => {
   void handleMessage(message);
@@ -94,6 +105,7 @@ async function handleMessage(message: unknown): Promise<void> {
   try {
     switch (message.kind) {
       case "acceptance-admin":
+        if (message.command.kind === "reset") resetAcceptanceScenario();
         respond({
           id: message.id,
           ok: true,
@@ -236,6 +248,15 @@ async function handleMessage(message: unknown): Promise<void> {
       requestHash,
     });
   }
+}
+
+function resetAcceptanceScenario(): void {
+  acceptanceAdmin.close();
+  host.close();
+  rmSync(acceptanceDataRoot, { recursive: true, force: true });
+  mkdirSync(acceptanceDataRoot, { recursive: true });
+  host = new RoomMessageHost(acceptanceDataRoot);
+  acceptanceAdmin = new GroupChatAcceptanceAdmin(acceptanceDataRoot, host);
 }
 
 function respond(response: HostResponse, afterSend?: () => void): void {

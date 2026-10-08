@@ -3,6 +3,7 @@ import { realpathSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { runGroupChatCheck } from "../../acceptance/group-chat-checks.ts";
 import {
   type GroupChatCommand,
   type GroupChatHostDriver,
@@ -97,6 +98,19 @@ describe("group-chat acceptance host process", () => {
     const readback = await driver.readRoomEvents(fixture.roomId);
     expect(readback.map((event) => event.id)).toContain(direct.event.id);
     expect(readback.find((event) => event.id === direct.event.id)?.body).toBe("judge-direct-write");
+  });
+
+  it("starts each acceptance scenario with an empty store without replacing the host process", async () => {
+    driver = createGroupChatHostDriver();
+    const run = await driver.startHost();
+    dataRoot = run.dataRoot;
+
+    const first = await runGroupChatCheck("GC-09", driver);
+    const second = await runGroupChatCheck("GC-09", driver);
+
+    expect(first.passed).toBe(true);
+    expect(second.passed).toBe(true);
+    expect(ipcCaptures.map((capture) => capture.pid)).toEqual([run.pid]);
   });
 
   it("reads room, delivery, private, memory and stage ledgers over IPC after host restart", async () => {
