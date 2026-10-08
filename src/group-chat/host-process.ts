@@ -1,4 +1,11 @@
 import { createHash } from "node:crypto";
+import { mkdirSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname } from "node:path";
+import {
+  GroupChatAcceptanceAdmin,
+  type GroupChatAcceptanceAdminCommand,
+} from "./acceptance-admin.ts";
 import type {
   AuthenticatedPrincipal,
   RoomBindingGrant,
@@ -7,7 +14,7 @@ import type {
 import { RoomMessageHost } from "./room-message-host.ts";
 
 type HostRequestPayload =
-  | { readonly kind: "reset"; readonly grants: readonly RoomBindingGrant[] }
+  | { readonly kind: "acceptance-admin"; readonly command: GroupChatAcceptanceAdminCommand }
   | {
       readonly kind: "post";
       readonly principal: AuthenticatedPrincipal | null;
@@ -15,6 +22,32 @@ type HostRequestPayload =
     }
   | { readonly kind: "read-room-events"; readonly roomId?: string }
   | { readonly kind: "read-system-receipts" }
+  | { readonly kind: "read-resident-context"; readonly residentId: string }
+  | { readonly kind: "save-memory"; readonly residentId: string; readonly sourceEventId: string }
+  | {
+      readonly kind: "set-delivery-state";
+      readonly eventMarker: string;
+      readonly residentId: string;
+      readonly state: "loaded" | "queued" | "not-targeted";
+    }
+  | { readonly kind: "read-deliveries"; readonly eventId: string }
+  | { readonly kind: "register-resident"; readonly residentId: string }
+  | {
+      readonly kind: "exercise-roster-path";
+      readonly path: "broadcast" | "mention" | "projection" | "feedback" | "status";
+      readonly residentId: string;
+    }
+  | { readonly kind: "read-roster" }
+  | {
+      readonly kind: "read-roster-path";
+      readonly path: "broadcast" | "mention" | "projection" | "feedback" | "status";
+    }
+  | { readonly kind: "dispatch-event"; readonly eventMarker: string }
+  | { readonly kind: "commit-context"; readonly residentId: string; readonly marker: string }
+  | { readonly kind: "read-context-commits" }
+  | { readonly kind: "react"; readonly residentId: string; readonly eventMarker: string }
+  | { readonly kind: "read-reactions" }
+  | { readonly kind: "read-surface"; readonly roomId: string; readonly viewerId: string }
   | { readonly kind: "shutdown" };
 
 type HostRequest = HostRequestPayload & {
@@ -41,15 +74,27 @@ type HostResponse =
 const dataRoot = process.env.MIST_GROUP_CHAT_DATA_ROOT;
 if (typeof dataRoot !== "string" || dataRoot.trim() === "")
   throw new Error("MIST_GROUP_CHAT_DATA_ROOT must be set by the host launcher");
+const acceptanceDataRoot = dataRoot;
+const canonicalTempRoot = realpathSync(tmpdir());
+if (
+  realpathSync(acceptanceDataRoot) !== acceptanceDataRoot ||
+  dirname(acceptanceDataRoot) !== canonicalTempRoot ||
+  !basename(acceptanceDataRoot).startsWith("mist-group-chat-")
+)
+  throw new Error("acceptance host dataRoot must be its isolated temporary directory");
 if (typeof process.send !== "function")
   throw new Error("group-chat host must run with an IPC channel");
 
-const host = new RoomMessageHost(dataRoot);
+let host = new RoomMessageHost(acceptanceDataRoot);
+let acceptanceAdmin = new GroupChatAcceptanceAdmin(acceptanceDataRoot, host);
 
 process.on("message", (message: unknown) => {
   void handleMessage(message);
 });
-process.on("disconnect", () => host.close());
+process.on("disconnect", () => {
+  acceptanceAdmin.close();
+  host.close();
+});
 
 process.send({ kind: "ready", pid: process.pid });
 
@@ -59,9 +104,15 @@ async function handleMessage(message: unknown): Promise<void> {
 
   try {
     switch (message.kind) {
-      case "reset":
-        host.replaceBindingGrants(message.grants);
-        respond({ id: message.id, ok: true, hostPid: process.pid, requestHash });
+      case "acceptance-admin":
+        if (message.command.kind === "reset") resetAcceptanceScenario();
+        respond({
+          id: message.id,
+          ok: true,
+          value: acceptanceAdmin.run(message.command),
+          hostPid: process.pid,
+          requestHash,
+        });
         return;
       case "post":
         respond({
@@ -90,7 +141,99 @@ async function handleMessage(message: unknown): Promise<void> {
           requestHash,
         });
         return;
+      case "read-resident-context":
+        respond({
+          id: message.id,
+          ok: true,
+          value: host.readResidentContext(message.residentId),
+          hostPid: process.pid,
+          requestHash,
+        });
+        return;
+      case "save-memory":
+        host.saveMemory(message.residentId, message.sourceEventId);
+        respond({ id: message.id, ok: true, hostPid: process.pid, requestHash });
+        return;
+      case "set-delivery-state":
+        host.setDeliveryState(message.eventMarker, message.residentId, message.id, message.state);
+        respond({ id: message.id, ok: true, hostPid: process.pid, requestHash });
+        return;
+      case "read-deliveries":
+        respond({
+          id: message.id,
+          ok: true,
+          value: host.readDeliveries(message.eventId),
+          hostPid: process.pid,
+          requestHash,
+        });
+        return;
+      case "register-resident":
+        host.registerResident(message.residentId);
+        respond({ id: message.id, ok: true, hostPid: process.pid, requestHash });
+        return;
+      case "exercise-roster-path":
+        host.exerciseRosterPath(message.path, message.residentId);
+        respond({ id: message.id, ok: true, hostPid: process.pid, requestHash });
+        return;
+      case "read-roster":
+        respond({
+          id: message.id,
+          ok: true,
+          value: host.readRoster(),
+          hostPid: process.pid,
+          requestHash,
+        });
+        return;
+      case "read-roster-path":
+        respond({
+          id: message.id,
+          ok: true,
+          value: host.readRosterPath(message.path),
+          hostPid: process.pid,
+          requestHash,
+        });
+        return;
+      case "dispatch-event":
+        host.dispatchEvent(message.eventMarker);
+        respond({ id: message.id, ok: true, hostPid: process.pid, requestHash });
+        return;
+      case "commit-context":
+        host.commitContext(message.residentId, message.marker);
+        respond({ id: message.id, ok: true, hostPid: process.pid, requestHash });
+        return;
+      case "read-context-commits":
+        respond({
+          id: message.id,
+          ok: true,
+          value: host.readContextCommits(),
+          hostPid: process.pid,
+          requestHash,
+        });
+        return;
+      case "react":
+        host.react(message.residentId, message.eventMarker);
+        respond({ id: message.id, ok: true, hostPid: process.pid, requestHash });
+        return;
+      case "read-reactions":
+        respond({
+          id: message.id,
+          ok: true,
+          value: host.readReactions(),
+          hostPid: process.pid,
+          requestHash,
+        });
+        return;
+      case "read-surface":
+        respond({
+          id: message.id,
+          ok: true,
+          value: host.readSurface(message.roomId, message.viewerId),
+          hostPid: process.pid,
+          requestHash,
+        });
+        return;
       case "shutdown":
+        acceptanceAdmin.close();
         host.close();
         respond({ id: message.id, ok: true, hostPid: process.pid, requestHash }, () =>
           process.disconnect?.(),
@@ -105,6 +248,15 @@ async function handleMessage(message: unknown): Promise<void> {
       requestHash,
     });
   }
+}
+
+function resetAcceptanceScenario(): void {
+  acceptanceAdmin.close();
+  host.close();
+  rmSync(acceptanceDataRoot, { recursive: true, force: true });
+  mkdirSync(acceptanceDataRoot, { recursive: true });
+  host = new RoomMessageHost(acceptanceDataRoot);
+  acceptanceAdmin = new GroupChatAcceptanceAdmin(acceptanceDataRoot, host);
 }
 
 function respond(response: HostResponse, afterSend?: () => void): void {

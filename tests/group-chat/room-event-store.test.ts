@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  DeliveryOperationConflictError,
   ROOM_RECORDED_CLAIM,
   RoomEventStore,
   RoomOperationConflictError,
@@ -17,7 +18,11 @@ const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as {
     location: string,
   ) => {
     exec(sql: string): void;
-    prepare(sql: string): { run(...parameters: (string | number)[]): unknown };
+    prepare(sql: string): {
+      run(...parameters: (string | number)[]): unknown;
+      get(...parameters: (string | number)[]): unknown;
+      all(...parameters: (string | number)[]): unknown[];
+    };
     close(): void;
   };
 };
@@ -46,6 +51,15 @@ afterEach(async () => {
 });
 
 describe("RoomEventStore", () => {
+  it("closes the SQLite connection without relying on DatabaseSync.isOpen", async () => {
+    const store = new RoomEventStore(await makeRoot());
+
+    store.close();
+    expect(() => store.readRoomEvents()).toThrow();
+    expect(() => store.roster.readRoster()).toThrow(/room event store is closed/);
+    expect(() => store.close()).not.toThrow();
+  });
+
   it("keeps the event, per-room position and recorded receipt durable together", async () => {
     const root = await makeRoot();
     const first = new RoomEventStore(root);
@@ -200,6 +214,239 @@ describe("RoomEventStore", () => {
     migrated.close();
   });
 
+  it("migrates schema v2 to v3 without changing recorded receipts", async () => {
+    const root = await makeRoot();
+    const initial = new RoomEventStore(root);
+    const appended = initial.append({ ...appendInput(), recordedClaim: ROOM_RECORDED_CLAIM });
+    initial.close();
+    downgradeToV2(root);
+
+    const migrated = new RoomEventStore(root);
+    expect(migrated.readRoomEvents()).toEqual([appended.event]);
+    expect(migrated.readSystemReceipts()).toEqual([
+      {
+        actor: "system",
+        phase: "recorded",
+        roomEventId: appended.event.id,
+        claim: ROOM_RECORDED_CLAIM,
+      },
+    ]);
+    const db = new DatabaseSync(join(root, "room-events.sqlite"));
+    expect(db.prepare("PRAGMA user_version").get()).toEqual({ user_version: 3 });
+    const receiptColumns = db.prepare("PRAGMA table_info(room_system_receipts)").all();
+    expect(receiptColumns).toHaveLength(4);
+    db.close();
+    migrated.close();
+  });
+
+  it("rolls back every v3 DDL change and the version when migration fails", async () => {
+    const root = await makeRoot();
+    const initial = new RoomEventStore(root);
+    initial.close();
+    downgradeToV2(root, true);
+
+    expect(() => new RoomEventStore(root)).toThrow(/room_stage_receipts/);
+    const db = new DatabaseSync(join(root, "room-events.sqlite"));
+    expect(db.prepare("PRAGMA user_version").get()).toEqual({ user_version: 2 });
+    expect(
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'room_roster_state'",
+        )
+        .get(),
+    ).toBeUndefined();
+    db.close();
+  });
+
+  it("keeps delivery transitions append-only and the current state idempotent", async () => {
+    const root = await makeRoot();
+    const store = new RoomEventStore(root);
+    const event = store.append(appendInput()).event;
+    const first = {
+      eventId: event.id,
+      residentId: "resident-a",
+      operationId: "delivery-a-loaded",
+      state: "loaded" as const,
+    };
+    expect(store.setDeliveryState(first)).toEqual({
+      residentId: "resident-a",
+      state: "loaded",
+      sequence: 1,
+    });
+    expect(store.setDeliveryState(first)).toEqual({
+      residentId: "resident-a",
+      state: "loaded",
+      sequence: 1,
+    });
+    expect(
+      store.setDeliveryState({ ...first, operationId: "delivery-a-queued", state: "queued" }),
+    ).toEqual({ residentId: "resident-a", state: "queued", sequence: 2 });
+    expect(store.readDeliveries(event.id)).toEqual([
+      { residentId: "resident-a", state: "queued", sequence: 2 },
+    ]);
+    expect(() => store.setDeliveryState({ ...first, state: "queued" })).toThrow(
+      DeliveryOperationConflictError,
+    );
+    const db = new DatabaseSync(join(root, "room-events.sqlite"));
+    expect(() => db.exec("UPDATE room_delivery_transitions SET state = 'queued'")).toThrow(
+      /append-only/,
+    );
+    expect(() => db.exec("DELETE FROM room_delivery_transitions")).toThrow(/append-only/);
+    db.close();
+    store.close();
+  });
+
+  it.each([
+    { initial: "loaded", next: "queued" },
+    { initial: "queued", next: "not-targeted" },
+    { initial: "not-targeted", next: "loaded" },
+  ] as const)(
+    "accepts $initial to $next as a new operation, but rejects changed replay",
+    async ({ initial, next }) => {
+      const store = new RoomEventStore(await makeRoot());
+      const event = store.append(appendInput()).event;
+      const original = {
+        eventId: event.id,
+        residentId: "resident-a",
+        operationId: "transition-operation",
+        state: initial,
+      };
+      const first = store.setDeliveryState(original);
+
+      expect(store.setDeliveryState(original)).toEqual(first);
+      expect(() => store.setDeliveryState({ ...original, state: next })).toThrow(
+        DeliveryOperationConflictError,
+      );
+      expect(
+        store.setDeliveryState({
+          ...original,
+          operationId: "next-transition-operation",
+          state: next,
+        }),
+      ).toEqual({ residentId: "resident-a", state: next, sequence: 2 });
+      store.close();
+    },
+  );
+
+  it("records dispatched then context-committed stages without implying a memory write", async () => {
+    const root = await makeRoot();
+    const store = new RoomEventStore(root);
+    const event = store.append({ ...appendInput(), recordedClaim: ROOM_RECORDED_CLAIM }).event;
+    expect(() =>
+      store.commitContext({ roomEventId: event.id, residentId: "resident-a", marker: "early" }),
+    ).toThrow(/before its room event is dispatched/);
+    store.dispatchEvent(event.id, ["resident-a", "resident-b"], store.roster.readRoster().version);
+    store.dispatchEvent(event.id, ["resident-a", "resident-b"], store.roster.readRoster().version);
+    expect(store.readDeliveries(event.id)).toEqual([
+      { residentId: "resident-a", state: "queued", sequence: 1 },
+      { residentId: "resident-b", state: "queued", sequence: 1 },
+    ]);
+    expect(() =>
+      store.commitContext({
+        roomEventId: event.id,
+        residentId: "resident-c",
+        marker: "no-delivery",
+      }),
+    ).toThrow(/without a dispatch delivery/);
+    const commit = store.commitContext({
+      roomEventId: event.id,
+      residentId: "resident-a",
+      marker: "context",
+    });
+    expect(
+      store.commitContext({ roomEventId: event.id, residentId: "resident-a", marker: "context" }),
+    ).toEqual(commit);
+    expect(commit.roomEventId).toBe(event.id);
+    expect(store.readContextCommits()).toEqual([commit]);
+    expect(store.readSystemReceipts()).toEqual([
+      { actor: "system", phase: "recorded", roomEventId: event.id, claim: ROOM_RECORDED_CLAIM },
+      { actor: "system", phase: "dispatched", roomEventId: event.id, rosterVersion: 0 },
+      {
+        actor: "system",
+        phase: "context-committed",
+        roomEventId: event.id,
+        rosterVersion: 0,
+        contextCommitRef: commit.id,
+      },
+    ]);
+    const db = new DatabaseSync(join(root, "room-events.sqlite"));
+    expect(() => db.exec("UPDATE room_stage_receipts SET claim = 'rewritten'")).toThrow(
+      /append-only/,
+    );
+    expect(() => db.exec("DELETE FROM room_stage_receipts")).toThrow(/append-only/);
+    db.close();
+    store.close();
+  });
+
+  it("rolls back a context commit when its stage receipt cannot be appended", async () => {
+    const root = await makeRoot();
+    const store = new RoomEventStore(root);
+    const event = store.append(appendInput()).event;
+    store.dispatchEvent(event.id, ["resident-a"], store.roster.readRoster().version);
+    const db = new DatabaseSync(join(root, "room-events.sqlite"));
+    db.exec(`CREATE TRIGGER reject_context_receipt BEFORE INSERT ON room_stage_receipts
+      WHEN NEW.phase = 'context-committed' BEGIN SELECT RAISE(ABORT, 'receipt rejected'); END`);
+    db.close();
+
+    expect(() =>
+      store.commitContext({ roomEventId: event.id, residentId: "resident-a", marker: "fail" }),
+    ).toThrow(/receipt rejected/);
+    expect(store.readContextCommits()).toEqual([]);
+    expect(store.readSystemReceipts()).toEqual([
+      { actor: "system", phase: "dispatched", roomEventId: event.id, rosterVersion: 0 },
+    ]);
+    store.close();
+  });
+
+  it("routes registration and membership changes through one versioned roster with join watermarks", async () => {
+    const root = await makeRoot();
+    const store = new RoomEventStore(root);
+    store.append(appendInput());
+    const before = store.roster.readRoster();
+    const registered = store.roster.registerResident({
+      operationId: "register-resident-a",
+      roomId: "room-a",
+      residentId: "resident-a",
+    });
+    expect(registered.version).toBe(before.version + 1);
+    expect(registered.residentIds).toContain("resident-a");
+    expect(
+      store.roster.registerResident({
+        operationId: "register-resident-a",
+        roomId: "room-a",
+        residentId: "resident-a",
+      }),
+    ).toEqual(registered);
+
+    store.roster.mutateMembership({
+      operationId: "leave-resident-a",
+      roomId: "room-a",
+      residentId: "resident-a",
+      active: false,
+    });
+    store.append(appendInput({ operationId: "operation-2", requestSemantics: "second" }));
+    store.roster.mutateMembership({
+      operationId: "rejoin-resident-a",
+      roomId: "room-a",
+      residentId: "resident-a",
+      active: true,
+    });
+    expect(store.roster.readRosterPath("broadcast", "room-a").residentIds).toContain("resident-a");
+    expect(store.roster.readRosterPath("mention", "room-a").residentIds).toEqual(
+      store.roster.readRosterPath("status", "room-a").residentIds,
+    );
+    const db = new DatabaseSync(join(root, "room-events.sqlite"));
+    expect(
+      db
+        .prepare(
+          "SELECT join_watermark, history_grant FROM room_memberships WHERE room_id = ? AND resident_id = ?",
+        )
+        .get("room-a", "resident-a"),
+    ).toEqual({ join_watermark: 2, history_grant: 0 });
+    db.close();
+    store.close();
+  });
+
   it("allocates positions independently for each room", async () => {
     const store = new RoomEventStore(await makeRoot());
     const firstA = store.append(appendInput());
@@ -315,4 +562,22 @@ async function waitForFile(path: string): Promise<void> {
     }
   }
   throw new Error(`timed out waiting for concurrent writer file: ${path}`);
+}
+
+function downgradeToV2(root: string, withStageCollision = false): void {
+  const db = new DatabaseSync(join(root, "room-events.sqlite"));
+  db.exec(`
+    DROP TABLE room_stage_receipts;
+    DROP TABLE room_resident_reactions;
+    DROP TABLE room_context_commits;
+    DROP TABLE room_delivery_current;
+    DROP TABLE room_delivery_transitions;
+    DROP TABLE room_roster_mutations;
+    DROP TABLE room_memberships;
+    DROP TABLE room_residents;
+    DROP TABLE room_roster_state;
+    ${withStageCollision ? "CREATE TABLE room_stage_receipts (collision TEXT);" : ""}
+    PRAGMA user_version = 2;
+  `);
+  db.close();
 }

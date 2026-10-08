@@ -54,13 +54,13 @@ describe("RoomMessageHost", () => {
       body: "hello",
     };
 
-    host.replaceBindingGrants([{ principalId, roomId, bindingId }]);
+    host.replaceAcceptanceGrants([{ principalId, roomId, bindingId }], roomId, [principalId]);
     const accepted = host.post({ principalId }, envelope);
     expect(accepted.status).toBe("recorded");
     expect(host.readRoomEvents()).toHaveLength(1);
     expect(host.readSystemReceipts()).toHaveLength(1);
 
-    host.replaceBindingGrants([]);
+    host.replaceAcceptanceGrants([], roomId, [principalId]);
     expect(host.post({ principalId }, { ...envelope, operationId: "after-reset" })).toMatchObject({
       status: "rejected",
       reasonCode: "room_binding_denied",
@@ -86,12 +86,18 @@ describe("RoomMessageHost", () => {
       body: "hello",
     };
 
-    host.replaceBindingGrants([{ principalId, roomId, bindingId: oldBinding }]);
+    host.replaceAcceptanceGrants([{ principalId, roomId, bindingId: oldBinding }], roomId, [
+      principalId,
+    ]);
     expect(() =>
-      host.replaceBindingGrants([
-        { principalId, roomId, bindingId: oldBinding },
-        { principalId, roomId, bindingId: "replacement-token" },
-      ]),
+      host.replaceAcceptanceGrants(
+        [
+          { principalId, roomId, bindingId: oldBinding },
+          { principalId, roomId, bindingId: "replacement-token" },
+        ],
+        roomId,
+        [principalId],
+      ),
     ).toThrow(/cannot be rebound/);
 
     expect(host.post({ principalId }, oldEnvelope).status).toBe("recorded");
