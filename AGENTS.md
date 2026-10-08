@@ -13,7 +13,8 @@
 
 ## 写代码的规矩
 
-- 里程碑验收先行：`npm run acceptance` 是红绿灯，六盏不绿，功能代码再漂亮也不算完。
+- 按改动分轻重（D32）：动事实账、一窗流、交接信的，判卷先行，施工和验收分两个人；
+  其余改动一张 PR 带代码和测试，一个人审。已有的验收灯（`npm run acceptance` 等）不许改红。
 - 提交前过 `npm run lint`、`npm run typecheck` 和 `npm test`。CI 红了的 PR 不会有人看。
 - 类型严格（tsconfig strict）。不许用 `any` 把类型系统糊弄过去，宁可来问。
 - 测试跟着功能走，新功能没有测试的 PR 会被打回。
