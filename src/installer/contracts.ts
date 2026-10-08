@@ -36,16 +36,20 @@ export interface LaneBinding {
   };
 }
 
+/**
+ * D31: the default install is terminal-only. "Connect my own frontend" is an explicit
+ * choice that lands the OpenAI-compatible adapter integration. The old `official-skin`
+ * branch was a stub that only ever wrote `installation: "pending"`; it is removed here
+ * and legacy bytes are rejected on read (see `./legacy-frontend.ts`), never silently
+ * migrated into terminal or external.
+ */
 export type FrontendChoice =
   | {
-      kind: "external";
-      integration: "mist-session-api";
+      kind: "terminal";
     }
   | {
-      kind: "official-skin";
-      pluginId: "mist-official-skin";
-      /** Issue #50 deliberately leaves this branch pending until issues #49 and #51 land. */
-      installation: "pending" | "installed";
+      kind: "external";
+      integration: "openai-compatible";
     };
 
 export type MemoryChoice =
@@ -189,29 +193,19 @@ function validateFrontendChoice(value: unknown): FrontendChoice {
     throw new InstallerValidationError("frontend choice has an unsupported shape");
   }
   switch (value.kind) {
+    case "terminal":
+      return { kind: "terminal" };
     case "external":
-      if (value.integration !== "mist-session-api") {
+      if (value.integration !== "openai-compatible") {
         throw new InstallerValidationError(
           `external frontend has unsupported integration: ${String(value.integration)}`,
         );
       }
-      return { kind: "external", integration: "mist-session-api" };
+      return { kind: "external", integration: "openai-compatible" };
     case "official-skin":
-      if (value.pluginId !== "mist-official-skin") {
-        throw new InstallerValidationError(
-          `official frontend has unsupported pluginId: ${String(value.pluginId)}`,
-        );
-      }
-      if (value.installation !== "pending" && value.installation !== "installed") {
-        throw new InstallerValidationError(
-          `official frontend has unsupported installation: ${String(value.installation)}`,
-        );
-      }
-      return {
-        kind: "official-skin",
-        pluginId: "mist-official-skin",
-        installation: value.installation,
-      };
+      throw new InstallerValidationError(
+        "official-skin is a legacy frontend that is no longer supported; re-run setup and choose terminal or external explicitly",
+      );
     default:
       throw new InstallerValidationError(`unsupported frontend kind: ${String(value.kind)}`);
   }
@@ -416,13 +410,7 @@ export function validateReadyDraft(draft: InstallerDraft): MistInstallConfigV0 {
     if (draft.frontend === null) {
       throw new InstallerValidationError("frontend choice is required");
     }
-    const choice = validateFrontendChoice(draft.frontend);
-    if (choice.kind === "official-skin") {
-      throw new InstallerValidationError(
-        "official skin is pending issues #49 and #51 and cannot be activated yet",
-      );
-    }
-    return choice;
+    return validateFrontendChoice(draft.frontend);
   });
 
   const memory = validateStep("memory", () => {

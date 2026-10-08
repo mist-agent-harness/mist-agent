@@ -665,57 +665,8 @@ const fe02: FrontendAdapterCheck = {
         return fail(`adapter 绕过唯一 writer：${json(wrongWriter)}`);
       }
 
-      // 非空结构正对照：仅空数组/null 不能证明 SSE 会携带真正的附件与交互。
-      const structuredStreams: Array<{ reply: ResidentReply; capabilities: ClientCapability[] }> = [
-        {
-          reply: {
-            kind: "attachment",
-            text: "structured attachment stream",
-            attachments: [attachment("fe02-stream")],
-          },
-          capabilities: ["attachments"],
-        },
-        {
-          reply: {
-            kind: "interaction",
-            text: "structured choice stream",
-            interaction: interaction("fe02-stream-choice"),
-          },
-          capabilities: ["interactions"],
-        },
-      ];
-      for (const scene of structuredStreams) {
-        await driver.queueResidentReply(target.bindingId, scene.reply);
-        const response = await driver.sendCompletion(
-          target.bindingId,
-          authorized(target),
-          request(`turn:${scene.reply.kind}:stream`, {
-            stream: true,
-            capabilities: scene.capabilities,
-          }),
-        );
-        const body = bodyOf(response);
-        const wire = (await driver.readRawWire(target.bindingId)).at(-1);
-        const parsed = wire === undefined ? null : parseSse(wire.responseBody);
-        const frames = parsed?.frames.filter((frame) => Object.keys(frame.mist).length > 0) ?? [];
-        if (
-          body === null ||
-          wire?.responseKind !== "sse" ||
-          parsed?.malformedCount !== 0 ||
-          parsed.doneCount !== 1 ||
-          frames.length !== 1 ||
-          !streamMistMatches(frames[0]?.mist, body) ||
-          body.projection.status !== "native" ||
-          json(body.attachments) !==
-            json(scene.reply.kind === "attachment" ? scene.reply.attachments : []) ||
-          json(body.interaction) !==
-            json(scene.reply.kind === "interaction" ? scene.reply.interaction : null)
-        ) {
-          return fail(
-            `非空 ${scene.reply.kind} SSE 的完整 mist 结构不对应：${json({ response, wire })}`,
-          );
-        }
-      }
+      // 非空附件/选项的流式正例已按主笔裁定（#218 2026-10-08 拆分）整段迁到 FE-05；
+      // 本步 D31-1 只交文字聊天，FE-02 只核普通/流式纯文本。
 
       // —— Open WebUI utility task：显式 task hint 只能用来拒绝 ——
       //
@@ -766,8 +717,8 @@ const fe02: FrontendAdapterCheck = {
         return fail(`utility 拒绝没有留下可扫的原始 wire：${json(utilityWire)}`);
       }
       const allWire = await driver.readRawWire(target.bindingId);
-      if (allWire.length !== 3 + structuredStreams.length) {
-        return fail(`本轮 wire 未覆盖普通/流式/结构化正例及 utility 拒绝：${allWire.length}`);
+      if (allWire.length !== 3) {
+        return fail(`本轮 wire 未覆盖普通/流式及 utility 拒绝：${allWire.length}`);
       }
       if (allWire[0]?.responseKind !== "json" || allWire[1]?.responseKind !== "sse") {
         return fail("普通/流式 wire 的 responseKind 不对");
@@ -1040,6 +991,8 @@ const fe05: FrontendAdapterCheck = {
     "readInteractions",
     "readAttachmentWrites",
     "readNetworkAttempts",
+    "runWebuiCommand",
+    "sendWebuiCompletion",
     "reset",
   ],
   async run(driver) {
@@ -1793,6 +1746,220 @@ const fe05: FrontendAdapterCheck = {
         return fail(`流式 interaction 耐久状态与声明不符：${json(streamedInteractionReadback)}`);
       }
 
+      // —— 从 FE-02 迁入（#218 2026-10-08 拆分）：非空附件/选项的流式正例 ——
+      // 结构通道随 FE-05 另开一单，判据不放松：SSE 的完整 mist 结构（附件/交互/投影）
+      // 必须与非空归一化对象逐项对应，不能只靠空数组/null 冒充。
+      const structuredStreams: Array<{ reply: ResidentReply; capabilities: ClientCapability[] }> = [
+        {
+          reply: {
+            kind: "attachment",
+            text: "structured attachment stream",
+            attachments: [attachment("fe02-stream")],
+          },
+          capabilities: ["attachments"],
+        },
+        {
+          reply: {
+            kind: "interaction",
+            text: "structured choice stream",
+            interaction: interaction("fe02-stream-choice"),
+          },
+          capabilities: ["interactions"],
+        },
+      ];
+      for (const scene of structuredStreams) {
+        await driver.queueResidentReply(target.bindingId, scene.reply);
+        const response = await driver.sendCompletion(
+          target.bindingId,
+          authorized(target),
+          request(`turn:${scene.reply.kind}:stream`, {
+            stream: true,
+            capabilities: scene.capabilities,
+          }),
+        );
+        const body = bodyOf(response);
+        const wire = (await driver.readRawWire(target.bindingId)).at(-1);
+        const parsed = wire === undefined ? null : parseSse(wire.responseBody);
+        const frames = parsed?.frames.filter((frame) => Object.keys(frame.mist).length > 0) ?? [];
+        if (
+          body === null ||
+          wire?.responseKind !== "sse" ||
+          parsed?.malformedCount !== 0 ||
+          parsed.doneCount !== 1 ||
+          frames.length !== 1 ||
+          !streamMistMatches(frames[0]?.mist, body) ||
+          body.projection.status !== "native" ||
+          json(body.attachments) !==
+            json(scene.reply.kind === "attachment" ? scene.reply.attachments : []) ||
+          json(body.interaction) !==
+            json(scene.reply.kind === "interaction" ? scene.reply.interaction : null)
+        ) {
+          return fail(`迁移的 ${scene.reply.kind} 流式正例结构不对应：${json({ response, wire })}`);
+        }
+      }
+
+      // —— 从 FE-07 迁入（#218 2026-10-08 拆分）：WebUI 入站 file + 出站 attachment 完整链路 ——
+      // 原场景判据不放松：wire 扩展、四 canonical 事件、model/canonical/私有 bytes 互证、
+      // 恰好两条私有写入与全部 owner 检查。需要先取得一个经 /webui 安装闸启动的服务。
+      const webuiStart = await driver.runWebuiCommand(target.bindingId, {
+        confirmed: true,
+        environment: { docker: true, python: false },
+      });
+      if (
+        webuiStart.status !== "started" ||
+        webuiStart.serviceId === null ||
+        webuiStart.endpointId !== target.endpointId
+      ) {
+        return fail(`迁移的 WebUI 场景无法取得同一 endpoint 的服务：${json(webuiStart)}`);
+      }
+      const webuiServiceId = webuiStart.serviceId;
+      const webuiContext = {
+        token: target.token,
+        source: "loopback" as const,
+        conversationId: webuiServiceId,
+      };
+      const webuiAttachment = attachment("webui-outbound");
+      await driver.queueResidentReply(target.bindingId, {
+        kind: "attachment",
+        text: "from-webui",
+        attachments: [webuiAttachment],
+      });
+      const webuiBefore = await driver.readCanonicalEvents(target.bindingId);
+      const webuiWritesBefore = await driver.readAttachmentWrites();
+      const webuiRequest = request("through webui", {
+        capabilities: ["attachments", "interactions"],
+      });
+      webuiRequest.messages[0] = {
+        role: "user",
+        content: [
+          { type: "text", text: "through webui" },
+          { type: "file", file: { filename: "webui-in.txt", file_data: "aGVsbG8=" } },
+        ],
+      };
+      const webuiResponse = await driver.sendWebuiCompletion(
+        webuiServiceId,
+        webuiContext,
+        webuiRequest,
+      );
+      const webuiResponseBody = bodyOf(webuiResponse);
+      if (
+        webuiResponseBody === null ||
+        webuiResponseBody.streamId !== target.streamId ||
+        webuiResponseBody.model !== target.serverModel ||
+        !sameAttachment(webuiResponseBody.attachments[0], webuiAttachment)
+      ) {
+        return fail(`迁移的 WebUI 往返没有走同一主流或附件结构不对：${json(webuiResponse)}`);
+      }
+      const webuiAfter = await driver.readCanonicalEvents(target.bindingId);
+      const webuiNewEvents = webuiAfter.slice(webuiBefore.length);
+      if (
+        webuiNewEvents.length !== 4 ||
+        webuiNewEvents[0]?.kind !== "user" ||
+        webuiNewEvents[0]?.text !== "through webui" ||
+        webuiNewEvents[1]?.kind !== "attachment" ||
+        webuiNewEvents[2]?.kind !== "assistant" ||
+        webuiNewEvents[2]?.text !== "from-webui" ||
+        webuiNewEvents[3]?.kind !== "attachment" ||
+        !webuiNewEvents.some(
+          (event) => event.kind === "attachment" && event.attachment?.filename === "webui-in.txt",
+        ) ||
+        !webuiNewEvents.some(
+          (event) =>
+            event.kind === "attachment" &&
+            event.attachment?.attachmentId === webuiAttachment.attachmentId,
+        ) ||
+        webuiNewEvents.some(
+          (event) =>
+            event.residentId !== target.residentId ||
+            event.scopeId !== target.scopeId ||
+            event.streamId !== target.streamId ||
+            event.writerId !== target.canonicalWriterId,
+        )
+      ) {
+        return fail(`迁移的 WebUI 往返没有恰好落同源事件（含附件）：${json(webuiNewEvents)}`);
+      }
+      const webuiWire = (await driver.readRawWire(target.bindingId)).at(-1);
+      const webuiEnvelope =
+        webuiWire === undefined ? null : parseJsonEnvelope(webuiWire.responseBody);
+      if (
+        webuiEnvelope === null ||
+        webuiEnvelope.object !== "chat.completion" ||
+        webuiEnvelope.id !== webuiResponseBody.id ||
+        webuiEnvelope.choices.length !== 1 ||
+        webuiEnvelope.choices[0]?.index !== 0 ||
+        webuiEnvelope.choices[0]?.message?.role !== "assistant" ||
+        webuiEnvelope.choices[0]?.message?.content !== "from-webui" ||
+        webuiEnvelope.choices[0]?.finish_reason !== "stop" ||
+        webuiEnvelope.model !== target.serverModel ||
+        webuiEnvelope.mist.stream_id !== target.streamId ||
+        json(wireProjection(webuiEnvelope.mist.projection)) !==
+          json(webuiResponseBody.projection) ||
+        webuiEnvelope.mist.interaction !== null ||
+        json(wireAttachments(webuiEnvelope.mist.attachments)) !== json([webuiAttachment])
+      ) {
+        return fail(`迁移的 WebUI wire 没有回同主流且扩展完整：${json(webuiWire)}`);
+      }
+      const webuiWritesAfter = await driver.readAttachmentWrites();
+      const webuiNewWrites = webuiWritesAfter.records.slice(webuiWritesBefore.count);
+      const webuiOwner = {
+        bindingId: target.bindingId,
+        residentId: target.residentId,
+        scopeId: target.scopeId,
+        streamId: target.streamId,
+        writerId: target.canonicalWriterId,
+      };
+      const webuiIngressTurnAttachment = (await driver.readModelTurns(target.bindingId)).find(
+        (turn) => turn.currentText === "through webui",
+      )?.attachments[0];
+      const webuiIngressCanonicalAttachment = webuiNewEvents.find(
+        (event) => event.kind === "attachment" && event.attachment?.filename === "webui-in.txt",
+      )?.attachment;
+      const webuiEgressCanonicalAttachment = webuiNewEvents.find(
+        (event) =>
+          event.kind === "attachment" &&
+          event.attachment?.attachmentId === webuiAttachment.attachmentId,
+      )?.attachment;
+      if (
+        webuiWritesAfter.count !== webuiWritesBefore.count + 2 ||
+        webuiWritesAfter.records.length !== webuiWritesAfter.count ||
+        webuiIngressTurnAttachment === undefined ||
+        webuiIngressCanonicalAttachment === undefined ||
+        webuiIngressTurnAttachment.kind !== "file" ||
+        webuiIngressTurnAttachment.filename !== "webui-in.txt" ||
+        webuiIngressTurnAttachment.source !== "inline" ||
+        webuiIngressTurnAttachment.sizeBytes !== Buffer.from("aGVsbG8=", "base64").length ||
+        !sameAttachment(webuiIngressCanonicalAttachment, webuiIngressTurnAttachment) ||
+        !sameAttachment(webuiEgressCanonicalAttachment, webuiAttachment)
+      ) {
+        return fail(
+          `迁移的 WebUI 入出站附件在 model turn / canonical 缺完整结构或真实字节数：${json({
+            webuiIngressTurnAttachment,
+            webuiIngressCanonicalAttachment,
+            webuiEgressCanonicalAttachment,
+          })}`,
+        );
+      }
+      const webuiIngressWrite = webuiNewWrites.find((record) =>
+        sameAttachmentWrite(record, webuiIngressTurnAttachment, webuiOwner),
+      );
+      const webuiEgressWrite = webuiNewWrites.find((record) =>
+        sameAttachmentWrite(record, webuiAttachment, webuiOwner),
+      );
+      if (
+        webuiIngressWrite === undefined ||
+        webuiEgressWrite === undefined ||
+        webuiNewWrites.length !== 2 ||
+        !sameAttachment(webuiEgressWrite, webuiAttachment)
+      ) {
+        return fail(
+          `迁移的 WebUI 私有附件面写入不是恰好入站/出站两条且占位/归属对不上：${json({
+            webuiWritesBefore,
+            webuiWritesAfter,
+            webuiNewEvents,
+          })}`,
+        );
+      }
+
       const turns = await driver.readModelTurns(target.bindingId);
       const firstTurn = turns.find((turn) => turn.currentText === "attachment ingress");
       const genericTurns = turns.filter(
@@ -2209,53 +2376,36 @@ const fe07: FrontendAdapterCheck = {
         attachments: await driver.readAttachmentWrites(),
       });
 
-      // —— 带附件的 WebUI 往返：wire 扩展、canonical、附件面都对上同一主流 ——
-      const webuiAttachment = attachment("webui-outbound");
-      await driver.queueResidentReply(target.bindingId, {
-        kind: "attachment",
-        text: "from-webui",
-        attachments: [webuiAttachment],
-      });
+      // —— WebUI 文字往返：走 FE-02 同一 endpoint/主流/唯一 writer ——
+      // 附件结构、私有附件写入的正反例已按主笔裁定（#218 2026-10-08 拆分）迁到 FE-05；
+      // 本步 FE-07 只核文字走同一真实宿主 endpoint。
+      const webuiText = "from-webui";
+      await driver.queueResidentReply(target.bindingId, { kind: "text", text: webuiText });
       const before = await driver.readCanonicalEvents(target.bindingId);
-      const writesBefore = await driver.readAttachmentWrites();
-      const webuiRequest = request("through webui", {
-        capabilities: ["attachments", "interactions"],
-      });
-      webuiRequest.messages[0] = {
-        role: "user",
-        content: [
-          { type: "text", text: "through webui" },
-          { type: "file", file: { filename: "webui-in.txt", file_data: "aGVsbG8=" } },
-        ],
-      };
-      const response = await driver.sendWebuiCompletion(serviceId, context, webuiRequest);
+      const response = await driver.sendWebuiCompletion(
+        serviceId,
+        context,
+        request("through webui"),
+      );
       const responseBody = bodyOf(response);
       if (
         responseBody === null ||
         responseBody.streamId !== target.streamId ||
         responseBody.model !== target.serverModel ||
-        !sameAttachment(responseBody.attachments[0], webuiAttachment)
+        responseBody.text !== webuiText ||
+        responseBody.attachments.length !== 0 ||
+        responseBody.interaction !== null
       ) {
-        return fail(`Open WebUI 没有走 FE-02 同一主流或附件结构不对：${json(response)}`);
+        return fail(`Open WebUI 文字没有走同一主流：${json(response)}`);
       }
       const after = await driver.readCanonicalEvents(target.bindingId);
       const newEvents = after.slice(before.length);
       if (
-        newEvents.length !== 4 ||
+        newEvents.length !== 2 ||
         newEvents[0]?.kind !== "user" ||
         newEvents[0]?.text !== "through webui" ||
-        newEvents[1]?.kind !== "attachment" ||
-        newEvents[2]?.kind !== "assistant" ||
-        newEvents[2]?.text !== "from-webui" ||
-        newEvents[3]?.kind !== "attachment" ||
-        !newEvents.some(
-          (event) => event.kind === "attachment" && event.attachment?.filename === "webui-in.txt",
-        ) ||
-        !newEvents.some(
-          (event) =>
-            event.kind === "attachment" &&
-            event.attachment?.attachmentId === webuiAttachment.attachmentId,
-        ) ||
+        newEvents[1]?.kind !== "assistant" ||
+        newEvents[1]?.text !== webuiText ||
         newEvents.some(
           (event) =>
             event.residentId !== target.residentId ||
@@ -2264,7 +2414,7 @@ const fe07: FrontendAdapterCheck = {
             event.writerId !== target.canonicalWriterId,
         )
       ) {
-        return fail(`Open WebUI 往返没有恰好落同源事件（含附件）：${json(newEvents)}`);
+        return fail(`Open WebUI 文字往返没有恰好落两条同源事件：${json(newEvents)}`);
       }
       const webuiWire = (await driver.readRawWire(target.bindingId)).at(-1);
       const webuiEnvelope =
@@ -2276,79 +2426,15 @@ const fe07: FrontendAdapterCheck = {
         webuiEnvelope.choices.length !== 1 ||
         webuiEnvelope.choices[0]?.index !== 0 ||
         webuiEnvelope.choices[0]?.message?.role !== "assistant" ||
-        webuiEnvelope.choices[0]?.message?.content !== "from-webui" ||
+        webuiEnvelope.choices[0]?.message?.content !== webuiText ||
         webuiEnvelope.choices[0]?.finish_reason !== "stop" ||
         webuiEnvelope.model !== target.serverModel ||
         webuiEnvelope.mist.stream_id !== target.streamId ||
         json(wireProjection(webuiEnvelope.mist.projection)) !== json(responseBody.projection) ||
         webuiEnvelope.mist.interaction !== null ||
-        json(wireAttachments(webuiEnvelope.mist.attachments)) !== json([webuiAttachment])
+        json(wireAttachments(webuiEnvelope.mist.attachments)) !== json([])
       ) {
-        return fail(`WebUI wire 没有回同主流且扩展完整：${json(webuiWire)}`);
-      }
-
-      // —— 私有附件面写入：前后 delta 恰好入站/出站两条，元数据与 canonical/输入输出互证 ——
-      const writesAfter = await driver.readAttachmentWrites();
-      const newWrites = writesAfter.records.slice(writesBefore.count);
-      const fe07Owner = {
-        bindingId: target.bindingId,
-        residentId: target.residentId,
-        scopeId: target.scopeId,
-        streamId: target.streamId,
-        writerId: target.canonicalWriterId,
-      };
-      // 入站：与本次 model turn 实际拿到的附件元数据互证（含真实解码字节数），
-      // 不凭空规定输入未声明的媒体类型策略。
-      const ingressTurnAttachment = (await driver.readModelTurns(target.bindingId)).find(
-        (turn) => turn.currentText === "through webui",
-      )?.attachments[0];
-      const ingressCanonicalAttachment = newEvents.find(
-        (event) => event.kind === "attachment" && event.attachment?.filename === "webui-in.txt",
-      )?.attachment;
-      const egressCanonicalAttachment = newEvents.find(
-        (event) =>
-          event.kind === "attachment" &&
-          event.attachment?.attachmentId === webuiAttachment.attachmentId,
-      )?.attachment;
-      if (
-        writesAfter.count !== writesBefore.count + 2 ||
-        writesAfter.records.length !== writesAfter.count ||
-        ingressTurnAttachment === undefined ||
-        ingressCanonicalAttachment === undefined ||
-        ingressTurnAttachment.kind !== "file" ||
-        ingressTurnAttachment.filename !== "webui-in.txt" ||
-        ingressTurnAttachment.source !== "inline" ||
-        ingressTurnAttachment.sizeBytes !== Buffer.from("aGVsbG8=", "base64").length ||
-        !sameAttachment(ingressCanonicalAttachment, ingressTurnAttachment) ||
-        !sameAttachment(egressCanonicalAttachment, webuiAttachment)
-      ) {
-        return fail(
-          `WebUI 入出站附件在 model turn / canonical 缺完整结构或真实字节数：${json({
-            ingressTurnAttachment,
-            ingressCanonicalAttachment,
-            egressCanonicalAttachment,
-          })}`,
-        );
-      }
-      const ingressWrite = newWrites.find((record) =>
-        sameAttachmentWrite(record, ingressTurnAttachment, fe07Owner),
-      );
-      const egressWrite = newWrites.find((record) =>
-        sameAttachmentWrite(record, webuiAttachment, fe07Owner),
-      );
-      if (
-        ingressWrite === undefined ||
-        egressWrite === undefined ||
-        newWrites.length !== 2 ||
-        !sameAttachment(egressWrite, webuiAttachment)
-      ) {
-        return fail(
-          `WebUI 成功路径的私有附件面写入不是恰好入站/出站两条且占位/归属对不上：${json({
-            writesBefore,
-            writesAfter,
-            newEvents,
-          })}`,
-        );
+        return fail(`WebUI 文字 wire 没有回同主流：${json(webuiWire)}`);
       }
 
       // —— WebUI 路径不许另开鉴权后门；拒绝零副作用 ——
@@ -2419,7 +2505,7 @@ const fe07: FrontendAdapterCheck = {
         return fail("WebUI utility 拒绝仍产生了 model/canonical/附件副作用");
       }
       return pass(
-        "确认、环境探测、插件闸、本机 URL、同 endpoint 完整 wire/附件、鉴权/历史/writer 与 utility 拒绝全部成立",
+        "确认、环境探测、插件闸、本机 URL、同 endpoint 文字 wire、鉴权/历史/writer 与 utility 拒绝全部成立",
       );
     } finally {
       await driver.reset();

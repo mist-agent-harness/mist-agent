@@ -1,12 +1,44 @@
 # OpenAI-compatible 前端适配层（D31）
 
-状态：**图纸候选，先供主笔评审；功能驱动尚未落地，FE-01～FE-07 应保持全红。**
+状态：**D31-1 文字路径已实现；FE-05 附件/选项保持红并延期。**实现的本机测试与判卷命令见下方；未运行真实 provider、安装真实 Open WebUI 或 browser，因此不把这些行为称为实证。
 
-本候选新增的观测面（远程 URL 网络尝试审计、流式 interaction、`/webui` 提案↔实装关联、
-私有附件写入 delta、逐请求鉴权 entries）也只是**判卷图纸**：合成 fixture 正例只证明判卷器能识别正确形状，
-不代表生产 adapter 已实现，也不替代真实宿主与独立验收席。
+> **D31 拆分（#218 2026-10-08 主笔裁定）**：D31 拆两步。第一步只交文字聊天
+> （FE-01～FE-04、FE-06、FE-07），只往一窗流写 user/assistant 文字；附件与选项
+> （FE-05）要让一窗流读写结构事件，按 D32 第二条另开一单。判卷随之把 FE-02 里带附件/
+> 选项的流式正例与 FE-07 里附件结构/私有附件写入正反例整段迁到 FE-05，判据不放松。
+> 本步产品路径对带真实附件/选项控制的请求在调用宿主与写附件前稳定拒绝，不退化成文本标记。
+> **D31-1 文字宿主接线**：文字成功回合经现役宿主 `runtime.say()`（宿主唯一 writer 写
+> user/assistant 文字事件）；adapter 不自建 writer、不默认 generation、不编造身份，身份/路由/
+> 代际/事件都由宿主给。运行时入口是 `src/resident-runtime/webui-cli.ts`：它借用已装配的
+> `ResidentRuntime`，通过 `HostTextEngine` 和 loopback `startFrontendHost()` 接入现役 `say()`。
+> 判卷驱动 `src/frontend-adapter-acceptance-driver.ts` 使用 `HostTextClient` spawn
+> `src/resident-runtime/host-process.ts`，测试夹具以 `assembleResidentRuntime` + 受控 synthetic
+> transport 提供确定性回复。`/webui` 经真实 `WebuiSystemPlatform`、插件事务、管理 API HTTP，
+> 由测试替身只替代系统命令/服务和公开 Open WebUI 管理 API；未安装真实 WebUI。旧的进程内结构
+> engine `src/frontend/deferred-structure-engine.ts` 不是这一步的写入入口。
+
+FE-05 专属观测面（远程 URL 网络尝试审计、interaction 状态与附件写入 delta）仍是延期判据，
+当前路径明确拒绝结构请求且零写。成功 SSE 在一次完整 `say()` 返回后序列化成 SSE 帧；它不是
+模型 token 的实时转发。
 
 关联：D31 / #218；D9 一窗流；D11 第二、三、四条；#49 鉴权；D30 删除旧 DSH webui。
+
+## D31-1 本步运行与边界
+
+先配置一个现役 runtime 住户与 provider，再运行 `npm run resident -- --resident <residentId>`；
+在提示符输入 `/webui`，阅读资源/后台任务限制并输入 `yes` 才会安装可选 Open WebUI。
+取消用 `no`。`npm run acceptance:frontend-adapter` 运行确定性判卷驱动；原生 Pipe 依赖
+通过 `pip install -r assets/openwebui/requirements.txt` 安装，针对性测试使用
+`MIST_PIPE_PYTHON` / `MIST_PIPE_PYTHONPATH` 指定解释器和依赖目录。
+
+本步 FE-01～FE-04、FE-06、FE-07 实现文字请求，唯一写入口是宿主 `say()`。FE-05 延期：
+附件、远程图片和交互响应在调用宿主/私有附件面前返回稳定拒绝码，不写结构事件。SSE 只在
+完整宿主回合结束后格式化；不提供实时 token 流。真实 provider、真实 Open WebUI 安装和
+browser 渲染未运行，不能据此声称已验证这些环境。
+
+代价：文字-only 先行会拒绝常见附件和交互工作流；前端服务、插件事务和住户 runtime 共同
+运行时带来可感知启动延迟；缓冲式 SSE 不能逐 token 显示；用户需自行准备 provider 和决定
+是否安装额外 WebUI 组件。
 
 ## 0. 一句话
 
@@ -350,7 +382,7 @@ identity/replay/concurrency 契约。代价：驱动要提供这组结构化鉴�
 
 ## 8. `/webui` 的接缝
 
-`/webui` 是后续施工，不在 adapter PR1 里偷跑。它必须：
+PR1 只冻结图纸；D31-1 已实现 `/webui`，接缝遵守以下边界：
 
 1. 先展示要安装的 Open WebUI、资源占用与将启动的服务，等待主人确认；
 2. 检查 Docker 或 Python，二者都没有时只说明缺项，不安装系统运行时；
@@ -392,15 +424,16 @@ FE-07 要从这条实际接线读回回复与精确事件数，核 writer、resi
 | FE-04 | 两请求各自新增事件的归属、writer、正文/顺序及 model currentText；客户端字段不改变 server route |
 | FE-05 | 完整结构、本轮非空投影子集、远程 URL SSRF 拒绝、流式 interaction、generic 降级、choice/approval 同次 resolution 绑定与负例 |
 | FE-06 | 同一 Bearer 闸、失败零模型/账/控制/附件 count+records、逐来源/result/code 鉴权审计、全表面 token 零泄漏 |
-| FE-07 | 展示→确认→安装顺序、提案与实装插件身份关联、环境、插件闸、本机 URL、私有附件写入 delta 与归属、同 endpoint 的 writer/history/auth 边界与 task 拒绝 |
+| FE-07 | 展示→确认→安装顺序、提案与实装插件身份关联、环境、插件闸、本机 URL、同 endpoint 的文字 writer/history/auth 边界与 task 拒绝；原附件检查已完整迁到 FE-05 |
 
 判卷驱动只观察公开边界；缺驱动时七盏全红。正向 fixture 只用于证明判卷器能识别正确形状，
-不替代真实 adapter、真实宿主或独立验收席。
+不替代真实 adapter、真实宿主接线或本步非施工者的 review；文字第一步不另设独立验收席。
 具体 typed 观察口见 [driver contract](../../acceptance/frontend-adapter-driver.ts)：
 `readRawWire` 保留实际请求/响应 body，包含被拒绝的响应；`readInteractions` 读回待决与解决状态；
 `readAttachmentWrites` 单独读回附件私有面的写入计数与 opaque 元数据，不导出附件字节。
-每条记录带 binding/resident/scope/stream/writer 归属（`writerId` 即 canonical 写入归属，
-不是另一个独立「附件 writer」），与 canonical 权威一致；后者是鉴权/utility 拒绝零附件副作用的
+每条记录带 binding/resident/scope/stream/writer 归属。文字驱动的 stream/writer 标签映射同一宿主
+owner；底层文字事件没有独立的 `streamId` / `writerId` 字段，标签不冒充原生字段或新增 writer。
+附件读回是鉴权/utility 拒绝零附件副作用的
 证据，不能由 canonical event 数或没有模型调用替代。
 `readNetworkAttempts` 只读回真实 transport 上发生过的远程抓取尝试的 opaque 元数据与归属，
 不导出 URL 查询串/token/字节；判卷要求零抓取尝试，任何真实尝试（含被策略阻止）都判红。
