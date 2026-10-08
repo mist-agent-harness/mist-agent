@@ -1,4 +1,8 @@
 import { createHash } from "node:crypto";
+import {
+  GroupChatAcceptanceAdmin,
+  type GroupChatAcceptanceAdminCommand,
+} from "./acceptance-admin.ts";
 import type {
   AuthenticatedPrincipal,
   RoomBindingGrant,
@@ -7,12 +11,7 @@ import type {
 import { RoomMessageHost } from "./room-message-host.ts";
 
 type HostRequestPayload =
-  | {
-      readonly kind: "reset";
-      readonly grants: readonly RoomBindingGrant[];
-      readonly roomId?: string;
-      readonly residentIds?: readonly string[];
-    }
+  | { readonly kind: "acceptance-admin"; readonly command: GroupChatAcceptanceAdminCommand }
   | {
       readonly kind: "post";
       readonly principal: AuthenticatedPrincipal | null;
@@ -20,10 +19,8 @@ type HostRequestPayload =
     }
   | { readonly kind: "read-room-events"; readonly roomId?: string }
   | { readonly kind: "read-system-receipts" }
-  | { readonly kind: "seed-resident-private"; readonly residentId: string; readonly canary: string }
   | { readonly kind: "read-resident-context"; readonly residentId: string }
   | { readonly kind: "save-memory"; readonly residentId: string; readonly sourceEventId: string }
-  | { readonly kind: "read-memories" }
   | {
       readonly kind: "set-delivery-state";
       readonly eventMarker: string;
@@ -41,12 +38,6 @@ type HostRequestPayload =
   | {
       readonly kind: "read-roster-path";
       readonly path: "broadcast" | "mention" | "projection" | "feedback" | "status";
-    }
-  | {
-      readonly kind: "record-event";
-      readonly roomId: string;
-      readonly authorId: string;
-      readonly body: string;
     }
   | { readonly kind: "dispatch-event"; readonly eventMarker: string }
   | { readonly kind: "commit-context"; readonly residentId: string; readonly marker: string }
@@ -84,11 +75,15 @@ if (typeof process.send !== "function")
   throw new Error("group-chat host must run with an IPC channel");
 
 const host = new RoomMessageHost(dataRoot);
+const acceptanceAdmin = new GroupChatAcceptanceAdmin(dataRoot, host);
 
 process.on("message", (message: unknown) => {
   void handleMessage(message);
 });
-process.on("disconnect", () => host.close());
+process.on("disconnect", () => {
+  acceptanceAdmin.close();
+  host.close();
+});
 
 process.send({ kind: "ready", pid: process.pid });
 
@@ -98,9 +93,14 @@ async function handleMessage(message: unknown): Promise<void> {
 
   try {
     switch (message.kind) {
-      case "reset":
-        host.replaceBindingGrants(message.grants, message.roomId, message.residentIds);
-        respond({ id: message.id, ok: true, hostPid: process.pid, requestHash });
+      case "acceptance-admin":
+        respond({
+          id: message.id,
+          ok: true,
+          value: acceptanceAdmin.run(message.command),
+          hostPid: process.pid,
+          requestHash,
+        });
         return;
       case "post":
         respond({
@@ -129,10 +129,6 @@ async function handleMessage(message: unknown): Promise<void> {
           requestHash,
         });
         return;
-      case "seed-resident-private":
-        host.seedResidentPrivate(message.residentId, message.canary);
-        respond({ id: message.id, ok: true, hostPid: process.pid, requestHash });
-        return;
       case "read-resident-context":
         respond({
           id: message.id,
@@ -146,17 +142,8 @@ async function handleMessage(message: unknown): Promise<void> {
         host.saveMemory(message.residentId, message.sourceEventId);
         respond({ id: message.id, ok: true, hostPid: process.pid, requestHash });
         return;
-      case "read-memories":
-        respond({
-          id: message.id,
-          ok: true,
-          value: host.readMemories(),
-          hostPid: process.pid,
-          requestHash,
-        });
-        return;
       case "set-delivery-state":
-        host.setDeliveryState(message.eventMarker, message.residentId, message.state);
+        host.setDeliveryState(message.eventMarker, message.residentId, message.id, message.state);
         respond({ id: message.id, ok: true, hostPid: process.pid, requestHash });
         return;
       case "read-deliveries":
@@ -193,10 +180,6 @@ async function handleMessage(message: unknown): Promise<void> {
           hostPid: process.pid,
           requestHash,
         });
-        return;
-      case "record-event":
-        host.recordEvent(message.roomId, message.authorId, message.body);
-        respond({ id: message.id, ok: true, hostPid: process.pid, requestHash });
         return;
       case "dispatch-event":
         host.dispatchEvent(message.eventMarker);
@@ -238,6 +221,7 @@ async function handleMessage(message: unknown): Promise<void> {
         });
         return;
       case "shutdown":
+        acceptanceAdmin.close();
         host.close();
         respond({ id: message.id, ok: true, hostPid: process.pid, requestHash }, () =>
           process.disconnect?.(),

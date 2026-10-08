@@ -34,7 +34,7 @@ describe("ResidentPrivateStore", () => {
     const store = new ResidentPrivateStore(await makeRoot());
 
     store.close();
-    expect(() => store.readMemories("resident-a")).toThrow();
+    expect(() => store.readMemories("resident-a", "resident-a")).toThrow();
     expect(() => store.close()).not.toThrow();
   });
 
@@ -51,8 +51,8 @@ describe("ResidentPrivateStore", () => {
       });
       const ownRead =
         surface === "context"
-          ? () => store.readContext("resident-a")
-          : () => store.readMemories("resident-a");
+          ? () => store.readContext("resident-a", "resident-a")
+          : () => store.readMemories("resident-a", "resident-a");
       const crossRead =
         surface === "context"
           ? () => store.readContext("resident-a", "resident-b")
@@ -70,8 +70,8 @@ describe("ResidentPrivateStore", () => {
     store.seedContext("resident-a", "private-a");
     store.seedContext("resident-a", "private-a");
     store.seedContext("resident-b", "private-b");
-    expect(store.readContext("resident-a")).toBe("private-a");
-    expect(store.readContext("resident-b")).toBe("private-b");
+    expect(store.readContext("resident-a", "resident-a")).toBe("private-a");
+    expect(store.readContext("resident-b", "resident-b")).toBe("private-b");
     expect(() => store.readContext("resident-a", "resident-b")).toThrow(
       CrossResidentPrivateReadError,
     );
@@ -89,8 +89,8 @@ describe("ResidentPrivateStore", () => {
         body: "public source body",
       }),
     ).toEqual(saved);
-    expect(store.readMemories("resident-a")).toEqual([saved]);
-    expect(store.readMemories("resident-b")).toEqual([]);
+    expect(store.readMemories("resident-a", "resident-a")).toEqual([saved]);
+    expect(store.readMemories("resident-b", "resident-b")).toEqual([]);
     expect(() => store.readMemories("resident-a", "resident-b")).toThrow(
       CrossResidentPrivateReadError,
     );
@@ -98,8 +98,8 @@ describe("ResidentPrivateStore", () => {
     store.close();
 
     const reopened = new ResidentPrivateStore(root);
-    expect(reopened.readContext("resident-a")).toBe("private-a");
-    expect(reopened.readMemories("resident-a")).toEqual([saved]);
+    expect(reopened.readContext("resident-a", "resident-a")).toBe("private-a");
+    expect(reopened.readMemories("resident-a", "resident-a")).toEqual([saved]);
     const file = await stat(join(root, "resident-private.sqlite"));
     expect(file.mode & 0o777).toBe(0o600);
     reopened.close();

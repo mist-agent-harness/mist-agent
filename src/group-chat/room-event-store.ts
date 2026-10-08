@@ -57,6 +57,7 @@ export interface RoomStageReceipt {
   readonly actor: "system";
   readonly phase: "dispatched" | "context-committed";
   readonly roomEventId: string;
+  readonly rosterVersion: number;
   readonly claim?: string;
   readonly contextCommitRef?: string;
 }
@@ -119,6 +120,7 @@ interface SystemReceiptReadRow {
   readonly phase: "recorded" | "dispatched" | "context-committed";
   readonly claim: string | null;
   readonly context_commit_id: string | null;
+  readonly roster_version: number | null;
 }
 
 interface ReactionRow {
@@ -168,7 +170,7 @@ export class RoomEventStore {
       this.#database.close();
       throw error;
     }
-    this.roster = new RoomRosterStore(this.#database);
+    this.roster = new RoomRosterStore(this.#database, () => this.#assertOpen());
     chmodSync(this.#databasePath, 0o600);
   }
 
@@ -318,6 +320,7 @@ export class RoomEventStore {
   }
 
   latestDispatchedEvent(roomId: string): RoomEvent | null {
+    this.#assertOpen();
     const row = this.#database
       .prepare(
         `SELECT event.id, event.room_id, event.position, event.principal_id, event.author_id,
@@ -335,16 +338,17 @@ export class RoomEventStore {
     if (this.#closed) throw new Error("room event store is closed");
     const rows = this.#database
       .prepare(
-        `SELECT event_id, actor, phase, claim, context_commit_id
+        `SELECT event_id, actor, phase, claim, context_commit_id, roster_version
          FROM (
            SELECT event.id AS event_id, 'system' AS actor, 'recorded' AS phase,
-                  receipt.claim AS claim, NULL AS context_commit_id,
+                  receipt.claim AS claim, NULL AS context_commit_id, NULL AS roster_version,
                   event.room_id AS room_id, event.position AS room_position, 0 AS receipt_order
            FROM room_system_receipts AS receipt
            JOIN room_events AS event ON event.id = receipt.event_id
            UNION ALL
            SELECT stage.event_id, stage.actor, stage.phase, stage.claim,
-                  stage.context_commit_id, event.room_id, event.position, stage.receipt_order
+                  stage.context_commit_id, stage.roster_version,
+                  event.room_id, event.position, stage.receipt_order
            FROM room_stage_receipts AS stage
            JOIN room_events AS event ON event.id = stage.event_id
          )
@@ -363,6 +367,7 @@ export class RoomEventStore {
             actor: row.actor,
             phase: row.phase,
             roomEventId: row.event_id,
+            rosterVersion: row.roster_version ?? 0,
             ...(row.claim === null ? {} : { claim: row.claim }),
             ...(row.context_commit_id === null ? {} : { contextCommitRef: row.context_commit_id }),
           },
@@ -388,6 +393,7 @@ export class RoomEventStore {
   }
 
   readDeliveries(eventId: string): readonly DeliveryRecord[] {
+    this.#assertOpen();
     const rows = this.#database
       .prepare(
         `SELECT resident_id, state, sequence FROM room_delivery_current
@@ -401,7 +407,7 @@ export class RoomEventStore {
     }));
   }
 
-  dispatchEvent(eventId: string, residentIds: readonly string[]): void {
+  dispatchEvent(eventId: string, residentIds: readonly string[], rosterVersion: number): void {
     this.#inTransaction(() => {
       const event = this.#database.prepare("SELECT id FROM room_events WHERE id = ?").get(eventId);
       if (event === undefined) throw new Error(`cannot dispatch unknown room event: ${eventId}`);
@@ -414,10 +420,11 @@ export class RoomEventStore {
 
       this.#database
         .prepare(
-          `INSERT INTO room_stage_receipts (event_id, actor, phase, claim, context_commit_id)
-           VALUES (?, 'system', 'dispatched', NULL, NULL)`,
+          `INSERT INTO room_stage_receipts
+            (event_id, actor, phase, claim, context_commit_id, roster_version)
+           VALUES (?, 'system', 'dispatched', NULL, NULL, ?)`,
         )
-        .run(eventId);
+        .run(eventId, rosterVersion);
       for (const residentId of residentIds) {
         this.#appendDeliveryTransition({
           eventId,
@@ -443,6 +450,15 @@ export class RoomEventStore {
       if (dispatched === undefined)
         throw new Error("context cannot be committed before its room event is dispatched");
 
+      const delivery = this.#database
+        .prepare(
+          `SELECT 1 AS present FROM room_delivery_current
+           WHERE event_id = ? AND resident_id = ? AND state IN ('queued', 'loaded')`,
+        )
+        .get(input.roomEventId, input.residentId);
+      if (delivery === undefined)
+        throw new Error("context cannot be committed for a resident without a dispatch delivery");
+
       const existing = this.#database
         .prepare(
           `SELECT id, event_id, resident_id, marker FROM room_context_commits
@@ -465,22 +481,51 @@ export class RoomEventStore {
         .run(commit.id, commit.roomEventId, commit.residentId, commit.marker);
       this.#database
         .prepare(
-          `INSERT INTO room_stage_receipts (event_id, actor, phase, claim, context_commit_id)
-           VALUES (?, 'system', 'context-committed', NULL, ?)`,
+          `INSERT INTO room_stage_receipts
+            (event_id, actor, phase, claim, context_commit_id, roster_version)
+           VALUES (?, 'system', 'context-committed', NULL, ?,
+             (SELECT roster_version FROM room_stage_receipts
+              WHERE event_id = ? AND phase = 'dispatched'))`,
         )
-        .run(commit.roomEventId, commit.id);
+        .run(commit.roomEventId, commit.id, commit.roomEventId);
       return commit;
     });
   }
 
   readContextCommits(): readonly ContextCommitRecord[] {
+    this.#assertOpen();
     const rows = this.#database
       .prepare("SELECT id, event_id, resident_id, marker FROM room_context_commits ORDER BY rowid")
       .all() as unknown as ContextCommitRow[];
     return rows.map(contextCommitFromRow);
   }
 
+  findContextCommitCandidates(
+    roomId: string,
+    residentId: string,
+    marker: string,
+  ): readonly string[] {
+    this.#assertOpen();
+    const rows = this.#database
+      .prepare(
+        `SELECT event.id
+         FROM room_events AS event
+         JOIN room_stage_receipts AS dispatched
+           ON dispatched.event_id = event.id AND dispatched.phase = 'dispatched'
+         JOIN room_delivery_current AS delivery
+           ON delivery.event_id = event.id AND delivery.resident_id = ?
+              AND delivery.state IN ('queued', 'loaded')
+         LEFT JOIN room_context_commits AS committed
+           ON committed.event_id = event.id AND committed.resident_id = ? AND committed.marker = ?
+         WHERE event.room_id = ? AND committed.id IS NULL
+         ORDER BY event.position`,
+      )
+      .all(residentId, residentId, marker, roomId) as unknown as { readonly id: string }[];
+    return rows.map((row) => row.id);
+  }
+
   recordReaction(residentId: string, eventId: string, eventMarker: string): RoomReactionRecord {
+    this.#assertOpen();
     this.#database
       .prepare(
         `INSERT INTO room_resident_reactions (event_id, resident_id, event_marker)
@@ -499,6 +544,7 @@ export class RoomEventStore {
   }
 
   readReactions(): readonly RoomReactionRecord[] {
+    this.#assertOpen();
     const rows = this.#database
       .prepare(
         `SELECT resident_id, event_marker FROM room_resident_reactions
@@ -584,6 +630,7 @@ export class RoomEventStore {
   }
 
   #inTransaction<T>(action: () => T): T {
+    this.#assertOpen();
     this.#database.exec("BEGIN IMMEDIATE");
     try {
       const result = action();
@@ -597,6 +644,10 @@ export class RoomEventStore {
       }
       throw error;
     }
+  }
+
+  #assertOpen(): void {
+    if (this.#closed) throw new Error("room event store is closed");
   }
 
   #initializeSchema(): void {
@@ -732,6 +783,7 @@ export class RoomEventStore {
         phase TEXT NOT NULL CHECK (phase IN ('dispatched', 'context-committed')),
         claim TEXT,
         context_commit_id TEXT REFERENCES room_context_commits(id),
+        roster_version INTEGER NOT NULL CHECK (roster_version >= 0),
         CHECK (
           (phase = 'dispatched' AND context_commit_id IS NULL) OR
           (phase = 'context-committed' AND context_commit_id IS NOT NULL)
@@ -786,9 +838,11 @@ function contextCommitFromRow(row: ContextCommitRow): ContextCommitRecord {
 /** One versioned roster, shared by registration, membership mutations and every roster path. */
 export class RoomRosterStore {
   readonly #database: DatabaseSyncType;
+  readonly #assertOpen: () => void;
 
-  constructor(database: DatabaseSyncType) {
+  constructor(database: DatabaseSyncType, assertOpen: () => void) {
     this.#database = database;
+    this.#assertOpen = assertOpen;
   }
 
   mutateMembership(input: {
@@ -870,6 +924,7 @@ export class RoomRosterStore {
   }
 
   synchronizeMemberships(roomId: string, residentIds: readonly string[]): void {
+    this.#assertOpen();
     const desired = new Set(residentIds);
     for (const residentId of this.activeResidentIds(roomId)) {
       if (desired.has(residentId)) continue;
@@ -893,17 +948,43 @@ export class RoomRosterStore {
   }
 
   readRoster(): RoomRosterSnapshot {
+    this.#assertOpen();
     return this.#readRoster();
   }
 
-  readRosterPath(_path: "broadcast" | "mention" | "projection" | "feedback" | "status"): {
+  readRosterPath(
+    path: "broadcast" | "mention" | "projection" | "feedback" | "status",
+    roomId: string,
+    humanIds: readonly string[] = [],
+  ): {
     readonly residentIds: readonly string[];
     readonly humanIds: readonly string[];
   } {
-    return { residentIds: this.#readRoster().residentIds, humanIds: [] };
+    this.#assertOpen();
+    const residentIds = this.activeResidentIds(roomId);
+    switch (path) {
+      case "broadcast":
+      case "mention":
+      case "projection":
+      case "feedback":
+      case "status":
+        return { residentIds, humanIds: [...humanIds] };
+    }
+  }
+
+  isActiveMember(roomId: string, residentId: string): boolean {
+    this.#assertOpen();
+    return (
+      this.#database
+        .prepare(
+          "SELECT 1 AS present FROM room_memberships WHERE room_id = ? AND resident_id = ? AND active = 1",
+        )
+        .get(roomId, residentId) !== undefined
+    );
   }
 
   activeResidentIds(roomId?: string): readonly string[] {
+    this.#assertOpen();
     const rows = this.#database
       .prepare(
         roomId === undefined

@@ -56,6 +56,7 @@ describe("RoomEventStore", () => {
 
     store.close();
     expect(() => store.readRoomEvents()).toThrow();
+    expect(() => store.roster.readRoster()).toThrow(/room event store is closed/);
     expect(() => store.close()).not.toThrow();
   });
 
@@ -334,12 +335,19 @@ describe("RoomEventStore", () => {
     expect(() =>
       store.commitContext({ roomEventId: event.id, residentId: "resident-a", marker: "early" }),
     ).toThrow(/before its room event is dispatched/);
-    store.dispatchEvent(event.id, ["resident-a", "resident-b"]);
-    store.dispatchEvent(event.id, ["resident-a", "resident-b"]);
+    store.dispatchEvent(event.id, ["resident-a", "resident-b"], store.roster.readRoster().version);
+    store.dispatchEvent(event.id, ["resident-a", "resident-b"], store.roster.readRoster().version);
     expect(store.readDeliveries(event.id)).toEqual([
       { residentId: "resident-a", state: "queued", sequence: 1 },
       { residentId: "resident-b", state: "queued", sequence: 1 },
     ]);
+    expect(() =>
+      store.commitContext({
+        roomEventId: event.id,
+        residentId: "resident-c",
+        marker: "no-delivery",
+      }),
+    ).toThrow(/without a dispatch delivery/);
     const commit = store.commitContext({
       roomEventId: event.id,
       residentId: "resident-a",
@@ -352,11 +360,12 @@ describe("RoomEventStore", () => {
     expect(store.readContextCommits()).toEqual([commit]);
     expect(store.readSystemReceipts()).toEqual([
       { actor: "system", phase: "recorded", roomEventId: event.id, claim: ROOM_RECORDED_CLAIM },
-      { actor: "system", phase: "dispatched", roomEventId: event.id },
+      { actor: "system", phase: "dispatched", roomEventId: event.id, rosterVersion: 0 },
       {
         actor: "system",
         phase: "context-committed",
         roomEventId: event.id,
+        rosterVersion: 0,
         contextCommitRef: commit.id,
       },
     ]);
@@ -373,7 +382,7 @@ describe("RoomEventStore", () => {
     const root = await makeRoot();
     const store = new RoomEventStore(root);
     const event = store.append(appendInput()).event;
-    store.dispatchEvent(event.id, []);
+    store.dispatchEvent(event.id, ["resident-a"], store.roster.readRoster().version);
     const db = new DatabaseSync(join(root, "room-events.sqlite"));
     db.exec(`CREATE TRIGGER reject_context_receipt BEFORE INSERT ON room_stage_receipts
       WHEN NEW.phase = 'context-committed' BEGIN SELECT RAISE(ABORT, 'receipt rejected'); END`);
@@ -384,7 +393,7 @@ describe("RoomEventStore", () => {
     ).toThrow(/receipt rejected/);
     expect(store.readContextCommits()).toEqual([]);
     expect(store.readSystemReceipts()).toEqual([
-      { actor: "system", phase: "dispatched", roomEventId: event.id },
+      { actor: "system", phase: "dispatched", roomEventId: event.id, rosterVersion: 0 },
     ]);
     store.close();
   });
@@ -422,9 +431,9 @@ describe("RoomEventStore", () => {
       residentId: "resident-a",
       active: true,
     });
-    expect(store.roster.readRosterPath("broadcast").residentIds).toContain("resident-a");
-    expect(store.roster.readRosterPath("mention").residentIds).toEqual(
-      store.roster.readRosterPath("status").residentIds,
+    expect(store.roster.readRosterPath("broadcast", "room-a").residentIds).toContain("resident-a");
+    expect(store.roster.readRosterPath("mention", "room-a").residentIds).toEqual(
+      store.roster.readRosterPath("status", "room-a").residentIds,
     );
     const db = new DatabaseSync(join(root, "room-events.sqlite"));
     expect(

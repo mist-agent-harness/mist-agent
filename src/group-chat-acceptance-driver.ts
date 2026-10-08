@@ -274,10 +274,13 @@ export function createGroupChatHostDriver(
               bindingId: trustedBinding,
             }))
           : [];
-      await active().request("reset", {
-        grants,
-        roomId: fixture.roomId,
-        residentIds: [fixture.residentIds.a, fixture.residentIds.b],
+      await active().request("acceptance-admin", {
+        command: {
+          kind: "reset",
+          grants,
+          roomId: fixture.roomId,
+          residentIds: [fixture.residentIds.a, fixture.residentIds.b],
+        },
       });
     },
     perform: async (command: GroupChatCommand) => {
@@ -300,7 +303,7 @@ export function createGroupChatHostDriver(
           return;
         }
         case "seed-resident-private":
-          await active().request("seed-resident-private", command);
+          await active().request("acceptance-admin", { command });
           return;
         case "save-memory":
           await active().request("save-memory", command);
@@ -315,7 +318,7 @@ export function createGroupChatHostDriver(
           await active().request("exercise-roster-path", command);
           return;
         case "record-event":
-          await active().request("record-event", command);
+          await active().request("acceptance-admin", { command });
           return;
         case "dispatch-event":
           await active().request("dispatch-event", command);
@@ -347,7 +350,9 @@ export function createGroupChatHostDriver(
     readDeliveries: (eventId: string) =>
       active().request<readonly DeliveryRecord[]>("read-deliveries", { eventId }),
     readMemories: async () => {
-      const memories = await active().request<readonly ResidentMemory[]>("read-memories");
+      const memories = await active().request<readonly ResidentMemory[]>("acceptance-admin", {
+        command: { kind: "read-memories" },
+      });
       return memories.map(
         ({ residentId, sourceEventId, body }): MemoryRecord => ({
           residentId: residentId as MemoryRecord["residentId"],

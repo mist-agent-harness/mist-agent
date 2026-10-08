@@ -59,6 +59,7 @@ export class ResidentPrivateStore {
   }
 
   seedContext(residentId: string, canary: string): void {
+    this.#assertOpen();
     this.#database
       .prepare(
         `INSERT INTO resident_private_context (id, resident_id, canary)
@@ -67,7 +68,8 @@ export class ResidentPrivateStore {
       .run(randomUUID(), residentId, canary);
   }
 
-  readContext(requesterResidentId: string, ownerResidentId = requesterResidentId): string {
+  readContext(requesterResidentId: string, ownerResidentId: string): string {
+    this.#assertOpen();
     this.#requireOwner(requesterResidentId, ownerResidentId);
     const rows = this.#database
       .prepare("SELECT canary FROM resident_private_context WHERE resident_id = ? ORDER BY rowid")
@@ -109,10 +111,8 @@ export class ResidentPrivateStore {
     });
   }
 
-  readMemories(
-    requesterResidentId: string,
-    ownerResidentId = requesterResidentId,
-  ): readonly ResidentMemory[] {
+  readMemories(requesterResidentId: string, ownerResidentId: string): readonly ResidentMemory[] {
+    this.#assertOpen();
     this.#requireOwner(requesterResidentId, ownerResidentId);
     const rows = this.#database
       .prepare(
@@ -125,6 +125,7 @@ export class ResidentPrivateStore {
 
   /** Trusted host-side acceptance audit; resident-facing reads must use the owner-checked API. */
   readAllMemoriesForHostAudit(): readonly ResidentMemory[] {
+    this.#assertOpen();
     const rows = this.#database
       .prepare(
         `SELECT id, resident_id, source_event_id, body FROM resident_memories
@@ -145,6 +146,7 @@ export class ResidentPrivateStore {
   }
 
   #inTransaction<T>(action: () => T): T {
+    this.#assertOpen();
     this.#database.exec("BEGIN IMMEDIATE");
     try {
       const result = action();
@@ -158,6 +160,10 @@ export class ResidentPrivateStore {
       }
       throw error;
     }
+  }
+
+  #assertOpen(): void {
+    if (this.#closed) throw new Error("resident-private store is closed");
   }
 
   #initializeSchema(): void {

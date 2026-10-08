@@ -167,6 +167,116 @@ describe("group-chat acceptance host process", () => {
     ]);
   });
 
+  it("uses a fresh operation identity for identical admin events and delivery transitions", async () => {
+    driver = createGroupChatHostDriver();
+    const fixture = groupChatSyntheticFixture;
+    const run = await driver.startHost();
+    dataRoot = run.dataRoot;
+    await driver.resetScenario("GC-03", fixture);
+
+    const duplicateBody = "TEST-REPEATED-IDENTICAL-EVENT";
+    await driver.perform({
+      kind: "record-event",
+      roomId: fixture.roomId,
+      authorId: fixture.humanId,
+      body: duplicateBody,
+    });
+    await driver.perform({
+      kind: "record-event",
+      roomId: fixture.roomId,
+      authorId: fixture.humanId,
+      body: duplicateBody,
+    });
+    const sameBodyEvents = (await driver.readRoomEvents(fixture.roomId)).filter(
+      (event) => event.body === duplicateBody,
+    );
+    expect(sameBodyEvents).toHaveLength(2);
+    expect(new Set(sameBodyEvents.map((event) => event.id)).size).toBe(2);
+
+    const deliveryBody = "TEST-DELIVERY-LOADED-QUEUED-LOADED";
+    await driver.perform({
+      kind: "record-event",
+      roomId: fixture.roomId,
+      authorId: fixture.humanId,
+      body: deliveryBody,
+    });
+    for (const state of ["loaded", "queued", "loaded"] as const)
+      await driver.perform({
+        kind: "set-delivery-state",
+        eventMarker: deliveryBody,
+        residentId: fixture.residentIds.a,
+        state,
+      });
+    const event = (await driver.readRoomEvents(fixture.roomId)).find(
+      (row) => row.body === deliveryBody,
+    );
+    expect(event).toBeDefined();
+    expect(event && (await driver.readDeliveries(event.id))).toEqual([
+      { residentId: fixture.residentIds.a, state: "loaded" },
+    ]);
+  });
+
+  it("requires exactly one dispatched delivery and rejects non-member reads and writes", async () => {
+    driver = createGroupChatHostDriver();
+    const fixture = groupChatSyntheticFixture;
+    const run = await driver.startHost();
+    dataRoot = run.dataRoot;
+    await driver.resetScenario("GC-01", fixture);
+
+    for (const body of ["TEST-COMMIT-CANDIDATE-A", "TEST-COMMIT-CANDIDATE-B"]) {
+      await driver.perform({
+        kind: "record-event",
+        roomId: fixture.roomId,
+        authorId: fixture.humanId,
+        body,
+      });
+      await driver.perform({ kind: "dispatch-event", eventMarker: body });
+    }
+    await expect(
+      driver.perform({
+        kind: "commit-context",
+        residentId: fixture.residentIds.a,
+        marker: "TEST-AMBIGUOUS-CONTEXT",
+      }),
+    ).rejects.toThrow(/exactly one dispatched delivery; found 2/);
+    expect(await driver.readContextCommits()).toEqual([]);
+
+    await driver.perform({
+      kind: "record-event",
+      roomId: fixture.roomId,
+      authorId: fixture.humanId,
+      body: "TEST-MEMBERSHIP-BOUNDARY",
+    });
+    const event = (await driver.readRoomEvents(fixture.roomId)).find(
+      (row) => row.body === "TEST-MEMBERSHIP-BOUNDARY",
+    );
+    if (event === undefined) throw new Error("membership test event was not recorded");
+    await expect(
+      driver.perform({
+        kind: "save-memory",
+        residentId: fixture.residentIds.c,
+        sourceEventId: event.id,
+      }),
+    ).rejects.toThrow(/active room member/);
+    await expect(
+      driver.perform({
+        kind: "set-delivery-state",
+        eventMarker: "TEST-MEMBERSHIP-BOUNDARY",
+        residentId: fixture.residentIds.c,
+        state: "loaded",
+      }),
+    ).rejects.toThrow(/active member/);
+
+    expect((await driver.readSurface(fixture.roomId, fixture.humanId)).body).toContain(
+      "TEST-MEMBERSHIP-BOUNDARY",
+    );
+    expect(await driver.readSurface(fixture.roomId, "untrusted-viewer")).toMatchObject({
+      body: "",
+      visibleEventIds: [],
+      errorCode: "room_membership_required",
+    });
+  });
+
   it("returns a wrong-binding rejection to its sender without recording it", async () => {
     const exchanges: RoomPostExchangeObservation[] = [];
     driver = createGroupChatHostDriver({ onPostExchange: (exchange) => exchanges.push(exchange) });
