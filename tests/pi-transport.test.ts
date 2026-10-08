@@ -72,6 +72,7 @@ process.stdin.on("data", (chunk) => {
     pid: process.pid,
     args,
     message: command.message,
+    images: command.images ?? null,
     systemPrompt: fs.readFileSync(promptPath, "utf8"),
     systemPromptPath: promptPath,
     systemPromptMode: fs.statSync(promptPath).mode & 0o777,
@@ -122,6 +123,16 @@ process.stdin.on("data", (chunk) => {
     emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "部分" } });
     process.exit(0);
   }
+  if (mode === "canary-type") {
+    const canary = process.env.DEEPSEEK_API_KEY ?? "no-canary";
+    emit({ type: "turn_end", message: {
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: "safe text" }, { type: canary }],
+    } });
+    emit({ type: "agent_settled" });
+    return;
+  }
   const deltas = process.env.FAKE_PI_TEXT !== undefined
     ? [process.env.FAKE_PI_TEXT]
     : mode === "ordinary-error"
@@ -141,7 +152,18 @@ process.stdin.on("data", (chunk) => {
       role: "assistant",
       stopReason: mode === "turn-error" ? "error" : mode === "turn-aborted" ? "aborted" : "stop",
       errorMessage: mode === "turn-error" ? "private auth details" : undefined,
-      content: [{ type: "text", text: finalText }],
+      content:
+        mode === "tool-call"
+          ? [
+              { type: "text", text: "synthetic text" },
+              { type: "toolCall", id: "synthetic-call", name: "synthetic-tool", arguments: {} },
+            ]
+          : mode === "thinking-ok"
+            ? [
+                { type: "thinking", thinking: "internal reasoning" },
+                { type: "text", text: finalText },
+              ]
+            : [{ type: "text", text: finalText }],
     },
   });
   emit({ type: "agent_settled" });
@@ -554,5 +576,110 @@ describe("pi 通道的解析件", () => {
   it('createModelTransport("pi") 接真通道', () => {
     expect(createModelTransport("pi")).toBeInstanceOf(PiCliTransport);
     expect(createModelTransport("synthetic")).not.toBeInstanceOf(PiCliTransport);
+  });
+});
+
+describe("PiCliTransport 原生图片块", () => {
+  const PNG =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgYAAAAAMAAWgmWQ0AAAAASUVORK5CYII=";
+
+  it("把受支持图片作为原生 images 块随 prompt 发送到 stdin", async () => {
+    const { bin, recordPath } = fakePi();
+    await collect(
+      new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_RECORD: recordPath } }).complete(
+        request({ images: [{ mimeType: "image/png", data: PNG }] }),
+      ),
+    );
+    const record = JSON.parse(readFileSync(recordPath, "utf8")) as {
+      message: string;
+      images: unknown;
+    };
+    expect(record.message).toBe("在吗");
+    expect(record.images).toEqual([{ type: "image", data: PNG, mimeType: "image/png" }]);
+  });
+
+  it("纯文本回合不带 images 字段", async () => {
+    const { bin, recordPath } = fakePi();
+    await collect(
+      new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_RECORD: recordPath } }).complete(
+        request(),
+      ),
+    );
+    const record = JSON.parse(readFileSync(recordPath, "utf8")) as { images: unknown };
+    expect(record.images).toBeNull();
+  });
+
+  it.each([
+    [{ mimeType: "text/html", data: PNG }, /不支持的图片媒体类型/],
+    [{ mimeType: "image/png", data: "!!!not-base64!!!" }, /不是有效 base64/],
+  ])("图片非法时在启动子进程前 fail-closed（%o）", async (image, pattern) => {
+    const { bin, recordPath } = fakePi();
+    await expect(
+      collect(
+        new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_RECORD: recordPath } }).complete(
+          request({ images: [image] }),
+        ),
+      ),
+    ).rejects.toThrow(pattern);
+    expect(() => readFileSync(recordPath, "utf8")).toThrow();
+  });
+
+  it("图片数量超过上限时在启动子进程前 fail-closed", async () => {
+    const { bin, recordPath } = fakePi();
+    const images = Array.from({ length: 9 }, () => ({ mimeType: "image/png", data: PNG }));
+    await expect(
+      collect(
+        new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_RECORD: recordPath } }).complete(
+          request({ images }),
+        ),
+      ),
+    ).rejects.toThrow(/图片数量超过安全上限/);
+    expect(() => readFileSync(recordPath, "utf8")).toThrow();
+  });
+});
+
+describe("PiCliTransport 结构化输出 fail-closed", () => {
+  it("turn_end 含 text+toolCall 混合内容时拒绝，不把 text 当完整成功", async () => {
+    const { bin, recordPath } = fakePi();
+    const completion = collect(
+      new PiCliTransport({
+        piBin: bin,
+        extraEnv: { FAKE_PI_MODE: "tool-call", FAKE_PI_RECORD: recordPath },
+      }).complete(request()),
+    );
+    await expect(completion).rejects.toThrow(/不受支持的内容类型：tool_call/);
+    // 上游确实被调用过（fake pi 写了记录）。
+    const record = JSON.parse(readFileSync(recordPath, "utf8")) as { message: string };
+    expect(record.message).toBe("在吗");
+  });
+
+  it("未知原生 type 只归固定枚举，不回显原文/凭据", async () => {
+    const { bin, recordPath } = fakePi();
+    const canary = "sk-canary-unknown-type-leak";
+    const completion = collect(
+      new PiCliTransport({
+        piBin: bin,
+        extraEnv: { FAKE_PI_MODE: "canary-type", FAKE_PI_RECORD: recordPath },
+      }).complete(request({ model: "deepseek/deepseek-chat", credentialSecret: canary })),
+    );
+    await expect(completion).rejects.toThrow(/不受支持的内容类型：unsupported_content/);
+    const message = await completion.then(
+      () => "",
+      (caught: unknown) => (caught instanceof Error ? caught.message : String(caught)),
+    );
+    expect(message).not.toContain(canary);
+    expect(message).not.toContain("sk-canary");
+    // 上游确实被调用。
+    expect(readFileSync(recordPath, "utf8")).toContain("deepseek");
+  });
+
+  it("既有 thinking+text 合法形状保持兼容", async () => {
+    const { bin } = fakePi();
+    const chunks = await collect(
+      new PiCliTransport({ piBin: bin, extraEnv: { FAKE_PI_MODE: "thinking-ok" } }).complete(
+        request(),
+      ),
+    );
+    expect(chunks.join("")).toContain("你好");
   });
 });

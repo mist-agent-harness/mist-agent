@@ -3,6 +3,11 @@
 对应 #218 与 [OpenAI-compatible 前端适配层图纸](../docs/design/openai-compatible-frontend-adapter.md)。
 本页是人话清单，可执行版是同目录的 `frontend-adapter-checks.ts`；两边必须同步。
 
+> **D31 拆分（#218 2026-10-08 主笔裁定）**：D31 拆两步。第一步（本单）只交文字聊天：
+> FE-01～FE-04、FE-06、FE-07 属文字第一步；**FE-05（附件与选项）保持红**，连同
+> 一窗流读写结构事件另开一单。按主笔裁定，FE-02 里带附件/选项的两条流式正例、
+> FE-07 里的附件结构/私有附件写入正反例已**整段迁到 FE-05**，判据不放松。
+
 ```bash
 npm run acceptance:frontend-adapter
 npm run acceptance:frontend-adapter:strict
@@ -10,20 +15,15 @@ npm run acceptance:frontend-adapter:strict
 
 报告模式在缺驱动时打印七盏红灯并退出 0；strict 模式只在七盏真绿时退出 0。
 实现方在 `src/frontend-adapter-acceptance-driver.ts` 导出
-`createFrontendAdapterDriver()`。驱动缺失是判卷先行的起点，不是实现失败；驱动存在却损坏必须
-直接报错，不能伪装成「缺驱动」。
+`createFrontendAdapterDriver()`。驱动缺失是判卷先行的起点；驱动存在却损坏必须直接报错。
 
-## PR1 交付边界
+## PR1 冻结记录
 
-本轮只冻结：
-
-- adapter 图纸；
-- FE-01～FE-07 的 typed driver、可执行检查与 runner；
-- 报告/strict npm 入口及判卷器自检。
-
-本轮不新增网络监听、不改安装器、不创建生产 driver、不实现 `/webui`、不安装 Open WebUI，
-所以七盏在真实仓库上应当保持未勾、runner 应报告 `0 / 7`。合成正对照只证明判卷器自身不矛盾，
-不能拿来申绿。
+以下是历史 PR1 边界，D31-1 后续裁定已改变实现状态：当时只冻结图纸、typed driver、判卷器
+与 runner，真实仓库预期 0/7。它不再描述当前代码。当前文字第一步已接入宿主 `say()`、
+loopback listener 与 `/webui` 插件路径；FE-05 仍按裁定延期并保持红。测试中的外部命令/服务、
+Open WebUI 管理 API 和 runtime transport 是受控替身，不代表真实 provider、真实 UI 安装或
+browser 渲染已运行。SSE 在完整回合后输出，不是实时 token 流。
 
 ## 七盏灯
 
@@ -37,7 +37,8 @@ npm run acceptance:frontend-adapter:strict
   解析它：envelope 的 `id`/`object`/`created`/`model`/`choices` message 或 delta、`finish_reason`、
   空行分帧、末尾唯一 `[DONE]` 与 snake_case `mist` 扩展逐项核对，归一化正文必须与 wire 逐字对应——坏 choices/SSE 不能靠驱动
   美化归一化值过灯。单份 SSE `mist` 的 stream_id、projection、attachments、interaction 必须与
-  归一化完整结构对应；空附件/null interaction 的纯文本及非空附件/choice 正例都要成立。
+  归一化完整结构对应；本步 FE-02 只冻结**纯文本**（空附件/null interaction）；非空附件/choice
+  的流式正例已迁到 FE-05。
   普通和流式两回合的文本事件按 user→assistant→user→assistant 核 kind、正文和顺序，
   各恰好一份；允许合法的非文本辅助事件，
   全部事件来自绑定的唯一 writer；响应 `model` 与 stream id 由服务端绑定给出。请求带显式
@@ -84,6 +85,9 @@ npm run acceptance:frontend-adapter:strict
   流式回合不能只搬附件：`kind: "blocked"` 等 interaction 的 options、reasonCode、投影关联与
   目标 writer/identity 必须在归一化值、SSE wire 与 canonical 三处逐字对齐，SSE 不能丢掉
   interaction 扩展。
+  另外，按主笔裁定从 FE-02 迁入：非空附件/choice 的两条 SSE 流式正例（完整 mist 结构逐项
+  对应）；从 FE-07 迁入：入站/出站附件的完整结构、私有附件面写入前后 delta 与五种归属、
+  与 model turn/canonical/wire 互证等正反例。判据不放松。
 
 - [ ] **FE-06 鉴权默认强制**：remote/loopback 的缺 token、错 token 都返回 401 与稳定 code，
   且模型调用、canonical/control/附件写入为零；附件副作用由独立 `readAttachmentWrites` 读口核验，
@@ -109,10 +113,9 @@ npm run acceptance:frontend-adapter:strict
   已安装服务。`runtimeUsed` 从实际服务配置读回，必须是该场景唯一可用的 runtime，且与安装
   操作审计一致；选择不可用 runtime 的两种 mutation 都判红。
   Open WebUI 的合成请求复用 FE-02 同一 endpoint 与 canonical stream：本轮恰好新增一对
-  同 resident/scope/stream/writer 的 user/assistant 事件；私有附件面写入前后 delta 恰好入站/出站
-  两条，每条核完整结构 + binding/resident/scope/stream/writer 五种归属（`writerId` 即 canonical
-  写入归属），入站与本次 model turn、canonical 事件及输入字节数互证，出站与 queued reply
-  完整结构匹配，并核完整 wire 回复。
+  同 resident/scope/stream/writer 的**文字** user/assistant 事件，并核完整 wire 回复。
+  （附件的完整结构、私有附件面写入前后 delta 与五种归属、入站/出站互证等正反例已按主笔
+  裁定迁到 FE-05。）
   无效鉴权 401 且零模型/账/附件副作用，伪造历史
   不进模型也不落账，`mist.task_kind` 的 utility 请求稳定拒绝且不落账——不另开
   auth/history/writer 后门。

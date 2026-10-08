@@ -123,10 +123,10 @@ function oauthRef(id: string, type: "claude_oauth" | "codex_oauth" | "grok_oauth
 }
 
 describe.each([
+  { frontend: "terminal", memory: "existing", expectedStatus: "committed" },
+  { frontend: "terminal", memory: "create", expectedStatus: "committed" },
   { frontend: "external", memory: "existing", expectedStatus: "committed" },
   { frontend: "external", memory: "create", expectedStatus: "committed" },
-  { frontend: "official-skin", memory: "existing", expectedStatus: "dependency-pending" },
-  { frontend: "official-skin", memory: "create", expectedStatus: "dependency-pending" },
 ] as const)("installer runner: $frontend + $memory", ({ frontend, memory, expectedStatus }) => {
   it("finishes safely without leaking credential text", async () => {
     const directory = freshDirectory();
@@ -134,13 +134,10 @@ describe.each([
     const memoryPath = join(directory, "memory-choice");
     if (memory === "existing") mkdirSync(memoryPath);
     const prompt = new ScriptedPrompt({
-      selects:
-        frontend === "official-skin"
-          ? ["codex", "api-key", "codex-key", frontend, memory, "keep"]
-          : ["codex", "api-key", "codex-key", frontend, memory],
+      selects: ["codex", "api-key", "codex-key", frontend, memory],
       inputs: ["codex-key", memoryPath],
       secrets: ["credential-text"],
-      confirms: frontend === "external" ? [false, false, true] : [false, false],
+      confirms: [false, false, true],
     });
     const result = await runInstaller({
       residentId: "resident-1",
@@ -158,11 +155,6 @@ describe.each([
       expect(result.receipt.config.memory.kind).toBe(memory);
       expect(JSON.stringify(result.receipt.config)).not.toContain("credential-text");
       expect(store.readCredentialSecret("codex-key")).toBe("credential-text");
-    } else if (result.status === "dependency-pending") {
-      expect(result.draft.frontend?.kind).toBe("official-skin");
-      expect(result.draft.memory?.kind).toBe(memory);
-      expect(store.loadCurrentConfig()).toBeNull();
-      expect(store.loadDraft()?.progress.currentStep).toBe("review");
     }
     expect(existsSync(memoryPath)).toBe(true);
     prompt.expectExhausted();
@@ -379,7 +371,7 @@ it("keeps the exact review draft when commit is declined", async () => {
       credentialRef: apiKeyRef("codex-key"),
     },
   ]);
-  controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
+  controller.saveFrontend({ kind: "external", integration: "openai-compatible" });
   controller.saveMemory({ kind: "create", path: join(directory, "memory") });
 
   const prompt = new ScriptedPrompt({
@@ -405,7 +397,7 @@ it("keeps the exact review draft when commit is declined", async () => {
   prompt.expectExhausted();
 });
 
-it("lets a pending official-skin draft switch to an external frontend without redoing memory", async () => {
+it("fails closed on a legacy official-skin draft instead of silently migrating it", async () => {
   const directory = freshDirectory();
   const store = new InstallerStateStore(directory);
   const memoryPath = join(directory, "memory");
@@ -431,20 +423,18 @@ it("lets a pending official-skin draft switch to an external frontend without re
       credentialRef: apiKeyRef("codex-key"),
     },
   ]);
+  // A draft written by an older build: official-skin is legacy and read-time rejected.
   first.saveFrontend({
     kind: "official-skin",
     pluginId: "mist-official-skin",
     installation: "pending",
-  });
+  } as never);
   const reviewDraft = first.saveMemory({ kind: "create", path: memoryPath });
   libraries.createEmpty(memoryPath, reviewDraft.draftId);
 
-  const prompt = new ScriptedPrompt({
-    selects: ["resume", "change", "external"],
-    inputs: [],
-    secrets: [],
-    confirms: [true],
-  });
+  const draftPath = join(directory, "installer-draft.json");
+  const bytesBefore = readFileSync(draftPath, "utf8");
+  const prompt = new ScriptedPrompt({ selects: [], inputs: [], secrets: [], confirms: [] });
   const result = await runInstaller({
     residentId: "resident-1",
     dataDir: directory,
@@ -455,13 +445,13 @@ it("lets a pending official-skin draft switch to an external frontend without re
     memoryLibraries: libraries,
   });
 
-  expect(result.status).toBe("committed");
-  if (result.status !== "committed") throw new Error("expected committed setup");
-  expect(result.receipt.config.frontend).toEqual({
-    kind: "external",
-    integration: "mist-session-api",
-  });
-  expect(result.receipt.config.memory.path).toBe(memoryPath);
+  expect(result.status).toBe("legacy-frontend");
+  if (result.status !== "legacy-frontend") throw new Error("expected legacy-frontend");
+  expect(result.remedy).toMatch(/no longer supported/);
+  expect(prompt.infoMessages.some((message) => message.includes("no longer supported"))).toBe(true);
+  // 原字节不动，也没有静默落成 terminal/external。
+  expect(readFileSync(draftPath, "utf8")).toBe(bytesBefore);
+  expect(store.loadCurrentConfig()).toBeNull();
   prompt.expectExhausted();
 });
 
@@ -489,7 +479,7 @@ it("keeps an existing installation by default instead of creating a second snaps
       credentialRef: apiKeyRef("codex-key"),
     },
   ]);
-  controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
+  controller.saveFrontend({ kind: "external", integration: "openai-compatible" });
   controller.saveMemory({ kind: "create", path: join(directory, "memory") });
   const first = controller.commit();
 
@@ -540,7 +530,7 @@ it("removes an untouched installer-created memory library when its draft is disc
       credentialRef: apiKeyRef("old-key"),
     },
   ]);
-  old.saveFrontend({ kind: "external", integration: "mist-session-api" });
+  old.saveFrontend({ kind: "external", integration: "openai-compatible" });
   const reviewDraft = old.saveMemory({ kind: "create", path: memoryPath });
   libraries.createEmpty(memoryPath, reviewDraft.draftId);
 
@@ -594,7 +584,7 @@ it("does not delete the active memory library when a same-path replacement draft
       credentialRef: apiKeyRef("active-key"),
     },
   ]);
-  active.saveFrontend({ kind: "external", integration: "mist-session-api" });
+  active.saveFrontend({ kind: "external", integration: "openai-compatible" });
   const activeDraft = active.saveMemory({ kind: "create", path: memoryPath });
   libraries.createEmpty(memoryPath, activeDraft.draftId);
   active.commit();
@@ -620,7 +610,7 @@ it("does not delete the active memory library when a same-path replacement draft
       credentialRef: apiKeyRef("abandoned-key"),
     },
   ]);
-  abandoned.saveFrontend({ kind: "external", integration: "mist-session-api" });
+  abandoned.saveFrontend({ kind: "external", integration: "openai-compatible" });
   const abandonedDraft = abandoned.saveMemory({ kind: "create", path: memoryPath });
   libraries.createEmpty(memoryPath, abandonedDraft.draftId);
 
@@ -674,7 +664,7 @@ function reviewReadyDraft(
         credentialRef: overrides.credentials[0]?.ref ?? apiKeyRef("codex-key"),
       },
     ],
-    frontend: { kind: "external", integration: "mist-session-api" },
+    frontend: { kind: "external", integration: "openai-compatible" },
     memory: overrides.memory,
     progress: {
       currentStep: "review",
@@ -830,7 +820,7 @@ it("lets the user pick another path when the memory library location is occupied
       credentialRef: apiKeyRef("codex-key"),
     },
   ]);
-  seeded.saveFrontend({ kind: "external", integration: "mist-session-api" });
+  seeded.saveFrontend({ kind: "external", integration: "openai-compatible" });
   seeded.saveMemory({ kind: "create", path: occupied });
 
   const prompt = new ScriptedPrompt({

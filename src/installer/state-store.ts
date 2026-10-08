@@ -21,6 +21,7 @@ import {
   credentialSecretRef,
   validateReadyDraft,
 } from "./contracts.ts";
+import { LegacyFrontendUnsupportedError, isLegacyFrontend } from "./legacy-frontend.ts";
 
 interface CurrentPointer {
   schemaVersion: 1;
@@ -121,6 +122,8 @@ export class InstallerStateStore {
         }
         return null;
       }
+      // D31：旧 official-skin 草稿在读取时 fail-closed，原字节不动，也不静默改写。
+      if (isLegacyFrontend(draft.frontend)) throw new LegacyFrontendUnsupportedError();
       return draft;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
@@ -222,9 +225,12 @@ export class InstallerStateStore {
       const pointer = this.#loadCurrentPointer();
       if (pointer === null) return null;
       assertSafeInstallerId(pointer.snapshotId, "snapshot id");
-      return parseJson<MistInstallConfigV0>(
+      const config = parseJson<MistInstallConfigV0>(
         join(this.#snapshotsDir, pointer.snapshotId, "config.json"),
       );
+      // D31：旧 official-skin 快照在读取时 fail-closed，不当作可用配置。
+      if (isLegacyFrontend(config.frontend)) throw new LegacyFrontendUnsupportedError();
+      return config;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
