@@ -48,6 +48,14 @@ type HostRequestPayload =
   | { readonly kind: "react"; readonly residentId: string; readonly eventMarker: string }
   | { readonly kind: "read-reactions" }
   | { readonly kind: "read-surface"; readonly roomId: string; readonly viewerId: string }
+  | { readonly kind: "attempt-room-read"; readonly roomId: string; readonly viewerId: string }
+  | {
+      readonly kind: "attempt-resident-scope-read";
+      readonly roomId: string;
+      readonly viewerId: string;
+      readonly ownerId: string;
+    }
+  | { readonly kind: "read-access-audit" }
   | { readonly kind: "shutdown" };
 
 type HostRequest = HostRequestPayload & {
@@ -228,6 +236,33 @@ async function handleMessage(message: unknown): Promise<void> {
           id: message.id,
           ok: true,
           value: host.readSurface(message.roomId, message.viewerId),
+          hostPid: process.pid,
+          requestHash,
+        });
+        return;
+      case "attempt-room-read":
+        respond({
+          id: message.id,
+          ok: true,
+          value: host.openRoom(message.roomId, message.viewerId),
+          hostPid: process.pid,
+          requestHash,
+        });
+        return;
+      case "attempt-resident-scope-read":
+        respond({
+          id: message.id,
+          ok: true,
+          value: host.attemptResidentScopeRead(message.roomId, message.viewerId, message.ownerId),
+          hostPid: process.pid,
+          requestHash,
+        });
+        return;
+      case "read-access-audit":
+        respond({
+          id: message.id,
+          ok: true,
+          value: host.readAccessAudit(),
           hostPid: process.pid,
           requestHash,
         });

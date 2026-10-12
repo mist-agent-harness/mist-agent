@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
@@ -10,6 +10,40 @@ const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as {
 
 export const ROOM_RECORDED_CLAIM = "房间已记录";
 
+export type RoomVisibility = "public" | "hidden";
+
+/** A room created through the registry; rooms never registered are treated as public. */
+export interface RoomRegistration {
+  readonly roomId: string;
+  readonly visibility: RoomVisibility;
+  readonly creatorId: string;
+}
+
+export interface RoomMembership {
+  readonly active: boolean;
+  /** Room ledger position at the latest join; events at or below it are pre-join history. */
+  readonly joinWatermark: number;
+  readonly historyGrant: boolean;
+}
+
+export type RoomAccessAuditKind = "room-read" | "resident-scope-read";
+/** What the requester is told: a refusal never says whether the target exists. */
+export type RoomAccessExternalResult = "allowed" | "not-found";
+
+export interface RoomAccessAuditInput {
+  readonly kind: RoomAccessAuditKind;
+  readonly viewerId: string;
+  readonly roomId: string;
+  readonly ownerId?: string;
+  readonly externalResult: RoomAccessExternalResult;
+  /** The real reason, kept for audit readers only; never returned to the requester. */
+  readonly internalReason: string;
+}
+
+export interface RoomAccessAuditEntry extends RoomAccessAuditInput {
+  readonly sequence: number;
+}
+
 export interface RoomEvent {
   readonly id: string;
   readonly roomId: string;
@@ -17,7 +51,7 @@ export interface RoomEvent {
   readonly principalId: string;
   readonly authorId: string;
   readonly body: string;
-  readonly visibility: "public" | "hidden";
+  readonly visibility: RoomVisibility;
   readonly mentions: readonly string[];
 }
 
@@ -68,7 +102,7 @@ export interface RoomEventAppend {
   readonly principalId: string;
   readonly authorId: string;
   readonly body: string;
-  readonly visibility: "public" | "hidden";
+  readonly visibility: RoomVisibility;
   readonly mentions?: readonly string[];
   /** Stable serialization of the full accepted request, used to detect operation-id reuse. */
   readonly requestSemantics: string;
@@ -192,113 +226,267 @@ export class RoomEventStore {
   }
 
   #append(input: RoomEventAppend, authorizeNew?: () => boolean): RoomEventAppendResult | null {
-    if (this.#closed) throw new Error("room event store is closed");
+    return this.#inTransaction(() => this.#appendLocked(input, authorizeNew));
+  }
 
-    let inTransaction = false;
-    try {
-      this.#database.exec("BEGIN IMMEDIATE");
-      inTransaction = true;
-
-      const existing = this.#database
-        .prepare(
-          `SELECT id, room_id, position, principal_id, author_id, body, visibility, mentions_json, request_semantics
+  /** Append inside the caller's write transaction; an operation id belongs to one room for good. */
+  #appendLocked(
+    input: RoomEventAppend,
+    authorizeNew?: () => boolean,
+  ): RoomEventAppendResult | null {
+    const existing = this.#database
+      .prepare(
+        `SELECT id, room_id, position, principal_id, author_id, body, visibility, mentions_json, request_semantics
            FROM room_events WHERE operation_id = ?`,
-        )
-        .get(input.operationId) as RoomEventRow | undefined;
+      )
+      .get(input.operationId) as RoomEventRow | undefined;
 
-      if (existing !== undefined) {
-        const receiptRow = this.#readReceiptRow(existing.id);
-        if (
-          existing.request_semantics !== input.requestSemantics ||
-          (receiptRow?.claim ?? null) !== (input.recordedClaim ?? null)
-        ) {
-          throw new RoomOperationConflictError(input.operationId);
-        }
-        this.#database.exec("COMMIT");
-        inTransaction = false;
-        return {
-          event: eventFromRow(existing),
-          receipt: receiptRow === undefined ? null : receiptFromRow(receiptRow),
-          replayed: true,
-        };
+    if (existing !== undefined) {
+      const receiptRow = this.#readReceiptRow(existing.id);
+      if (
+        existing.room_id !== input.roomId ||
+        existing.request_semantics !== input.requestSemantics ||
+        (receiptRow?.claim ?? null) !== (input.recordedClaim ?? null)
+      ) {
+        throw new RoomOperationConflictError(input.operationId);
       }
-
-      if (authorizeNew !== undefined && !authorizeNew()) {
-        this.#database.exec("COMMIT");
-        inTransaction = false;
-        return null;
-      }
-
-      const currentHead = this.#database
-        .prepare("SELECT last_position FROM room_heads WHERE room_id = ?")
-        .get(input.roomId) as { readonly last_position: number } | undefined;
-      const position = (currentHead?.last_position ?? 0) + 1;
-      const mentions = [...(input.mentions ?? [])];
-      const event: RoomEvent = {
-        id: randomUUID(),
-        roomId: input.roomId,
-        position,
-        principalId: input.principalId,
-        authorId: input.authorId,
-        body: input.body,
-        visibility: input.visibility,
-        mentions,
+      return {
+        event: eventFromRow(existing),
+        receipt: receiptRow === undefined ? null : receiptFromRow(receiptRow),
+        replayed: true,
       };
+    }
 
-      this.#database
-        .prepare(
-          `INSERT INTO room_events
+    if (authorizeNew !== undefined && !authorizeNew()) return null;
+
+    const currentHead = this.#database
+      .prepare("SELECT last_position FROM room_heads WHERE room_id = ?")
+      .get(input.roomId) as { readonly last_position: number } | undefined;
+    const position = (currentHead?.last_position ?? 0) + 1;
+    const mentions = [...(input.mentions ?? [])];
+    const event: RoomEvent = {
+      id: roomEventId(input.roomId, position),
+      roomId: input.roomId,
+      position,
+      principalId: input.principalId,
+      authorId: input.authorId,
+      body: input.body,
+      visibility: input.visibility,
+      mentions,
+    };
+
+    this.#database
+      .prepare(
+        `INSERT INTO room_events
             (id, operation_id, room_id, position, principal_id, author_id, body, visibility, mentions_json, request_semantics)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          event.id,
-          input.operationId,
-          event.roomId,
-          event.position,
-          event.principalId,
-          event.authorId,
-          event.body,
-          event.visibility,
-          JSON.stringify(event.mentions),
-          input.requestSemantics,
-        );
+      )
+      .run(
+        event.id,
+        input.operationId,
+        event.roomId,
+        event.position,
+        event.principalId,
+        event.authorId,
+        event.body,
+        event.visibility,
+        JSON.stringify(event.mentions),
+        input.requestSemantics,
+      );
+    this.#database
+      .prepare(
+        `INSERT INTO room_heads (room_id, last_position) VALUES (?, ?)
+           ON CONFLICT(room_id) DO UPDATE SET last_position = excluded.last_position`,
+      )
+      .run(event.roomId, event.position);
+
+    let receipt: RoomRecordedReceipt | null = null;
+    if (input.recordedClaim !== undefined) {
       this.#database
         .prepare(
-          `INSERT INTO room_heads (room_id, last_position) VALUES (?, ?)
-           ON CONFLICT(room_id) DO UPDATE SET last_position = excluded.last_position`,
+          `INSERT INTO room_system_receipts (event_id, actor, phase, claim)
+             VALUES (?, 'system', 'recorded', ?)`,
         )
-        .run(event.roomId, event.position);
+        .run(event.id, input.recordedClaim);
+      receipt = {
+        actor: "system",
+        phase: "recorded",
+        roomEventId: event.id,
+        claim: input.recordedClaim,
+      };
+    }
 
-      let receipt: RoomRecordedReceipt | null = null;
-      if (input.recordedClaim !== undefined) {
+    return { event, receipt, replayed: false };
+  }
+
+  /**
+   * Register a room and record its opening event in one transaction. Replaying the same
+   * operation returns the original; a room cannot be created twice or over existing history.
+   */
+  createRoom(input: {
+    readonly operationId: string;
+    readonly roomId: string;
+    readonly visibility: RoomVisibility;
+    readonly creatorId: string;
+    readonly openingBody: string;
+  }): RoomEventAppendResult {
+    return this.#inTransaction(() => {
+      const registered = this.#database
+        .prepare("SELECT operation_id, visibility, creator_id FROM room_registry WHERE room_id = ?")
+        .get(input.roomId) as
+        | {
+            readonly operation_id: string;
+            readonly visibility: RoomVisibility;
+            readonly creator_id: string;
+          }
+        | undefined;
+      if (registered !== undefined) {
+        if (
+          registered.operation_id !== input.operationId ||
+          registered.visibility !== input.visibility ||
+          registered.creator_id !== input.creatorId
+        )
+          throw new RoomOperationConflictError(input.operationId);
+      } else {
+        const head = this.#database
+          .prepare("SELECT 1 AS present FROM room_heads WHERE room_id = ?")
+          .get(input.roomId);
+        if (head !== undefined)
+          throw new Error(`room already has history and cannot be created: ${input.roomId}`);
+        const operationTaken = this.#database
+          .prepare("SELECT 1 AS present FROM room_registry WHERE operation_id = ?")
+          .get(input.operationId);
+        if (operationTaken !== undefined) throw new RoomOperationConflictError(input.operationId);
         this.#database
           .prepare(
-            `INSERT INTO room_system_receipts (event_id, actor, phase, claim)
-             VALUES (?, 'system', 'recorded', ?)`,
+            `INSERT INTO room_registry (room_id, visibility, operation_id, creator_id)
+             VALUES (?, ?, ?, ?)`,
           )
-          .run(event.id, input.recordedClaim);
-        receipt = {
-          actor: "system",
-          phase: "recorded",
-          roomEventId: event.id,
-          claim: input.recordedClaim,
-        };
+          .run(input.roomId, input.visibility, input.operationId, input.creatorId);
       }
+      const opened = this.#appendLocked({
+        operationId: input.operationId,
+        roomId: input.roomId,
+        principalId: input.creatorId,
+        authorId: input.creatorId,
+        body: input.openingBody,
+        visibility: input.visibility,
+        requestSemantics: JSON.stringify({
+          kind: "create-room",
+          roomId: input.roomId,
+          visibility: input.visibility,
+          creatorId: input.creatorId,
+          body: input.openingBody,
+        }),
+        recordedClaim: ROOM_RECORDED_CLAIM,
+      });
+      if (opened === null) throw new Error("room opening event was not recorded");
+      return opened;
+    });
+  }
 
-      this.#database.exec("COMMIT");
-      inTransaction = false;
-      return { event, receipt, replayed: false };
-    } catch (error) {
-      if (inTransaction) {
-        try {
-          this.#database.exec("ROLLBACK");
-        } catch {
-          // Preserve the original transaction error.
+  readRoomRegistration(roomId: string): RoomRegistration | null {
+    this.#assertOpen();
+    const row = this.#database
+      .prepare("SELECT room_id, visibility, creator_id FROM room_registry WHERE room_id = ?")
+      .get(roomId) as
+      | {
+          readonly room_id: string;
+          readonly visibility: RoomVisibility;
+          readonly creator_id: string;
         }
-      }
-      throw error;
-    }
+      | undefined;
+    return row === undefined
+      ? null
+      : { roomId: row.room_id, visibility: row.visibility, creatorId: row.creator_id };
+  }
+
+  /** Whether the room has a registry entry or any ledger history; used for audit reasons only. */
+  roomExists(roomId: string): boolean {
+    this.#assertOpen();
+    return (
+      this.#database
+        .prepare(
+          `SELECT 1 AS present FROM room_registry WHERE room_id = ?
+           UNION ALL SELECT 1 AS present FROM room_heads WHERE room_id = ?
+           LIMIT 1`,
+        )
+        .get(roomId, roomId) !== undefined
+    );
+  }
+
+  /** The durable operation that recorded an event, for replay checks inside the host. */
+  readEventOperation(eventId: string): {
+    readonly operationId: string;
+    readonly principalId: string;
+    readonly requestSemantics: string;
+  } | null {
+    this.#assertOpen();
+    const row = this.#database
+      .prepare("SELECT operation_id, principal_id, request_semantics FROM room_events WHERE id = ?")
+      .get(eventId) as
+      | {
+          readonly operation_id: string;
+          readonly principal_id: string;
+          readonly request_semantics: string;
+        }
+      | undefined;
+    return row === undefined
+      ? null
+      : {
+          operationId: row.operation_id,
+          principalId: row.principal_id,
+          requestSemantics: row.request_semantics,
+        };
+  }
+
+  recordAccessAudit(input: RoomAccessAuditInput): RoomAccessAuditEntry {
+    return this.#inTransaction(() => {
+      if ((input.kind === "resident-scope-read") !== (input.ownerId !== undefined))
+        throw new Error("only a resident-scope read names the scope owner");
+      const result = this.#database
+        .prepare(
+          `INSERT INTO room_access_audit
+            (kind, viewer_id, room_id, owner_id, external_result, internal_reason)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.kind,
+          input.viewerId,
+          input.roomId,
+          input.ownerId ?? null,
+          input.externalResult,
+          input.internalReason,
+        );
+      return { ...input, sequence: Number(result.lastInsertRowid) };
+    });
+  }
+
+  readAccessAudit(): readonly RoomAccessAuditEntry[] {
+    this.#assertOpen();
+    const rows = this.#database
+      .prepare(
+        `SELECT sequence, kind, viewer_id, room_id, owner_id, external_result, internal_reason
+         FROM room_access_audit ORDER BY sequence`,
+      )
+      .all() as unknown as {
+      readonly sequence: number;
+      readonly kind: RoomAccessAuditKind;
+      readonly viewer_id: string;
+      readonly room_id: string;
+      readonly owner_id: string | null;
+      readonly external_result: RoomAccessExternalResult;
+      readonly internal_reason: string;
+    }[];
+    return rows.map((row) => ({
+      sequence: row.sequence,
+      kind: row.kind,
+      viewerId: row.viewer_id,
+      roomId: row.room_id,
+      ...(row.owner_id === null ? {} : { ownerId: row.owner_id }),
+      externalResult: row.external_result,
+      internalReason: row.internal_reason,
+    }));
   }
 
   readRoomEvents(roomId?: string): readonly RoomEvent[] {
@@ -655,7 +843,7 @@ export class RoomEventStore {
       | { readonly user_version: number }
       | undefined;
     const version = versionRow?.user_version ?? 0;
-    if (version > 3) throw new Error(`unsupported room-event schema version: ${version}`);
+    if (version > 4) throw new Error(`unsupported room-event schema version: ${version}`);
 
     this.#database.exec("BEGIN IMMEDIATE");
     try {
@@ -663,7 +851,7 @@ export class RoomEventStore {
         | { readonly user_version: number }
         | undefined;
       const lockedVersion = lockedVersionRow?.user_version ?? 0;
-      if (lockedVersion > 3)
+      if (lockedVersion > 4)
         throw new Error(`unsupported room-event schema version: ${lockedVersion}`);
       if (lockedVersion === 1) {
         this.#database.exec(
@@ -704,6 +892,10 @@ export class RoomEventStore {
         readonly user_version: number;
       };
       if (baseVersion.user_version === 2) this.#migrateV2ToV3();
+      const rosterVersion = this.#database.prepare("PRAGMA user_version").get() as {
+        readonly user_version: number;
+      };
+      if (rosterVersion.user_version === 3) this.#migrateV3ToV4();
       this.#database.exec("COMMIT");
     } catch (error) {
       try {
@@ -802,6 +994,52 @@ export class RoomEventStore {
       PRAGMA user_version = 3;
     `);
   }
+
+  /** v4: the room registry (hidden rooms) and the append-only access audit. */
+  #migrateV3ToV4(): void {
+    this.#database.exec(`
+      CREATE TABLE room_registry (
+        room_id TEXT PRIMARY KEY NOT NULL,
+        visibility TEXT NOT NULL CHECK (visibility IN ('public', 'hidden')),
+        operation_id TEXT UNIQUE NOT NULL,
+        creator_id TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE room_access_audit (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL CHECK (kind IN ('room-read', 'resident-scope-read')),
+        viewer_id TEXT NOT NULL,
+        room_id TEXT NOT NULL,
+        owner_id TEXT,
+        external_result TEXT NOT NULL CHECK (external_result IN ('allowed', 'not-found')),
+        internal_reason TEXT NOT NULL,
+        CHECK ((kind = 'resident-scope-read') = (owner_id IS NOT NULL))
+      ) STRICT;
+      CREATE TRIGGER room_registry_no_update
+        BEFORE UPDATE ON room_registry
+        BEGIN SELECT RAISE(ABORT, 'room registrations are immutable'); END;
+      CREATE TRIGGER room_registry_no_delete
+        BEFORE DELETE ON room_registry
+        BEGIN SELECT RAISE(ABORT, 'room registrations are immutable'); END;
+      CREATE TRIGGER room_access_audit_no_update
+        BEFORE UPDATE ON room_access_audit
+        BEGIN SELECT RAISE(ABORT, 'access audit is append-only'); END;
+      CREATE TRIGGER room_access_audit_no_delete
+        BEFORE DELETE ON room_access_audit
+        BEGIN SELECT RAISE(ABORT, 'access audit is append-only'); END;
+      PRAGMA user_version = 4;
+    `);
+  }
+}
+
+/**
+ * Event ids follow from (room, position) alone, so identical public histories get identical ids
+ * whatever happens in other rooms; nothing about a hidden room can show up in a public id.
+ */
+function roomEventId(roomId: string, position: number): string {
+  const digest = createHash("sha256")
+    .update(JSON.stringify(["room-event", roomId, position]))
+    .digest("hex");
+  return `room-event:${digest.slice(0, 32)}`;
 }
 
 function eventFromRow(row: RoomEventRow): RoomEvent {
@@ -970,6 +1208,39 @@ export class RoomRosterStore {
       case "status":
         return { residentIds, humanIds: [...humanIds] };
     }
+  }
+
+  readMembership(roomId: string, residentId: string): RoomMembership | null {
+    this.#assertOpen();
+    const row = this.#database
+      .prepare(
+        `SELECT active, join_watermark, history_grant FROM room_memberships
+         WHERE room_id = ? AND resident_id = ?`,
+      )
+      .get(roomId, residentId) as
+      | {
+          readonly active: number;
+          readonly join_watermark: number;
+          readonly history_grant: number;
+        }
+      | undefined;
+    return row === undefined
+      ? null
+      : {
+          active: row.active === 1,
+          joinWatermark: row.join_watermark,
+          historyGrant: row.history_grant === 1,
+        };
+  }
+
+  /** Registered residents are judged by membership alone; binding grants never stand in. */
+  isRegisteredResident(residentId: string): boolean {
+    this.#assertOpen();
+    return (
+      this.#database
+        .prepare("SELECT 1 AS present FROM room_residents WHERE resident_id = ?")
+        .get(residentId) !== undefined
+    );
   }
 
   isActiveMember(roomId: string, residentId: string): boolean {

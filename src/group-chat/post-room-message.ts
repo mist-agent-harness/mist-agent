@@ -83,6 +83,11 @@ export class RoomAccessRegistry {
     return this.#bindings.get(membershipKey(principalId, roomId)) === binding;
   }
 
+  /** Whether the principal holds any binding for this exact room. */
+  grantsRoom(principalId: string, roomId: string): boolean {
+    return this.#bindings.has(membershipKey(principalId, roomId));
+  }
+
   replace(grants: readonly RoomBindingGrant[]): void {
     const replacement = new Map<string, string>();
     for (const grant of grants) {

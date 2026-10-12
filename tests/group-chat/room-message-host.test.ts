@@ -114,4 +114,71 @@ describe("RoomMessageHost", () => {
     expect(host.readRoomEvents()).toHaveLength(1);
     expect(host.readSystemReceipts()).toHaveLength(1);
   });
+
+  async function makeHost(): Promise<RoomMessageHost> {
+    const root = await mkdtemp(join(tmpdir(), "mist-room-host-"));
+    roots.push(root);
+    const host = new RoomMessageHost(root);
+    hosts.push(host);
+    return host;
+  }
+
+  it("audits refused room reads as not-found without revealing a hidden room", async () => {
+    const host = await makeHost();
+    host.replaceAcceptanceGrants(
+      [{ principalId: "human-owner", roomId: "room-public", bindingId: "owner-binding" }],
+      "room-public",
+      ["resident-a", "resident-b"],
+    );
+    host.createRoom({
+      operationId: "create-hidden",
+      roomId: "room-hidden",
+      visibility: "hidden",
+      creatorId: "human-owner",
+      openingBody: "TEST-HIDDEN-CANARY",
+    });
+
+    const hidden = host.openRoom("room-hidden", "resident-b");
+    const missing = host.openRoom("room-never-created", "resident-b");
+    host.openRoom("room-public", "human-owner");
+
+    expect(hidden).toEqual(missing);
+    expect(JSON.stringify(hidden)).not.toContain("TEST-HIDDEN-CANARY");
+    expect(host.readSurface("room-hidden", "resident-b")).toEqual(hidden);
+    expect(host.readAccessAudit()).toEqual({
+      crossResidentPrivateReads: 0,
+      unauthorizedReadResults: ["not-found", "not-found"],
+    });
+  });
+
+  it("refuses another resident's scope through room membership and counts no read", async () => {
+    const host = await makeHost();
+    host.replaceAcceptanceGrants([], "room-public", ["resident-a", "resident-b"]);
+
+    expect(host.attemptResidentScopeRead("room-public", "resident-b", "resident-a")).toBeNull();
+    expect(host.attemptResidentScopeRead("room-public", "resident-a", "resident-a")).toBe("");
+    expect(host.readAccessAudit()).toEqual({
+      crossResidentPrivateReads: 0,
+      unauthorizedReadResults: ["not-found"],
+    });
+  });
+
+  it("rejects a recorded public operation replayed into another room", async () => {
+    const host = await makeHost();
+    const grant = { principalId: "human-owner", roomId: "room-public", bindingId: "owner-binding" };
+    host.replaceAcceptanceGrants([grant], "room-public", ["resident-a"]);
+    const envelope = {
+      operationId: "public-once",
+      roomId: "room-public",
+      visibility: "public" as const,
+      binding: "owner-binding",
+      body: "TEST-REPLAY",
+    };
+    expect(host.post({ principalId: "human-owner" }, envelope).status).toBe("recorded");
+
+    expect(
+      host.post({ principalId: "human-owner" }, { ...envelope, roomId: "room-hidden" }),
+    ).toMatchObject({ status: "conflict", reasonCode: "operation_id_conflict" });
+    expect(host.readRoomEvents("room-hidden")).toEqual([]);
+  });
 });
