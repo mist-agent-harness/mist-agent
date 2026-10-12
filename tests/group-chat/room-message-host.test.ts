@@ -1,7 +1,8 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { RoomEventStore } from "../../src/group-chat/room-event-store.ts";
 import { RoomMessageHost } from "../../src/group-chat/room-message-host.ts";
 
 describe("RoomMessageHost", () => {
@@ -149,6 +150,30 @@ describe("RoomMessageHost", () => {
       crossResidentPrivateReads: 0,
       unauthorizedReadResults: ["not-found", "not-found"],
     });
+  });
+
+  it("answers a refused read without touching the room's ledger", async () => {
+    const host = await makeHost();
+    host.replaceAcceptanceGrants([], "room-public", ["resident-a", "resident-b"]);
+    host.createRoom({
+      operationId: "create-hidden",
+      roomId: "room-hidden",
+      visibility: "hidden",
+      creatorId: "human-owner",
+      openingBody: "TEST-HIDDEN-CANARY",
+    });
+    const ledgerReads = vi.spyOn(RoomEventStore.prototype, "readRoomEvents");
+    try {
+      host.readSurface("room-hidden", "resident-b");
+      host.openRoom("room-hidden", "resident-b");
+      host.openRoom("room-never-created", "resident-b");
+      expect(ledgerReads).not.toHaveBeenCalled();
+
+      host.openRoom("room-public", "resident-a");
+      expect(ledgerReads).toHaveBeenCalledTimes(1);
+    } finally {
+      ledgerReads.mockRestore();
+    }
   });
 
   it("refuses another resident's scope through room membership and counts no read", async () => {

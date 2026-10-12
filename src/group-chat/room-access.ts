@@ -46,11 +46,12 @@ export function authorizeRoomRead(
 ): RoomReadDecision {
   const registration = store.readRoomRegistration(roomId);
   const visibility = registration?.visibility ?? "public";
+  // A former member keeps that reason in the audit; anyone else outside a hidden room is a non-member.
   const deny = (reason: RoomReadDenialReason): RoomReadDecision => ({
     allowed: false,
     internalReason: !store.roomExists(roomId)
       ? "unknown-room"
-      : visibility === "hidden"
+      : visibility === "hidden" && reason !== "inactive-resident"
         ? "hidden-room-non-member"
         : reason,
   });

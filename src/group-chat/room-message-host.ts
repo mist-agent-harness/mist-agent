@@ -8,7 +8,13 @@ import {
   postRoomMessage,
 } from "./post-room-message.ts";
 import { CrossResidentPrivateReadError, ResidentPrivateStore } from "./resident-private-store.ts";
-import { type RoomSurface, authorizeRoomRead, projectRoomSurface } from "./room-access.ts";
+import {
+  type RoomReadDecision,
+  type RoomSurface,
+  authorizeRoomRead,
+  projectRoomSurface,
+  roomNotFoundSurface,
+} from "./room-access.ts";
 import {
   type DeliveryState,
   type RoomEventAppendResult,
@@ -199,10 +205,7 @@ export class RoomMessageHost {
 
   /** The viewer's projection of a room, unaudited; every refusal has the same not-found shape. */
   readSurface(roomId: string, viewerId: string): RoomSurface {
-    return projectRoomSurface(
-      this.#store.readRoomEvents(roomId),
-      authorizeRoomRead(this.#store, this.#access, roomId, viewerId),
-    );
+    return this.#surfaceFor(roomId, authorizeRoomRead(this.#store, this.#access, roomId, viewerId));
   }
 
   /** A principal opening a room: the same decision as {@link readSurface}, written to the audit. */
@@ -215,6 +218,12 @@ export class RoomMessageHost {
       externalResult: decision.allowed ? "allowed" : "not-found",
       internalReason: decision.allowed ? "authorized" : decision.internalReason,
     });
+    return this.#surfaceFor(roomId, decision);
+  }
+
+  /** A refusal never touches the room's ledger, so its cost says nothing about what the room holds. */
+  #surfaceFor(roomId: string, decision: RoomReadDecision): RoomSurface {
+    if (!decision.allowed) return roomNotFoundSurface();
     return projectRoomSurface(this.#store.readRoomEvents(roomId), decision);
   }
 

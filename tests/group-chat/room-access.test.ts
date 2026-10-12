@@ -133,6 +133,43 @@ describe("authorizeRoomRead", () => {
     });
   });
 
+  it("keeps a former member's reason in a hidden room and still answers not-found", async () => {
+    const store = await makeStore();
+    store.createRoom({
+      operationId: "create-hidden",
+      roomId: "room-hidden",
+      visibility: "hidden",
+      creatorId: "human-owner",
+      openingBody: "TEST-HIDDEN-CANARY",
+    });
+    store.roster.registerResident({
+      operationId: "join-a",
+      roomId: "room-hidden",
+      residentId: "resident-a",
+    });
+    store.roster.registerResident({
+      operationId: "join-b",
+      roomId: "room-public",
+      residentId: "resident-b",
+    });
+    store.roster.mutateMembership({
+      operationId: "leave-a",
+      roomId: "room-hidden",
+      residentId: "resident-a",
+      active: false,
+    });
+    const access = new RoomAccessRegistry();
+
+    const former = authorizeRoomRead(store, access, "room-hidden", "resident-a");
+    const stranger = authorizeRoomRead(store, access, "room-hidden", "resident-b");
+
+    expect(former).toEqual({ allowed: false, internalReason: "inactive-resident" });
+    expect(stranger).toEqual({ allowed: false, internalReason: "hidden-room-non-member" });
+    expect(projectRoomSurface(store.readRoomEvents("room-hidden"), former)).toEqual(
+      roomNotFoundSurface(),
+    );
+  });
+
   it("lets a granted non-resident read the whole room and nobody else", async () => {
     const store = await makeStore();
     store.createRoom({
