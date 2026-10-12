@@ -170,6 +170,28 @@ describe("authorizeRoomRead", () => {
     );
   });
 
+  it("shows a hidden room's own events to a viewer it grants", async () => {
+    const store = await makeStore();
+    store.createRoom({
+      operationId: "create-hidden",
+      roomId: "room-hidden",
+      visibility: "hidden",
+      creatorId: "human-owner",
+      openingBody: "TEST-HIDDEN-CANARY",
+    });
+    const access = new RoomAccessRegistry();
+    access.register("human-owner", "room-hidden", "owner-binding");
+
+    const owner = authorizeRoomRead(store, access, "room-hidden", "human-owner");
+
+    expect(owner).toEqual({ allowed: true, visibility: "hidden", historyFloor: 0 });
+    expect(projectRoomSurface(store.readRoomEvents("room-hidden"), owner)).toMatchObject({
+      body: "TEST-HIDDEN-CANARY",
+      count: 1,
+      errorCode: null,
+    });
+  });
+
   it("lets a granted non-resident read the whole room and nobody else", async () => {
     const store = await makeStore();
     store.createRoom({

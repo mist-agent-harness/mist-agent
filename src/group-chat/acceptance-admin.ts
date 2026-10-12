@@ -99,6 +99,7 @@ export class GroupChatAcceptanceAdmin {
     command: Extract<GroupChatAcceptanceAdminCommand, { readonly kind: "replay-public-payload" }>,
   ): RoomPostResult {
     const source = this.#events.findRoomEventByMarker(command.eventMarker, command.sourceRoomId);
+    if (source.visibility !== "public") throw new Error("only a public event can be replayed");
     const operation = this.#events.readEventOperation(source.id);
     if (operation === null) throw new Error("replayed event has no recorded operation");
     const original = JSON.parse(operation.requestSemantics) as {
