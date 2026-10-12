@@ -1559,8 +1559,6 @@ describe("#218 frontend adapter acceptance contract", () => {
     ["FE-02", "fe02-reverse-text-order"],
     ["FE-02", "sse-missing-attachments"],
     ["FE-02", "sse-missing-interaction"],
-    ["FE-02", "sse-drop-stream-interaction"],
-    ["FE-02", "wire-textual-attachment"],
     ["FE-03", "trust-developer-history"],
     ["FE-03", "trust-tool-history"],
     ["FE-03", "developer-audit-history"],
@@ -1622,6 +1620,10 @@ describe("#218 frontend adapter acceptance contract", () => {
     ["FE-05", "fetch-remote-image"],
     ["FE-05", "remote-image-writes-attachment"],
     ["FE-05", "sse-drop-stream-interaction"],
+    ["FE-05", "attachment-write-wrong-owner"],
+    // 从 FE-07 迁入的 WebUI 结构链路专用 mutation，继续在 FE-05 执行。
+    ["FE-05", "webui-skip-attachment-writes"],
+    ["FE-05", "webui-canonical-egress-metadata-drop"],
     // FE-06：loopback 豁免 / 鉴权先写附件 / token 泄漏进 error.message、body.id、canonical、401 wire、SSE wire、审计 detail
     ["FE-06", "loopback-bypass"],
     ["FE-06", "auth-writes-attachment"],
@@ -1640,14 +1642,11 @@ describe("#218 frontend adapter acceptance contract", () => {
     ["FE-07", "webui-utility-not-refused"],
     ["FE-07", "webui-skip-proposal"],
     ["FE-07", "webui-wrong-category"],
-    ["FE-07", "webui-skip-attachment-writes"],
     ["FE-07", "webui-cancel-proposal-empty"],
     ["FE-07", "webui-proposal-identity-mismatch"],
-    ["FE-07", "webui-canonical-egress-metadata-drop"],
     ["FE-07", "webui-install-before-confirm"],
     ["FE-07", "webui-python-only-uses-docker"],
     ["FE-07", "webui-docker-only-uses-python"],
-    ["FE-07", "attachment-write-wrong-owner"],
   ] as const)(
     "%s rejects its targeted false-green mutation (%s)",
     async (id: (typeof expectedFrontendAdapterCheckIds)[number], fault: Fault) => {
@@ -1705,26 +1704,49 @@ describe("#218 frontend adapter acceptance contract", () => {
 });
 
 describe("#218 judging runner", () => {
-  function runRunner(args: readonly string[]): { status: number | null; stdout: string } {
+  function runRunner(
+    args: readonly string[],
+    env: Record<string, string> = {},
+  ): { status: number | null; stdout: string } {
     const result = spawnSync(
       process.execPath,
       ["--import", "tsx", join(repoRoot, "acceptance/frontend-adapter-run.ts"), ...args],
-      { cwd: repoRoot, encoding: "utf8" },
+      { cwd: repoRoot, encoding: "utf8", env: { ...process.env, ...env } },
     );
     return { status: result.status, stdout: `${result.stdout}${result.stderr}` };
   }
 
-  it("reports seven explicit red lamps while the production driver is absent", () => {
-    expect(existsSync(join(repoRoot, "src/frontend-adapter-acceptance-driver.ts"))).toBe(false);
-    const report = runRunner([]);
+  it("reports seven explicit red lamps in the isolated missing-driver scenario", () => {
+    // 生产驱动已经落地，所以「缺驱动七红」只在隔离场景里核验：把驱动路径指到一个
+    // 不存在的 specifier，验证 runner 仍如实打印七盏缺驱动红灯，而不是把坏驱动伪装成起点。
+    const missing = {
+      MIST_FRONTEND_ADAPTER_DRIVER: "../src/__missing_frontend_adapter_driver__.ts",
+    };
+    const report = runRunner([], missing);
     expect(report.status).toBe(0);
     for (const id of expectedFrontendAdapterCheckIds) {
       expect(report.stdout).toContain(`🔴 ${id} 缺驱动`);
     }
     expect(report.stdout).toContain("真绿 0 / 7");
 
-    const strict = runRunner(["--strict"]);
+    const strict = runRunner(["--strict"], missing);
     expect(strict.status).toBe(1);
     expect(strict.stdout).toContain("真绿 0 / 7");
+  });
+
+  it("wires the production driver: D31-1 text lamps green, FE-05 red", () => {
+    expect(existsSync(join(repoRoot, "src/frontend-adapter-acceptance-driver.ts"))).toBe(true);
+    const report = runRunner([]);
+    // D31-1 只交文字聊天 + /webui：FE-01～FE-04、FE-06、FE-07 真绿；FE-05 按裁定保持红。
+    for (const id of ["FE-01", "FE-02", "FE-03", "FE-04", "FE-06", "FE-07"]) {
+      expect(report.stdout, `${id} should be true-green`).toContain(`🟢 ${id}`);
+    }
+    expect(report.stdout).toContain("🔴 FE-05");
+    expect(report.stdout).toContain("真绿 6 / 7");
+
+    // strict 因 FE-05 非零退出；D31-1 预期如此，不冒充全绿。
+    const strict = runRunner(["--strict"]);
+    expect(strict.status).toBe(1);
+    expect(strict.stdout).toContain("真绿 6 / 7");
   });
 });

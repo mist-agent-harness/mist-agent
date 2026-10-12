@@ -12,7 +12,12 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { BootPackLetter, ModelCompletionRequest, ModelTransport } from "./channels.ts";
+import type {
+  BootPackLetter,
+  ModelCompletionRequest,
+  ModelImage,
+  ModelTransport,
+} from "./channels.ts";
 /** provider → pi-ai 使用的密钥环境变量名。 */
 const PROVIDER_SECRET_ENV: Readonly<Record<string, string>> = {
   anthropic: "ANTHROPIC_API_KEY",
@@ -83,6 +88,50 @@ const FORCE_KILL_GRACE_MS = 1_000;
 const STDERR_ERROR_LINE = /^(?:error|fatal|uncaught exception)$/i;
 const STDERR_ERROR_PREFIX = /^(?:error|fatal|uncaught exception)[^a-z0-9_]/i;
 const MAX_STDERR_PREFIX_CHARS = 32;
+/** 受支持的图片媒体类型（与前端入站校验一致）。 */
+const SUPPORTED_IMAGE_MIME = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const MAX_IMAGES = 8;
+const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
+
+interface PiImageBlock {
+  readonly type: "image";
+  readonly data: string;
+  readonly mimeType: string;
+}
+
+/**
+ * 校验并把入站图片规范成 Pi RPC 原生 `images` 块。任何不支持的媒体/坏 base64/超限
+ * 在**启动子进程之前** fail-closed（零实际上游调用），不静默丢字段。
+ */
+function normalizePiImages(input: readonly ModelImage[] | undefined): PiImageBlock[] {
+  if (input === undefined || input.length === 0) return [];
+  if (input.length > MAX_IMAGES) throw new Error("pi 图片数量超过安全上限");
+  // base64 编码长度上限：先按编码长度拒，避免为了检查超限先分配整个输入。
+  const maxBase64Chars = Math.ceil((MAX_IMAGE_BYTES * 4) / 3) + 4;
+  const blocks: PiImageBlock[] = [];
+  let total = 0;
+  for (const image of input) {
+    if (!SUPPORTED_IMAGE_MIME.has(image.mimeType)) {
+      throw new Error("pi 拒绝不支持的图片媒体类型");
+    }
+    if (typeof image.data !== "string" || image.data.length === 0) {
+      throw new Error("pi 图片数据无效");
+    }
+    if (image.data.length > maxBase64Chars) {
+      throw new Error("pi 图片超过安全上限");
+    }
+    const bytes = Buffer.from(image.data, "base64");
+    if (bytes.length === 0 || bytes.toString("base64") !== image.data) {
+      throw new Error("pi 图片数据不是有效 base64");
+    }
+    total += bytes.length;
+    if (bytes.length > MAX_IMAGE_BYTES || total > MAX_IMAGE_BYTES * MAX_IMAGES) {
+      throw new Error("pi 图片超过安全上限");
+    }
+    blocks.push({ type: "image", data: image.data, mimeType: image.mimeType });
+  }
+  return blocks;
+}
 
 export interface PiCliTransportOptions {
   /** pi 可执行文件；测试注入假 pi。缺省 PATH 里的 `pi`。 */
@@ -94,6 +143,8 @@ export interface PiCliTransportOptions {
 }
 
 export class PiCliTransport implements ModelTransport {
+  /** 声明会经由 Pi RPC 原生 `images` 字段承载图片（不代表 provider 有视觉能力）。 */
+  readonly supportsNativeImages = true;
   readonly #piBin: string;
   readonly #extraEnv: Readonly<Record<string, string>>;
   readonly #timeoutMs: number;
@@ -141,6 +192,8 @@ export class PiCliTransport implements ModelTransport {
     if (!isClaudeBridge && secretEnvName === undefined) {
       throw new Error("pi API-key transport refused an unsupported provider");
     }
+    // 原生图片块在启动子进程前校验；非法即 fail-closed，零上游调用。
+    const images = normalizePiImages(request.images);
 
     // 只清理/设置本次路由需要的凭证，避免把其他 provider 的环境密钥交给 pi。
     const env: NodeJS.ProcessEnv = { ...process.env, ...this.#extraEnv };
@@ -274,7 +327,12 @@ export class PiCliTransport implements ModelTransport {
     timeoutTimer.unref();
 
     const commandId = "mist-prompt";
-    const command = `${JSON.stringify({ type: "prompt", id: commandId, message: request.text })}\n`;
+    const command = `${JSON.stringify({
+      type: "prompt",
+      id: commandId,
+      message: request.text,
+      ...(images.length > 0 ? { images } : {}),
+    })}\n`;
     let reply = "";
     let promptAcknowledged = false;
     let finalTurnSeen = false;
@@ -325,8 +383,14 @@ export class PiCliTransport implements ModelTransport {
         ) {
           throw new Error("pi 回合未正常完成");
         }
-        finalText = extractAssistantText(message);
-        if (finalText === null) throw new Error("pi 最终消息结构无效");
+        const reply = extractAssistantReply(message);
+        if (!reply.ok) {
+          // 收到不支持的结构输出（toolCall/未知 content/image 等）后 fail-closed：
+          // 此刻上游调用已发生；不把 text 拿出来冒充完整成功，也不落 canonical/附件。
+          // 失败原因只用**固定枚举**，绝不回显上游任意 type 字符串/角色/内容/私有详情。
+          throw new Error(`pi 回复包含不受支持的内容类型：${reply.reason}`);
+        }
+        finalText = reply.text;
         finalTurnSeen = true;
         return [];
       }
@@ -487,17 +551,32 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function extractAssistantText(message: unknown): string | null {
+/**
+ * 解析最终 assistant 消息的受支持形状：`text` 保留，`thinking` 属既有合法形状（忽略），
+ * `toolCall` 归固定 `tool_call`，其余未知 content 类型归固定 `unsupported_content`。
+ * 失败原因**只回固定枚举**，绝不回显上游任意 type 字符串（可能含凭据/私有内容）。
+ */
+function extractAssistantReply(
+  message: unknown,
+):
+  | { ok: true; text: string }
+  | { ok: false; reason: "tool_call" | "unsupported_content" | "structure" } {
   if (!isRecord(message) || message.role !== "assistant" || !Array.isArray(message.content)) {
-    return null;
+    return { ok: false, reason: "structure" };
   }
   const text: string[] = [];
   for (const part of message.content) {
-    if (!isRecord(part)) return null;
+    if (!isRecord(part)) return { ok: false, reason: "structure" };
     if (part.type === "text") {
-      if (typeof part.text !== "string") return null;
+      if (typeof part.text !== "string") return { ok: false, reason: "structure" };
       text.push(part.text);
+    } else if (part.type === "thinking") {
+      // 既有合法形状：保留兼容，不并入正文。
+    } else if (part.type === "toolCall") {
+      return { ok: false, reason: "tool_call" };
+    } else {
+      return { ok: false, reason: "unsupported_content" };
     }
   }
-  return text.join("");
+  return { ok: true, text: text.join("") };
 }

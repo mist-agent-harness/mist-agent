@@ -74,10 +74,8 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     prompt.info(`Setup saved as ${result.receipt.snapshotId}.`);
   } else if (result.status === "paused") {
     prompt.info("Setup paused. Run the same command to continue.");
-  } else if (result.status === "dependency-pending") {
-    prompt.info(
-      `Setup is not active. The draft is waiting for ${result.dependencies.join(" and ")}.`,
-    );
+  } else if (result.status === "legacy-frontend") {
+    prompt.info(`[${result.code}] ${result.remedy}`);
   } else {
     prompt.info("Current setup kept unchanged.");
   }

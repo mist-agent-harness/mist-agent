@@ -16,7 +16,15 @@ import {
   cloneFrontendAdapterDriverBoundary,
 } from "./frontend-adapter-driver.ts";
 
-const DRIVER_SPECIFIER = "../src/frontend-adapter-acceptance-driver.ts";
+/**
+ * 默认驱动路径；`MIST_FRONTEND_ADAPTER_DRIVER` 只给判卷自己在隔离场景下覆盖
+ * （例如把「缺驱动七红」搬到一个不存在的路径上核验），不是产品配置。
+ */
+const DRIVER_OVERRIDE = process.env.MIST_FRONTEND_ADAPTER_DRIVER;
+const DRIVER_SPECIFIER =
+  DRIVER_OVERRIDE === undefined || DRIVER_OVERRIDE === ""
+    ? "../src/frontend-adapter-acceptance-driver.ts"
+    : DRIVER_OVERRIDE;
 const strict = process.argv.includes("--strict");
 
 interface LoadedDriver {

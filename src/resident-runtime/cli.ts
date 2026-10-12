@@ -9,6 +9,12 @@ import { assembleResidentRuntime } from "./assembly.ts";
 import type { ModelTransport } from "./channels.ts";
 import { CredentialStore } from "./credentials.ts";
 import { ResidentChatTui } from "./tui.ts";
+import {
+  WebuiCliError,
+  type WebuiEnvironmentReport,
+  installWebui,
+  preflightWebui,
+} from "./webui-cli.ts";
 
 /** 身份闸拒绝在终端边界的人话 message：保持与 runtime identityFailure 同一口径。 */
 function identityFailureMessage(
@@ -44,15 +50,18 @@ interface ResidentCliOptions {
 export type ResidentCliInput =
   | { readonly kind: "exit" }
   | { readonly kind: "breathe"; readonly via: BreathTrigger }
+  | { readonly kind: "webui" }
   | { readonly kind: "chat"; readonly text: string };
 
 /**
  * 把一行真实 CLI 输入分派到出口。`/exit` 是本层唯一的退出命令；三个换气命令
  * 经现役 `parseManualBreath` 归一（大小写、首尾空白、带参数形式同义），转成
  * 换气 `via`——D8 三个入口同一条流程，不在这里另认一套命令表。
+ * `/webui` 是宿主前端管理入口，绝不作为发言落进 `say()`。
  */
 export function parseResidentCliInput(line: string): ResidentCliInput {
   if (line.trim() === "/exit") return { kind: "exit" };
+  if (line.trim() === "/webui") return { kind: "webui" };
   const trigger = parseManualBreath(line);
   if (trigger !== null && trigger.command !== null) {
     return { kind: "breathe", via: trigger.command.slice(1) as BreathTrigger };
@@ -89,7 +98,14 @@ export function parseResidentCliArguments(args: readonly string[]): ResidentCliO
 
 export async function main(
   args = process.argv.slice(2),
-  injection: { transport?: ModelTransport } = {},
+  injection: {
+    transport?: ModelTransport;
+    webui?: {
+      runner?: import("../frontend/webui-platform.ts").CommandRunner;
+      newToken?: () => string;
+      port?: number;
+    };
+  } = {},
 ): Promise<void> {
   const options = parseResidentCliArguments(args);
   if (options.help) {
@@ -143,14 +159,88 @@ export async function main(
     };
     process.once("SIGINT", onSigint);
 
+    // `/webui` 与聊天共用同一条 stdin 的状态机：识别 /webui 立即 await 只读探测并展示
+    // 提案，然后下一行归确认；EOF//exit/SIGINT 在任何阶段都取消待确认并清理。
+    let webuiPhase: "idle" | "awaiting-confirm" = "idle";
+    let pendingEnvironment: WebuiEnvironmentReport | null = null;
+    let startedWebui: { url: string; close: () => Promise<void> } | null = null;
+    const webuiDeps = {
+      runtime,
+      residentId,
+      dataDir: options.dataDir,
+      ...(injection.webui === undefined ? {} : injection.webui),
+      log: (message: string) => process.stdout.write(`${message}\n`),
+    };
+
     try {
       tui.start();
-      process.stdout.write("输入 /exit 结束。\n你> ");
+      process.stdout.write("输入 /exit 结束，/webui 安装可选网页前端。\n你> ");
       for await (const line of input) {
-        const command = parseResidentCliInput(line);
-        if (command.kind === "exit") break;
+        // SIGINT/EOF 后即使还有缓冲行被 yield，也不得再进入安装/聊天。
+        if (interrupted) break;
+        // /exit 在任何阶段都结束：待确认直接取消，不落 say。
+        if (line.trim() === "/exit") break;
+        if (webuiPhase === "awaiting-confirm") {
+          webuiPhase = "idle";
+          const environment = pendingEnvironment;
+          pendingEnvironment = null;
+          if (interrupted) break;
+          if (!/^\s*yes\s*$/i.test(line)) {
+            process.stdout.write("已取消，未安装、未启动。\n你> ");
+            continue;
+          }
+          if (environment === null) {
+            process.stdout.write("环境信息丢失，已取消。\n你> ");
+            continue;
+          }
+          process.stdout.write("安装并启动 Open WebUI 中…\n");
+          const outcome = await installWebui(webuiDeps, environment);
+          if (outcome.status === "started") {
+            startedWebui = { url: outcome.url, close: outcome.close };
+            process.stdout.write(`Open WebUI 已启动：${outcome.url}\n`);
+            process.stdout.write(
+              `管理登录用专属 admin 凭据：私有面 ${join(
+                webuiDeps.dataDir,
+                "webui",
+                "credentials",
+                "webui-admin.json",
+              )}（本终端不回显密码）。\n`,
+            );
+          } else if (outcome.status === "missing-runtime") {
+            process.stdout.write(`缺少运行环境：${outcome.missing.join("、")}；未安装、未启动。\n`);
+          } else if (outcome.status === "failed") {
+            process.stdout.write(`[${outcome.code}] ${outcome.remedy}\n`);
+          }
+          process.stdout.write("你> ");
+          continue;
+        }
         if (line.trim().length === 0) {
           process.stdout.write("\n你> ");
+          continue;
+        }
+        const command = parseResidentCliInput(line);
+        if (command.kind === "exit") break;
+        if (command.kind === "webui") {
+          if (startedWebui !== null) {
+            process.stdout.write(`Open WebUI 已在运行：${startedWebui.url}\n你> `);
+            continue;
+          }
+          if (webuiPhase !== "idle") {
+            process.stdout.write("已有 /webui 正在处理，请先完成或取消。\n你> ");
+            continue;
+          }
+          process.stdout.write("正在只读探测 Docker/Python…\n");
+          const pre = await preflightWebui(webuiDeps);
+          // 探测期间收到 SIGINT/EOF：丢弃取消路径，不展示确认也不安装。
+          if (interrupted) break;
+          if (!pre.ok) {
+            process.stdout.write(`[${pre.code}] ${pre.remedy}\n你> `);
+            continue;
+          }
+          process.stdout.write(`${pre.value.proposal}\n`);
+          pendingEnvironment = pre.value.environment;
+          webuiPhase = "awaiting-confirm";
+          process.stdout.write("你> ");
           continue;
         }
         if (command.kind === "breathe") {
@@ -164,6 +254,23 @@ export async function main(
     } finally {
       input.close();
       process.off("SIGINT", onSigint);
+      // 先清前端服务与 listener，再由 owner finally 关闭 runtime；清理失败不吞。
+      if (startedWebui !== null) {
+        try {
+          await startedWebui.close();
+        } catch (error) {
+          const code =
+            error instanceof Error && error.name === "WebuiCliError"
+              ? error.message
+              : "WEBUI_CLEANUP_FAILED";
+          const remedy =
+            error instanceof WebuiCliError
+              ? error.remedy
+              : "前端清理失败；保留隔离态，请手动处理后重试。";
+          process.stderr.write(`[${code}] ${remedy}\n`);
+          process.exitCode = 1;
+        }
+      }
       if (interrupted) process.exitCode = 130;
     }
   } finally {

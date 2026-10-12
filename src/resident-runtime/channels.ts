@@ -68,6 +68,16 @@ export interface HistoryMessage {
 }
 
 /**
+ * 随 prompt 进底层子进程的**原生图片块**（Pi RPC 已定义的 `images` 字段）。
+ * `data` 是 base64 编码的真实图片字节，不是把 base64/路径/[attachment] 标记塞进文本。
+ * 类型明确限定在受支持图片；不支持的结构走具体 fail-closed，不静默丢字段。
+ */
+export interface ModelImage {
+  readonly mimeType: string;
+  readonly data: string;
+}
+
+/**
  * 随启动包进模型的交接信（D8 补记三「醒来即已读」）。
  *
  * 复用现役 `LetterView`：标题、作者代际、writtenAt、条目 tier 与原文都保留。
@@ -112,12 +122,24 @@ export interface ModelCompletionRequest {
   };
   /** 当前一窗流上下文：此前回合的 user/assistant 消息按流序送进模型（验收席意见 1）。 */
   readonly history: readonly HistoryMessage[];
+  /**
+   * 本轮入站的受支持图片，作为 Pi 原生 `images` 字段随 prompt 进子进程。
+   * 缺席/空数组 = 纯文本回合（与既有文本调用完全兼容）。
+   */
+  readonly images?: readonly ModelImage[];
   /** 调用时刻从凭证面解析出的密钥原文。唯一去处是上游适配器，不许落任何盘。 */
   readonly credentialSecret: string;
 }
 
 /** 模型传输：流式产出增量（RT-05 要 ≥2 个增量才算流式）。 */
 export interface ModelTransport {
+  /**
+   * 本实现是否声明能承载 Pi 原生图片块（`ModelCompletionRequest.images`）。
+   * 缺席/ false = 只文本：带图请求必须在调用前被拒，不能靠 JS 忽略额外字段“成功看图”。
+   * 该声明只证明“本 transport 会把图片序列化进原生字段”，**不证明**任何 provider/model
+   * 有视觉能力（真实 provider 未在公共 CI 验证）。
+   */
+  readonly supportsNativeImages?: boolean;
   complete(request: ModelCompletionRequest): AsyncIterable<string>;
 }
 

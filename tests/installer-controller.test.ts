@@ -46,7 +46,7 @@ function completeDraft(controller: InstallerController): InstallerDraft {
   controller.start("resident-1");
   controller.saveCredentials([{ credential: apiCredential(), secret: "secret-value" }]);
   controller.saveBindings([primaryBinding()]);
-  controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
+  controller.saveFrontend({ kind: "external", integration: "openai-compatible" });
   return controller.saveMemory({ kind: "create", path: "/tmp/mist-memory" });
 }
 
@@ -96,11 +96,7 @@ describe("installer controller", () => {
     controller.start("resident-1");
     controller.saveCredentials([{ credential: apiCredential(), secret: "secret-value" }]);
     controller.saveBindings([primaryBinding()]);
-    controller.saveFrontend({
-      kind: "official-skin",
-      pluginId: "mist-official-skin",
-      installation: "pending",
-    });
+    controller.saveFrontend({ kind: "terminal" });
     controller.saveMemory({ kind: "create", path: "/tmp/mist-memory" });
 
     const revisited = controller.revisitFrontend();
@@ -109,7 +105,7 @@ describe("installer controller", () => {
 
     const changed = controller.saveFrontend({
       kind: "external",
-      integration: "mist-session-api",
+      integration: "openai-compatible",
     });
     expect(changed.progress.currentStep).toBe("review");
     expect(changed.memory).toEqual(revisited.memory);
@@ -199,7 +195,7 @@ describe("installer controller", () => {
         credentialRef: { id: "claude-login", type: "claude_oauth", issuerId: "pi" },
       },
     ]);
-    controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
+    controller.saveFrontend({ kind: "external", integration: "openai-compatible" });
     controller.saveMemory({ kind: "existing", path: "/tmp/existing" });
 
     expect(() => controller.commit()).toThrow(/does not accept credential type claude_oauth/);
@@ -211,7 +207,7 @@ describe("installer controller", () => {
     controller.start("resident-1");
     controller.saveCredentials([{ credential: apiCredential(), secret: "secret-value" }]);
     controller.saveBindings([{ ...primaryBinding(), residentId: "other-resident" }]);
-    controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
+    controller.saveFrontend({ kind: "external", integration: "openai-compatible" });
     controller.saveMemory({ kind: "existing", path: "/tmp/existing" });
 
     expect(() => controller.commit()).toThrow(/does not match draft resident/);
@@ -238,7 +234,7 @@ describe("installer controller", () => {
         credentialRef: { id: "codex-login", type: "codex_oauth", issuerId: "pi" },
       },
     ]);
-    controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
+    controller.saveFrontend({ kind: "external", integration: "openai-compatible" });
     controller.saveMemory({ kind: "existing", path: "/tmp/existing" });
 
     expect(() => controller.commit()).toThrow(
@@ -300,37 +296,26 @@ describe("installer controller", () => {
       error: /unsupported integration/,
     },
     {
-      name: "official frontend plugin",
-      mutate(draft: InstallerDraft) {
-        draft.frontend = {
-          kind: "official-skin",
-          pluginId: "future-skin",
-          installation: "installed",
-        } as never;
-      },
-      error: /unsupported pluginId/,
-    },
-    {
-      name: "official frontend installation",
-      mutate(draft: InstallerDraft) {
-        draft.frontend = {
-          kind: "official-skin",
-          pluginId: "mist-official-skin",
-          installation: "future-state",
-        } as never;
-      },
-      error: /unsupported installation/,
-    },
-    {
-      name: "official frontend installed stub",
+      name: "legacy official frontend plugin",
       mutate(draft: InstallerDraft) {
         draft.frontend = {
           kind: "official-skin",
           pluginId: "mist-official-skin",
           installation: "installed",
-        };
+        } as never;
       },
-      error: /cannot be activated yet/,
+      error: /no longer supported/,
+    },
+    {
+      name: "legacy official frontend installation state",
+      mutate(draft: InstallerDraft) {
+        draft.frontend = {
+          kind: "official-skin",
+          pluginId: "mist-official-skin",
+          installation: "pending",
+        } as never;
+      },
+      error: /no longer supported/,
     },
     {
       name: "deferred Grok OAuth credential",
@@ -360,10 +345,12 @@ describe("installer controller", () => {
     const draft = completeDraft(controller);
     mutate(draft);
     store.saveDraft(draft);
-    const resumed = new InstallerController(store);
-    resumed.start("resident-1", "resume");
 
-    expect(() => resumed.commit()).toThrow(error);
+    expect(() => {
+      const resumed = new InstallerController(store);
+      resumed.start("resident-1", "resume");
+      resumed.commit();
+    }).toThrow(error);
   });
 
   it("rejects a corrupted memory ownership receipt before it can be discarded", () => {
@@ -436,7 +423,7 @@ describe("installer controller", () => {
         },
       },
     ]);
-    controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
+    controller.saveFrontend({ kind: "external", integration: "openai-compatible" });
     controller.saveMemory({ kind: "existing", path: "/tmp/existing" });
 
     expect(() => controller.commit()).toThrow(/type or issuer does not match/);
@@ -455,7 +442,7 @@ describe("installer controller", () => {
         credentialRef: { ...credential.ref },
       },
     ]);
-    controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
+    controller.saveFrontend({ kind: "external", integration: "openai-compatible" });
     controller.saveMemory({ kind: "existing", path: "/tmp/existing" });
 
     expect(() => controller.commit()).toThrow(/issuer is unavailable/);
@@ -488,7 +475,7 @@ describe("installer controller", () => {
         },
       },
     ]);
-    controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
+    controller.saveFrontend({ kind: "external", integration: "openai-compatible" });
     controller.saveMemory({ kind: "existing", path: "/tmp/existing" });
 
     expect(() => controller.commit()).toThrow(/duplicate primary binding/);
@@ -505,7 +492,7 @@ describe("installer controller", () => {
     expect(second).toEqual(first);
   });
 
-  it("refuses to activate the official-skin stub before its dependencies land", () => {
+  it("refuses to activate legacy official-skin drafts and points at the replacement", () => {
     const directory = freshDirectory();
     const controller = new InstallerController(new InstallerStateStore(directory));
     controller.start("resident-1");
@@ -515,10 +502,10 @@ describe("installer controller", () => {
       kind: "official-skin",
       pluginId: "mist-official-skin",
       installation: "pending",
-    });
+    } as never);
     controller.saveMemory({ kind: "create", path: "/tmp/mist-memory" });
 
-    expect(() => controller.commit()).toThrow(/cannot be activated yet/);
+    expect(() => controller.commit()).toThrow(/no longer supported/);
   });
 
   it("validates a Claude-compatible gateway using an API key reference", () => {
@@ -547,7 +534,7 @@ describe("installer controller", () => {
         },
       },
     ]);
-    controller.saveFrontend({ kind: "external", integration: "mist-session-api" });
+    controller.saveFrontend({ kind: "external", integration: "openai-compatible" });
     controller.saveMemory({ kind: "existing", path: "/tmp/existing" });
 
     expect(() => controller.commit()).not.toThrow();

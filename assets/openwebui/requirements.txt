@@ -1,0 +1,5 @@
+# D31-1 Open WebUI Pipe native test dependencies (public, no keys).
+# CI: setup-python 3.12 + `pip install -r assets/openwebui/requirements.txt`.
+requests>=2.31
+starlette>=0.37
+pydantic>=2.0

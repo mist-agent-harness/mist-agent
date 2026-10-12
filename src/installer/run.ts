@@ -12,6 +12,7 @@ import type {
 } from "./contracts.ts";
 import { InstallerValidationError, installerAdapterAcceptsCredentialType } from "./contracts.ts";
 import type { InstallerController } from "./controller.ts";
+import { LegacyFrontendUnsupportedError } from "./legacy-frontend.ts";
 import type { MemoryLibraryPort } from "./memory-library.ts";
 import type { OAuthLoginPort } from "./pi-login.ts";
 import type { PromptPort } from "./prompt-port.ts";
@@ -31,7 +32,7 @@ export interface RunInstallerOptions {
 export type RunInstallerResult =
   | { status: "committed"; receipt: InstallCommitReceipt }
   | { status: "paused"; draft: InstallerDraft }
-  | { status: "dependency-pending"; draft: InstallerDraft; dependencies: ["#49", "#51"] }
+  | { status: "legacy-frontend"; code: string; remedy: string }
   | { status: "already-configured" };
 
 function slug(value: string): string {
@@ -215,24 +216,19 @@ async function collectFrontend(options: RunInstallerOptions): Promise<void> {
   const kind = await options.prompt.select<FrontendChoice["kind"]>({
     message: "Step 3/4 · Frontend",
     choices: [
-      { value: "official-skin", name: "Install the official Mist skin" },
-      { value: "external", name: "Connect my own frontend" },
+      { value: "terminal", name: "Terminal only (default)" },
+      { value: "external", name: "Connect my own OpenAI-compatible frontend" },
     ],
-    default: "official-skin",
+    default: "terminal",
   });
-  if (kind === "official-skin") {
-    options.prompt.info(
-      "The official skin install seam is reserved. It will activate when issues #49 and #51 land.",
-    );
-    options.controller.saveFrontend({
-      kind,
-      pluginId: "mist-official-skin",
-      installation: "pending",
-    });
+  if (kind === "terminal") {
+    options.controller.saveFrontend({ kind: "terminal" });
     return;
   }
-  options.prompt.info("Use the Mist session API contract to connect your existing frontend.");
-  options.controller.saveFrontend({ kind, integration: "mist-session-api" });
+  options.prompt.info(
+    "The OpenAI-compatible adapter exposes one canonical stream behind a Bearer gate; replayed client history is ignored.",
+  );
+  options.controller.saveFrontend({ kind: "external", integration: "openai-compatible" });
 }
 
 async function collectMemory(options: RunInstallerOptions): Promise<void> {
@@ -300,8 +296,19 @@ const REVIEW_REPAIRS: Partial<
 };
 
 export async function runInstaller(options: RunInstallerOptions): Promise<RunInstallerResult> {
-  const existing = options.store.loadDraft();
-  const current = options.store.loadCurrentConfig();
+  let existing: InstallerDraft | null;
+  let current: ReturnType<InstallerStateStore["loadCurrentConfig"]>;
+  try {
+    existing = options.store.loadDraft();
+    current = options.store.loadCurrentConfig();
+  } catch (error) {
+    // D31：旧 official-skin 草稿/快照在读取处 fail-closed；只报可操作 remedy，原字节不动。
+    if (error instanceof LegacyFrontendUnsupportedError) {
+      options.prompt.info(`[${error.code}] ${error.remedy}`);
+      return { status: "legacy-frontend", code: error.code, remedy: error.remedy };
+    }
+    throw error;
+  }
   if (existing === null && current === null) {
     options.prompt.info(
       "Welcome to Mist setup. Four steps: credentials → channels → frontend → memory. You can quit any time; only a draft is kept until you confirm.",
@@ -379,24 +386,6 @@ export async function runInstaller(options: RunInstallerOptions): Promise<RunIns
           }
         }
         options.prompt.info(formatReview(draft));
-        if (draft.frontend?.kind === "official-skin") {
-          options.prompt.info(
-            "The official skin is not installed: issues #49 and #51 are still pending. This draft was kept and no active config changed.",
-          );
-          const pendingChoice = await options.prompt.select({
-            message: "Official skin dependencies are still pending",
-            choices: [
-              { value: "keep", name: "Keep this draft and exit" },
-              { value: "change", name: "Choose a different frontend" },
-            ],
-            default: "keep",
-          });
-          if (pendingChoice === "keep") {
-            return { status: "dependency-pending", draft, dependencies: ["#49", "#51"] };
-          }
-          options.controller.revisitFrontend();
-          break;
-        }
         const shouldCommit = await options.prompt.confirm({
           message: "Save this setup?",
           default: true,
@@ -457,9 +446,7 @@ function formatReview(draft: InstallerDraft): string {
     )
     .join("\n  ");
   const frontend =
-    draft.frontend?.kind === "external"
-      ? "external · mist-session-api"
-      : "official-skin · pending #49/#51";
+    draft.frontend?.kind === "external" ? "external · openai-compatible" : "terminal";
   const memory =
     draft.memory === null ? "not configured" : `${draft.memory.kind} · ${draft.memory.path}`;
   return `Review your setup (active config is unchanged):\n  Credentials: ${credentials}\n  ${bindings}\n  Frontend: ${frontend}\n  Memory: ${memory}`;
