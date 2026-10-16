@@ -68,6 +68,25 @@ export interface HistoryMessage {
 }
 
 /**
+ * 一个回合上游真实报告的 token usage（#227 第 2 项）。
+ *
+ * 字段名照 pi-ai 的 `Usage`（`input` / `output` / `cacheRead` / `cacheWrite` /
+ * `totalTokens`）与 `cost.total`。**只保留上游实际报告的字段**：缺席 = 未知
+ * （字段直接不出现在对象里），不从别的数推、不补零、不用本地估算冒充实测。
+ * 一个值恰好等于 0 时它是 0——但那**不等于**「上游测到零」，见 pi-transport 顶注
+ * 对 pi-ai 归零行为的说明：mist 只如实搬运 pi 报出来的数字，不替它背书。
+ */
+export interface TurnUsage {
+  readonly input?: number;
+  readonly output?: number;
+  readonly cacheRead?: number;
+  readonly cacheWrite?: number;
+  readonly totalTokens?: number;
+  /** pi-ai `usage.cost.total`；上游没报就不出现。 */
+  readonly costTotal?: number;
+}
+
+/**
  * 随启动包进模型的交接信（D8 补记三「醒来即已读」）。
  *
  * 复用现役 `LetterView`：标题、作者代际、writtenAt、条目 tier 与原文都保留。
@@ -114,6 +133,12 @@ export interface ModelCompletionRequest {
   readonly history: readonly HistoryMessage[];
   /** 调用时刻从凭证面解析出的密钥原文。唯一去处是上游适配器，不许落任何盘。 */
   readonly credentialSecret: string;
+  /**
+   * 上游回合成功终态报告 usage 时的观察口（#227 第 2 项）。传输层**至多**在回合
+   * 正常完成时调用一次；失败/取消/超时不报（不许把没发生的事记成成功用量）。
+   * 上游没报 usage 就不调用——「未知」与「零」是两回事。
+   */
+  readonly onUsage?: (usage: TurnUsage) => void;
 }
 
 /** 模型传输：流式产出增量（RT-05 要 ≥2 个增量才算流式）。 */
@@ -132,6 +157,8 @@ export class SyntheticModelTransport implements ModelTransport {
       // 合成通道也要走完整凭证路径：空密钥 = 上游会拒，fail-closed。
       throw new Error("synthetic channel refused an empty credential");
     }
+    // 合成通道不伪造 usage：本地确定性实现没有真实 provider 读数，宁可报未知，
+    // 不报一个看起来像实测的零（#227 第 2 项：缺失 = 未知）。
     const digest = createHash("sha256")
       .update(`${request.residentId}\n${request.model}\n${request.text}`)
       .digest("hex")

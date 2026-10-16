@@ -9,11 +9,14 @@ import { spawnSync } from "node:child_process";
  */
 import {
   existsSync,
+  linkSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1442,6 +1445,336 @@ describe("交接信随启动包进模型请求（D8 补记三：醒来即已读�
     } finally {
       await runtime.close();
     }
+  });
+});
+
+/**
+ * #227 第 2 项：usage 观察口 → 真实 runtime 逐回合日志 → 可读表面。抓的是「只 new 一个
+ * store / 只声明接口」的漏接线：这里经真实 say() → transport 回调 → usage-log → turnUsage()。
+ */
+describe("#227 逐回合 usage 日志（真实 runtime 接线 + 读口）", () => {
+  /** 录音传输：可选在成功时回调一次 usage，再吐一个非空回复。 */
+  function usageTransport(reported: ((call: number) => unknown) | null): {
+    transport: ModelTransport;
+    calls: () => number;
+  } {
+    let calls = 0;
+    return {
+      transport: {
+        async *complete(request: ModelCompletionRequest): AsyncIterable<string> {
+          calls += 1;
+          yield "收到。";
+          if (reported !== null) request.onUsage?.(reported(calls) as never);
+        },
+      },
+      calls: () => calls,
+    };
+  }
+
+  it("上游报 usage：逐回合记录 + 读口逐字段累加，字段原样（含显式 0）", async () => {
+    const stub = usageTransport(() => ({
+      input: 100,
+      output: 20,
+      cacheRead: 0,
+      cacheWrite: 5,
+      totalTokens: 125,
+      costTotal: 0.02,
+    }));
+    const runtime = new ResidentRuntime({ dataDir: tempDir(), transport: stub.transport });
+    try {
+      runtimeProvision(runtime, "r-usage");
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-usage", text: "第一句" }));
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-usage", text: "第二句" }));
+      const view = unwrap(runtime.turnUsage({ residentId: "r-usage" }));
+      expect(view.turns).toHaveLength(2);
+      expect(view.turns[0]).toMatchObject({
+        model: "model-alpha",
+        adapterId: "pi-claude-bridge",
+        turn: {
+          input: 100,
+          output: 20,
+          cacheRead: 0,
+          cacheWrite: 5,
+          totalTokens: 125,
+          costTotal: 0.02,
+        },
+      });
+      expect(view.cumulative).toEqual({
+        input: 200,
+        output: 40,
+        cacheRead: 0,
+        cacheWrite: 10,
+        totalTokens: 250,
+        costTotal: 0.04,
+      });
+      expect(view.cumulativeCoverage).toEqual({
+        totalTurns: 2,
+        perField: {
+          input: 2,
+          output: 2,
+          cacheRead: 2,
+          cacheWrite: 2,
+          totalTokens: 2,
+          costTotal: 2,
+        },
+      });
+      expect(view.logError).toBeNull();
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("上游没报 usage：回合仍完成，但该回合 turn 缺席（未知，不是零）", async () => {
+    const stub = usageTransport(null);
+    const runtime = new ResidentRuntime({ dataDir: tempDir(), transport: stub.transport });
+    try {
+      runtimeProvision(runtime, "r-nousage");
+      const turn = unwrap<TurnResult>(await runtime.say({ residentId: "r-nousage", text: "说话" }));
+      expect(turn.reply).toBe("收到。");
+      const view = unwrap(runtime.turnUsage({ residentId: "r-nousage" }));
+      expect(view.turns).toHaveLength(1);
+      expect(view.turns[0]?.turn).toBeUndefined();
+      expect(view.cumulative).toEqual({});
+      expect(view.cumulativeCoverage.totalTurns).toBe(1);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("部分字段：只累加被报过的字段，coverage 写明每字段覆盖回合数（不冒充完整总量）", async () => {
+    const stub = usageTransport((call) => (call === 1 ? { input: 10 } : { output: 4 }));
+    const runtime = new ResidentRuntime({ dataDir: tempDir(), transport: stub.transport });
+    try {
+      runtimeProvision(runtime, "r-partial");
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-partial", text: "一" }));
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-partial", text: "二" }));
+      const view = unwrap(runtime.turnUsage({ residentId: "r-partial" }));
+      expect(view.cumulative).toEqual({ input: 10, output: 4 });
+      expect(view.cumulativeCoverage).toEqual({
+        totalTurns: 2,
+        perField: { input: 1, output: 1 },
+      });
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("住户隔离：一批 usage 只落本户，另一户读不到", async () => {
+    const stub = usageTransport(() => ({ input: 7 }));
+    const runtime = new ResidentRuntime({ dataDir: tempDir(), transport: stub.transport });
+    try {
+      runtimeProvision(runtime, "r-a");
+      runtimeProvision(runtime, "r-b");
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-a", text: "a 说话" }));
+      expect(unwrap(runtime.turnUsage({ residentId: "r-a" })).turns).toHaveLength(1);
+      expect(unwrap(runtime.turnUsage({ residentId: "r-b" })).turns).toHaveLength(0);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("字段 allowlist：回调多塞的 raw 字段（prompt/密钥）不进日志", async () => {
+    const dataDir = tempDir();
+    const stub = usageTransport(
+      () =>
+        ({
+          input: 1,
+          prompt: "不该出现的 prompt 正文",
+          credentialSecret: "sk-canary-usage",
+          raw: { secret: "x" },
+        }) as never,
+    );
+    const runtime = new ResidentRuntime({ dataDir, transport: stub.transport });
+    try {
+      runtimeProvision(runtime, "r-allow");
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-allow", text: "说话" }));
+      const view = unwrap(runtime.turnUsage({ residentId: "r-allow" }));
+      expect(view.turns[0]?.turn).toEqual({ input: 1 });
+      const raw = readFileSync(join(dataDir, "logs", "r-allow.usage.jsonl"), "utf8");
+      expect(raw).not.toContain("不该出现的 prompt 正文");
+      expect(raw).not.toContain("sk-canary-usage");
+      expect(raw).not.toContain("credentialSecret");
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("密钥扫描：usage 日志面不含 canary 密钥（RT-06 扫描面之一）", async () => {
+    const stub = usageTransport(() => ({ input: 3, output: 1 }));
+    const runtime = new ResidentRuntime({ dataDir: tempDir(), transport: stub.transport });
+    try {
+      runtimeProvision(runtime, "r-scan", "sk-canary-scan-usage");
+      unwrap<TurnResult>(await runtime.say({ residentId: "r-scan", text: "说话" }));
+      const report = unwrap(
+        runtime.secretScan({ residentId: "r-scan", needle: "sk-canary-scan-usage" }),
+      );
+      expect(report.hits).toEqual([]);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("写日志失败不改变回合完成语义：回合仍 ok，读口如实拒绝不可读日志", async () => {
+    const dataDir = tempDir();
+    const stub = usageTransport(() => ({ input: 2 }));
+    const runtime = new ResidentRuntime({ dataDir, transport: stub.transport });
+    try {
+      runtimeProvision(runtime, "r-logfail");
+      // 把 logs/<id>.usage.jsonl 变成目录，让 append 必然失败。
+      mkdirSync(join(dataDir, "logs", "r-logfail.usage.jsonl"), { recursive: true });
+      const turn = unwrap<TurnResult>(await runtime.say({ residentId: "r-logfail", text: "说话" }));
+      expect(turn.reply).toBe("收到。");
+      expect(runtime.turnUsage({ residentId: "r-logfail" })).toMatchObject({
+        ok: false,
+        error: { code: "writer-unavailable" },
+      });
+      // 一窗流照常落账（回合完整），不因为日志失败而回滚。
+      expect(unwrap(runtime.readStream({ residentId: "r-logfail" })).events).toHaveLength(2);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("usage read gate refuses unaccepted candidates and path-shaped identifiers", async () => {
+    const runtime = new ResidentRuntime({
+      dataDir: tempDir(),
+      transport: usageTransport(null).transport,
+    });
+    try {
+      const pending = runtime.createCandidate({
+        residentId: "r-usage-pending",
+        persona: "synthetic",
+        proposedBy: { kind: "installer", id: "test" },
+      });
+      expect(runtime.turnUsage({ residentId: pending.candidateId })).toMatchObject({
+        ok: false,
+        error: { code: "resident-not-found" },
+      });
+      expect(runtime.turnUsage({ residentId: "../../outside" })).toMatchObject({
+        ok: false,
+        error: { code: "resident-not-found" },
+      });
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("usage only accepts canonical residentId after activation", async () => {
+    const runtime = new ResidentRuntime({ dataDir: tempDir() });
+    try {
+      const candidate = runtime.createCandidate({
+        residentId: "review-usage",
+        persona: "synthetic",
+        proposedBy: { kind: "installer", id: "test" },
+      });
+      runtime.attestCandidate(
+        candidate.candidateId,
+        { kind: "candidate", candidateId: candidate.candidateId },
+        "accepted",
+      );
+      expect(runtime.turnUsage({ residentId: "review-usage" })).toMatchObject({ ok: true });
+      expect(runtime.turnUsage({ residentId: candidate.candidateId })).toMatchObject({
+        ok: false,
+        error: { code: "resident-not-found" },
+      });
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("usage preserves valid records on both sides of a truncated line and counts damaged records", async () => {
+    const dataDir = tempDir();
+    const runtime = new ResidentRuntime({
+      dataDir,
+      transport: usageTransport(() => ({ input: 2 })).transport,
+    });
+    try {
+      runtimeProvision(runtime, "review-truncated");
+      unwrap(await runtime.say({ residentId: "review-truncated", text: "first" }));
+      const path = join(dataDir, "logs", "review-truncated.usage.jsonl");
+      const before = readFileSync(path, "utf8");
+      writeFileSync(path, `${before}{ truncated`);
+      unwrap(await runtime.say({ residentId: "review-truncated", text: "second" }));
+      const view = unwrap(runtime.turnUsage({ residentId: "review-truncated" }));
+      expect(view.turns).toHaveLength(2);
+      expect(view.cumulative).toMatchObject({ input: 4 });
+      expect(view).toMatchObject({ invalidRecords: 1, cumulativeCoverage: { totalTurns: 2 } });
+      expect(readFileSync(path, "utf8")).toContain("{ truncated\n{");
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("a usage symlink cannot change another file or the successful chat result", async () => {
+    const dataDir = tempDir();
+    const runtime = new ResidentRuntime({
+      dataDir,
+      transport: usageTransport(() => ({ input: 2 })).transport,
+    });
+    try {
+      runtimeProvision(runtime, "r-log-link");
+      const other = join(dataDir, "other.json");
+      const original = '{"private":"synthetic-log-link-canary"}';
+      writeFileSync(other, original);
+      symlinkSync(other, join(dataDir, "logs", "r-log-link.usage.jsonl"));
+      expect((await runtime.say({ residentId: "r-log-link", text: "hello" })).ok).toBe(true);
+      expect(readFileSync(other, "utf8")).toBe(original);
+      const read = runtime.turnUsage({ residentId: "r-log-link" });
+      expect(read.ok).toBe(false);
+      expect(JSON.stringify(read)).not.toContain("synthetic-log-link-canary");
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("a usage hard link cannot change another file or its permissions", async () => {
+    const dataDir = tempDir();
+    const runtime = new ResidentRuntime({
+      dataDir,
+      transport: usageTransport(() => ({ input: 2 })).transport,
+    });
+    try {
+      runtimeProvision(runtime, "r-log-hardlink");
+      const other = join(dataDir, "other.json");
+      const original = '{"private":"synthetic-hardlink-canary"}';
+      writeFileSync(other, original, { mode: 0o640 });
+      const mode = statSync(other).mode;
+      linkSync(other, join(dataDir, "logs", "r-log-hardlink.usage.jsonl"));
+      expect((await runtime.say({ residentId: "r-log-hardlink", text: "hello" })).ok).toBe(true);
+      expect(readFileSync(other, "utf8")).toBe(original);
+      expect(statSync(other).mode).toBe(mode);
+      expect(runtime.turnUsage({ residentId: "r-log-hardlink" }).ok).toBe(false);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("a FIFO usage target fails without blocking", () => {
+    const dataDir = tempDir();
+    const target = join(dataDir, "r-fifo.usage.jsonl");
+    const fifo = spawnSync("mkfifo", [target], { encoding: "utf8" });
+    expect(fifo.status).toBe(0);
+    const module = fileURLToPath(new URL("../src/resident-runtime/usage-log.ts", import.meta.url));
+    // 放独立子进程并设超时：错误实现同步 open FIFO 时也能被测试拒绝，不挂死 Vitest。
+    const probe = spawnSync(
+      process.execPath,
+      [
+        "--import",
+        "tsx",
+        "--input-type=module",
+        "-e",
+        `import { TurnUsageLog } from ${JSON.stringify(module)};
+const log = new TurnUsageLog(${JSON.stringify(dataDir)});
+const result = log.record("r-fifo", { turnId: "t", generation: 0, model: "synthetic", adapterId: "synthetic", at: "synthetic" });
+let readFailed = false;
+try { log.read("r-fifo"); } catch { readFailed = true; }
+console.log(JSON.stringify({ result, readFailed }));`,
+      ],
+      { encoding: "utf8", timeout: 3_000 },
+    );
+    expect(probe.error).toBeUndefined();
+    expect(probe.status).toBe(0);
+    expect(JSON.parse(probe.stdout)).toMatchObject({ result: { ok: false }, readFailed: true });
   });
 });
 
