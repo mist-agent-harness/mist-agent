@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,9 +29,9 @@ afterEach(async () => {
   }
 });
 
-function startHost(): Promise<ChildProcess> {
-  const dataDir = mkdtempSync(join(tmpdir(), "mist-runtime-host-boundary-"));
-  temporaryDirectories.push(dataDir);
+function startHost(existingDataDir?: string): Promise<ChildProcess> {
+  const dataDir = existingDataDir ?? mkdtempSync(join(tmpdir(), "mist-runtime-host-boundary-"));
+  if (existingDataDir === undefined) temporaryDirectories.push(dataDir);
   const child = spawn(process.execPath, ["--import", "tsx", hostPath], {
     env: {
       ...process.env,
@@ -115,14 +115,25 @@ describe("resident runtime host identity boundary", () => {
         canarySecret: "test-only-not-a-real-secret",
       }),
     );
+    const request = { residentId: candidate.candidateId, text: "入口换号后再说话" };
+    const first = unwrap(await callHost<Result<TurnResult>>(child, "say", request));
+    expect(first.residentId).toBe("resident-host-boundary");
+    expect(first.turnId).toEqual(expect.any(String));
     expect(
       unwrap(
-        await callHost<Result<TurnResult>>(child, "say", {
-          residentId: candidate.candidateId,
-          text: "入口换号后再说话",
-        }),
-      ).residentId,
-    ).toBe("resident-host-boundary");
+        await callHost<Result<TurnResult>>(child, "say", { ...request, turnId: first.turnId }),
+      ),
+    ).toEqual(first);
+    expect(
+      await callHost<Result<TurnResult>>(child, "say", {
+        ...request,
+        text: "different text",
+        turnId: first.turnId,
+      }),
+    ).toMatchObject({
+      ok: false,
+      error: { code: "turn-id-conflict", turnId: first.turnId },
+    });
     const stream = unwrap(
       await callHost<Result<StreamSnapshot>>(child, "readStream", {
         residentId: candidate.candidateId,
@@ -147,5 +158,64 @@ describe("resident runtime host identity boundary", () => {
     ).toMatchObject({ fromGeneration: 1, toGeneration: 2 });
 
     await callHost(child, "stop", {});
+  });
+  it("returns the generated failure anchor over IPC and retains pending state across a real host restart", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "mist-host-retry-"));
+    temporaryDirectories.push(dataDir);
+    const residentId = "r-host-retry";
+    const child = await startHost(dataDir);
+    const candidate = await callHost<CandidateSnapshot>(child, "createCandidate", {
+      persona: "synthetic host retry persona",
+      proposedBy: { kind: "installer", id: "test" },
+      residentId,
+    });
+    expect(
+      await callHost<IdentityResult<CandidateSnapshot>>(child, "attestCandidate", {
+        candidateId: candidate.candidateId,
+        actor: { kind: "candidate", candidateId: candidate.candidateId },
+        decision: "accepted",
+      }),
+    ).toMatchObject({ ok: true });
+    unwrap(
+      await callHost<Result<{ credentialRef: string }>>(child, "provisionChannel", {
+        residentId,
+        channel: {
+          claudeSubscription: false,
+          credentialKind: "api-key",
+          model: "openai/test-model",
+        },
+        canarySecret: "synthetic-host-only",
+      }),
+    );
+    const blocked = join(dataDir, "turns", `${residentId}.turns.json.tmp`);
+    mkdirSync(blocked);
+    const failed = await callHost<Result<TurnResult>>(child, "say", {
+      residentId,
+      text: "failed host message",
+    });
+    expect(failed).toMatchObject({
+      ok: false,
+      error: { code: "writer-unavailable", turnId: expect.any(String) },
+    });
+    if (failed.ok || failed.error.turnId === undefined)
+      throw new Error("expected failure with anchor");
+    rmSync(blocked, { recursive: true });
+    const request = { residentId, text: "failed host message", turnId: failed.error.turnId };
+    expect(await callHost<Result<TurnResult>>(child, "say", request)).toMatchObject({
+      ok: false,
+      error: { code: "reconciliation-needed", turnId: request.turnId },
+    });
+    const stopped = new Promise<void>((resolve) => child.once("close", () => resolve()));
+    await callHost(child, "stop", {});
+    await stopped;
+    const reopened = await startHost(dataDir);
+    expect(await callHost<Result<TurnResult>>(reopened, "say", request)).toMatchObject({
+      ok: false,
+      error: { code: "reconciliation-needed", turnId: request.turnId },
+    });
+    expect(
+      unwrap(await callHost<Result<StreamSnapshot>>(reopened, "readStream", { residentId })).events,
+    ).toHaveLength(2);
+    await callHost(reopened, "stop", {});
   });
 });

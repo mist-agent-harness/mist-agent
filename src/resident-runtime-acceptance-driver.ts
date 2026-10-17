@@ -1,6 +1,6 @@
 /**
- * #194（RT-01～RT-07）的**生产验收驱动**。acceptance/resident-runtime-run.ts import
- * 本文件并调用 createResidentRuntimeDriver()；缺本文件时七盏灯全红（判卷先行的起点）。
+ * #194（RT-01～RT-08）的**生产验收驱动**。acceptance/resident-runtime-run.ts import
+ * 本文件并调用 createResidentRuntimeDriver()；缺本文件时八盏灯全红（判卷先行的起点）。
  *
  * 真实性纪律（照 src/window-history-acceptance-driver.ts 的口径）：
  *   - startHost() 真 spawn 子进程 src/resident-runtime/host-process.ts（spawn + stdio ipc
@@ -11,12 +11,12 @@
  *   - 模型往返经 MIST_RESIDENT_RUNTIME_TRANSPORT 选传输（默认合成通道，见
  *     src/resident-runtime/channels.ts 顶注：公开 CI 不带密钥；真实 pi 传输随 RT-04）。
  *
- * 出处归结构（清单「真灯与桩灯」）：真实现住在 src/resident-runtime/ 各模块，
- * 本文件只准 import 和接线；所有 RT-01～RT-07 方法均经真实宿主，无桩。
- * STUBBED 为空，验收灯色全部由生产实现决定。
+ * 出处归结构（清单「真灯与桩灯」）：被判的运行时实现在 src/resident-runtime/ 各模块；
+ * 正常行为方法只做 IPC 接线。RT-08 的三个故障夹具只在宿主停止时破坏临时数据根，
+ * 并由判卷另行读回正对照；它们不实现被判行为。STUBBED 为空，所有行为仍经真实宿主。
  */
 import { type ChildProcess, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -121,8 +121,71 @@ class ResidentRuntimeProductionDriver implements ResidentRuntimeDriver {
 
   // —— 对话往返 ——
 
-  say(input: { residentId: string; text: string }): Promise<Result<TurnResult>> {
+  say(input: { residentId: string; text: string; turnId?: string }): Promise<Result<TurnResult>> {
     return this.#ensureActiveResident(input.residentId).then(() => this.#call("say", { input }));
+  }
+
+  modelInvocationCount(): Promise<number> {
+    return this.#call("modelInvocationCount", {});
+  }
+
+  async armTurnConfirmationWriteFault(input: { residentId: string }): Promise<void> {
+    await this.#ensureActiveResident(input.residentId);
+    mkdirSync(join(this.#dataDir, "turns"), { recursive: true });
+    mkdirSync(this.#turnReceiptTemporaryPath(input.residentId));
+  }
+
+  repairTurnConfirmationWriteFault(input: { residentId: string }): Promise<void> {
+    rmSync(this.#turnReceiptTemporaryPath(input.residentId), { recursive: true, force: true });
+    return Promise.resolve();
+  }
+
+  async crashAfterUserWrite(input: { residentId: string; turnId: string }): Promise<void> {
+    assertFixtureResidentId(input.residentId);
+    await this.killHost();
+    const streamPath = join(this.#dataDir, "streams", `${input.residentId}.stream.json`);
+    const record = parseObjectFile(streamPath);
+    const events = requireArray(record.events, "stream events");
+    const idempotency = requireArray(record.idempotency, "stream idempotency");
+    const matching = events.filter((event) => eventTurnId(event) === input.turnId);
+    const user = matching.find((event) => eventRole(event) === "user");
+    const assistant = matching.find((event) => eventRole(event) === "assistant");
+    if (user === undefined || assistant === undefined || matching.length !== 2) {
+      throw new Error(`cannot create orphan fixture for ${input.residentId}/${input.turnId}`);
+    }
+    const assistantId = requireString(assistant.eventId, "assistant eventId");
+    const retainedEvents = events.filter((event) => event !== assistant);
+    const retainedIdempotency = idempotency.filter(
+      (entry) => idempotencyEventId(entry) !== assistantId,
+    );
+    if (retainedIdempotency.length !== idempotency.length - 1) {
+      throw new Error(`assistant idempotency row missing for ${input.residentId}/${input.turnId}`);
+    }
+    writeFileSync(
+      streamPath,
+      JSON.stringify({
+        ...record,
+        nextSeq: retainedEvents.length + 1,
+        events: retainedEvents,
+        idempotency: retainedIdempotency,
+      }),
+      "utf8",
+    );
+
+    const turnsPath = join(this.#dataDir, "turns", `${input.residentId}.turns.json`);
+    if (existsSync(turnsPath)) {
+      const turnsRecord = parseObjectFile(turnsPath);
+      const turns = requireArray(turnsRecord.turns, "turn confirmations");
+      writeFileSync(
+        turnsPath,
+        JSON.stringify({
+          ...turnsRecord,
+          turns: turns.filter((entry) => objectString(entry, "turnId") !== input.turnId),
+        }),
+        "utf8",
+      );
+    }
+    await this.startHost();
   }
 
   // —— 一窗流只读 ——
@@ -289,10 +352,67 @@ class ResidentRuntimeProductionDriver implements ResidentRuntimeDriver {
       throw new Error(`failed to activate acceptance resident ${residentId}`);
     }
   }
+
+  #turnReceiptTemporaryPath(residentId: string): string {
+    assertFixtureResidentId(residentId);
+    return join(this.#dataDir, "turns", `${residentId}.turns.json.tmp`);
+  }
 }
 
 /** 结构与契约 ProvisionedChannel 相同；host 走 JSON，这里只做转发类型。 */
 type ProvisionedChannelForward = ChannelRoute & { readonly credentialRef: string };
+
+function assertFixtureResidentId(residentId: string): void {
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(residentId)) {
+    throw new Error(`unsafe acceptance residentId: ${residentId}`);
+  }
+}
+
+function parseObjectFile(path: string): Record<string, unknown> {
+  const value: unknown = JSON.parse(readFileSync(path, "utf8"));
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`expected object in ${path}`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function requireArray(value: unknown, name: string): Record<string, unknown>[] {
+  if (!Array.isArray(value)) throw new Error(`${name} must be an array`);
+  return value.map((entry) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      throw new Error(`${name} entry must be an object`);
+    }
+    return entry as Record<string, unknown>;
+  });
+}
+
+function requireString(value: unknown, name: string): string {
+  if (typeof value !== "string" || value.length === 0) throw new Error(`${name} must be a string`);
+  return value;
+}
+
+function objectString(value: Record<string, unknown>, key: string): string | null {
+  const member = value[key];
+  return typeof member === "string" ? member : null;
+}
+
+function eventTurnId(event: Record<string, unknown>): string | null {
+  const payload = event.payload;
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return null;
+  return objectString(payload as Record<string, unknown>, "turnId");
+}
+
+function eventRole(event: Record<string, unknown>): string | null {
+  const payload = event.payload;
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return null;
+  return objectString(payload as Record<string, unknown>, "role");
+}
+
+function idempotencyEventId(entry: Record<string, unknown>): string | null {
+  const receipt = entry.receipt;
+  if (typeof receipt !== "object" || receipt === null || Array.isArray(receipt)) return null;
+  return objectString(receipt as Record<string, unknown>, "eventId");
+}
 
 function stub<T>(method: string, plan: string): Promise<T> {
   return Promise.reject(

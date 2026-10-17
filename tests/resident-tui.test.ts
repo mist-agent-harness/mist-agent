@@ -1,5 +1,13 @@
 import { spawn } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,6 +26,7 @@ const turn: TurnResult = {
   generation: 1,
   reply: "第一段第二段",
   streamed: true,
+  turnId: "test-turn",
 };
 
 describe("ResidentChatTui", () => {
@@ -66,6 +75,37 @@ describe("ResidentChatTui", () => {
     expect(transcript.errorText).toContain("channel-unavailable");
     expect(transcript.errorText).toContain("检查凭证后重试");
     expect(transcript.frames.at(-1)?.text).toContain("[错误]");
+  });
+
+  it("replaces the retry anchor on a newer failure and clears it after recovery", async () => {
+    const say = vi.fn<ChatTurnPort["say"]>(async ({ text, turnId }) => {
+      if (turnId === undefined) throw new Error("TUI must supply an explicit turn anchor");
+      if (say.mock.calls.filter(([input]) => input.text === text).length === 1) {
+        return {
+          ok: false,
+          error: {
+            code: "writer-unavailable",
+            turnId,
+            message: "合成落盘失败",
+            remedy: "修好后重试",
+            residentId: turn.residentId,
+          },
+        };
+      }
+      return { ok: true, value: { ...turn, turnId } };
+    });
+    const tui = new ResidentChatTui({ say }, { residentId: turn.residentId, model: turn.model });
+    await tui.submit("older failure");
+    await tui.submit("latest failure");
+    const latestAnchor = say.mock.calls[1]?.[0].turnId;
+    await tui.retry();
+    expect(say.mock.calls[2]?.[0]).toMatchObject({ text: "latest failure", turnId: latestAnchor });
+    expect(tui.transcript().frames.at(-1)?.text).toContain("你：older failure\n[错误]");
+    expect(tui.transcript().frames.at(-1)?.text).toContain(
+      "你：latest failure\n住户：第一段第二段",
+    );
+    expect(await tui.retry()).toMatchObject({ ok: false, error: { code: "tui-unavailable" } });
+    expect(say).toHaveBeenCalledTimes(3);
   });
 
   it("breathe renders the generation handover as visible feedback, not a chat turn", async () => {
@@ -147,6 +187,10 @@ describe("resident CLI arguments", () => {
 });
 
 describe("resident CLI input dispatch", () => {
+  it("dispatches explicit retry while ordinary same-text input remains chat", () => {
+    expect(parseResidentCliInput("  /retry  ")).toEqual({ kind: "retry" });
+    expect(parseResidentCliInput("/retrying")).toEqual({ kind: "chat", text: "/retrying" });
+  });
   it("maps the three lifecycle commands to the same breathe kind with their own via", () => {
     expect(parseResidentCliInput("/new")).toEqual({ kind: "breathe", via: "new" });
     expect(parseResidentCliInput("/clear")).toEqual({ kind: "breathe", via: "clear" });
@@ -171,6 +215,89 @@ describe("resident CLI input dispatch", () => {
   });
 });
 describe("resident CLI", () => {
+  it("real stdin preserves a pending retry through a later successful delivery", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "mist-cli-retry-followup-"));
+    const residentId = "r-cli-retry-followup";
+    try {
+      await provisionSyntheticResident({ dataDir, residentId });
+      const blockedReceipt = join(dataDir, "turns", `${residentId}.turns.json.tmp`);
+      mkdirSync(blockedReceipt);
+      const recordedRequests = join(dataDir, "model-requests.json");
+      const runner = join(dataDir, "retry-cli.mjs");
+      writeFileSync(
+        runner,
+        `import { main } from ${JSON.stringify(new URL("../src/resident-runtime/cli.ts", import.meta.url).href)};
+import { rmSync, writeFileSync } from 'node:fs';
+const requests = [];
+await main(process.argv.slice(2), { transport: { async *complete(request) {
+  requests.push(request.text);
+  writeFileSync(${JSON.stringify(recordedRequests)}, JSON.stringify(requests));
+  if (request.text === 'later actual delivery') rmSync(${JSON.stringify(blockedReceipt)}, { recursive: true });
+  yield 'recorded reply ' + requests.length;
+} } });
+`,
+      );
+      const result = await spawnResidentCli({
+        residentId,
+        dataDir,
+        entryPath: runner,
+        stdin: "original failure\n/retry\nlater actual delivery\n/retry\n/retry\n/exit\n",
+      });
+      expect(result.code, result.error).toBe(0);
+      expect(result.output).toContain("writer-unavailable");
+      expect(result.output).toContain("reconciliation-needed");
+      const frames = result.output.split(`住户：${residentId}　模型：openai/test-model`);
+      // 只看动作完成后已回到输入提示的帧。保留失败回复后，B 成功时也会同时显示两段正文；
+      // 倒数第二个已完成动作才是成功 /retry，末个是「没有可重试回合」。
+      const recovered = frames.filter((frame) => frame.includes("\n你> ")).at(-2);
+      expect(recovered).toBeDefined();
+      expect(recovered).toContain("你：original failure\n住户：recorded reply 1");
+      expect(recovered).toContain("你：later actual delivery\n住户：recorded reply 2");
+      expect(recovered).not.toContain("[错误]");
+      expect(frames.at(-1)).toContain("没有可重试的失败回合");
+      expect(JSON.parse(readFileSync(recordedRequests, "utf8"))).toEqual([
+        "original failure",
+        "later actual delivery",
+      ]);
+      const persisted = JSON.parse(
+        readFileSync(join(dataDir, "streams", `${residentId}.stream.json`), "utf8"),
+      ) as { events: { payload: { text: string; turnId: string } }[] };
+      expect(persisted.events).toHaveLength(4);
+      expect(new Set(persisted.events.map((event) => event.payload.turnId)).size).toBe(2);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+  it("real /retry keeps the failed turn anchor without appending another pair", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "mist-cli-retry-"));
+    const residentId = "r-cli-retry";
+    try {
+      await provisionSyntheticResident({ dataDir, residentId });
+      mkdirSync(join(dataDir, "turns", `${residentId}.turns.json.tmp`));
+      const result = await spawnResidentCli({
+        residentId,
+        dataDir,
+        stdin: "same message\n/retry\n/retry\nsame message\n/exit\n",
+      });
+      expect(result.code, result.error).toBe(0);
+      expect(result.output).toContain("writer-unavailable");
+      expect(result.output).toContain("reconciliation-needed");
+      const persisted = JSON.parse(
+        readFileSync(join(dataDir, "streams", `${residentId}.stream.json`), "utf8"),
+      ) as {
+        events: { payload: { role: string; text: string; turnId: string } }[];
+      };
+      expect(persisted.events).toHaveLength(4);
+      expect(
+        persisted.events
+          .filter((event) => event.payload.role === "user")
+          .map((event) => event.payload.text),
+      ).toEqual(["same message", "same message"]);
+      expect(new Set(persisted.events.map((event) => event.payload.turnId)).size).toBe(2);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
   it("runs an interactive round trip with stdin text outside argv", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "mist-resident-cli-test-"));
     const residentId = "resident-cli-test";
@@ -297,11 +424,20 @@ function spawnResidentCli(input: {
   readonly residentId: string;
   readonly dataDir: string;
   readonly stdin: string;
+  readonly entryPath?: string;
 }): Promise<SpawnedCliResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
-      ["--import", "tsx", cliPath, "--resident", input.residentId, "--data-dir", input.dataDir],
+      [
+        "--import",
+        "tsx",
+        input.entryPath ?? cliPath,
+        "--resident",
+        input.residentId,
+        "--data-dir",
+        input.dataDir,
+      ],
       {
         env: { ...process.env, MIST_RESIDENT_RUNTIME_TRANSPORT: "synthetic" },
         stdio: ["pipe", "pipe", "pipe"],

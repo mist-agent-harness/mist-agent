@@ -1,9 +1,9 @@
 /**
- * #194（RT-01～RT-07）的验收驱动契约。
+ * #194（RT-01～RT-08）的验收驱动契约。
  *
  * 判卷只通过本接口观察住户运行时，不 import `src/` 实现。实现方在
  * `src/resident-runtime-acceptance-driver.ts` 导出 `createResidentRuntimeDriver()`；
- * 驱动缺失时七盏灯全部保持红色——那是判卷先行的起点，不是故障。
+ * 驱动缺失时八盏灯全部保持红色——那是判卷先行的起点，不是故障。
  *
  * 判卷对象是 D28 那条最小闭环：醒来（读启动包 + 真实对话往返）、写流（一窗流唯一
  * writer）、换代（亲笔交接信）、通道（D25 订阅 / API key）、TUI、凭证、真源。
@@ -51,6 +51,11 @@ export type ResidentRuntimeErrorCode =
    * message/remedy 的自由文本不作机器判据）。
    */
   | "turn-id-conflict"
+  /**
+   * 正文已落流但缺少原交付的耐久确认依据，或孤立 user 腿已跨窗/跨代。
+   * 这类重试保留原锚与正文，停止在模型调用前，不能当作重新生成的信号。
+   */
+  | "reconciliation-needed"
   /** 换气被拒：临线改阈值、不写信就想换代、代际不对。 */
   | "breath-refused"
   /** 交接信不合模板：缺标题、超长度上限、tier 非法。 */
@@ -67,6 +72,11 @@ export interface ResidentRuntimeError {
    */
   readonly remedy: string;
   readonly residentId: string | null;
+  /**
+   * say() 的重试锚：显式传入时原样返回，省略时由运行时分配。
+   * 其他动作的错误不一定有锚；同回合重试必须保留该锚与原文。
+   */
+  readonly turnId?: string;
 }
 
 export type Result<T> =
@@ -130,6 +140,11 @@ export interface TurnResult {
   readonly reply: string;
   /** 是否流式产出（RT-05 的正对照）。 */
   readonly streamed: boolean;
+  /**
+   * 本回合的幂等锚。显式传入时原样返回，省略时返回运行时分配的锚。
+   * 与原文一起保存，供同回合重试使用。
+   */
+  readonly turnId: string;
 }
 
 // —— 一窗流只读 ——
@@ -237,9 +252,16 @@ export interface TuiTranscript {
   readonly errorText: string | null;
 }
 
-/** TUI 脚本步骤：敲一行、等回复、或注入一次故障看错误呈现。 */
+/**
+ * TUI 脚本步骤：敲一行、等回复、显式重试、或注入一次故障看错误呈现。
+ *
+ * `retry` 与 `input` 是两条不同的路径：`input` 是普通提交，
+ * 同文本也是**新回合**；`retry` 是显式重试动作，复用上一次失败回合的锚与原文。
+ */
 export type TuiStep =
   | { readonly kind: "input"; readonly text: string }
+  /** 显式重试：复用上一条失败回合的 turnId 与原文，不把重试当新回合。 */
+  | { readonly kind: "retry" }
   | { readonly kind: "breakChannel" }
   | { readonly kind: "input-after-break"; readonly text: string };
 
@@ -282,7 +304,23 @@ export interface ResidentRuntimeDriver {
   resolveChannelRoute(input: { channel: ChannelSpec }): Promise<Result<ChannelRoute>>;
 
   // —— 对话往返 ——
-  say(input: { residentId: string; text: string }): Promise<Result<TurnResult>>;
+  say(input: { residentId: string; text: string; turnId?: string }): Promise<Result<TurnResult>>;
+
+  /**
+   * 验收观察口：真实模型 transport 的调用次数。RT-08 用前后差证明恢复拒绝发生在
+   * 模型调用之前；只看结构化错误码不足以排除「先调用、再报错」的假绿。
+   */
+  modelInvocationCount(): Promise<number>;
+
+  /** RT-08 故障夹具：让下一次认证回合在正文与 ACK 落盘后，确认记录写入失败。 */
+  armTurnConfirmationWriteFault(input: { residentId: string }): Promise<void>;
+  /** 清掉上面的确定性落盘故障；不补造确认记录。 */
+  repairTurnConfirmationWriteFault(input: { residentId: string }): Promise<void>;
+  /**
+   * RT-08 崩溃夹具：把一个已完成回合裁成只剩耐久 user 腿，随后用同一数据根拉起
+   * 新宿主。夹具只负责造状态；判卷仍须独立读流确认只剩一条 user，再执行换代与重试。
+   */
+  crashAfterUserWrite(input: { residentId: string; turnId: string }): Promise<void>;
 
   // —— 一窗流只读 ——
   readStream(input: { residentId: string }): Promise<Result<StreamSnapshot>>;

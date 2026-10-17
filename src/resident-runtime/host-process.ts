@@ -28,7 +28,12 @@ import type {
   TurnResult,
 } from "../../acceptance/resident-runtime-driver.ts";
 import { assembleResidentRuntime } from "./assembly.ts";
-import type { ChannelSpecLike } from "./channels.ts";
+import {
+  type ChannelSpecLike,
+  type ModelCompletionRequest,
+  type ModelTransport,
+  createModelTransport,
+} from "./channels.ts";
 import { runResidentTuiScript } from "./tui.ts";
 
 const dataDir = process.env.MIST_RESIDENT_RUNTIME_DIR;
@@ -38,9 +43,17 @@ if (dataDir === undefined || dataDir.length === 0) {
 
 /** 每次 boot 新随机；判卷靠它 + pid 断言「确实换了一个进程」。 */
 const bootId = randomUUID();
+let modelInvocationCount = 0;
+const upstreamTransport = createModelTransport();
+const countedTransport: ModelTransport = {
+  async *complete(request: ModelCompletionRequest) {
+    modelInvocationCount += 1;
+    yield* upstreamTransport.complete(request);
+  },
+};
 // 宿主装配走与 CLI 共用的 seam：接上认证权威事实账（与住户档案同在 residents/），
 // currentFacts 与信里 commitment 档实际来自 ledger.currentSet()，say 走真实交付/回执。
-const runtime = assembleResidentRuntime({ dataDir });
+const runtime = assembleResidentRuntime({ dataDir, transport: countedTransport });
 
 interface Command {
   readonly requestId?: string;
@@ -133,6 +146,8 @@ async function handle(command: Command): Promise<unknown> {
         text: required(input.text, "text"),
         ...(input.turnId === undefined ? {} : { turnId: input.turnId }),
       })) as Result<TurnResult>;
+    case "modelInvocationCount":
+      return modelInvocationCount;
     case "tuiTranscript": {
       if (input.script === undefined) throw new Error("script is required");
       return runResidentTuiScript(runtime, {

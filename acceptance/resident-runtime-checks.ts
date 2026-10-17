@@ -1,5 +1,5 @@
 /**
- * #194 RT-01～RT-07 的七盏可执行判卷。
+ * #194 RT-01～RT-08 的八盏可执行判卷。
  *
  * 清单真源：`acceptance/resident-runtime.md`。两边必须同步改，判卷以代码为准。
  *
@@ -1001,6 +1001,168 @@ export const residentRuntimeChecks: readonly ResidentRuntimeCheck[] = [
       } finally {
         rmSync(fixtureRoot, { recursive: true, force: true });
       }
+    },
+  },
+
+  {
+    id: "RT-08",
+    title: "恢复：缺确认不假绿，孤立 user 不跨代补写，重试不调模型也不添正文",
+    uses: [
+      "provisionChannel",
+      "say",
+      "readStream",
+      "modelInvocationCount",
+      "armTurnConfirmationWriteFault",
+      "repairTurnConfirmationWriteFault",
+      "crashAfterUserWrite",
+      "breathe",
+    ],
+    async run(driver) {
+      const PENDING = residentFor("RT-08-pending");
+      const ORPHAN = residentFor("RT-08-orphan");
+      for (const residentId of [PENDING, ORPHAN]) {
+        const provisioned = await driver.provisionChannel({
+          residentId,
+          channel: CHANNEL_A,
+          canarySecret: CANARY_SECRET,
+        });
+        if (!provisioned.ok) fatal(`给 ${residentId} 配通道失败：${provisioned.error.code}`);
+      }
+
+      // —— 缺确认不能把完整正文假报为成功；runtime 自造的锚须经 IPC 原样返回 ——
+      await driver.armTurnConfirmationWriteFault({ residentId: PENDING });
+      const pendingText = markerFor("RT-08", "pending");
+      const callsBeforeFailure = await driver.modelInvocationCount();
+      const failed = await driver.say({ residentId: PENDING, text: pendingText });
+      expect(!failed.ok, "确认记录写失败却返回成功——缺确认假绿");
+      if (failed.ok) fatal("确认记录写失败却返回成功");
+      expect(
+        failed.error.code === "writer-unavailable",
+        `确认记录写失败报 ${failed.error.code}，应为 writer-unavailable`,
+      );
+      const pendingTurnId = failed.error.turnId;
+      expect(
+        typeof pendingTurnId === "string" && pendingTurnId.length > 0,
+        "写后失败没有把 runtime 自造的 turnId 经 IPC 返回，调用方无法重试原回合",
+      );
+      if (pendingTurnId === undefined) fatal("写后失败缺 turnId");
+      const callsAfterFailure = await driver.modelInvocationCount();
+      expect(
+        callsAfterFailure === callsBeforeFailure + 1,
+        `故障正对照没有恰好调用一次模型：${callsBeforeFailure}→${callsAfterFailure}`,
+      );
+      const pendingStream = await driver.readStream({ residentId: PENDING });
+      if (!pendingStream.ok) fatal(`确认故障后读流失败：${pendingStream.error.code}`);
+      expect(
+        pendingStream.value.events.length === 2 &&
+          pendingStream.value.events[0]?.kind === "user" &&
+          pendingStream.value.events[1]?.kind === "assistant",
+        `确认故障正对照不是完整 user→assistant：${pendingStream.value.events.map((event) => event.kind).join("→")}`,
+      );
+
+      await driver.repairTurnConfirmationWriteFault({ residentId: PENDING });
+      const pendingBeforeRetry = snapshotFingerprint(pendingStream.value);
+      const retry = await driver.say({
+        residentId: PENDING,
+        text: pendingText,
+        turnId: pendingTurnId,
+      });
+      expect(!retry.ok, "缺确认的同锚重试假报成功");
+      if (retry.ok) fatal("缺确认的同锚重试假报成功");
+      expect(
+        retry.error.code === "reconciliation-needed" && retry.error.turnId === pendingTurnId,
+        `缺确认重试没有保留锚并报 reconciliation-needed：${retry.error.code}/${String(retry.error.turnId)}`,
+      );
+      const callsAfterRetry = await driver.modelInvocationCount();
+      expect(
+        callsAfterRetry === callsAfterFailure,
+        `缺确认重试又调了模型：${callsAfterFailure}→${callsAfterRetry}`,
+      );
+      const pendingAfterRetry = await driver.readStream({ residentId: PENDING });
+      if (!pendingAfterRetry.ok) fatal(`缺确认重试后读流失败：${pendingAfterRetry.error.code}`);
+      expect(
+        stableJson(pendingBeforeRetry) === stableJson(snapshotFingerprint(pendingAfterRetry.value)),
+        "缺确认重试改动了一窗流——零新正文没有成立",
+      );
+
+      // 后续真实交付覆盖原 target 后，旧锚只能回放；成功 TurnResult 仍须带原锚。
+      const later = await driver.say({
+        residentId: PENDING,
+        text: markerFor("RT-08", "later-delivery"),
+      });
+      if (!later.ok) fatal(`后续真实交付失败：${later.error.code}`);
+      expect(later.value.turnId.length > 0, "成功 TurnResult 没有必填 turnId");
+      const callsBeforeReplay = await driver.modelInvocationCount();
+      const streamBeforeReplay = await driver.readStream({ residentId: PENDING });
+      if (!streamBeforeReplay.ok) fatal(`回放前读流失败：${streamBeforeReplay.error.code}`);
+      const replay = await driver.say({
+        residentId: PENDING,
+        text: pendingText,
+        turnId: pendingTurnId,
+      });
+      if (!replay.ok) fatal(`后续交付覆盖后仍不能回放：${replay.error.code}`);
+      expect(replay.value.turnId === pendingTurnId, "成功回放没有原样返回 IPC 传入的 turnId");
+      expect((await driver.modelInvocationCount()) === callsBeforeReplay, "已确认回放又调用了模型");
+      const streamAfterReplay = await driver.readStream({ residentId: PENDING });
+      if (!streamAfterReplay.ok) fatal(`回放后读流失败：${streamAfterReplay.error.code}`);
+      expect(
+        stableJson(snapshotFingerprint(streamBeforeReplay.value)) ===
+          stableJson(snapshotFingerprint(streamAfterReplay.value)),
+        "已确认回放追加了正文",
+      );
+
+      // —— 真宿主死在 user 耐久之后：重启并换代，旧锚须在模型前 fail-closed ——
+      const orphanText = markerFor("RT-08", "orphan");
+      const orphanTurnId = markerFor("RT-08", "orphan-anchor");
+      const seeded = await driver.say({
+        residentId: ORPHAN,
+        text: orphanText,
+        turnId: orphanTurnId,
+      });
+      if (!seeded.ok) fatal(`孤立 user 夹具的正对照回合失败：${seeded.error.code}`);
+      expect(seeded.value.turnId === orphanTurnId, "显式 turnId 没经 IPC 原样回到 TurnResult");
+      await driver.crashAfterUserWrite({ residentId: ORPHAN, turnId: orphanTurnId });
+      const orphaned = await driver.readStream({ residentId: ORPHAN });
+      if (!orphaned.ok) fatal(`崩溃夹具后读流失败：${orphaned.error.code}`);
+      expect(
+        orphaned.value.events.length === 1 && orphaned.value.events[0]?.kind === "user",
+        `崩溃夹具没有留下恰一条孤立 user：${orphaned.value.events.map((event) => event.kind).join("→")}`,
+      );
+      const breathed = await driver.breathe({ residentId: ORPHAN, via: "new" });
+      if (!breathed.ok) fatal(`孤立 user 后换代失败：${breathed.error.code}`);
+      expect(
+        breathed.value.toGeneration === breathed.value.fromGeneration + 1,
+        "孤立 user 场景没有真的跨代",
+      );
+      const orphanBeforeRetry = snapshotFingerprint(orphaned.value);
+      const callsBeforeOrphanRetry = await driver.modelInvocationCount();
+      const refused = await driver.say({
+        residentId: ORPHAN,
+        text: orphanText,
+        turnId: orphanTurnId,
+      });
+      expect(!refused.ok, "跨代孤立 user 重试被当成新回合成功了");
+      if (refused.ok) fatal("跨代孤立 user 重试被当成新回合成功了");
+      expect(
+        refused.error.code === "reconciliation-needed" && refused.error.turnId === orphanTurnId,
+        `跨代孤立 user 没保留锚并报 reconciliation-needed：${refused.error.code}/${String(refused.error.turnId)}`,
+      );
+      expect(
+        (await driver.modelInvocationCount()) === callsBeforeOrphanRetry,
+        "跨代孤立 user 的拒绝发生在模型调用之后",
+      );
+      const orphanAfterRetry = await driver.readStream({ residentId: ORPHAN });
+      if (!orphanAfterRetry.ok) fatal(`跨代拒绝后读流失败：${orphanAfterRetry.error.code}`);
+      expect(
+        stableJson(orphanBeforeRetry) === stableJson(snapshotFingerprint(orphanAfterRetry.value)),
+        "跨代孤立 user 重试追加或改写了正文",
+      );
+
+      return pass(
+        `确认写失败落 user→assistant 且返回锚 ${pendingTurnId.slice(0, 12)}…；` +
+          `立即重试 ${retry.error.code}，模型调用与 2 条正文均不增；后续真实交付后原锚零调用回放；` +
+          `崩溃后恰 1 条孤立 user，跨 ${breathed.value.fromGeneration}→${breathed.value.toGeneration} 代重试在模型前拒绝且流逐项不变`,
+      );
     },
   },
 ];

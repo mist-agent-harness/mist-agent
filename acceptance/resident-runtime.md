@@ -115,11 +115,64 @@ npm test -- tests/resident-runtime.test.ts tests/pi-transport.test.ts
 及短引用，旧字符串承诺仍 fail-closed 拒绝。上述检查证明已有信被送入模型，
 不判信的内容质量，也不替代 D8「当刻亲笔」的语义核对或正式独立验收落章。
 
+## 回合恢复补充回归
+
+`say({ residentId, text, turnId? })` 成功返回 `value.turnId`，结构化失败返回 `error.turnId`。
+省略时由 runtime 分配；同回合重试必须带原锚与原文，复用锚却换文本仍报
+`turn-id-conflict`。已完成回合回放原 assistant 的 reply/model/generation/streamed，
+不新调模型、不新写 user/assistant。
+
+认证新回合先读确认存储；损坏或不可读时在模型、写流和账交付之前报 `writer-unavailable`。
+文件须人工检查权限或从可靠备份恢复，不自动覆盖损坏记录。认证回合按顺序写两条正文、
+立即计入 D8、消费 SessionRegistry 的真实 settlement、提交 FactLedger ACK，
+最后发布耐久确认元数据。assistant 的 `ledgerDelivery` 保存原 resident/scope/window/generation、
+dispatchId 与 targetSeq；`turns/<residentId>.turns.json` 只保存确认元数据和原 assistant 指针，
+不复制对话或事实正文，不恢复旧 dispatch authority。原确认回执或**后续**同身份的真实交付
+回执覆盖原 target，才允许成功回放。当前 latestSeq、登记 baseline 或更早的回执都不能代替它。
+新增目录纳入 `secretScan()` 的按户扫描，凭证仍只落专属私有凭证面。
+
+ACK 或确认记录写失败时保留真实正文与已经发生的 ACK，并返回 `writer-unavailable`。
+晚失败不跳过到线换气；旧代回执在换代前尝试结算，错误仍如实返回。TUI 在已显示回复后附上
+错误；同锚重试等待协调时也不抹掉该回复，错误不代表已取得确认。
+此后同锚重试在模型调用前返回 `reconciliation-needed`，直到有合法确认依据；它不重开
+已落流回复，也不尝试消费失效的旧回执。修好落盘后，同代后续正常交付可以覆盖原 target；
+跨代未确认回合须宿主协调，新代 baseline 不补确认。
+
+只有 user 腿耐久且仍是同窗同代最后一条事件时，修好 writer 后可以重新调用模型，
+请求历史去掉本条 user，当前输入仅一次；去重 user 并补 assistant。后面已有同窗同代事件则
+报 `reconciliation-needed`，在模型和写流前拒绝补写，不把旧 assistant 插到后来回合之后；
+原模型输出尚未耐久保存，因此不能保证回复逐字相同。重启、换气或猝死后若已跨窗/跨代，
+保留孤立 user，返回 `reconciliation-needed`，在模型调用前阻断，不冒写旧代。
+旧 assistant 缺少 `ledgerDelivery` 时，认证装配不能重建原交付身份，明确等待协调；
+无认证账的 legacy 嵌入继续按完整正文回放。新回合用 `ledgerDelivery: null` 明示创建时无认证交付，
+以后启用账也不会给它补造 ACK；已有认证 target 则不能通过关闭账选项降级成成功。
+
+代价：认证回合多一次本地原子写入与 fsync；确认记录保留各回合，数量增长，每回合整文件
+读改写，不做压缩。确认文件损坏须人工处理，会使新回合停在模型调用前、已完成正文等待协调；
+恢复材料须随 runtime 数据一起保留。旧认证回合缺材料不会自动迁移或重算，跨代半回合
+本轮只准确阻断，不提供丢失输出的重建或宿主协调工具。
+
+```bash
+npm test -- tests/resident-turn-recovery.test.ts tests/resident-tui.test.ts tests/resident-runtime-host-boundary.test.ts
+```
+
+这些回归用临时目录与 synthetic transport，真实 `EISDIR` 落盘故障分别截断 assistant、
+ACK 和确认记录；同时检查模型调用次数、原 generation/target、最终流条数、回放字节。
+新增回归覆盖截断/不可读确认文件的零副作用、ACK/确认记录晚失败仍触发 D8 换代、TUI 保留
+回复与可见错误、立即孤立 user 重试仅输入一次，以及隔着 B 后重试 A 拒绝且流序逐项不变。
+TUI 的 ACK 故障回归从 `tui.submit()` 发出后续补账消息，再从 `/retry` 恢复原回复与原显示行；
+后续普通回合成功不会清掉待恢复锚，恢复成功才清除，后来的新失败接替最近失败锚。
+真实 CLI stdin 验证 `/retry` 与普通同文本提交，IPC 子进程验证返回锚、同锚回放与跨宿主
+重启的 pending 状态。它们是恢复补充证据，不替代 RT 八灯、真实 provider 或独立验收落章。
+
 ## 终端命令输入回归
 
 `tests/resident-tui.test.ts` 从真实 `src/resident-runtime/cli.ts` 子进程的 stdin 输入
 `/new`、`/clear`、`/compact`，观察落盘信、代际、同一窗号与主流正文；命令不得成为聊天
 回合。另注入信文件落盘失败，验证错误可见、代际未推进、拒绝后普通对话仍可进行。
+`/retry` 的恢复回归也从真实 stdin 进入：连续重试保留原回合，确认记录落盘故障修好后，
+后续正常交付和原回复回放只产生两次模型请求、两对正文；原错误显示行恢复原回复。
+恢复后再次 `/retry` 显示无可重试回合的错误，普通同文本输入仍落独立回合。
 空行、普通输入、`/exit` 与 SIGINT 的既有回归继续保留。
 
 这些测试用临时目录和 synthetic 通道：身份先由 synthetic candidate 本人显式自认，
@@ -127,7 +180,7 @@ npm test -- tests/resident-runtime.test.ts tests/pi-transport.test.ts
 真实 provider 往返或 intent 当刻亲笔成立。
 原 RT-03 判据与未勾独立复验状态保持不变。
 
-## 七盏灯
+## 八盏灯
 
 每条带主证据形式。标 [集成] 的由 Vitest 集成测试或验收驱动提供（真实宿主子进程、
 真实文件系统目录，杀得起拉得起，可注入故障）；标 [静态] 的由代码检索与类型检查提供。
@@ -200,6 +253,18 @@ npm test -- tests/resident-runtime.test.ts tests/pi-transport.test.ts
   正对照（干净夹具树报 0 findings、零定义树三面各报 missing、扩展根里那份被判 duplicated
   且点到具体文件），`tests/resident-runtime-write-surface.test.ts` 另钉住上述三个「不算」。
 
+- [x] **RT-08 回合恢复** [集成＋跨进程]：认证回合正文已经耐久、确认记录缺失时不能
+  假报成功；同锚重试与跨代孤立 user 都在模型调用前停下，不追加或改写一窗流；运行时
+  生成的失败锚和成功回放锚经 IPC 原样往返。
+  **判过**：先用真实落盘故障卡住 `turns/<residentId>.turns.json.tmp`，正对照必须已经
+  调用一次模型并落下完整 user→assistant，返回 `writer-unavailable` 与非空 `turnId`；修好
+  故障后立即同锚重试必须报 `reconciliation-needed`，模型调用计数不增，事件逐项指纹不变。
+  再用后续真实交付覆盖原 target，旧锚只允许零模型调用、零正文写入的成功回放，返回的
+  `TurnResult.turnId` 仍等于原锚。另把一个完整回合在宿主关闭后裁成只有耐久 user 腿，
+  从同一数据根拉起新宿主并真实换代；跨代重试仍报 `reconciliation-needed`，模型计数与
+  孤立 user 的逐项指纹都不变。判卷自检分别把「缺确认假绿」「拒绝前偷调模型」「拒绝仍写
+  正文」「跨代重新生成」「失败丢锚」五种实现改坏，RT-08 必须逐一转红。
+
 ## 判据修订记录
 
 | 日期 | 改了什么 | 依据 |
@@ -211,12 +276,31 @@ npm test -- tests/resident-runtime.test.ts tests/pi-transport.test.ts
 | 2026-09-24 | RT-03 代际按 1 起点算（开工第 1 代、首封信签名 `#1`、换代增量 1→2→…） | [#200 技术门（复审 ca2ec60）第 1 条](https://github.com/mist-agent-harness/mist-agent/pull/200)：原判据写死 0 起点，与现役 `SessionRegistry.open`（第一代 (last ?? 0)+1）、journal 拒 `generation<1`、`formatAuthor` 的 1 起点冲突，接真实栈的正确实现被判红 |
 | 2026-09-24 | RT-03 把「窗无权改自己的线」的拒绝断言移到第一句 say **之后**（回合已起才锁） | 同上第 2 条：现役 turn-gate 的锁在 `beforeTurn` 之后才合上（MV-D02：开工 configure 成功、先 say、再改才 CONFIG_INVALID）；放在起回合前会把「开工阶段窗还能配线」的正确实现判红 |
 | 2026-09-24 | RT-03 猝死单判加：猝死前标记确已入流（正对照）+ 继任者代际必须更高（真换代）+ 归档按代可查（D8 三正面）；驱动契约新增只读 `archivedTranscript` | 同上第 3 条：原判据只查「启动包里没有标记」，空的 `suddenDeath` 也能点绿，且没验 D8 三「原始流水进归档可查」，允许丢史 |
+| 2026-10-17 | 新增 RT-08：确认缺失、同锚重试、跨代孤立 user、模型零调用、正文零新增与 IPC 锚往返合成一盏恢复灯 | [#223 D32 主笔裁定](https://github.com/mist-agent-harness/mist-agent/pull/223#issuecomment-6214284808)：恢复语义动一窗流与事实账，施工方单测不能替代可执行判卷与独立验收席 |
+
+## 2026-10-17 D32 独立验收落章（#223）
+
+- 被验实现：PR #223 的施工方 head `8b9af1ea22a70e20e2e89bf2209e0e36b9e33431`。
+- 独立验收席：Elio（`zaymb`）。本席没有参与 #223 的运行时实现；本轮只补 RT-08 判卷、
+  判卷反对照、驱动观察口与收卷清理。
+- 驱动契约背书：`reconciliation-needed` 保留「正文已耐久但交付真实性待协调」这一种可机分
+  状态，不能塌成通道失败或重新生成；`TuiStep.retry` 把复用旧锚的动作与普通同文本新回合
+  分开；`TurnResult.turnId` 必填让成功回放也能原样交还幂等锚。三项都由 RT-08 的真实 IPC
+  往返、模型调用计数和一窗流指纹共同约束，不只靠类型声明。
+- 负例：同一份 RT-08 判卷套到 PR 基线 main `8cc44dde37dc501436dd16c00cdad30080cf8afa`，
+  严格运行得到 7/8；RT-08 红在「确认记录写失败却返回成功——缺确认假绿」。
+- 正例：PR head 上 `npm run acceptance:resident-runtime:strict` 为 8/8；判卷自身 43/43，
+  恢复相关四文件 84/84，完整套件 1603 passed / 38 todo；lint 与 typecheck 通过。
+- 边界：本席落章只覆盖 #223 的 D32 回合恢复增补与上述三项驱动契约，不改写 RT-01～RT-07
+  原有未勾状态，也不声称真实 provider 或断电验证已经发生。
+
+**Elio / zaymb，D32 独立验收席，2026-10-17。**
 
 ## 真灯与桩灯
 
 驱动模块可以导出 `STUBBED: string[]` 申报哪些方法还是代写的判卷桩。runner 拿每条验收
 的 `uses` 清单对照申报名单：依赖桩方法跑绿的灯显示 🟡 桩灯——行为通过，但不计入完成。
-只有七盏**真绿**才算 RT-01～RT-07 全部交付。各包交付时从名单里划掉自己那几个方法，
+只有八盏**真绿**才算 RT-01～RT-08 全部交付。各包交付时从名单里划掉自己那几个方法，
 桩灯就地转真。隐瞒申报按伪证论，评审在 PR 里对照 TODO 标记查这份名单。
 
 出处归结构（照 `acceptance/README.md` 三条边界第 2 条）：真实现必须住在 `src/` 自己的
@@ -224,7 +308,7 @@ npm test -- tests/resident-runtime.test.ts tests/pi-transport.test.ts
 内联写的实现，一律按桩论，不论申报什么。
 
 判卷自身也要被判：`tests/resident-runtime-write-surface.test.ts` 钉 RT-07 的审计，
-`tests/resident-runtime-checks.test.ts` 用合成驱动 + 改坏对照钉七盏灯本身——证明
+`tests/resident-runtime-checks.test.ts` 用合成驱动 + 改坏对照钉八盏灯本身——证明
 合规实现能点绿、每条判据被破坏时确实变红。**判卷没被测过，等于判卷没被验过。**
 
 ## 完成条件

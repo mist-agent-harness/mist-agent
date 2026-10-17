@@ -1,11 +1,11 @@
 /**
- * RT-01～RT-07 **判卷自身**的回归测试。
+ * RT-01～RT-08 **判卷自身**的回归测试。
  *
  * 为什么要测判卷：判卷没被测过，等于判卷没被验过。#200 审读第 1 条就是这么漏的——
- * 七盏灯共用一个住户、`reset()` 从没被调用，正确实现会被判红，而判卷自己全绿，
+ * 原七盏灯共用一个住户、`reset()` 从没被调用，正确实现会被判红，而判卷自己全绿，
  * 谁也看不出来。这个文件用一份**内存合成驱动**做两件事：
  *
- * 1. 正对照：合规实现跑七盏全绿，连跑（模拟 runner 的循环）也全绿。
+ * 1. 正对照：合规实现跑八盏全绿，连跑（模拟 runner 的循环）也全绿。
  * 2. 反对照：逐条改坏，断言**预期的那一盏**真的变红。
  *
  * 合成驱动不碰真实持久目录（落盘清单是内存数组 + `os.tmpdir()` 下的临时夹具），
@@ -120,6 +120,16 @@ interface Faults {
   suddenDeathNoSuccessor: boolean;
   /** suddenDeath 把那代原始流水直接丢了，归档查不到——#200 技术门第 3 条正面。 */
   suddenDeathDropsArchive: boolean;
+  /** RT-08：缺确认的回合直接回放成功，制造假绿。 */
+  recoveryPendingFalseGreen: boolean;
+  /** RT-08：恢复拒绝前仍调用模型。 */
+  recoveryRetryCallsModel: boolean;
+  /** RT-08：恢复拒绝仍追加正文。 */
+  recoveryRetryWritesBody: boolean;
+  /** RT-08：跨代孤立 user 被重新生成。 */
+  recoveryCrossGenerationRegenerates: boolean;
+  /** RT-08：写后失败不返回 runtime 自造的锚。 */
+  recoveryDropsFailureAnchor: boolean;
 }
 
 const NO_FAULTS: Faults = {
@@ -158,6 +168,11 @@ const NO_FAULTS: Faults = {
   windowRefusesBeforeTurn: false,
   suddenDeathNoSuccessor: false,
   suddenDeathDropsArchive: false,
+  recoveryPendingFalseGreen: false,
+  recoveryRetryCallsModel: false,
+  recoveryRetryWritesBody: false,
+  recoveryCrossGenerationRegenerates: false,
+  recoveryDropsFailureAnchor: false,
 };
 
 interface SynthCredential {
@@ -193,14 +208,31 @@ interface SynthResident {
   effectiveId: string | null;
 }
 
+interface SynthTurn {
+  readonly text: string;
+  readonly result: TurnResult;
+  readonly userEventId: string;
+  readonly assistantEventId: string;
+  status: "complete" | "pending" | "orphan";
+}
+
 function ok<T>(value: T): Result<T> {
   return { ok: true, value };
 }
 
 type ErrorCode = Extract<Result<never>, { readonly ok: false }>["error"]["code"];
 
-function err<T>(code: ErrorCode, message: string, remedy: string, residentId: string): Result<T> {
-  return { ok: false, error: { code, message, remedy, residentId } };
+function err<T>(
+  code: ErrorCode,
+  message: string,
+  remedy: string,
+  residentId: string,
+  turnId?: string,
+): Result<T> {
+  return {
+    ok: false,
+    error: { code, message, remedy, residentId, ...(turnId === undefined ? {} : { turnId }) },
+  };
 }
 
 class SyntheticDriver implements ResidentRuntimeDriver {
@@ -214,6 +246,10 @@ class SyntheticDriver implements ResidentRuntimeDriver {
   #boots = 0;
   #eventSeq = 0;
   #letterSeq = 0;
+  #turnSeq = 0;
+  #modelCalls = 0;
+  #turns = new Map<string, Map<string, SynthTurn>>();
+  #confirmationFaults = new Set<string>();
   #fixtureRoot = mkdtempSync(join(tmpdir(), "mist-rt-synth-"));
 
   async reset(): Promise<void> {
@@ -223,6 +259,10 @@ class SyntheticDriver implements ResidentRuntimeDriver {
     this.#logs = [];
     this.#eventSeq = 0;
     this.#letterSeq = 0;
+    this.#turnSeq = 0;
+    this.#modelCalls = 0;
+    this.#turns.clear();
+    this.#confirmationFaults.clear();
   }
 
   async startHost(): Promise<HostDescriptor> {
@@ -307,7 +347,11 @@ class SyntheticDriver implements ResidentRuntimeDriver {
     });
   }
 
-  async say(input: { residentId: string; text: string }): Promise<Result<TurnResult>> {
+  async say(input: {
+    residentId: string;
+    text: string;
+    turnId?: string;
+  }): Promise<Result<TurnResult>> {
     const resident = this.#ensure(input.residentId);
     const credential = resident.credential;
     if (credential === null) {
@@ -329,7 +373,41 @@ class SyntheticDriver implements ResidentRuntimeDriver {
       );
     }
 
-    this.#append(input.residentId, "user", input.text);
+    const turnId = input.turnId ?? `synth-turn-${input.residentId}-${++this.#turnSeq}`;
+    const existing = this.#turns.get(input.residentId)?.get(turnId);
+    if (existing !== undefined) {
+      if (existing.text !== input.text) {
+        return err(
+          "turn-id-conflict",
+          "turnId 已被另一条正文占用",
+          "换一个 turnId，或带原文重试",
+          input.residentId,
+          turnId,
+        );
+      }
+      if (existing.status === "complete") return ok(existing.result);
+      if (this.faults.recoveryRetryCallsModel) this.#modelCalls += 1;
+      if (this.faults.recoveryRetryWritesBody) {
+        this.#append(input.residentId, "assistant", `错误恢复 ${input.text}`);
+      }
+      if (existing.status === "pending" && this.faults.recoveryPendingFalseGreen) {
+        return ok(existing.result);
+      }
+      if (existing.status === "orphan" && this.faults.recoveryCrossGenerationRegenerates) {
+        this.#modelCalls += 1;
+        this.#append(input.residentId, "assistant", `跨代重生 ${input.text}`);
+      }
+      return err(
+        "reconciliation-needed",
+        "回合需要协调",
+        "保留原锚，不再调用模型",
+        input.residentId,
+        turnId,
+      );
+    }
+
+    this.#modelCalls += 1;
+    const userEvent = this.#append(input.residentId, "user", input.text);
     resident.tokensSinceBreath += TOKENS_PER_SAY;
     // 回合已起：从这一刻起窗无权给自己改线（对齐现役 turn-gate 的 beforeTurn 锁点）。
     resident.turnStarted = true;
@@ -344,13 +422,13 @@ class SyntheticDriver implements ResidentRuntimeDriver {
     if (crossed) this.#breatheInPlace(resident, input.residentId);
 
     const reply = `回复 ${input.text}`;
-    this.#append(input.residentId, "assistant", reply);
+    const assistantEvent = this.#append(input.residentId, "assistant", reply);
     if (this.faults.switchChannelRewritesStream && resident.events.length > 2) {
       const first = resident.events[0];
       if (first !== undefined) resident.events[0] = { ...first, text: `${first.text}~改史` };
     }
 
-    return ok({
+    const result: TurnResult = {
       residentId: resident.effectiveId ?? input.residentId,
       model: resident.channel?.model ?? "model-alpha",
       // 正确实现报「回复落在的那一代」；generationZeroOrigin 故障把它整体减 1，
@@ -358,7 +436,56 @@ class SyntheticDriver implements ResidentRuntimeDriver {
       generation: this.faults.generationZeroOrigin ? generationOfReply - 1 : generationOfReply,
       reply,
       streamed: true,
+      turnId,
+    };
+    const turns = this.#turns.get(input.residentId) ?? new Map<string, SynthTurn>();
+    this.#turns.set(input.residentId, turns);
+    turns.set(turnId, {
+      text: input.text,
+      result,
+      userEventId: userEvent.eventId,
+      assistantEventId: assistantEvent.eventId,
+      status: this.#confirmationFaults.has(input.residentId) ? "pending" : "complete",
     });
+    if (!this.#confirmationFaults.has(input.residentId)) {
+      for (const turn of turns.values()) {
+        if (turn.status === "pending") turn.status = "complete";
+      }
+    }
+    if (this.#confirmationFaults.has(input.residentId)) {
+      return err(
+        "writer-unavailable",
+        "确认记录写入失败",
+        "修好确认存储后带原锚重试",
+        input.residentId,
+        this.faults.recoveryDropsFailureAnchor ? undefined : turnId,
+      );
+    }
+    return ok(result);
+  }
+
+  async modelInvocationCount(): Promise<number> {
+    return this.#modelCalls;
+  }
+
+  async armTurnConfirmationWriteFault(input: { residentId: string }): Promise<void> {
+    this.#confirmationFaults.add(input.residentId);
+  }
+
+  async repairTurnConfirmationWriteFault(input: { residentId: string }): Promise<void> {
+    this.#confirmationFaults.delete(input.residentId);
+  }
+
+  async crashAfterUserWrite(input: { residentId: string; turnId: string }): Promise<void> {
+    const turn = this.#turns.get(input.residentId)?.get(input.turnId);
+    if (turn === undefined || turn.status !== "complete") {
+      throw new Error(`cannot create orphan fixture for ${input.residentId}/${input.turnId}`);
+    }
+    const resident = this.#ensure(input.residentId);
+    resident.events = resident.events.filter((event) => event.eventId !== turn.assistantEventId);
+    turn.status = "orphan";
+    await this.killHost();
+    await this.startHost();
   }
 
   async readStream(input: { residentId: string }): Promise<Result<StreamSnapshot>> {
@@ -541,6 +668,15 @@ class SyntheticDriver implements ResidentRuntimeDriver {
         broken = true;
         continue;
       }
+      if (step.kind === "retry") {
+        // 恢复回归使用真实控制器；这个灯色对照只实现 RT-05 的原脚本。
+        return err(
+          "tui-unavailable",
+          "对照驱动不支持恢复脚本",
+          "使用真实 resident runtime 驱动",
+          input.residentId,
+        );
+      }
       const said = await this.say({
         residentId: input.residentId,
         text: step.text,
@@ -660,7 +796,7 @@ class SyntheticDriver implements ResidentRuntimeDriver {
     return created;
   }
 
-  #append(residentId: string, kind: "user" | "assistant", text: string): void {
+  #append(residentId: string, kind: "user" | "assistant", text: string): StreamEventView {
     const resident = this.#ensure(residentId);
     if (resident.streamFile !== null && !this.#files.includes(resident.streamFile)) {
       this.#files.push(resident.streamFile);
@@ -669,13 +805,15 @@ class SyntheticDriver implements ResidentRuntimeDriver {
       this.#files.push(`${residentId}.dup.json`);
     }
     this.#eventSeq += 1;
-    resident.events.push({
+    const event: StreamEventView = {
       eventId: `evt-${this.#eventSeq}`,
       streamSeq: this.#eventSeq,
       kind,
       text,
       payloadHash: `h-${this.#eventSeq}`,
-    });
+    };
+    resident.events.push(event);
+    return event;
   }
 
   #sealFor(resident: SynthResident, residentId: string): LetterView {
@@ -804,12 +942,12 @@ afterEach(() => {
   driver.dispose();
 });
 
-describe("判卷正对照：合规实现七盏全绿", () => {
-  it("连跑七盏全绿（模拟 runner：每盏灯前 reset）", async () => {
+describe("判卷正对照：合规实现八盏全绿", () => {
+  it("连跑八盏全绿（模拟 runner：每盏灯前 reset）", async () => {
     const outcomes = await runAllLamps(driver);
     const red = outcomes.filter((outcome) => !outcome.passed);
     expect(red.map((outcome) => `${outcome.id}：${outcome.detail}`)).toEqual([]);
-    expect(outcomes).toHaveLength(7);
+    expect(outcomes).toHaveLength(8);
   });
 
   it("每盏灯单独跑也全绿", async () => {
@@ -1026,5 +1164,32 @@ describe("判卷反对照：改坏必须变红", () => {
   it("密钥明文漏进一窗流 → RT-06 红", async () => {
     driver.faults.secretLeaksIntoStream = true;
     expect(lampById(await runAllLamps(driver), "RT-06").passed).toBe(false);
+  });
+
+  // —— RT-08 ——
+
+  it("缺确认却直接回放成功 → RT-08 红", async () => {
+    driver.faults.recoveryPendingFalseGreen = true;
+    expect(lampById(await runAllLamps(driver), "RT-08").passed).toBe(false);
+  });
+
+  it("恢复拒绝前仍调用模型 → RT-08 红", async () => {
+    driver.faults.recoveryRetryCallsModel = true;
+    expect(lampById(await runAllLamps(driver), "RT-08").passed).toBe(false);
+  });
+
+  it("恢复拒绝仍追加正文 → RT-08 红", async () => {
+    driver.faults.recoveryRetryWritesBody = true;
+    expect(lampById(await runAllLamps(driver), "RT-08").passed).toBe(false);
+  });
+
+  it("跨代孤立 user 被重新生成 → RT-08 红", async () => {
+    driver.faults.recoveryCrossGenerationRegenerates = true;
+    expect(lampById(await runAllLamps(driver), "RT-08").passed).toBe(false);
+  });
+
+  it("写后失败丢掉 runtime 自造锚 → RT-08 红", async () => {
+    driver.faults.recoveryDropsFailureAnchor = true;
+    expect(lampById(await runAllLamps(driver), "RT-08").passed).toBe(false);
   });
 });
