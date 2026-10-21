@@ -214,7 +214,7 @@ describe("RoomEventStore", () => {
     migrated.close();
   });
 
-  it("migrates schema v2 to v3 without changing recorded receipts", async () => {
+  it("migrates schema v2 through v4 without changing recorded receipts", async () => {
     const root = await makeRoot();
     const initial = new RoomEventStore(root);
     const appended = initial.append({ ...appendInput(), recordedClaim: ROOM_RECORDED_CLAIM });
@@ -232,7 +232,7 @@ describe("RoomEventStore", () => {
       },
     ]);
     const db = new DatabaseSync(join(root, "room-events.sqlite"));
-    expect(db.prepare("PRAGMA user_version").get()).toEqual({ user_version: 3 });
+    expect(db.prepare("PRAGMA user_version").get()).toEqual({ user_version: 4 });
     const receiptColumns = db.prepare("PRAGMA table_info(room_system_receipts)").all();
     expect(receiptColumns).toHaveLength(4);
     db.close();
@@ -565,6 +565,7 @@ async function waitForFile(path: string): Promise<void> {
 }
 
 function downgradeToV2(root: string, withStageCollision = false): void {
+  downgradeToV3(root);
   const db = new DatabaseSync(join(root, "room-events.sqlite"));
   db.exec(`
     DROP TABLE room_stage_receipts;
@@ -581,3 +582,180 @@ function downgradeToV2(root: string, withStageCollision = false): void {
   `);
   db.close();
 }
+
+function downgradeToV3(root: string, withAuditCollision = false): void {
+  const db = new DatabaseSync(join(root, "room-events.sqlite"));
+  db.exec(`
+    DROP TABLE room_access_audit;
+    DROP TABLE room_registry;
+    ${withAuditCollision ? "CREATE TABLE room_access_audit (collision TEXT);" : ""}
+    PRAGMA user_version = 3;
+  `);
+  db.close();
+}
+
+describe("RoomEventStore rooms and access audit (schema v4)", () => {
+  it("migrates v3 to v4 without touching events, rosters or receipts", async () => {
+    const root = await makeRoot();
+    const initial = new RoomEventStore(root);
+    const appended = initial.append({ ...appendInput(), recordedClaim: ROOM_RECORDED_CLAIM });
+    initial.roster.registerResident({
+      operationId: "join-a",
+      roomId: "room-a",
+      residentId: "resident-a",
+    });
+    initial.close();
+    downgradeToV3(root);
+
+    const migrated = new RoomEventStore(root);
+    expect(migrated.readRoomEvents()).toEqual([appended.event]);
+    expect(migrated.roster.readRoster()).toEqual({ version: 1, residentIds: ["resident-a"] });
+    expect(migrated.readRoomRegistration("room-a")).toBeNull();
+    expect(migrated.readAccessAudit()).toEqual([]);
+    migrated.close();
+    const db = new DatabaseSync(join(root, "room-events.sqlite"));
+    expect(db.prepare("PRAGMA user_version").get()).toEqual({ user_version: 4 });
+    db.close();
+  });
+
+  it("rolls back every v4 DDL change and the version when migration fails", async () => {
+    const root = await makeRoot();
+    new RoomEventStore(root).close();
+    downgradeToV3(root, true);
+
+    expect(() => new RoomEventStore(root)).toThrow(/room_access_audit/);
+    const db = new DatabaseSync(join(root, "room-events.sqlite"));
+    expect(db.prepare("PRAGMA user_version").get()).toEqual({ user_version: 3 });
+    expect(
+      db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'room_registry'")
+        .get(),
+    ).toBeUndefined();
+    db.close();
+  });
+
+  it("derives event ids from room and position only, so equal histories share ids", async () => {
+    const left = new RoomEventStore(await makeRoot());
+    const right = new RoomEventStore(await makeRoot());
+    right.createRoom({
+      operationId: "hidden-only-on-the-right",
+      roomId: "room-hidden",
+      visibility: "hidden",
+      creatorId: "human-owner",
+      openingBody: "hidden canary",
+    });
+    const leftEvent = left.append(appendInput({ operationId: "left-op" })).event;
+    const rightEvent = right.append(appendInput({ operationId: "right-op" })).event;
+
+    expect(leftEvent.id).toBe(rightEvent.id);
+    expect(leftEvent.id).toMatch(/^room-event:[0-9a-f]{32}$/);
+    expect(left.append(appendInput({ operationId: "second" })).event.id).not.toBe(leftEvent.id);
+    left.close();
+    right.close();
+  });
+
+  it("never replays an operation into another room, even with identical semantics", async () => {
+    const store = new RoomEventStore(await makeRoot());
+    const original = store.append(appendInput());
+
+    expect(() => store.append(appendInput({ roomId: "room-b" }))).toThrow(
+      RoomOperationConflictError,
+    );
+    expect(store.readRoomEvents()).toEqual([original.event]);
+    store.close();
+  });
+
+  it("creates a room with its opening event once and replays the same creation", async () => {
+    const store = new RoomEventStore(await makeRoot());
+    const creation = {
+      operationId: "create-hidden",
+      roomId: "room-hidden",
+      visibility: "hidden" as const,
+      creatorId: "human-owner",
+      openingBody: "opening",
+    };
+    const created = store.createRoom(creation);
+
+    expect(created.event).toMatchObject({
+      roomId: "room-hidden",
+      position: 1,
+      authorId: "human-owner",
+      visibility: "hidden",
+      body: "opening",
+    });
+    expect(created.receipt?.claim).toBe(ROOM_RECORDED_CLAIM);
+    expect(store.readRoomRegistration("room-hidden")).toEqual({
+      roomId: "room-hidden",
+      visibility: "hidden",
+      creatorId: "human-owner",
+    });
+    expect(store.createRoom(creation)).toEqual({ ...created, replayed: true });
+    expect(() => store.createRoom({ ...creation, operationId: "create-again" })).toThrow(
+      RoomOperationConflictError,
+    );
+    expect(() => store.createRoom({ ...creation, visibility: "public" })).toThrow(
+      RoomOperationConflictError,
+    );
+    expect(store.readRoomEvents("room-hidden")).toHaveLength(1);
+    store.close();
+  });
+
+  it("refuses to create a room over existing history and keeps the ledger unchanged", async () => {
+    const store = new RoomEventStore(await makeRoot());
+    store.append(appendInput());
+
+    expect(() =>
+      store.createRoom({
+        operationId: "hide-after-the-fact",
+        roomId: "room-a",
+        visibility: "hidden",
+        creatorId: "human-owner",
+        openingBody: "too late",
+      }),
+    ).toThrow(/already has history/);
+    expect(store.readRoomRegistration("room-a")).toBeNull();
+    expect(store.readRoomEvents("room-a")).toHaveLength(1);
+    store.close();
+  });
+
+  it("keeps the access audit append-only and the registry immutable", async () => {
+    const root = await makeRoot();
+    const store = new RoomEventStore(root);
+    store.createRoom({
+      operationId: "create-public",
+      roomId: "room-a",
+      visibility: "public",
+      creatorId: "human-owner",
+      openingBody: "opening",
+    });
+    const entry = store.recordAccessAudit({
+      kind: "resident-scope-read",
+      viewerId: "resident-b",
+      roomId: "room-a",
+      ownerId: "resident-a",
+      externalResult: "not-found",
+      internalReason: "cross-resident-scope",
+    });
+    expect(() =>
+      store.recordAccessAudit({
+        kind: "room-read",
+        viewerId: "resident-b",
+        roomId: "room-a",
+        ownerId: "resident-a",
+        externalResult: "allowed",
+        internalReason: "authorized",
+      }),
+    ).toThrow(/scope owner/);
+    expect(store.readAccessAudit()).toEqual([entry]);
+    store.close();
+
+    const db = new DatabaseSync(join(root, "room-events.sqlite"));
+    expect(() => db.exec("UPDATE room_access_audit SET external_result = 'allowed'")).toThrow(
+      /append-only/,
+    );
+    expect(() => db.exec("DELETE FROM room_access_audit")).toThrow(/append-only/);
+    expect(() => db.exec("UPDATE room_registry SET visibility = 'hidden'")).toThrow(/immutable/);
+    expect(() => db.exec("DELETE FROM room_registry")).toThrow(/immutable/);
+    db.close();
+  });
+});

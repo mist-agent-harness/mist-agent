@@ -287,7 +287,7 @@ describe("group-chat acceptance host process", () => {
     expect(await driver.readSurface(fixture.roomId, "untrusted-viewer")).toMatchObject({
       body: "",
       visibleEventIds: [],
-      errorCode: "room_membership_required",
+      errorCode: "room_not_found",
     });
   });
 

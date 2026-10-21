@@ -7,8 +7,26 @@ import {
   type RoomPostResult,
   postRoomMessage,
 } from "./post-room-message.ts";
-import { ResidentPrivateStore } from "./resident-private-store.ts";
-import { type DeliveryState, RoomEventStore } from "./room-event-store.ts";
+import { CrossResidentPrivateReadError, ResidentPrivateStore } from "./resident-private-store.ts";
+import {
+  type RoomReadDecision,
+  type RoomSurface,
+  authorizeRoomRead,
+  projectRoomSurface,
+  roomNotFoundSurface,
+} from "./room-access.ts";
+import {
+  type DeliveryState,
+  type RoomEventAppendResult,
+  RoomEventStore,
+  type RoomVisibility,
+} from "./room-event-store.ts";
+
+/** Approved audit readback: refusals as the requester saw them, and any cross-resident read. */
+export interface RoomAccessAuditView {
+  readonly crossResidentPrivateReads: number;
+  readonly unauthorizedReadResults: readonly string[];
+}
 
 /** Production composition: trusted grants arrive separately from untrusted post envelopes. */
 export class RoomMessageHost {
@@ -175,30 +193,76 @@ export class RoomMessageHost {
     return this.#store.readReactions();
   }
 
-  readSurface(roomId: string, viewerId: string) {
-    const activeResident = this.#store.roster.isActiveMember(roomId, viewerId);
-    const acceptedHuman =
-      roomId === this.#scenarioRoomId && this.#scenarioHumanIds.includes(viewerId);
-    if (!activeResident && !acceptedHuman) {
-      return {
-        body: "",
-        visibleEventIds: [],
-        candidates: [],
-        count: 0,
-        errorCode: "room_membership_required",
-        receipt: null,
-      };
+  createRoom(input: {
+    readonly operationId: string;
+    readonly roomId: string;
+    readonly visibility: RoomVisibility;
+    readonly creatorId: string;
+    readonly openingBody: string;
+  }): RoomEventAppendResult {
+    return this.#store.createRoom(input);
+  }
+
+  /** The viewer's projection of a room, unaudited; every refusal has the same not-found shape. */
+  readSurface(roomId: string, viewerId: string): RoomSurface {
+    return this.#surfaceFor(roomId, authorizeRoomRead(this.#store, this.#access, roomId, viewerId));
+  }
+
+  /** A principal opening a room: the same decision as {@link readSurface}, written to the audit. */
+  openRoom(roomId: string, viewerId: string): RoomSurface {
+    const decision = authorizeRoomRead(this.#store, this.#access, roomId, viewerId);
+    this.#store.recordAccessAudit({
+      kind: "room-read",
+      viewerId,
+      roomId,
+      externalResult: decision.allowed ? "allowed" : "not-found",
+      internalReason: decision.allowed ? "authorized" : decision.internalReason,
+    });
+    return this.#surfaceFor(roomId, decision);
+  }
+
+  /** A refusal never touches the room's ledger, so its cost says nothing about what the room holds. */
+  #surfaceFor(roomId: string, decision: RoomReadDecision): RoomSurface {
+    if (!decision.allowed) return roomNotFoundSurface();
+    return projectRoomSurface(this.#store.readRoomEvents(roomId), decision);
+  }
+
+  /**
+   * A room member asking for another resident's internal scope. Room membership grants nothing
+   * here: the private store decides, and a refusal reads like a missing scope.
+   */
+  attemptResidentScopeRead(roomId: string, viewerId: string, ownerId: string): string | null {
+    let context: string | null = null;
+    let internalReason = "owner";
+    try {
+      context = this.#privateStore.readContext(viewerId, ownerId);
+    } catch (error) {
+      if (!(error instanceof CrossResidentPrivateReadError)) throw error;
+      internalReason = "cross-resident-scope";
     }
-    const events = this.#store
-      .readRoomEvents(roomId)
-      .filter((event) => event.visibility === "public");
+    this.#store.recordAccessAudit({
+      kind: "resident-scope-read",
+      viewerId,
+      roomId,
+      ownerId,
+      externalResult: context === null ? "not-found" : "allowed",
+      internalReason,
+    });
+    return context;
+  }
+
+  readAccessAudit(): RoomAccessAuditView {
+    const entries = this.#store.readAccessAudit();
     return {
-      body: events.map((event) => event.body).join("\n"),
-      visibleEventIds: events.map((event) => event.id),
-      candidates: [],
-      count: events.length,
-      errorCode: null,
-      receipt: null,
+      crossResidentPrivateReads: entries.filter(
+        (entry) =>
+          entry.kind === "resident-scope-read" &&
+          entry.externalResult === "allowed" &&
+          entry.viewerId !== entry.ownerId,
+      ).length,
+      unauthorizedReadResults: entries
+        .filter((entry) => entry.externalResult !== "allowed")
+        .map((entry) => entry.externalResult),
     };
   }
 

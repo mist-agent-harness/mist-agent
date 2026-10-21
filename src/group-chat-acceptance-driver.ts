@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
   RoomEvent as AcceptanceRoomEvent,
+  AccessAudit,
   ContextCommit,
   DeliveryRecord,
   GroupChatCheckId,
@@ -205,6 +206,7 @@ export function createGroupChatHostDriver(
   const hostEntry = fileURLToPath(new URL("./group-chat/host-process.ts", import.meta.url));
   const dataRoot = realpathSync(mkdtempSync(join(tmpdir(), "mist-group-chat-")));
   let client: HostProcessClient | null = null;
+  let scenarioOwnerId: string | null = null;
   process.once("exit", () => rmSync(dataRoot, { recursive: true, force: true }));
 
   const startHost = async (): Promise<GroupChatHostRun> => {
@@ -265,6 +267,7 @@ export function createGroupChatHostDriver(
     },
     stopHost,
     resetScenario: async (_id: GroupChatCheckId, fixture: FixtureWithTrustedBinding) => {
+      scenarioOwnerId = fixture.humanId;
       const trustedBinding = fixture.trustedOwnerBinding;
       const grants: RoomBindingGrant[] =
         typeof trustedBinding === "string"
@@ -329,6 +332,29 @@ export function createGroupChatHostDriver(
         case "react":
           await active().request("react", command);
           return;
+        case "create-room": {
+          if (scenarioOwnerId === null) throw new Error("create-room needs a scenario owner");
+          await active().request("acceptance-admin", {
+            command: { ...command, creatorId: scenarioOwnerId },
+          });
+          return;
+        }
+        case "replay-public-payload":
+          await active().request("acceptance-admin", { command });
+          return;
+        case "attempt-room-read":
+          await active().request("attempt-room-read", {
+            roomId: command.roomId,
+            viewerId: command.viewerId,
+          });
+          return;
+        case "attempt-resident-scope-read":
+          await active().request("attempt-resident-scope-read", {
+            roomId: command.roomId,
+            viewerId: command.viewerId,
+            ownerId: command.ownerId,
+          });
+          return;
         default:
           throw new Error(`unsupported group-chat host command: ${command.kind}`);
       }
@@ -370,7 +396,7 @@ export function createGroupChatHostDriver(
     readContextCommits: () => active().request<readonly ContextCommit[]>("read-context-commits"),
     readSurface: (roomId, viewerId) =>
       active().request<SurfaceSnapshot>("read-surface", { roomId, viewerId }),
-    readAccessAudit: unsupported("readAccessAudit"),
+    readAccessAudit: () => active().request<AccessAudit>("read-access-audit"),
     readReactions: () => active().request<readonly ResidentReaction[]>("read-reactions"),
     readRoundRecords: unsupported("readRoundRecords"),
     readScheduler: unsupported("readScheduler"),
