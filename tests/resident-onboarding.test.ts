@@ -86,7 +86,8 @@ class ScriptedTransport implements ModelTransport {
     this.#replies = [...replies];
   }
   async *complete(request: ModelCompletionRequest): AsyncIterable<string> {
-    this.requests.push(structuredClone(request));
+    const { onUsage: _onUsage, ...serializable } = request;
+    this.requests.push(structuredClone(serializable));
     const reply = this.#replies.shift() ?? "（没有预设回答）";
     const middle = Math.ceil(reply.length / 2);
     yield reply.slice(0, middle);

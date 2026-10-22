@@ -16,6 +16,7 @@
 |---|---|---|---|
 | `MIST_DATA_DIR` | `src/installer/cli.ts`、`src/resident-runtime/cli.ts` | `~/.mist` | 安装器与终端的数据根；各入口的 `--data-dir` 优先。不带 `--resident` 的 `npm run resident` 从这里的当前安装启动（#182）；带 `--resident` 的老入口不读安装 |
 | `MIST_RESIDENT_RUNTIME_TRANSPORT` | `src/resident-runtime/channels.ts`、`src/resident-runtime/cli.ts` | `synthetic`（未设或空字符串）；不带 `--resident` 从安装启动时为 `pi` | `synthetic` 为确定性合成通道；`pi` 经外部 pi CLI 调真实模型。其他值拒绝启动。从安装启动时由第一次启动按安装配通道；带 `--resident` 时设为 pi 不自动完成通道配置 |
+| `PI_CODING_AGENT_DIR`（pi 上游变量） | `src/resident-runtime/pi-transport.ts`、外部 pi CLI | `~/.pi/agent`；单独 `~` 展开为 HOME（与 pi 相同） | 原配置根只读：每回合把 settings 去掉 `packages` 后投影到 0700 私有临时配置根，强制 `compaction.enabled=false`，models.json 以原路径符号链接。不复制 `auth.json`、`trust.json`、`models-store.json` 或其他配置根状态，也不把 `packages` 带进新根，避免 npm / git 包每回合重装或克隆。子进程用临时根，启动后先读有效策略；仅当项目 settings 经有效信任加载且仍启用 compaction 时，在 prompt 前拒绝。不写用户全局或项目 settings |
 | `MIST_RESIDENT_RUNTIME_DIR` | `src/resident-runtime/host-process.ts` | 无；缺失拒绝启动 | runtime IPC 宿主的落盘根，判卷 adapter 显式注入。普通 `npm run resident` 的数据根仍走 `--data-dir` / `MIST_DATA_DIR` |
 | `MIST_GROUP_CHAT_DATA_ROOT` | `src/group-chat/host-process.ts` | 无；缺失拒绝启动 | 群聊 IPC 宿主的落盘根，由群聊判卷 adapter（`src/group-chat-acceptance-driver.ts`）显式注入 |
 | `MIST_WINDOW_ARCHIVE_PATH` | `tests/fixtures/session-registry-host.ts` | 空 = 纯内存 | 窗生命周期 JSONL 归档路径（`window_opened` / `window_archived` 追加写）。不设则不持久化，供无持久化需求的嵌入方 |
@@ -63,6 +64,50 @@ CLI 与宿主子进程共用 `src/resident-runtime/assembly.ts`，沿用现役
 嵌入方可选 `ledger: { dataDir }` 接认证宿主，或
 `factLedger` 接已有账的只读视图；两者互斥，都不传则 `currentFacts` 缺席。
 交接信的 `commitment` 只保存 seq 指针和短引用，不复印正文；现行正文随 `currentFacts`
-进入启动包，Pi 系统提示按 `[#seq] 正文` 渲染，供信里的指针定位。
+进入启动包，Pi 的本轮 context 消息按 `[#seq] 正文` 渲染，供信里的指针定位。
 宿主维护经 `AuthenticatedLedgerHost.system(senderId).append`，新承诺用 `active_rule`；
 住户写入仍须经过已认证 ingress 和现役 `forDispatch(...).append`，没有新增终端立承诺命令。
+
+Pi 模型输入布局：system prompt 放身份、原交接信与固定权威说明；本代 history 按 user/assistant
+角色载入回合私有 session；当前承诺、记忆、可选现行事实放在 history 之前，当前 user
+仍经 RPC `prompt` 只发一次。session 文件与 prompt 共用 0700 临时目录、文件 0600，
+回合结束或取消后删除。header 的 cwd 取进程 cwd，不取随机临时目录；材料不变时上一轮
+模型输入是下一轮的消息前缀，材料变化会让该前缀失效一次。
+私有配置关闭 compaction，`get_state` 确认 `autoCompactionEnabled=false` 后才发送 prompt。
+这项预检只在项目 settings 实际被加载时能看到项目覆盖：私有根不继承 `trust.json`，所以用户
+曾在原根信任的项目目录不会因此自动获得信任；项目配置若没被加载，预检只确认投影后的
+`false`。收到 compaction 事件也拒绝，用户 global/project settings 均不写。
+
+私有根故意只投影 settings（去掉 `packages`）和 models.json：`pi install` 的 npm/git 扩展不会
+每回合被安装或克隆，但子进程也看不到这些包；`--no-extensions` 本来就不加载它们。原根的
+`auth.json` 不复制（凭证按 RT-06 走环境变量），`trust.json` 不继承（原根逐项目的信任不沿用；
+settings 中显式的 `defaultProjectTrust` 策略仍会投影），
+`models-store.json` 等动态模型缓存不继承（自定义静态模型仍从 models.json 读取，动态目录可能
+缺项或由 pi 在新根重建）。其余配置根状态也不会出现。代价是项目级设置/信任和动态模型状态
+与用户原 `pi` 会话不完全一致；mist 每回合都建一次小配置投影，不承诺原根扩展在 mist 通道内可用。
+
+所核 Pi 1.2.0 源码中，请求模型不在可用目录而进入自定义模型 ID 回退时，会沿用同一 provider
+默认模型（或目录中该 provider 的首个模型）的其余信息，包括上下文窗口和单价。这些值未必对应目标模型，
+因而 `costTotal` 估算可能不准，也不能把回退窗口当作目标模型真实容量的已验证依据。
+此回退分支仅核对上游源码，尚未做运行复验。
+
+真实通道的外部包已迁至 `@earendil-works/pi-coding-agent`，要求 pi ≥0.86.1；
+核过的 0.86.1 / 1.2.0 要求 Node ≥22.19。bridge 启动修复及其持久聊天史处理待 #232 后另件，
+本项撤回显式 bridge loader。
+
+Usage 无新增环境变量：成功回合追加到 `dataDir/logs/<residentId>.usage.jsonl`，文件 0600。
+只记录 turnId、代际、模型、adapter、时间及有效的 reported 数值；缺失字段省略，合成通道
+不造读数。`runtime.turnUsage()` 走身份读闸，只认 canonical residentId；按字段累计
+附 `cumulativeCoverage`，其 `totalTurns` 仅计已记录回合，不涵盖丢失日志或失败模型调用。
+`costTotal` 是上游报告的估算，不是账单；默认 0 可能来自上游归零，不能据此判定缓存。
+写日志失败不会回滚完成的聊天/ACK；本进程的 `logError` 保留已知遗漏，重启后不重建它。
+读盘访问失败报 `writer-unavailable`，不回显原文；坏行跳过，`invalidRecords` 报损坏记录数，
+有效记录继续参与累计。追加前末字节非换行就先补分隔符，保留原损坏字节供人工调查。
+日志无轮转、每次读整文件。累计不是 context 占用，换气估算门不变。
+
+`npm run verify:pi-wire -- /path/to/pi` 使用已有真实 pi、回合私有配置与本机假 Anthropic
+端点验证请求；不读真实 auth.json、不用真实 key、不请求真实 provider，不要求公开 CI 安装 pi。
+探针的 settings 带 npm/git `packages`，且不设 `PI_OFFLINE`；PATH 前置只记录并失败的 npm/git
+替身，核零安装/克隆尝试。该探针仍不证明真实 provider、真实缓存命中或费用。
+模型输入投影由 `pi-transport.ts` 维护，usage 由 `usage-log.ts` 维护；相关回归在
+`tests/pi-transport.test.ts` / `tests/resident-runtime.test.ts`，其验证边界见 resident-runtime 清单。

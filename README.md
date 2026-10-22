@@ -64,6 +64,33 @@ baseline 不能替旧回合确认。完整行为与旧数据边界见
 解析或条目结构无法读出时，在调用模型前报 `letter-invalid`。旧代原始对话保留在流水里，
 不自动塞回新一代上下文。
 
+模型请求把身份、交接信与固定权威说明放在 system prompt，本代历史保持 user / assistant 角色与顺序；
+承诺、记忆和现行事实每轮从真源重读，放在历史之前，本轮用户输入仍在历史之后发送。
+材料不变时，上一轮输入保留为下一轮的消息前缀；材料变化会让该前缀失效一次。
+pi 使用稳定 cwd 和回合私有临时 session；session、prompt 与私有配置在结束、失败或取消后删除。
+私有配置只投影原 settings 的普通运行设置并去掉 `packages`，models.json 以原路径引用；
+`auth.json`、`trust.json`、`models-store.json` 及其他配置根状态不复制。因此 `pi install`
+装的 npm / git 包清单不会进入此根，避免每回合重新安装或克隆；项目信任与动态模型缓存也不随之
+继承。若项目 settings 原本会被加载并仍启用压缩，prompt 前会被拒绝。子进程的自动 compaction
+被关闭，遇到压缩事件也会拒绝本轮；不改用户全局配置。
+
+成功完成的聊天回合会向 `logs/<residentId>.usage.jsonl` 追加运行读数，默认合成通道的读数
+为未知。真实 pi 终态报告的 input、output、cacheRead、cacheWrite、totalTokens 与 costTotal
+按字段保留，未报告的字段省略；不保存 prompt、历史、凭证或上游 raw payload。
+嵌入方用 `runtime.turnUsage({ residentId })` 读取逐回合记录、日志中已报告值的累计和字段
+覆盖数，只接受 canonical residentId；这些累计不是当前窗口占用，也不是完整账单。`costTotal` 是 pi 报告的成本估算。
+pi / bridge 可能用默认 0 表示未收到计数，因此报告的 0 不证明实测零或缓存未命中。
+写日志失败不改变聊天与 ACK 结果；末行截断后新记录另起一行，读口跳过坏行并报告 `invalidRecords`，
+有效记录仍可读。文件访问失败及本进程已知的 `logError` 另报；日志无轮转，每次读全部文件。
+本次不承诺缓存节省比例；实际收益需真实 provider usage 验证。
+
+真实 pi 通道要求外部 `@earendil-works/pi-coding-agent` ≥0.86.1；所核 0.86.1 / 1.2.0 包要求
+Node ≥22.19，不随 Mist 安装。可用 `npm run verify:pi-wire -- /path/to/pi` 核实际请求：真实 pi 连接
+本机假 Anthropic 端点、使用合成 key，验证稳定前缀、最新上下文与长历史不压缩，不测真实缓存收益。
+探针会带 `packages` 设置且不设 `PI_OFFLINE`，用本地 npm/git 陷阱核零包管理器调用。
+Claude 订阅的 bridge 启动修复已从本项撤回，待 #232 路线决定后另件处理；本项不宣称 bridge
+真实往返或其磁盘历史已清理。配置边界见 [运行时配置](docs/runtime-config.md)。
+
 现状限制：交接信 `intent` 半仍是确定性装配，当刻亲笔（D8）按主笔
 排期单列；旧字符串承诺的确认/迁移工具另单，本运行时只做 fail-closed 拒绝并给出宿主 API
 入口，不做自动迁移。住户入住先经过 #182 的 candidate / self-attestation 生产闸，只有 active 身份物化 room 与账；

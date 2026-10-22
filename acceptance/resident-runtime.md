@@ -103,6 +103,32 @@ RT-05 判的是渲染输入的结构（帧、增量、状态栏字段、错误�
 
 ## 模型输入的补充回归
 
+`#227` 第 1/2 项沿现有输入读口：system prompt 保留身份、原交接信与固定权威说明，本代历史按原
+user/assistant 角色进入私有 Pi session，动态承诺/记忆/currentFacts 放在历史之前，当前
+user 仍排在历史之后。历史 assistant 使用合法 content 数组，导入 metadata/零计数只用于上游 schema，
+不作为实测或本轮 usage；session 与 prompt 回合后删除。没有改一窗流、事实账和信档的口径。
+
+Usage 定向回归覆盖终态存在/缺失/部分/显式零/非法数字、重复事件、失败/取消；真实 runtime
+回调到 `logs/<residentId>.usage.jsonl` 与 `turnUsage()` 的链路、字段 allowlist、canonical
+residentId 身份隔离、坏行计数/截断后的正常追加和写日志失败后的正常正文/ACK。累计只针对已记录且上游报告的字段，附覆盖数，不是 context
+占用或完整账单；上游默认零可能没有真实读数，不能宣称缓存已命中或节省费用。
+代价：每回合生成、删除私有 session/配置投影并追加诊断日志；日志无轮转、读取全文件且可能遗漏，正式 provider
+缓存收益仍需实测。自动换气与亲笔交接信仍归第 3/4 项另单，本项不施工。
+
+上游格式依据为 `@earendil-works/pi-coding-agent` 0.86.1 / 1.2.0 的 session v3 与 RPC；
+这些 pi 包要求 Node ≥22.19，外部通道不随主仓安装。bridge 启动修复撤回，待 #232 后另件。
+
+`tests/pi-transport.test.ts` 核 session cwd 稳定、私有配置禁压缩和 prompt 前有效策略确认，
+原 settings 带 npm/git `packages` 时私有根不出现 `packages`、不复制 auth/trust/models-store，
+坏/不可读 settings 在启动 pi 前给出具体错误且不调模型；`compaction_start` / `compaction_end`
+使真实 runtime 失败且不落流。私有根不继承项目信任或动态模型缓存，代价见 runtime-config。
+`npm run verify:pi-wire -- /path/to/pi`
+驱动真实 pi 向本机假 Anthropic 端点发请求：核完整 system（含 cwd）稳定、上一轮角色/正文
+是下一轮消息前缀、材料变化立即可见，以及 24 条长历史不触发摘要请求。前缀比较只剥除
+`cache_control` 这种请求元数据；两轮断点的消息正文与位置保留。settings 带 `packages`
+且不设 `PI_OFFLINE`，本地 npm/git 陷阱核零包管理器尝试。原 settings 逐字不变。
+这项检查使用合成 key，不证明真实 provider 的 cache hit 或费用，也不代替独立验收。
+
 `bootPack()` 诊断读口和 `say()` 的模型请求共用 runtime 装配路径：从现役存储读身份、
 承诺、记忆、可选现行事实和最新交接信。无信为 `null`；信档无法解析或条目结构无法读出
 时，两处均报 `letter-invalid`，模型不被调用、既有一窗流不变。

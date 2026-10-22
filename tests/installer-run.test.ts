@@ -1131,7 +1131,8 @@ class ScriptedTransport implements ModelTransport {
     this.#replies = [...replies];
   }
   async *complete(request: ModelCompletionRequest): AsyncIterable<string> {
-    this.requests.push(structuredClone(request));
+    const { onUsage: _onUsage, ...serializable } = request;
+    this.requests.push(structuredClone(serializable));
     const reply = this.#replies.shift() ?? "";
     yield reply.slice(0, 1);
     yield reply.slice(1);

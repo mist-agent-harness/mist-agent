@@ -92,6 +92,7 @@ import {
   ChannelSpecError,
   type ChannelSpecLike,
   type ModelTransport,
+  type TurnUsage,
   createModelTransport,
   resolveChannelRoute,
 } from "./channels.ts";
@@ -99,6 +100,7 @@ import { CredentialStore } from "./credentials.ts";
 import { PauseRecordStore } from "./pause-records.ts";
 import { ResidentHostLockError, ResidentHostLocks } from "./resident-lock.ts";
 import { type TurnLedgerTarget, TurnReceiptStore, readTurnLedgerTarget } from "./turn-receipts.ts";
+import { TurnUsageLog, type TurnUsageView } from "./usage-log.ts";
 
 const WINDOW_INDEX_SCHEMA = 1;
 
@@ -257,6 +259,8 @@ export class ResidentRuntime {
   readonly #factLedger: FactLedger | undefined;
   readonly #breathState: BreathStateStore;
   readonly #letters: LetterStore;
+  /** 逐回合模型 usage 运行日志（#227 第 2 项）：只非敏感 metadata/数值。 */
+  readonly #usageLog: TurnUsageLog;
   readonly #breathCycle: BreathCycle<{ letter: SealedLetter | null }>;
   /** 调用方指定的窗身份（住户号同款「指定事实」纪律）：对外窗号，换气前后逐字不变。
    * 认领与 window-index 同级落盘（协助审查）：重启也不许换号。 */
@@ -327,6 +331,7 @@ export class ResidentRuntime {
     }
     this.#breathState = new BreathStateStore(join(dataDir, "sessions", "breath.json"));
     this.#letters = new LetterStore(this.#lettersDir);
+    this.#usageLog = new TurnUsageLog(this.#logsDir);
     // 换气编排走现役 BreathCycle（封信 sealLetter → 落时间线 → kill+open 换代 → 注入）。
     this.#breathCycle = new BreathCycle<{ letter: SealedLetter | null }>({
       registry: this.#sessions,
@@ -640,6 +645,9 @@ export class ResidentRuntime {
 
     let reply = "";
     let chunks = 0;
+    // 上游终态 usage 的观察口（#227 第 2 项）：传输层至多成功时回调一次；这里只暂存，
+    // 回合成功收口后再落日志，失败/取消不写（不把没发生的回合记成成功用量）。
+    let turnUsage: TurnUsage | null = null;
     try {
       for await (const chunk of this.#transport.complete({
         residentId: input.residentId,
@@ -649,6 +657,9 @@ export class ResidentRuntime {
         bootPack,
         history,
         credentialSecret,
+        onUsage: (usage) => {
+          turnUsage = usage;
+        },
       })) {
         reply += chunk;
         chunks += 1;
@@ -770,6 +781,18 @@ export class ResidentRuntime {
         };
       }
     }
+    // 逐回合 usage 运行日志（#227 第 2 项）：回合已经落流+确认账，这里只把上游**成功
+    // 终态**报出来的数字记一条诊断。写日志失败**不改变**本回合的完成结果——它只把
+    // 「这一条没记上」如实记在 usage-log 的 logError 里，不吞错、也不伪报已记录。
+    // 上游没报 usage（turnUsage 为 null）就不写 turn 字段——缺失即未知，不补零。
+    this.#usageLog.record(input.residentId, {
+      turnId,
+      generation: window.generation,
+      model: route.model,
+      adapterId: route.adapterId,
+      at: new Date().toISOString(),
+      ...(turnUsage === null ? {} : { turn: turnUsage }),
+    });
     // 到线换气（D8 一）：本回合落账后按累积 token 判线，到线就亲笔写信换代。
     // 累积按 estimateTokens（handover-letter 的保守估算，同尺子量到底）。
     if (config.accumulated >= config.current) {
@@ -831,6 +854,29 @@ export class ResidentRuntime {
       .sort()
       .map((file) => join(this.#streamsDir, file));
     return ok({ files });
+  }
+
+  /**
+   * 逐回合模型 usage 读口（#227 第 2 项）。只读运行日志里的非敏感 metadata/数值，
+   * 不碰一窗流、凭证或启动包。返回本住户逐回合记录 + 逐字段累加 + 字段覆盖数 +
+   * 最近一次写日志失败原因。上游没报 usage 的回合 `turn` 缺席；缺失即未知，不补零。
+   *
+   * 「累计费用用量」与「当前上下文占用」是两个量：这里给的是前者（逐回合相加），
+   * **不产出**后者（上下文占用由换气估算门另管，本读口与它无涉）。
+   */
+  turnUsage(input: { residentId: string }): Result<TurnUsageView> {
+    const active = this.#identities.requireResident(input.residentId);
+    if (!active.ok) return identityFailure(active.reason, input.residentId);
+    try {
+      return ok(this.#usageLog.read(active.value.residentId));
+    } catch {
+      return fail(
+        "writer-unavailable",
+        "usage 日志不可读取",
+        "检查 dataDir/logs 下的 usage 日志文件是否可读；损坏就归档后重建",
+        input.residentId,
+      );
+    }
   }
 
   // —— 启动包（RT-07：装配器唯一，调用次数不限） ——
