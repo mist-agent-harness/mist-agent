@@ -1,8 +1,9 @@
 /**
- * 住户宿主锁的确定性竞态与读失败（Grok 评审 #234 锁）：在 node:fs 的 rename / link /
- * readFileSync 上挂钩，把「三个进程抢同一把陈锁」和「判过之后锁路径变成目录或符号链接」卡进挪走与
- * 放回之间的空档，以及把锁文件读不出造出来。真进程的并发抢锁见 resident-lock.test.ts。
+ * 住户宿主锁的确定性竞态与读失败（Grok 评审 #234 锁）：在 node:fs 的 link / unlink /
+ * readFileSync 上挂钩，把「几个进程抢同一把陈锁」和「判过之后锁路径变成目录或符号链接」卡进判陈
+ * 与认领之间的空档，以及把锁文件、认领名读不出造出来。真进程的并发抢锁见 resident-lock.test.ts。
  */
+import { createHash } from "node:crypto";
 import type { PathLike } from "node:fs";
 import {
   lstatSync,
@@ -15,7 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ResidentHostLockError,
@@ -24,22 +25,15 @@ import {
 } from "../src/resident-runtime/resident-lock.ts";
 
 const hooks = vi.hoisted(() => ({
-  /** 接管时 rename(锁, 旁名) 真正执行之前跑一次（一次性）。 */
-  beforeStaleRename: null as (() => void) | null,
-  /** 放回 link(旁名, 锁) 时跑一次（一次性），代替或先于真 link。 */
-  onPutBack: null as (() => void) | null,
+  /** 接管时 link(锁, 认领名) 真正执行之前跑一次（一次性）。 */
+  beforeClaim: null as (() => void) | null,
   /** 读这些路径时抛这个错误码。 */
   readFails: null as ((path: string) => string | null) | null,
-  /** 把旁名挪回锁路径的 rename 抛这个错误码。 */
-  renameBackFails: null as string | null,
-  /**
-   * 把非文件放回锁路径真正执行之前跑一次（一次性）：rename / link 的源是旁名，或任何一次
-   * symlink（锁模块只在放回符号链接时调它；测试自己造链接用的是未挂钩的原版）。
-   */
-  beforeAnyPutBack: null as (() => void) | null,
+  /** 删锁路径（不是认领名）时抛这个错误码。 */
+  unlinkLockFails: null as string | null,
   /**
    * 照 macOS 的 link(2)：源是符号链接时链到它解引用后的目标（Linux 不解引用）。
-   * 打开后任何平台上都按 macOS 的语义跑，放回符号链接若退回用 link 就会现形。
+   * 打开后任何平台上都按 macOS 的语义跑。
    */
   linkFollowsSymlinks: false,
 }));
@@ -50,31 +44,10 @@ vi.mock("node:fs", async (importOriginal) => {
     Object.assign(new Error(`${code}: simulated`), { code });
   return {
     ...actual,
-    renameSync: (from: PathLike, to: PathLike): void => {
-      if (hooks.renameBackFails !== null && String(from).includes(".stale-")) {
-        throw fail(hooks.renameBackFails);
-      }
-      const putBack = hooks.beforeAnyPutBack;
-      if (putBack !== null && String(from).includes(".stale-")) {
-        hooks.beforeAnyPutBack = null;
-        putBack();
-      }
-      const hook = hooks.beforeStaleRename;
-      if (hook !== null && String(to).includes(".stale-")) {
-        hooks.beforeStaleRename = null;
-        hook();
-      }
-      actual.renameSync(from, to);
-    },
     linkSync: (existing: PathLike, target: PathLike): void => {
-      const putBack = hooks.beforeAnyPutBack;
-      if (putBack !== null && String(existing).includes(".stale-")) {
-        hooks.beforeAnyPutBack = null;
-        putBack();
-      }
-      const hook = hooks.onPutBack;
-      if (hook !== null && String(existing).includes(".stale-")) {
-        hooks.onPutBack = null;
+      const hook = hooks.beforeClaim;
+      if (hook !== null && String(target).includes(".takeover-")) {
+        hooks.beforeClaim = null;
         hook();
       }
       if (hooks.linkFollowsSymlinks && actual.lstatSync(existing).isSymbolicLink()) {
@@ -83,14 +56,12 @@ vi.mock("node:fs", async (importOriginal) => {
       }
       actual.linkSync(existing, target);
     },
-    symlinkSync: ((...args: Parameters<typeof actual.symlinkSync>) => {
-      const putBack = hooks.beforeAnyPutBack;
-      if (putBack !== null) {
-        hooks.beforeAnyPutBack = null;
-        putBack();
+    unlinkSync: (path: PathLike): void => {
+      if (hooks.unlinkLockFails !== null && String(path).endsWith(".lock")) {
+        throw fail(hooks.unlinkLockFails);
       }
-      actual.symlinkSync(...args);
-    }) as typeof actual.symlinkSync,
+      actual.unlinkSync(path);
+    },
     readFileSync: ((...args: Parameters<typeof actual.readFileSync>) => {
       const code = hooks.readFails?.(String(args[0])) ?? null;
       if (code !== null) throw fail(code);
@@ -105,11 +76,9 @@ const unhookedFs = await vi.importActual<typeof import("node:fs")>("node:fs");
 const roots: string[] = [];
 
 afterEach(() => {
-  hooks.beforeStaleRename = null;
-  hooks.onPutBack = null;
+  hooks.beforeClaim = null;
   hooks.readFails = null;
-  hooks.renameBackFails = null;
-  hooks.beforeAnyPutBack = null;
+  hooks.unlinkLockFails = null;
   hooks.linkFollowsSymlinks = false;
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -138,6 +107,9 @@ function writeLock(root: string, holder: { pid: number; token: string }): string
 }
 
 const DEAD_PID = 2 ** 22 + 12_345;
+/** 判过陈的那份锁原文对应的认领名（与锁模块同一个算法）。 */
+const claimOf = (path: string): string =>
+  `${path}.takeover-${createHash("sha256").update(readFileSync(path, "utf8")).digest("hex").slice(0, 32)}`;
 const tokenAt = (path: string): string =>
   (JSON.parse(readFileSync(path, "utf8")) as { token: string }).token;
 
@@ -151,50 +123,75 @@ function refusalOf(action: () => void): ResidentHostLockError {
   throw new Error("预期被拒却拿到了锁");
 }
 
-describe("ResidentHostLocks：三个进程抢同一把陈锁（挪走与放回之间的空档）", () => {
-  it("第三个进程在空档里建上新锁：抢的一边认输；被挤掉的 B 下一回合核对令牌时停下，C 照常", () => {
+describe("ResidentHostLocks：几个进程抢同一把陈锁（认领名）", () => {
+  it("别的进程先接管完、建上新锁：本进程认领到的是那把新锁，只删自己的认领名，新锁不动", () => {
     const root = tempRoot();
     const path = writeLock(root, { pid: DEAD_PID, token: "stale" });
     const a = new ResidentHostLocks(root);
     const b = new ResidentHostLocks(root);
-    const c = new ResidentHostLocks(root);
-    // A 判过陈锁、正要挪走时，B 先接管成功；A 挪走的其实是 B 的新锁。
-    hooks.beforeStaleRename = () => b.acquire("r-a");
-    // A 发现挪错了、放回之前，C 在空着的锁路径上建锁。
-    hooks.onPutBack = () => c.acquire("r-a");
+    // A 判过陈锁、正要认领时，B 先把这把陈锁接管完并建上自己的锁。
+    hooks.beforeClaim = () => b.acquire("r-a");
     expect(refusalOf(() => a.acquire("r-a")).message).toMatch(/正在另一个 mist 进程/);
-    const cToken = tokenAt(path);
-    expect(cToken).not.toBe("stale");
-
-    expect(refusalOf(() => b.acquire("r-a")).message).toMatch(/已被接管或删除/);
-    expect(() => c.acquire("r-a")).not.toThrow();
-    expect(tokenAt(path)).toBe(cToken);
+    expect(b.stillHolds("r-a")).toBe(true);
+    expect(tokenAt(path)).not.toBe("stale");
     expect(readdirSync(dirname(path))).toEqual(["r-a.lock"]);
   });
 
-  it("放回时出 EEXIST 以外的错：照实报错，不冒充别人拿着；被挪走的 B 下一回合停下", () => {
+  it("认领名被占着（别人正在接管，或接管到一半被硬杀）：拒绝并给出两个文件，陈锁与认领名都不动", () => {
     const root = tempRoot();
     const path = writeLock(root, { pid: DEAD_PID, token: "stale" });
-    const a = new ResidentHostLocks(root);
-    const b = new ResidentHostLocks(root);
-    hooks.beforeStaleRename = () => b.acquire("r-a");
-    hooks.onPutBack = () => {
-      throw Object.assign(new Error("EIO: simulated"), { code: "EIO" });
-    };
-    const refused = refusalOf(() => a.acquire("r-a"));
-    expect(refused.message).toMatch(/放回时出错（EIO）/);
+    const claim = claimOf(path);
+    unhookedFs.linkSync(path, claim);
+    const refused = refusalOf(() => new ResidentHostLocks(root).acquire("r-a"));
+    expect(refused.message).toMatch(/正被另一个 mist 进程接管/);
+    expect(refused.remedy).toContain(path);
+    expect(refused.remedy).toContain(claim);
+    expect(tokenAt(path)).toBe("stale");
+    expect(readdirSync(dirname(path)).sort()).toEqual(["r-a.lock", basename(claim)].sort());
+    // 按提示删掉两个文件，之后正常起的进程拿得到。
+    rmSync(path);
+    rmSync(claim);
+    expect(() => new ResidentHostLocks(root).acquire("r-a")).not.toThrow();
+  });
+
+  it("认领名留着、陈锁已被删（接管到最后一步前被硬杀）：不挡后来的进程", () => {
+    const root = tempRoot();
+    const path = writeLock(root, { pid: DEAD_PID, token: "stale" });
+    const claim = claimOf(path);
+    unhookedFs.linkSync(path, claim);
+    rmSync(path);
+    const locks = new ResidentHostLocks(root);
+    expect(() => locks.acquire("r-a")).not.toThrow();
+    expect(locks.stillHolds("r-a")).toBe(true);
+  });
+
+  it("认领时陈锁刚被删掉（ENOENT）：锁路径空着就再建一次，拿到，不报别人拿着", () => {
+    const root = tempRoot();
+    const path = writeLock(root, { pid: DEAD_PID, token: "stale" });
+    hooks.beforeClaim = () => rmSync(path);
+    const locks = new ResidentHostLocks(root);
+    expect(() => locks.acquire("r-a")).not.toThrow();
+    expect(locks.stillHolds("r-a")).toBe(true);
+    expect(readdirSync(dirname(path))).toEqual(["r-a.lock"]);
+  });
+
+  it("陈锁删不掉：照实报错，不冒充别人拿着；认领名删掉，陈锁原样", () => {
+    const root = tempRoot();
+    const path = writeLock(root, { pid: DEAD_PID, token: "stale" });
+    hooks.unlinkLockFails = "EACCES";
+    const refused = refusalOf(() => new ResidentHostLocks(root).acquire("r-a"));
+    hooks.unlinkLockFails = null;
+    expect(refused.message).toMatch(/陈锁删不掉（EACCES）/);
     expect(refused.message).not.toMatch(/正在另一个 mist 进程/);
     expect(refused.remedy).toContain(path);
-    expect(refusalOf(() => b.acquire("r-a")).message).toMatch(/已被接管或删除/);
-    // 没人拿着，也没留下改名的残档；之后正常起的进程拿得到。
-    expect(readdirSync(dirname(path))).toEqual([]);
-    expect(() => new ResidentHostLocks(root).acquire("r-a")).not.toThrow();
+    expect(readdirSync(dirname(path))).toEqual(["r-a.lock"]);
+    expect(tokenAt(path)).toBe("stale");
   });
 });
 
 describe("ResidentHostLocks：锁文件读不出就拒绝，不当坏锁抢", () => {
   it.each(["EIO", "EMFILE", "EACCES"])(
-    "锁文件在、读它抛 %s（挪走后再读也抛）：拒绝并给出锁路径，锁原样留着",
+    "锁文件在、读它抛 %s（认领名再读也抛）：拒绝并给出锁路径，锁原样留着",
     (code) => {
       const root = tempRoot();
       const path = writeLock(root, { pid: process.pid, token: "unverifiable" });
@@ -208,12 +205,12 @@ describe("ResidentHostLocks：锁文件读不出就拒绝，不当坏锁抢", ()
     },
   );
 
-  it("坏锁挪走后再读读不出：不算核对通过，放回原样并认输", () => {
+  it("坏锁的认领名读不出：不算核对通过，只删认领名，坏锁原样并认输", () => {
     const root = tempRoot();
     const path = residentLockPath(root, "r-a");
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, "garbage");
-    hooks.readFails = (target) => (target.includes(".stale-") ? "EIO" : null);
+    hooks.readFails = (target) => (target.includes(".takeover-") ? "EIO" : null);
     refusalOf(() => new ResidentHostLocks(root).acquire("r-a"));
     hooks.readFails = null;
     expect(readdirSync(dirname(path))).toEqual(["r-a.lock"]);
@@ -229,20 +226,15 @@ describe("ResidentHostLocks：锁文件读不出就拒绝，不当坏锁抢", ()
   });
 });
 
-describe("ResidentHostLocks：判过陈锁之后锁路径变成非文件（绝不递归删除）", () => {
-  /** 判过陈锁、正要挪走时，锁路径被换成一个装着东西的目录。 */
-  function directoryRacesIn(path: string): void {
-    hooks.beforeStaleRename = () => {
+describe("ResidentHostLocks：判过陈锁之后锁路径变成非文件（锁路径不动，绝不递归删除）", () => {
+  it("变成装着东西的目录：认领不了，目录与里面的东西原样；拒绝并说那不是 mist 的锁", () => {
+    const root = tempRoot();
+    const path = writeLock(root, { pid: DEAD_PID, token: "stale" });
+    hooks.beforeClaim = () => {
       rmSync(path);
       mkdirSync(join(path, "nested"), { recursive: true });
       writeFileSync(join(path, "nested", "keep.txt"), "别人的东西");
     };
-  }
-
-  it("挪走的是目录：原样挪回锁路径，里面的东西一样不少；拒绝并说那不是 mist 的锁", () => {
-    const root = tempRoot();
-    const path = writeLock(root, { pid: DEAD_PID, token: "stale" });
-    directoryRacesIn(path);
     const refused = refusalOf(() => new ResidentHostLocks(root).acquire("r-a"));
     expect(statSync(path).isDirectory()).toBe(true);
     expect(readFileSync(join(path, "nested", "keep.txt"), "utf8")).toBe("别人的东西");
@@ -251,63 +243,29 @@ describe("ResidentHostLocks：判过陈锁之后锁路径变成非文件（绝�
     expect(readdirSync(dirname(path))).toEqual(["r-a.lock"]);
   });
 
-  it("挪不回去：留在旁名、东西不少，报错里给出旁名", () => {
-    const root = tempRoot();
-    const path = writeLock(root, { pid: DEAD_PID, token: "stale" });
-    directoryRacesIn(path);
-    hooks.renameBackFails = "EXDEV";
-    const refused = refusalOf(() => new ResidentHostLocks(root).acquire("r-a"));
-    hooks.renameBackFails = null;
-    const [aside, ...rest] = readdirSync(dirname(path));
-    expect(rest).toEqual([]);
-    expect(aside).toMatch(/^r-a\.lock\.stale-/);
-    const asidePath = join(dirname(path), aside ?? "");
-    expect(refused.message).toContain(asidePath);
-    expect(refused.message).toContain("EXDEV");
-    expect(refused.remedy).toContain(asidePath);
-    expect(readFileSync(join(asidePath, "nested", "keep.txt"), "utf8")).toBe("别人的东西");
-  });
-});
-
-describe("ResidentHostLocks：判过陈锁之后锁路径变成符号链接（放回不换掉别人的锁）", () => {
-  function symlinkRacesIn(root: string, path: string): string {
-    hooks.linkFollowsSymlinks = true;
-    const target = join(root, "elsewhere.txt");
-    writeFileSync(target, "链接指向的东西");
-    hooks.beforeStaleRename = () => {
-      rmSync(path);
-      unhookedFs.symlinkSync(target, path);
-    };
-    return target;
-  }
-
-  it("没人插进来：符号链接原样放回，指向的东西不动；拒绝并说那不是 mist 的锁", () => {
-    const root = tempRoot();
-    const path = writeLock(root, { pid: DEAD_PID, token: "stale" });
-    const target = symlinkRacesIn(root, path);
-    const refused = refusalOf(() => new ResidentHostLocks(root).acquire("r-a"));
-    expect(lstatSync(path).isSymbolicLink()).toBe(true);
-    expect(readFileSync(target, "utf8")).toBe("链接指向的东西");
-    expect(refused.message).toContain("不是 mist 锁");
-    expect(readdirSync(dirname(path))).toEqual(["r-a.lock"]);
-  });
-
-  it("放回前空档里有人建上新锁：那把锁不被换掉，符号链接留在旁名并报出来", () => {
-    const root = tempRoot();
-    const path = writeLock(root, { pid: DEAD_PID, token: "stale" });
-    const target = symlinkRacesIn(root, path);
-    const holder = new ResidentHostLocks(root);
-    hooks.beforeAnyPutBack = () => holder.acquire("r-a");
-    const refused = refusalOf(() => new ResidentHostLocks(root).acquire("r-a"));
-    expect(holder.stillHolds("r-a")).toBe(true);
-    expect(lstatSync(path).isFile()).toBe(true);
-    const asides = readdirSync(dirname(path)).filter((name) => name.includes(".stale-"));
-    expect(asides).toHaveLength(1);
-    const asidePath = join(dirname(path), asides[0] ?? "");
-    expect(lstatSync(asidePath).isSymbolicLink()).toBe(true);
-    expect(refused.message).toContain(asidePath);
-    expect(readFileSync(target, "utf8")).toBe("链接指向的东西");
-  });
+  it.each([
+    ["Linux（link 不解引用）", false],
+    ["macOS（link 解引用到目标）", true],
+  ])(
+    "变成符号链接，%s：只删自己的认领名，链接与它指向的东西都不动；拒绝并说那不是 mist 的锁",
+    (_label, followsSymlinks) => {
+      const root = tempRoot();
+      const path = writeLock(root, { pid: DEAD_PID, token: "stale" });
+      hooks.linkFollowsSymlinks = followsSymlinks;
+      const target = join(root, "elsewhere.txt");
+      writeFileSync(target, "链接指向的东西");
+      hooks.beforeClaim = () => {
+        rmSync(path);
+        unhookedFs.symlinkSync(target, path);
+      };
+      const refused = refusalOf(() => new ResidentHostLocks(root).acquire("r-a"));
+      expect(lstatSync(path).isSymbolicLink()).toBe(true);
+      expect(readFileSync(target, "utf8")).toBe("链接指向的东西");
+      expect(statSync(target).nlink).toBe(1);
+      expect(refused.message).toContain("不是 mist 锁");
+      expect(readdirSync(dirname(path))).toEqual(["r-a.lock"]);
+    },
+  );
 });
 
 describe("ResidentHostLocks.stillHolds", () => {

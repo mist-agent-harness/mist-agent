@@ -15,26 +15,28 @@
  * 锁在且 pid 活着、不是本进程：拒绝（调用方收成 writer-unavailable）。锁文件在却读不出
  * （EIO、EMFILE、EACCES 等）：核实不了谁拿着，同样拒绝，绝不当坏锁抢。锁路径被目录、符号
  * 链接等非文件占住：那不是 mist 的锁，也拒绝，要人把它挪走——本模块从不递归删除任何东西。
- * pid 已死（ESRCH）、就是本进程，或读出来解析不了：当陈锁接管——先 rename 到独有名字（同时
- * 接管的几个进程只有一个 rename 得到），核对挪走的正是判过陈的那份（普通文件、读出来逐字
- * 相同；读不出不算相同），再按上面建锁；挪走的若是别人刚建的新锁就 link 放回认输，放回时出
- * EEXIST 以外的错就照实报错、不冒充「别人拿着」；挪走的若是判过之后才冒出来的非文件，原样
- * 按类型放回（目录 rename、符号链接按原 link text 排他重建、fifo 等 link，都换不掉空档里别人
- * 刚建的锁），放不回去就留在旁名并在报错里给出旁名。旁名只在 lstat 认得是普通文件、或非文件
- * 已原样放回之后才删。
+ * pid 已死（ESRCH）、就是本进程，或读出来解析不了：当陈锁接管。先给锁路径上此刻的那个东西
+ * link 一个认领名 `<锁>.takeover-<陈锁原文的 sha256 前缀>`：同一份陈锁的认领名相同，link 排他，
+ * 同时接管的几个进程只有一个认领得到。认领名读出来逐字就是判过陈的那份（普通文件），才删锁
+ * 路径、删认领名，再按上面建锁。陈锁只有认领者会删，认领名在删完之前一直占着，所以删掉的一定
+ * 是那份陈锁，不会是别人刚建的新锁；认领名读出来不是那份（锁已换人、变成符号链接等）或读不出，
+ * 就只删自己刚建的认领名，锁路径一概不动。锁路径从不挪走、从不放回。前提是锁路径只经本模块
+ * 改动：有人在核对与删除之间手动换掉锁文件，或同一进程里两个实例把对方的锁当成「就是本进程」
+ * 的陈锁时，删的是那一刻锁路径上的东西（unlink 不能按 inode 有条件地删）。
  *
- * 两个进程同时起不会两边都拿到。文件路径上没有比较并交换，三个以上进程同时接管同一把陈锁
- * 时，挪走与放回之间的空档里可能有第三个进程建上新锁，把刚接管的那一边挤掉；被挤掉的持有者
- * 在下一回合开头核对令牌时停下，至多已在途的那一回合与新持有者重叠一次；被挤掉的进程不再
- * 重建这把锁、不再为这位住户开窗，关闭时也不落暂停记录（`stillHolds`），要退出重启。
+ * 所以不论几个进程同时起、同时接管同一把陈锁，都只有一个拿到；锁建上之后只有持有者自己放
+ * （令牌对得上才删），或它死后被当成陈锁接管。被人手动删掉或换掉锁文件的持有者，在下一回合
+ * 开头核对令牌时停下，不再重建这把锁、不再为这位住户开窗，关闭时也不落暂停记录（`stillHolds`），
+ * 要退出重启。
  *
  * 代价：死进程的 pid 被系统复用给别的活进程时，这位住户会一直显示「在别处打开」，直到有人
- * 按提示删掉锁文件；锁路径被非文件占住时要人手动挪走；三个以上进程抢陈锁时可能有一回合重叠
- * （见上）；每回合多读一次锁文件；
+ * 按提示删掉锁文件；锁路径被非文件占住时要人手动挪走；接管到一半（认领名建上、陈锁还没删）
+ * 被硬杀，陈锁和认领名都留着，之后的进程认领不到、一直被拒，要人按提示删掉这两个文件（认领名
+ * 建上、陈锁已删之后才被硬杀，只多留一个认领名文件，不挡任何人）；每回合多读一次锁文件；
  * 两个 pid 命名空间不同的容器共用一个数据目录时，存活判断不可靠——对方活着也可能被当成陈锁
  * 接管，本空间碰巧有同号进程时又会一直显示「在别处打开」。
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   fchmodSync,
@@ -44,10 +46,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
-  readlinkSync,
-  renameSync,
   rmSync,
-  symlinkSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
@@ -121,23 +120,26 @@ function observe(path: string): Observed {
   }
 }
 
-/** lstat 认得是普通文件（不跟符号链接）；看不了就不算。 */
-function isRegularFile(path: string): boolean {
+/** 删掉本进程自己刚建的认领名（只是个名字，不论它指向什么）；删不掉就留着，不会被当成锁。 */
+function dropOwnName(path: string): void {
   try {
-    return lstatSync(path).isFile();
+    unlinkSync(path);
   } catch {
-    return false;
+    // 留一个认领名残档：它的名字只对应那份陈锁，挡不住别的锁。
   }
 }
 
-/** 只删普通文件，绝不递归：旁名是本进程独有的名字，删不掉就留着。 */
-function discardRegularFile(path: string): void {
-  try {
-    if (isRegularFile(path)) unlinkSync(path);
-  } catch {
-    // 留一份改了名的残档，不会被当成锁。
-  }
+/** 同一份陈锁只有一个认领名：由判过陈的那份原文定（原文里有随机令牌，不同的锁不撞名）。 */
+function claimPathFor(path: string, staleRaw: string): string {
+  const digest = createHash("sha256").update(staleRaw).digest("hex").slice(0, 32);
+  return `${path}.takeover-${digest}`;
 }
+
+/** 接管的结局：接管了（陈锁已删）；认领名被别人占着；锁路径已经不是判过的那份陈锁。 */
+type TakeOver =
+  | { readonly kind: "taken" }
+  | { readonly kind: "claimed-elsewhere"; readonly claim: string }
+  | { readonly kind: "changed" };
 
 function parseHolder(observed: Observed, residentId: string): LockHolder | null {
   if (observed.kind !== "file") return null;
@@ -202,7 +204,7 @@ function createExclusive(path: string, content: string): boolean {
 
 export class ResidentHostLocks {
   readonly #dataDir: string;
-  /** 本进程拿到过的锁：residentId → 令牌。被挤掉后照旧留着，核对永远不过，直到重启。 */
+  /** 本进程拿到过的锁：residentId → 令牌。锁文件被人删掉或换掉后照旧留着，核对永远不过，直到重启。 */
   readonly #held = new Map<string, string>();
   #closed = false;
 
@@ -252,14 +254,22 @@ export class ResidentHostLocks {
       if (holder !== null && holder.pid !== process.pid && isAlive(holder.pid)) {
         throw this.#busy(residentId, holder.pid, path);
       }
-      if (!this.#takeOver(residentId, path, observed.raw)) break;
-      if (createExclusive(path, content)) {
+      const takeOver = this.#takeOver(residentId, path, observed.raw);
+      if (takeOver.kind === "claimed-elsewhere") {
+        throw this.#claimedElsewhere(residentId, path, takeOver.claim);
+      }
+      if (takeOver.kind === "taken" && createExclusive(path, content)) {
         this.#held.set(residentId, token);
         return;
       }
+      // 认领时锁刚好被删掉（ENOENT）：空着就再建一次；别的情形照此刻看到的报。
+      if (takeOver.kind === "changed" && observe(path).kind === "missing") continue;
       break;
     }
-    throw this.#busy(residentId, parseHolder(observe(path), residentId)?.pid, path);
+    const now = observe(path);
+    if (now.kind === "unreadable") throw this.#unverifiable(residentId, now.code, path, false);
+    if (now.kind === "not-file") throw this.#notALock(residentId, path);
+    throw this.#busy(residentId, parseHolder(now, residentId)?.pid, path);
   }
 
   /** 从此不再拿锁、不再认可已拿的锁（runtime.close() 一开头就调）。重复调用无事。 */
@@ -317,71 +327,48 @@ export class ResidentHostLocks {
   }
 
   /**
-   * 接管陈锁：rename 到独有名字（抢不到就是别人先接管了），核对挪走的正是判过陈的那份
-   * （普通文件、逐字相同）。挪走的若是别人刚建的新锁，link 放回并认输：放回撞上 EEXIST 是
-   * 锁路径又被人建上了，那份才是现役的锁；别的错照实抛——被挪走的持有者下一回合核对令牌时
-   * 会停下。挪走的若是判过之后才冒出来的非文件，按类型原样放回（`#putBackNonFile`），绝不删。
+   * 接管陈锁：给锁路径上此刻的那个东西 link 一个认领名（同一份陈锁同一个名字，link 排他）。
+   * 认领名读出来逐字就是判过陈的那份普通文件，才删锁路径：陈锁只有认领者删，认领名删完陈锁
+   * 才放，所以删掉的一定是那份陈锁。读出来不是那份（锁已换人、变成符号链接）或读不出：只删
+   * 自己刚建的认领名，锁路径不动。认领名被别人占着：别人正在接管，或接管到一半被硬杀。
    */
-  #takeOver(residentId: string, path: string, staleRaw: string): boolean {
-    const aside = `${path}.stale-${process.pid}-${randomUUID()}`;
+  #takeOver(residentId: string, path: string, staleRaw: string): TakeOver {
+    const claim = claimPathFor(path, staleRaw);
     try {
-      renameSync(path, aside);
-    } catch {
-      return false;
-    }
-    const moved = observe(aside);
-    if (moved.kind === "file" && moved.raw === staleRaw) {
-      discardRegularFile(aside);
-      return true;
-    }
-    if (!isRegularFile(aside)) {
-      this.#putBackNonFile(residentId, path, aside);
-      throw this.#notALock(residentId, path);
-    }
-    let putBackCode: string | null = null;
-    try {
-      linkSync(aside, path);
+      linkSync(path, claim);
     } catch (error) {
-      const code = errorCode(error);
-      if (code !== "EEXIST") putBackCode = code;
+      // EEXIST：认领名已在。其余（锁刚被删 ENOENT、锁路径成了目录 EPERM 等）：锁路径已经不是
+      // 判过的那份，回头按此刻看到的报。
+      return errorCode(error) === "EEXIST"
+        ? { kind: "claimed-elsewhere", claim }
+        : { kind: "changed" };
     }
-    discardRegularFile(aside);
-    if (putBackCode !== null) {
-      throw new ResidentHostLockError(
-        `住户 ${residentId} 的锁接管没成：挪走的是另一个进程刚建的锁，放回时出错（${putBackCode}）；那个进程下一回合核对锁时会停下`,
-        `稍后重试；若确认没有别的 mist 进程在跑，删掉锁文件 ${path} 后重试`,
-      );
+    const claimed = observe(claim);
+    if (claimed.kind !== "file" || claimed.raw !== staleRaw) {
+      dropOwnName(claim);
+      return { kind: "changed" };
     }
-    return false;
+    try {
+      unlinkSync(path);
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") {
+        dropOwnName(claim);
+        throw new ResidentHostLockError(
+          `住户 ${residentId} 的陈锁删不掉（${errorCode(error)}）：本进程不开窗、不调模型、不写一窗流`,
+          `修好 ${dirname(path)} 的写权限后重试；若确认没有别的 mist 进程在跑，删掉锁文件 ${path} 后重试`,
+        );
+      }
+    }
+    dropOwnName(claim);
+    return { kind: "taken" };
   }
 
-  /**
-   * 把判过之后才冒出来的非文件原样放回，但绝不换掉空档里别人刚建上的锁。按类型来：目录用
-   * rename（目标是文件时 ENOTDIR、非空目录时 ENOTEMPTY；顶多换掉一个空目录，不丢东西）；
-   * 符号链接读出原 link text 再 `symlink` 到锁路径（排他，目标已在就 EEXIST）——不能用 link，
-   * macOS 的 link(2) 会解引用符号链接，放回去的就成了目标文件的硬链接；fifo、socket 等用 link
-   * （目标已在就 EEXIST）。放回之后才删旁名；放不回去就留在旁名，报错里给出旁名。
-   */
-  #putBackNonFile(residentId: string, path: string, aside: string): void {
-    try {
-      const moved = lstatSync(aside);
-      if (moved.isDirectory()) {
-        renameSync(aside, path);
-        return;
-      }
-      if (moved.isSymbolicLink()) symlinkSync(readlinkSync(aside), path);
-      else linkSync(aside, path);
-    } catch (error) {
-      throw new ResidentHostLockError(
-        `住户 ${residentId} 的锁路径上冒出来一个不是 mist 锁的东西，挪走后放不回去（${errorCode(error)}），现在在 ${aside}`,
-        `把 ${aside} 挪回 ${path} 或挪到别处，确认锁路径上没有不是 mist 锁的东西后重试`,
-      );
-    }
-    try {
-      unlinkSync(aside);
-    } catch {
-      // 已经放回锁路径；旁名多留一个名字，不会被当成锁。
-    }
+  /** 认领名被别人占着：别人正在接管这把陈锁，或接管到一半被硬杀留下了认领名。 */
+  #claimedElsewhere(residentId: string, path: string, claim: string): ResidentHostLockError {
+    return new ResidentHostLockError(
+      `住户 ${residentId} 的陈锁正被另一个 mist 进程接管：本进程不开窗、不调模型、不写一窗流`,
+      `稍后重试；若一直这样且确认没有别的 mist 进程在跑，删掉锁文件 ${path} 和认领名 ${claim} 后重试`,
+    );
   }
 
   /** 从没拿到过这把锁的进程：提示到那边退出，或确认没人在跑后删锁重试。 */
